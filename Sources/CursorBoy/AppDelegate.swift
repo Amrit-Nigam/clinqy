@@ -4,68 +4,176 @@ import Carbon
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private var statusItem: NSStatusItem!
-    private var buddy: BuddyCursor!
-    private var orchestrator: Orchestrator!
-    private var panel: PromptPanel!
+    private var buddy: Buddy!
+    private var agent: Agent!
+    private var voice: Voice!
+    private var panel: CommandPanel!
+    private var island: IslandPanel!
+    private var resultPanel: ResultPanel!
     private var hotKey: HotKey?
+    private var pressedAt: Date?
+    private var holdTimer: Timer?
+    private var holdToTalk = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
-        buddy = BuddyCursor()
-        orchestrator = Orchestrator(buddy: buddy)
-        panel = PromptPanel(orchestrator: orchestrator) { [weak self] in self?.panel.orderOut(nil) }
-        // While acting, the panel must not be key or keystrokes would land in it instead of the target app.
-        orchestrator.hidePanel = { [weak self] in self?.panel.orderOut(nil) }
-        orchestrator.showPanel = { [weak self] in self?.panel.orderFrontRegardless() }
+        buddy = Buddy()
+        agent = Agent(buddy: buddy)
+        voice = Voice()
+        panel = CommandPanel(agent: agent, voice: voice) { [weak self] in self?.toggleMic() }
+        island = IslandPanel(agent: agent, voice: voice)
+        resultPanel = ResultPanel(agent: agent)
+        agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
+        Brain.prewarm()
+        Whisper.shared.prepare()
+        BrowserBridge.shared.start()
+
+        agent.onStart = { [weak self] in
+            guard let self else { return }
+            // Keystrokes must reach the target app, and clicks must not land on our windows.
+            self.panel.orderOut(nil)
+            self.island.show()
+        }
+        agent.onFinish = { [weak self] _, _ in
+            guard let self else { return }
+            self.island.show(for: 4.5)
+        }
+        // Paused for the user's input: bring the bar up with the question; hide it again once answered.
+        agent.onQuestion = { [weak self] in
+            guard let self else { return }
+            self.panel.showCentered()
+            self.island.show()
+        }
+        agent.onAnswered = { [weak self] in self?.panel.orderOut(nil) }
+        voice.onLevel = { [weak self] level in self?.buddy.level = level }
+        voice.onFinal = { [weak self] text in
+            guard let self else { return }
+            self.buddy.mood = .idle
+            // A spoken reply to a question answers it; otherwise it's a new request.
+            if self.agent.question != nil { self.agent.answer(text) } else { self.agent.submit(text) }
+        }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "CursorBoy")
-
         let menu = NSMenu()
         menu.addItem(withTitle: "Open CursorBoy  (⌥Space)", action: #selector(togglePanel), keyEquivalent: "")
-        menu.addItem(withTitle: "Check Permissions", action: #selector(checkPermissions), keyEquivalent: "")
+        menu.addItem(withTitle: "Talk  (hold ⌥Space)", action: #selector(toggleMic), keyEquivalent: "")
+        menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
+        menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(.separator())
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for item in menu.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
         statusItem.menu = menu
 
-        // Option+Space
-        hotKey = HotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey)) { [weak self] in
-            self?.togglePanel()
-        }
+        // ⌥Space: tap opens the bar, hold talks, and while working it stops.
+        hotKey = HotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey),
+                        onPress: { [weak self] in self?.hotKeyDown() },
+                        onRelease: { [weak self] in self?.hotKeyUp() })
 
         if !Permissions.allGranted {
             Permissions.requestMissing()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.checkPermissions() }
         }
-        if Config.typesafeKey == nil {
-            NSLog("CursorBoy: TYPESAFE_API_KEY missing; fast clicks disabled")
+    }
+
+    /// `cursorboy://run?task=…` runs a task in whatever app is in front (used for scripting and tests).
+    func application(_ application: NSApplication, open urls: [URL]) {
+        for url in urls where url.scheme == "cursorboy" && url.host == "reload-extension" {
+            Task { Agent.writeLog("extension reloaded in \(await BrowserBridge.shared.reloadAll()) browser(s)") }
+        }
+        for url in urls where url.scheme == "cursorboy" && url.host == "answer" {
+            agent.answer(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value)
+        }
+        for url in urls where url.scheme == "cursorboy" && url.host == "cancel" { agent.cancel() }
+        for url in urls where url.scheme == "cursorboy" && url.host == "run" {
+            guard let task = URLComponents(url: url, resolvingAgainstBaseURL: false)?
+                .queryItems?.first(where: { $0.name == "task" })?.value else { continue }
+            rememberTarget()
+            agent.submit(task)
         }
     }
 
-    @objc func togglePanel() {
-        if panel.isVisible {
-            panel.orderOut(nil)
-            return
+    // MARK: - Hotkey
+
+    private func hotKeyDown() {
+        // While working, ⌥Space stops it — unless it's waiting on you, then it opens/talks as usual.
+        if agent.isRunning, agent.question == nil { agent.cancel(); return }
+        guard pressedAt == nil else { return }   // key repeat
+        pressedAt = Date()
+        holdTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.pressedAt != nil else { return }
+                self.holdToTalk = true
+                self.rememberTarget()
+                self.panel.orderOut(nil)
+                self.startListening(autoStop: false)
+                self.island.show()
+            }
         }
-        // Remember what the user was looking at; that's the app "click X" should act on.
+    }
+
+    private func hotKeyUp() {
+        holdTimer?.invalidate()
+        defer { pressedAt = nil; holdToTalk = false }
+        guard pressedAt != nil else { return }
+        if holdToTalk {
+            voice.stop()
+            if voice.transcript.isEmpty { island.hide(); buddy.mood = .idle }
+        } else {
+            togglePanel()
+        }
+    }
+
+    private func startListening(autoStop: Bool) {
+        buddy.mood = .listening
+        voice.start(autoStop: autoStop)
+    }
+
+    private func rememberTarget() {
+        guard agent.question == nil else { return }   // answering, not starting something new
         let front = NSWorkspace.shared.frontmostApplication
-        if front?.bundleIdentifier != Bundle.main.bundleIdentifier {
-            orchestrator.targetApp = front
+        guard let front, front.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
+        agent.targetApp = front
+        // Whatever the user had highlighted goes along with their request.
+        agent.selectedText = AXEngine.selectedText(of: front)
+        if agent.selectedText == nil, Launcher.isBrowser(front), BrowserBridge.shared.isConnected {
+            Task { [agent] in
+                if let text = await BrowserBridge.shared.selection(), agent?.isRunning == false { agent?.selectedText = text }
+            }
         }
+    }
+
+    // MARK: - Menu actions
+
+    @objc func togglePanel() {
+        if panel.isVisible { panel.orderOut(nil); return }
+        rememberTarget()
         panel.showCentered()
     }
 
-    @objc func checkPermissions() {
-        let lines = Permissions.all.map { item in
-            "\(item.granted() ? "✅" : "❌")  \(item.name): \(item.why)"
+    @objc func toggleMic() {
+        if voice.isListening { voice.stop(); return }
+        rememberTarget()
+        if !panel.isVisible { panel.showCentered() }
+        startListening(autoStop: true)
+    }
+
+    @objc func openMemory() {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/cursorboy/memory.md")
+        if !FileManager.default.fileExists(atPath: url.path) {
+            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? "".write(to: url, atomically: true, encoding: .utf8)
         }
+        NSWorkspace.shared.open(url)
+    }
+
+    @objc func checkPermissions() {
+        let lines = Permissions.all.map { "\($0.granted() ? "✅" : "❌")  \($0.name): \($0.why)" }
         let alert = NSAlert()
         alert.messageText = Permissions.allGranted ? "All permissions granted" : "CursorBoy needs these permissions"
         alert.informativeText = lines.joined(separator: "\n") + """
 
 
-        Jev key: \(Config.typesafeKey == nil ? "❌ missing" : "✅ found")
-        agy: \(Config.agyPath)
+        Claude CLI: \(ClaudeSession.claudePath ?? "❌ not found")
 
         After enabling something in System Settings, click Check Again. \
         Screen Recording may need CursorBoy to be restarted.
