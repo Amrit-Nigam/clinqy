@@ -66,6 +66,24 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--transcribe" 
     RunLoop.main.run()
 }
 
+// `CursorBoy --selftest`: fast checks of logic that needs no UI (safety rules, reply parsing).
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
+    var failures = 0
+    func check(_ ok: Bool, _ what: String) { print((ok ? "ok   " : "FAIL ") + what); if !ok { failures += 1 } }
+    check(Safety.needsConfirmation(label: "Pay ₹500", request: "open the checkout page") != nil, "pay needs confirmation")
+    check(Safety.needsConfirmation(label: "Pay ₹500", request: "pay for my order") == nil, "pay allowed when asked")
+    check(Safety.needsConfirmation(label: "Submit", request: "fill the form but don't submit") != nil, "don't submit is respected")
+    check(Safety.needsConfirmation(label: "Send", request: "message mom hi") == nil, "send allowed for a message request")
+    check(Safety.needsConfirmation(label: "Delete", request: "open my inbox") != nil, "delete needs confirmation")
+    check(Safety.needsConfirmation(label: "Search", request: "anything") == nil, "harmless click passes")
+    check(Safety.needsConfirmation(label: "Book now", request: "find flights to mumbai") != nil, "booking needs confirmation")
+    check(Safety.isYes("Yes, go ahead") && Safety.isYes("haan") && !Safety.isYes("No"), "yes/no parsing")
+    check(MainActor.assumeIsolated { Brain.json(from: "sure {\"say\":\"x\",\"actions\":[]} ok")?["say"] as? String == "x" }, "json in prose")
+    check(MainActor.assumeIsolated { (Brain.json(from: "<invoke name=\"look\">")?["actions"] as? [[String: Any]])?.first?["do"] as? String == "look" }, "tool-call tag")
+    print(failures == 0 ? "all passed" : "\(failures) failed")
+    exit(failures == 0 ? 0 : 1)
+}
+
 // `CursorBoy --snapshots`: what each connected browser reports for its active tab (debugging the extension).
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--snapshots" {
     Task { @MainActor in

@@ -1,0 +1,32 @@
+<!doctype html><html><head><title>form:</title><meta charset="utf-8"><style>
+body{font-family:-apple-system;max-width:640px;margin:40px auto}
+.q{border:1px solid #ddd;border-radius:8px;padding:16px;margin:12px 0}
+.box{display:flex;align-items:center;gap:10px;padding:6px 0;cursor:pointer}
+.box span.c{width:18px;height:18px;border:2px solid #555;border-radius:3px;display:inline-block}
+.box[aria-checked=true] span.c{background:#673ab7;border-color:#673ab7}
+</style></head><body>
+<h1>Event Feedback</h1>
+<div class="q"><div>Which sessions did you attend?</div>
+<div class="box" role="checkbox" aria-checked="false" aria-label="Keynote"><span class="c"></span>Keynote</div>
+<div class="box" role="checkbox" aria-checked="false" aria-label="Swift workshop"><span class="c"></span>Swift workshop</div>
+<div class="box" role="checkbox" aria-checked="false" aria-label="Design panel"><span class="c"></span>Design panel</div></div>
+<div class="q"><div>How was it?</div>
+<div class="box" role="radio" aria-checked="false" aria-label="Great"><span class="c" style="border-radius:50%"></span>Great</div>
+<div class="box" role="radio" aria-checked="false" aria-label="Okay"><span class="c" style="border-radius:50%"></span>Okay</div></div>
+<div class="q"><label>Your name <input id="name" name="name" autocomplete="name"></label></div>
+<div class="q"><label>City <select id="city"><option>Choose…</option><option>Delhi</option><option>Mumbai</option><option>Pune</option></select></label></div>
+<script>
+// Like Google Forms: only real (trusted) mouse input counts. State is mirrored into the title for the test runner.
+const sync = () => {
+  const on = [...document.querySelectorAll("[aria-checked=true]")].map(b => b.getAttribute("aria-label")).join(",");
+  document.title = "form:" + on + "|name=" + document.getElementById("name").value + "|city=" + document.getElementById("city").value;
+};
+document.querySelectorAll(".box").forEach(b => b.addEventListener("click", e => {
+  if (!e.isTrusted) return;
+  if (b.getAttribute("role") === "radio") document.querySelectorAll("[role=radio]").forEach(r => r.setAttribute("aria-checked", "false"));
+  b.setAttribute("aria-checked", b.getAttribute("aria-checked") === "true" && b.getAttribute("role") === "checkbox" ? "false" : "true");
+  sync();
+}));
+document.getElementById("name").addEventListener("input", sync);
+document.getElementById("city").addEventListener("change", sync);
+</script></body></html>
