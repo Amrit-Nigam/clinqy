@@ -18,11 +18,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleIdentifier</key><string>com.amritnigam.cursorboy</string>
   <key>CFBundleExecutable</key><string>CursorBoy</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.1.0</string>
+  <key>CFBundleShortVersionString</key><string>0.2.0</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>CursorBoy controls apps on your behalf.</string>
+  <key>CFBundleURLTypes</key>
+  <array><dict>
+    <key>CFBundleURLName</key><string>CursorBoy</string>
+    <key>CFBundleURLSchemes</key><array><string>cursorboy</string></array>
+  </dict></array>
+  <key>NSMicrophoneUsageDescription</key><string>CursorBoy listens while you hold ⌥Space so you can talk to it.</string>
+  <key>NSSpeechRecognitionUsageDescription</key><string>CursorBoy turns what you say into requests.</string>
 </dict>
 </plist>
 PLIST
