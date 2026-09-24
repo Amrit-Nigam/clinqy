@@ -383,6 +383,31 @@ enum AXEngine {
         return url
     }
 
+    /// Role and label of whatever is on screen at a point (for recording what the user clicked).
+    static func describe(at point: CGPoint) -> (role: String, label: String) {
+        let system = AXUIElementCreateSystemWide()
+        var element: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(system, Float(point.x), Float(point.y), &element) == .success,
+              let element else { return ("something", "") }
+        let role: String = attr(element, kAXRoleAttribute) ?? "AXUnknown"
+        var text = label(of: element, role: role)
+        // Many click targets are an unlabeled image or text inside a labeled button/row: use the parent's label.
+        if text.isEmpty, let parent: AXUIElement = attr(element, kAXParentAttribute) {
+            let pr: String = attr(parent, kAXRoleAttribute) ?? ""
+            text = label(of: parent, role: pr)
+        }
+        return (String(role.dropFirst(2)), text)
+    }
+
+    /// Role and label of the focused element (for recording where the user typed).
+    static func focusedDescription(of app: NSRunningApplication) -> (role: String, label: String) {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let f: AXUIElement = attr(root, kAXFocusedUIElementAttribute) else { return ("field", "") }
+        let role: String = attr(f, kAXRoleAttribute) ?? "AXTextField"
+        let subrole: String = attr(f, kAXSubroleAttribute) ?? ""
+        return (subrole == "AXSecureTextField" ? "AXSecureTextField" : String(role.dropFirst(2)), label(of: f, role: role))
+    }
+
     /// Role of the element with keyboard focus (e.g. "AXTextArea"), if any.
     static func focusedRole(of app: NSRunningApplication) -> String? {
         let root = AXUIElementCreateApplication(app.processIdentifier)

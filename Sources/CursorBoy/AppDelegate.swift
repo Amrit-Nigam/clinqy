@@ -19,7 +19,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         buddy = Buddy()
         agent = Agent(buddy: buddy)
         voice = Voice()
-        panel = CommandPanel(agent: agent, voice: voice) { [weak self] in self?.toggleMic() }
+        panel = CommandPanel(agent: agent, voice: voice, onMic: { [weak self] in self?.toggleMic() },
+                             onWatch: { [weak self] in self?.startWatching() })
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
         agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
@@ -87,6 +88,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             agent.answer(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value)
         }
         for url in urls where url.scheme == "cursorboy" && url.host == "cancel" { agent.cancel() }
+        for url in urls where url.scheme == "cursorboy" && url.host == "watch" { rememberTarget(); startWatching() }
+        for url in urls where url.scheme == "cursorboy" && url.host == "stop-watching" { stopWatching() }
         for url in urls where url.scheme == "cursorboy" && url.host == "run" {
             guard let task = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "task" })?.value else { continue }
@@ -114,11 +117,38 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    @objc private func stopFromMenuBar() { agent.cancel() }
+    @objc private func stopFromMenuBar() {
+        if Recorder.shared.isRecording { stopWatching() } else { agent.cancel() }
+    }
+
+    // MARK: - Watch & learn
+
+    private func startWatching() {
+        panel.orderOut(nil)
+        // Give the user their app back, then watch.
+        if let target = agent.targetApp { target.activate() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            guard let self else { return }
+            Recorder.shared.start()
+            self.setStatusIcon(running: true)
+            self.island.show()
+            self.buddy.bubble("watching…", for: 2)
+        }
+    }
+
+    private func stopWatching() {
+        let recording = Recorder.shared.stop()
+        setStatusIcon(running: false)
+        island.hide()
+        panel.showCentered()
+        Task { await Skills.shared.learn(from: recording) }
+    }
 
     // MARK: - Hotkey
 
     private func hotKeyDown() {
+        // While watching, ⌥Space stops the recording and learns from it.
+        if Recorder.shared.isRecording { stopWatching(); return }
         // While working, ⌥Space stops it — unless it's waiting on you, then it opens/talks as usual.
         if agent.isRunning, agent.question == nil { agent.cancel(); return }
         guard pressedAt == nil else { return }   // key repeat

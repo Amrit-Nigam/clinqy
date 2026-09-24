@@ -7,7 +7,7 @@ import SwiftUI
 final class CommandPanel: NSPanel {
     static let size = NSSize(width: 660, height: 460)
 
-    init(agent: Agent, voice: Voice, onMic: @escaping () -> Void) {
+    init(agent: Agent, voice: Voice, onMic: @escaping () -> Void, onWatch: @escaping () -> Void = {}) {
         super.init(contentRect: NSRect(origin: .zero, size: Self.size),
                    styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
                    backing: .buffered, defer: false)
@@ -19,8 +19,9 @@ final class CommandPanel: NSPanel {
         hasShadow = false
         isMovableByWindowBackground = true
         appearance = NSAppearance(named: .darkAqua)
-        contentView = NSHostingView(rootView: CommandView(agent: agent, voice: voice, onMic: onMic,
-                                                          onClose: { [weak self] in self?.orderOut(nil) }))
+        var view = CommandView(agent: agent, voice: voice, onMic: onMic, onClose: { [weak self] in self?.orderOut(nil) })
+        view.onWatch = onWatch
+        contentView = NSHostingView(rootView: view)
     }
 
     override var canBecomeKey: Bool { true }
@@ -148,6 +149,10 @@ private struct Orb: View {
 struct CommandView: View {
     @ObservedObject var agent: Agent
     @ObservedObject var voice: Voice
+    @ObservedObject private var skills = Skills.shared
+    @StateObject private var skillsTab = Hover()
+    /// Starts Watch & Learn (set by the app delegate).
+    var onWatch: () -> Void = {}
     @StateObject private var historyTab = Hover()
     @ObservedObject private var whisper = Whisper.shared
     let onMic: () -> Void
@@ -212,7 +217,7 @@ struct CommandView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in focused = true }
     }
 
-    private var showBody: Bool { historyTab.on || voice.isTranscribing || whisper.statusText != nil || !agent.steps.isEmpty || !agent.answer.isEmpty || voice.isListening || voice.error != nil || agent.input.isEmpty }
+    private var showBody: Bool { historyTab.on || skillsTab.on || skills.isLearning || skills.lastError != nil || voice.isTranscribing || whisper.statusText != nil || !agent.steps.isEmpty || !agent.answer.isEmpty || voice.isListening || voice.error != nil || agent.input.isEmpty }
 
     private var bar: some View {
         HStack(spacing: 14) {
@@ -263,7 +268,12 @@ struct CommandView: View {
     }
 
     @ViewBuilder private var content: some View {
-        if historyTab.on && agent.question == nil && !voice.isListening {
+        if skillsTab.on && agent.question == nil && !voice.isListening {
+            SkillsView(onRun: { skill in
+                skillsTab.on = false
+                agent.submit("Use the skill “\(skill.name)”.")
+            })
+        } else if historyTab.on && agent.question == nil && !voice.isListening {
             HistoryView(
                 onContinue: { entry in
                     agent.continuation = entry
@@ -283,6 +293,12 @@ struct CommandView: View {
     }
 
     @ViewBuilder private var mainContent: some View {
+        if skills.isLearning {
+            Label("Learning what you showed me…", systemImage: "graduationcap").font(.system(size: 13))
+                .foregroundStyle(DS.secondary).symbolEffect(.pulse)
+        } else if let error = skills.lastError {
+            Label(error, systemImage: "exclamationmark.circle").font(.system(size: 13)).foregroundStyle(DS.secondary)
+        }
         if let status = whisper.statusText, agent.steps.isEmpty {
             Label(status, systemImage: "waveform.badge.plus").font(.system(size: 12)).foregroundStyle(DS.tertiary)
                 .padding(.bottom, 4)
@@ -321,7 +337,24 @@ struct CommandView: View {
             Hint(keys: "⌥ Space", text: "open")
             Hint(keys: "hold ⌥ Space", text: "talk")
             Spacer()
-            Button { withAnimation(.easeOut(duration: 0.15)) { historyTab.on.toggle() } } label: {
+            Button(action: onWatch) {
+                HStack(spacing: 4) {
+                    Circle().fill(Color.red.opacity(0.85)).frame(width: 7, height: 7)
+                    Text("Watch & learn").font(.system(size: 11))
+                }
+                .foregroundStyle(DS.tertiary)
+            }
+            .buttonStyle(.plain)
+            .help("Show CursorBoy how to do something: it watches, then learns it as a skill")
+            Button { withAnimation(.easeOut(duration: 0.15)) { skillsTab.on.toggle(); historyTab.on = false } } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "graduationcap").font(.system(size: 11))
+                    Text(skillsTab.on ? "Back" : "Skills").font(.system(size: 11))
+                }
+                .foregroundStyle(skillsTab.on ? DS.text : DS.tertiary)
+            }
+            .buttonStyle(.plain)
+            Button { withAnimation(.easeOut(duration: 0.15)) { historyTab.on.toggle(); skillsTab.on = false } } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "clock.arrow.circlepath").font(.system(size: 11))
                     Text(historyTab.on ? "Back" : "History").font(.system(size: 11))
@@ -570,6 +603,7 @@ struct IslandView: View {
 
     private var text: String {
         if voice.isListening { return voice.transcript.isEmpty ? "Listening…" : voice.transcript }
+        if Recorder.shared.isRecording { return "Watching you… do the task, then ⌥Space or ⏹ to stop" }
         if voice.isTranscribing { return "Transcribing…" }
         if let q = agent.question { return "Needs your input: \(q.text)" }
         return agent.narration.isEmpty ? "Thinking…" : agent.narration
@@ -811,5 +845,66 @@ private struct SmallButton: View {
                 .background(Capsule().fill(Color.white.opacity(0.1)))
         }
         .buttonStyle(.plain)
+    }
+}
+
+
+// MARK: - Skills
+
+struct SkillsView: View {
+    @ObservedObject var skills = Skills.shared
+    let onRun: (Skills.Skill) -> Void
+
+    var body: some View {
+        if skills.all.isEmpty {
+            Text("No skills yet. Click “Watch & learn”, do the task yourself, then press ⌥Space to stop — I'll learn it.")
+                .font(.system(size: 13)).foregroundStyle(DS.tertiary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .fixedSize(horizontal: false, vertical: true)
+        } else {
+            ScrollView {
+                LazyVStack(alignment: .leading, spacing: 4) {
+                    ForEach(skills.all) { skill in
+                        SkillRow(skill: skill, onRun: { onRun(skill) }, onDelete: { skills.remove(skill) })
+                    }
+                }
+            }
+            .frame(maxHeight: 250)
+        }
+    }
+}
+
+private struct SkillRow: View {
+    let skill: Skills.Skill
+    let onRun: () -> Void
+    let onDelete: () -> Void
+    @StateObject private var hover = Hover()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "graduationcap").font(.system(size: 12)).foregroundStyle(Color(nsColor: Palette.accent)).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(skill.name).font(.system(size: 13, weight: .medium)).foregroundStyle(DS.text).lineLimit(1)
+                Text(skill.summary + (skill.parameters.isEmpty ? "" : " · asks for " + skill.parameters.joined(separator: ", ")))
+                    .font(.system(size: 12)).foregroundStyle(DS.tertiary).lineLimit(2)
+                if hover.on {
+                    Text(skill.steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
+                        .font(.system(size: 11)).foregroundStyle(DS.secondary).padding(.top, 3)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Spacer(minLength: 6)
+            if hover.on {
+                HStack(spacing: 4) {
+                    SmallButton(title: "Run", action: onRun)
+                    Button(action: onDelete) { Image(systemName: "trash").font(.system(size: 10)) }
+                        .buttonStyle(.plain).foregroundStyle(DS.tertiary)
+                }
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.white.opacity(hover.on ? 0.07 : 0)))
+        .contentShape(Rectangle())
+        .onHover { hover.on = $0 }
     }
 }

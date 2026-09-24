@@ -284,6 +284,10 @@ final class Agent: ObservableObject {
             Earlier result: \(earlier.answer)\(earlier.result.map { "\nEarlier output: \($0.plain.prefix(1500))" } ?? "")
             """
         }
+        let skills = Skills.shared.promptText
+        if !skills.isEmpty {
+            text += "\nSkills the user taught you (follow the matching one's steps when a request fits; ask for any missing parameters):\n" + skills
+        }
         let facts = Memory.facts
         if !facts.isEmpty { text += "\nThings you remember about the user:\n" + facts.map { "- \($0)" }.joined(separator: "\n") }
         return text
