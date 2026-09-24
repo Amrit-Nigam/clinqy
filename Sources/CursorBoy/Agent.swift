@@ -737,6 +737,13 @@ final class Agent: ObservableObject {
             onResult()
             return .init(ok: true, summary: "shown to the user on screen")
 
+        case "dictionary":
+            // The app's own scripting vocabulary, for an applescript fallback.
+            guard let app = context.app, Scripting.isScriptable(app) else { return fail("this app isn't scriptable") }
+            let line = begin("Check \(app.cleanName ?? "the app")'s scripting")
+            guard let dict = await Scripting.dictionary(for: app) else { return end(line, fail("couldn't read its dictionary")) }
+            return end(line, .init(ok: true, summary: dict))
+
         case "look":
             return .init(ok: true, summary: "screenshot attached next turn", effect: .look)
 
@@ -935,7 +942,7 @@ struct Observation {
             .map { "e\($0.offset) \($0.element.role.dropFirst(2)): \($0.element.label)" }
             .joined(separator: "\n")
         var text = """
-        Frontmost app: \(app.cleanName ?? "?")\(Launcher.isBrowser(app) ? " (browser)" : "")
+        Frontmost app: \(app.cleanName ?? "?")\(Launcher.isBrowser(app) ? " (browser)" : "")\(Scripting.isScriptable(app) && !Launcher.isBrowser(app) ? " (scriptable)" : "")
         Window: \(scan.window.isEmpty ? "(none)" : scan.window)
         Focused: \(scan.focused)
         \(page != nil ? "Browser controls" : "Elements"):

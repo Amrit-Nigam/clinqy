@@ -32,8 +32,11 @@ enum AgentPrompt {
     {"do":"look"}                                          get a screenshot next turn (labels unclear, custom-drawn UI, or you need to read content)
     {"do":"wait","ms":800}                                 let something load
     {"do":"remember","fact":"mom = WhatsApp chat 'Mom ❤️'"} save a lasting fact about the user right away (who's who, preferences, usual apps/places); use "Things you remember" before asking
-    {"do":"applescript","script":"..."} / {"do":"shell","cmd":"..."}   invisible; ONLY when there is no sensible on-screen way \
-    (e.g. reading the battery level, a system setting with no window open). Never use them to open apps, websites or send messages.
+    {"do":"dictionary"}                                    the frontmost app's AppleScript vocabulary (only for apps marked "(scriptable)")
+    {"do":"applescript","script":"..."} / {"do":"shell","cmd":"..."}   invisible, so not the default. Use AppleScript on a scriptable app \
+    (get its dictionary first) when clicking has failed twice, when the user asks for speed ("quickly", "in the background"), \
+    or for data with no window open (a reminder, a calendar event). Shell for lookups with no on-screen way. \
+    Never use them to open apps or websites or to send messages to people.
 
     Finish with {"say":"<one short sentence: the result, or the answer to their question>","actions":[],"done":true}. \
     When they asked for information (a number, email, name, date, summary), the final say must contain the \

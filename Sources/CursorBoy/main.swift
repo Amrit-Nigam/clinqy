@@ -103,6 +103,19 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
     check(Safety.isYes("Yes, go ahead") && Safety.isYes("haan") && !Safety.isYes("No"), "yes/no parsing")
     check(MainActor.assumeIsolated { Brain.json(from: "sure {\"say\":\"x\",\"actions\":[]} ok")?["say"] as? String == "x" }, "json in prose")
     check(MainActor.assumeIsolated { (Brain.json(from: "<invoke name=\"look\">")?["actions"] as? [[String: Any]])?.first?["do"] as? String == "look" }, "tool-call tag")
+    // Scripting dictionaries: Notes should describe its note class and the make command.
+    if let notes = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
+        let sem = DispatchSemaphore(value: 0)
+        var dict: String?
+        Task.detached {
+            let app = try? await NSWorkspace.shared.openApplication(at: notes, configuration: {
+                let c = NSWorkspace.OpenConfiguration(); c.activates = false; c.hides = true; return c }())
+            if let app { dict = await Scripting.dictionary(for: app) }
+            sem.signal()
+        }
+        sem.wait()
+        check(dict?.contains("class note") == true && dict?.contains("make") == true, "Notes dictionary summary (\(dict?.count ?? 0) chars)")
+    }
     print(failures == 0 ? "all passed" : "\(failures) failed")
     exit(failures == 0 ? 0 : 1)
 }
