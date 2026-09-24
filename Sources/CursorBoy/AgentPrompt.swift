@@ -21,6 +21,7 @@ enum AgentPrompt {
     {"do":"scroll","dir":"down"}                           up/down
     {"do":"point","id":"e3","label":"Brightness"}         mark something for the user: the cursor flies over, draws a circle around it and an arrow to it, with a 1-3 word label. Doesn't click.
     {"do":"point","x":640,"y":210,"w":40,"h":30,"label":"New Terminal"}   same, by position on the last screenshot (pixels) when it has no element id
+    {"do":"read","path":"~/Documents/file.pdf"}            read a file on disk without opening it (PDF, Word, text)
     {"do":"read"}                                          read the text of what's open — web page, PDF, Word doc, resume, scan or image (uses the file or text recognition). Use it whenever you need to find or quote information (phone numbers, emails, dates) instead of guessing from labels
     {"do":"ask","question":"Which date and how many passengers?","options":["Just me","2 people"],"sensitive":false}
                                                            pause and ask the user; their answer comes back as the result. options = quick choices (optional);

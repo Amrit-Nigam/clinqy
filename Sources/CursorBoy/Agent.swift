@@ -531,6 +531,12 @@ final class Agent: ObservableObject {
             var text: String?
             var source = ""
             let short = { (t: String?) in (t?.count ?? 0) < 80 }
+            // A specific file (e.g. the user's resume from memory), read without opening it.
+            if let path = action["path"] as? String {
+                let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+                guard let fileText = await Reader.fileText(url) else { return end(line, fail("couldn't read \(path)")) }
+                return end(line, .init(ok: true, summary: "text of \(url.lastPathComponent):\n\(fileText)"))
+            }
             if let page = context.page, !page.url.lowercased().hasSuffix(".pdf"), page.url.hasPrefix("http") || page.url.hasPrefix("file") {
                 text = (try? await BrowserBridge.shared.perform("read", on: page))?["text"] as? String
                 source = "the web page"
