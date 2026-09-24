@@ -28,7 +28,7 @@ enum Permissions {
              request: { _ = CGRequestScreenCaptureAccess() },
              settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_ScreenCapture"),
         Item(name: "Automation (System Events)",
-             why: "Let agy control apps with AppleScript",
+             why: "Control apps with AppleScript",
              granted: { automationStatus() == noErr },
              request: { requestAutomation() },
              settingsURL: "x-apple.systempreferences:com.apple.preference.security?Privacy_Automation"),

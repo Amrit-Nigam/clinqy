@@ -21,19 +21,4 @@ enum Config {
     static func value(_ key: String) -> String? {
         ProcessInfo.processInfo.environment[key] ?? fileValues[key]
     }
-
-    static var typesafeKey: String? { value("TYPESAFE_API_KEY") }
-
-    /// Path to the Antigravity CLI. GUI apps don't inherit the shell PATH, so probe common spots.
-    static var agyPath: String {
-        if let explicit = value("AGY_PATH") { return explicit }
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let candidates = ["\(home)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
-        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) } ?? "agy"
-    }
-
-    /// Working directory for agent tasks.
-    static var workDir: String {
-        value("CURSORBOY_WORKDIR") ?? FileManager.default.homeDirectoryForCurrentUser.path
-    }
 }
