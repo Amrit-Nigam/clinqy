@@ -63,5 +63,30 @@ case_ pay-declined pay.html    "click the pay button"                           
 case_ pay-asked    pay.html    "buy this mouse"                                   "title:pay:PAID"     "Yes, go ahead"
 case_ read-pdf     resume.pdf  "what's the mobile number on this resume?"         "answer:98450 12345"
 
+# Watch & learn: act like the user (real input via the debug binary), learn a skill, then run it with new values.
+watch_learn() {
+  [[ -n $FILTER && watch-learn != *$FILTER* ]] && return
+  local B=../.build/debug/CursorBoy
+  [[ -x $B ]] || { echo "SKIP  watch-learn (swift build first)"; return; }
+  local SK=~/Library/Application\ Support/CursorBoy/skills.json
+  local before=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/CursorBoy/skills.json');print(len(json.load(open(p))) if os.path.exists(p) else 0)")
+  chrome "set URL of active tab of front window to \"$BASE/form.html\""; chrome "activate"; sleep 2.5
+  open -g "cursorboy://watch"; sleep 1.5
+  $B --click-label "Your name" >/dev/null && sleep 0.4 && $B --type "Amrit Nigam"; sleep 0.4
+  $B --click-label "Keynote" >/dev/null; sleep 0.4; $B --click-label "Great" >/dev/null; sleep 0.6
+  open -g "cursorboy://stop-watching"
+  local name=""
+  for i in $(seq 1 30); do sleep 1
+    name=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/CursorBoy/skills.json');d=json.load(open(p)) if os.path.exists(p) else [];print(d[0]['name'] if len(d)>$before else '')")
+    [[ -n $name ]] && break
+  done
+  if [[ -z $name ]]; then FAIL=$((FAIL+1)); echo "FAIL  watch-learn      no skill learned"; return; fi
+  case_ skill-run form.html "Use the skill “$name”." "title:name=Priya" "name Priya, session Swift workshop, rating Okay"
+  # Leave the user's skills as they were.
+  python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/CursorBoy/skills.json');d=json.load(open(p));json.dump([s for s in d if s['name']!='$name'],open(p,'w'))"
+  PASS=$((PASS+1)); echo "PASS  watch-learn      learned “$name”"
+}
+watch_learn
+
 echo "\n$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

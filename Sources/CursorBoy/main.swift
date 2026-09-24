@@ -66,6 +66,29 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--transcribe" 
     RunLoop.main.run()
 }
 
+// Test helpers that act like the user (real input events): --click-label <text>, --type <text>, --key <combo>.
+if CommandLine.arguments.count >= 3, ["--click-label", "--type", "--key"].contains(CommandLine.arguments[1]) {
+    let arg = CommandLine.arguments[2]
+    switch CommandLine.arguments[1] {
+    case "--click-label":
+        guard let app = NSWorkspace.shared.frontmostApplication else { exit(1) }
+        // Chromium only builds its web accessibility tree once an assistive client asks for it.
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier), "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        var found: UIElementInfo?
+        for _ in 0..<10 where found == nil {
+            found = AXEngine.elements(of: app, limit: 600).first { $0.label.lowercased().contains(arg.lowercased()) }
+            if found == nil { usleep(300_000) }
+        }
+        guard let el = found else { print("not found: \(arg)"); exit(1) }
+        AXEngine.click(at: el.center)
+        print("clicked \(el.role) \(el.label)")
+    case "--type": AXEngine.type(arg)
+    default: AXEngine.press(combo: arg)
+    }
+    usleep(300_000)
+    exit(0)
+}
+
 // `CursorBoy --selftest`: fast checks of logic that needs no UI (safety rules, reply parsing).
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
     var failures = 0
