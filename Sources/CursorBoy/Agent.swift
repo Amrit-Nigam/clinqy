@@ -48,6 +48,8 @@ final class Agent: ObservableObject {
     var onFinish: (_ answer: String, _ ok: Bool) -> Void = { _, _ in }
     /// Test mode: mirror progress to stdout with timings.
     var echo = false
+    /// Test runs aren't saved to History and teach memory nothing.
+    var isTest = false
 
     private let buddy: Buddy
     private let hand: Hand
@@ -105,7 +107,8 @@ final class Agent: ObservableObject {
         hand = Hand(buddy: buddy)
     }
 
-    func submit(_ raw: String) {
+    func submit(_ raw: String, test: Bool = false) {
+        isTest = test || echo
         let request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
         started = Date()
@@ -241,7 +244,7 @@ final class Agent: ObservableObject {
     /// After a task, keep anything lasting it revealed about the user (people, preferences, usual apps and
     /// places), so next time is faster. Runs in the background once the user already has their answer.
     private func learn(from session: ClaudeSession) async {
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, !isTest else { return }
         let known = Memory.facts
         let prompt = """
         The task is finished. List lasting facts about the user that this task revealed and that would help future \
@@ -853,8 +856,8 @@ final class Agent: ObservableObject {
             result = runResult
             onResult()
         }
-        History.shared.add(.init(date: started, request: request, answer: text, ok: ok,
-                                 steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult))
+        if !isTest { History.shared.add(.init(date: started, request: request, answer: text, ok: ok,
+                                 steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult)) }
         session = nil
         onFinish(text, ok)
     }

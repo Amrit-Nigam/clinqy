@@ -94,7 +94,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let task = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "task" })?.value else { continue }
             rememberTarget()
-            agent.submit(task)
+            let test = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "test" }?.value == "1"
+            agent.submit(task, test: test)
         }
     }
 

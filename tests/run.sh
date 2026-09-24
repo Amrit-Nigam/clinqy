@@ -30,7 +30,7 @@ case_() {
   local url=$(chrome "get URL of active tab of front window")
   if [[ $front != "Google Chrome" || $url != $BASE/* ]]; then echo "SKIP  $name (test page not in front: $front $url)"; return; fi
   local start=$(wc -l < $LOG) t0=$(date +%s)
-  open -g "cursorboy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")"
+  open -g "cursorboy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1"
   local answered=0
   for i in $(seq 1 90); do
     sleep 1
