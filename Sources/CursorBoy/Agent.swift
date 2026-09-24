@@ -58,6 +58,8 @@ final class Agent: ObservableObject {
     private var openedTab = false
     /// The browser tab this task opened (the only tab it may navigate in place).
     private var ownedTab: Int?
+    /// The user already said yes to a confirmation in this run.
+    private var userConfirmed = false
 
     static func isNewTabPage(_ url: String) -> Bool {
         url.isEmpty || url.hasPrefix("chrome://newtab") || url.hasPrefix("arc://newtab") || url == "about:blank"
@@ -65,6 +67,27 @@ final class Agent: ObservableObject {
     }
 
     var isRunning: Bool { phase == .thinking || phase == .acting || phase == .waiting }
+
+    /// Pauses for the user's answer to `text` (nil = no answer / cancelled).
+    private func askUser(_ text: String, options: [String] = [], sensitive: Bool = false) async -> String? {
+        let previous = phase
+        phase = .waiting
+        buddy.bubble("need your input", for: 4)
+        question = Question(text: text, options: options, sensitive: sensitive)
+        onQuestion()
+        let reply = await withCheckedContinuation { answerWaiter = $0 }
+        if !Task.isCancelled { phase = previous == .waiting ? .acting : previous }
+        return reply
+    }
+
+    /// Consequential clicks (pay, book, send, delete…) the request didn't clearly ask for need the user's OK.
+    private func confirmRisky(_ label: String) async -> Bool {
+        guard !userConfirmed, let what = Safety.needsConfirmation(label: label, request: request) else { return true }
+        let reply = await askUser("About to click “\(what)”. Go ahead?", options: ["Yes, go ahead", "No"])
+        let yes = reply.map(Safety.isYes) ?? false
+        if yes { userConfirmed = true }
+        return yes
+    }
 
     /// The user's reply to the current question (nil = they declined / cancelled).
     func answer(_ text: String?) {
@@ -91,6 +114,7 @@ final class Agent: ObservableObject {
         narration = ""
         openedTab = false
         ownedTab = nil
+        userConfirmed = false
         secrets = []
         self.request = request
         runResult = nil
@@ -119,6 +143,16 @@ final class Agent: ObservableObject {
             return finish(ok: false, "Turn on Accessibility for CursorBoy in System Settings → Privacy & Security.")
         }
         buddy.mood = .thinking
+
+        // Don't start clicking around during a call or meeting unless the user says so.
+        if Safety.micInUse {
+            let reply = await askUser("You seem to be on a call (the mic is in use). Should I go ahead and use the screen?",
+                                      options: ["Go ahead", "Not now"])
+            guard let reply, reply.lowercased().hasPrefix("go") || Safety.isYes(reply) else {
+                return finish(ok: false, "Okay, I'll wait until you're off the call")
+            }
+            phase = .thinking
+        }
 
         let session: ClaudeSession
         do { session = try Brain.session() } catch { return finish(ok: false, error.localizedDescription) }
@@ -332,6 +366,7 @@ final class Agent: ObservableObject {
         case "click" where Self.isWebRef(action["id"]):
             guard let (el, rect) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
             let line = begin("Click \(el.text.prefix(32))")
+            guard await confirmRisky(el.text) else { return end(line, fail("the user said not to click \(el.text.prefix(40).debugDescription); stop and tell them where things stand")) }
             if let app = context.app { await Launcher.bringToFront(app) }
             // A real mouse click, like a person: many sites (Google Forms, React apps) ignore script clicks.
             // If nothing changed and it wasn't covered, fall back to clicking through the page.
@@ -361,6 +396,9 @@ final class Agent: ObservableObject {
                 // Dropdown: choose the option directly (typing into a native select is unreliable).
                 do {
                     let r = try await BrowserBridge.shared.perform("fill", on: page, ["index": el.index, "text": text])
+                    // Confirm the page really holds the new choice before calling it done.
+                    let now = (try? await BrowserBridge.shared.perform("value", on: page, ["index": el.index]))?["value"] as? String
+                    log("    dropdown: fill → \(r["value"] ?? "nil") · now \(now ?? "nil")")
                     buddy.clearHighlight()
                     return end(line, .init(ok: true, summary: "chose \((r["value"] as? String ?? text).debugDescription) in the dropdown"))
                 } catch { return end(line, fail(error.localizedDescription)) }
@@ -567,6 +605,7 @@ final class Agent: ObservableObject {
             guard let app = context.app else { return fail("no app") }
             guard let el = await resolve(action["id"], context: &context) else { return fail("element \(action["id"] ?? "?") isn't on screen anymore") }
             let line = begin("Click \(el.shortLabel)")
+            guard await confirmRisky(el.label) else { return end(line, fail("the user said not to click \(el.label.prefix(40).debugDescription); stop and tell them where things stand")) }
             await Launcher.bringToFront(app)
             await hand.click(el, in: app, fingerprint: context.fingerprint)
             let didChange = await changed(app, from: context.fingerprint, ms: 600)
@@ -665,6 +704,7 @@ final class Agent: ObservableObject {
                 return end(line, fail("the user didn't answer; stop here and say what's still needed"))
             }
             if sensitive { secrets.append(reply) }
+            if !options.isEmpty, Safety.isYes(reply) { userConfirmed = true }
             phase = .acting
             buddy.mood = .acting
             if let app = context.app { await Launcher.bringToFront(app) }

@@ -29,12 +29,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         agent.onStart = { [weak self] in
             guard let self else { return }
+            self.setStatusIcon(running: true)
             // Keystrokes must reach the target app, and clicks must not land on our windows.
             self.panel.orderOut(nil)
             self.island.show()
         }
         agent.onFinish = { [weak self] _, _ in
             guard let self else { return }
+            self.setStatusIcon(running: false)
             self.island.show(for: 4.5)
         }
         // Paused for the user's input: bring the bar up with the question; hide it again once answered.
@@ -63,6 +65,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for item in menu.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
         statusItem.menu = menu
+        self.menu = menu
 
         // ⌥Space: tap opens the bar, hold talks, and while working it stops.
         hotKey = HotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey),
@@ -91,6 +94,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             agent.submit(task)
         }
     }
+
+    /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
+    private var menu: NSMenu?
+
+    private func setStatusIcon(running: Bool) {
+        guard let button = statusItem.button else { return }
+        if running {
+            button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop CursorBoy")
+            button.contentTintColor = .systemRed
+            statusItem.menu = nil
+            button.target = self
+            button.action = #selector(stopFromMenuBar)
+        } else {
+            button.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "CursorBoy")
+            button.contentTintColor = nil
+            button.action = nil
+            statusItem.menu = menu
+        }
+    }
+
+    @objc private func stopFromMenuBar() { agent.cancel() }
 
     // MARK: - Hotkey
 

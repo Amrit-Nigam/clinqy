@@ -586,7 +586,7 @@ struct IslandView: View {
                 .contentTransition(.opacity)
                 .animation(.easeOut(duration: 0.2), value: text)
             if agent.isRunning {
-                Text("⌥Space stops").font(.system(size: 11)).foregroundStyle(DS.tertiary)
+                Text("⌥Space or ⏹ in menu bar stops").font(.system(size: 11)).foregroundStyle(DS.tertiary)
             }
         }
         .padding(.horizontal, 14)
