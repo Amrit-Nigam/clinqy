@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "CursorBoy",
-  "version": "0.9.0",
+  "version": "1.0.0",
   "description": "Lets the CursorBoy Mac app see and act on web pages precisely.",
   "permissions": ["tabs", "scripting", "alarms"],
   "host_permissions": ["<all_urls>"],
