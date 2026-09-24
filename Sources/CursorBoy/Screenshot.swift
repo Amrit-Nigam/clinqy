@@ -4,6 +4,16 @@ import ScreenCaptureKit
 /// Captures the target app's window and draws numbered boxes over the elements we'll offer GPT,
 /// so it sees the real screen and can refer to elements by the same "e<N>" ids.
 enum Screenshot {
+    /// Geometry of the most recent capture, so a position on the image can be mapped back to the screen.
+    nonisolated(unsafe) static var lastWindowFrame: CGRect?
+    nonisolated(unsafe) static var lastImageSize: CGSize?
+
+    /// Converts a point in the last screenshot's pixels to global screen coordinates.
+    static func screenPoint(x: Double, y: Double) -> CGPoint? {
+        guard let frame = lastWindowFrame, let size = lastImageSize, size.width > 0 else { return nil }
+        return CGPoint(x: frame.minX + x * frame.width / size.width, y: frame.minY + y * frame.height / size.height)
+    }
+
     static func annotated(app: NSRunningApplication, elements: [UIElementInfo]) async -> String? {
         guard CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
@@ -12,6 +22,7 @@ enum Screenshot {
                 .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
         else { return nil }
 
+        lastWindowFrame = window.frame
         let config = SCStreamConfiguration()
         let maxWidth: CGFloat = 1280
         let scale = min(1, maxWidth / window.frame.width)
@@ -23,6 +34,7 @@ enum Screenshot {
         else { return nil }
 
         let width = image.width, height = image.height
+        lastImageSize = CGSize(width: width, height: height)
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
