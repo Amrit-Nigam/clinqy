@@ -93,6 +93,7 @@ final class Agent: ObservableObject {
     func answer(_ text: String?) {
         guard let waiter = answerWaiter else { return }
         answerWaiter = nil
+        lastProgress = Date()   // time spent answering isn't "stuck"
         question = nil
         input = ""
         onAnswered()
@@ -121,6 +122,7 @@ final class Agent: ObservableObject {
         phase = .thinking
         buddy.clearMark()
         onStart()
+        startWatchdog()
         Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")")
         task = Task {
             await run(request)
@@ -165,6 +167,7 @@ final class Agent: ObservableObject {
         var failures = 0
         var lastSignature = ""
         var repeats = 0
+        var lastScreen = ""
 
         for turn in 0..<30 {
             guard !Task.isCancelled else { return }
@@ -177,7 +180,10 @@ final class Agent: ObservableObject {
             var image: String?
             if wantsLook, let shotApp = obs.app { image = await Screenshot.annotated(app: shotApp, elements: obs.elements) }
             wantsLook = false
-            let turnText = message + "\n\n" + obs.text + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)" : "")
+            // An unchanged screen is one line, not the whole list again (less to read, faster replies).
+            let screen = obs.text == lastScreen && image == nil ? "Screen: unchanged since your last look." : obs.text
+            lastScreen = obs.text
+            let turnText = message + "\n\n" + screen + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)" : "")
 
             phase = .thinking
             buddy.mood = .thinking
@@ -374,13 +380,16 @@ final class Agent: ObservableObject {
             let state = { (try? await BrowserBridge.shared.perform("state", on: page, ["index": el.index]))?["sig"] as? String }
             let before = await state()
             await hand.click(at: CGPoint(x: rect.midX, y: rect.midY))
-            try? await Task.sleep(for: .milliseconds(350))
-            let after = await state()
+            var after = await state()
+            for _ in 0..<3 where before != nil && before == after {
+                try? await Task.sleep(for: .milliseconds(120))
+                after = await state()
+            }
             if before != nil, before == after {
                 do { _ = try await BrowserBridge.shared.perform("click", on: page, ["index": el.index]) }
                 catch { return end(line, fail(error.localizedDescription)) }
+                try? await Task.sleep(for: .milliseconds(250))
             }
-            try? await Task.sleep(for: .milliseconds(250))
             buddy.clearHighlight()
             return end(line, .init(ok: true, summary: "clicked \(el.role) \(el.text.prefix(60).debugDescription) on the page"))
 
@@ -833,7 +842,28 @@ final class Agent: ObservableObject {
         onFinish(text, ok)
     }
 
+    /// Last time the run made progress; a watchdog stops runs stuck on one step.
+    private var lastProgress = Date()
+    private var watchdog: Timer?
+
+    private func startWatchdog() {
+        lastProgress = Date()
+        watchdog?.invalidate()
+        watchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
+            MainActor.assumeIsolated {
+                guard let self, self.isRunning else { timer.invalidate(); return }
+                guard self.phase != .waiting, Date().timeIntervalSince(self.lastProgress) > 30 else { return }
+                let step = self.steps.last?.text ?? "a step"
+                self.log("watchdog: no progress for 30 s on \(step)")
+                self.task?.cancel()
+                self.session?.close()
+                self.finish(ok: false, "I got stuck on “\(step)” and stopped")
+            }
+        }
+    }
+
     private func log(_ text: String) {
+        lastProgress = Date()
         var text = text
         for secret in secrets where secret.count >= 3 { text = text.replacingOccurrences(of: secret, with: "••••") }
         let line = String(format: "[%6.2fs] ", Date().timeIntervalSince(started)) + text

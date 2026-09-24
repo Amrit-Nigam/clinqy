@@ -13,6 +13,12 @@ enum Launcher {
             .deletingPathExtension().lastPathComponent
     }
 
+    /// Title of the frontmost window: cheap way to notice a page change.
+    static var frontURLHint: String {
+        guard let app = NSWorkspace.shared.frontmostApplication else { return "" }
+        return AXEngine.focusSummary(of: app).window
+    }
+
     static func isBrowser(_ app: NSRunningApplication) -> Bool { browserIDs.contains(app.bundleIdentifier ?? "") }
 
     /// Brings a running app (or finds and launches one by name) to the front with its window loaded.

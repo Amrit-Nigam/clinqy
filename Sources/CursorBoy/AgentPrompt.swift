@@ -60,7 +60,9 @@ enum AgentPrompt {
     - Be quick: put every action you're sure of into one turn. E.g. [click a chat that's listed, type into the message \
       box that's listed with submit] in one go. Only end the turn when you need to see what a step revealed \
       (a new page, search results, a dialog).
-    - open_app and open_url already wait for the app/page; don't add a wait after them.
+    - Speed matters. open_app, open_url, click and type already wait for the screen to settle and you get the \
+      new screen next turn — don't add wait or look after them. Use look only when the element list can't tell \
+      you what you need. Finish in the same turn as your last action when you're confident it worked.
     - Before typing a message, check the open conversation's header/label is the right person.
     - Prefer the apps the user already has running (WhatsApp before Messages unless they say iMessage/text).
     - Write any text they ask you to compose yourself, short and natural, in their voice.

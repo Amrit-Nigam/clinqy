@@ -272,7 +272,13 @@ final class Hand {
         }
         try? await Task.sleep(for: .milliseconds(200))
         press("return")
-        try? await Task.sleep(for: .milliseconds(900))
+        // Wait for the page to start loading rather than a fixed pause.
+        let startURL = Launcher.frontURLHint
+        for _ in 0..<12 {
+            try? await Task.sleep(for: .milliseconds(100))
+            if Launcher.frontURLHint != startURL { break }
+        }
+        try? await Task.sleep(for: .milliseconds(250))
         trace("returned")
         return browser
     }
