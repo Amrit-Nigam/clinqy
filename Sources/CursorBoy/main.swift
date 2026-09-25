@@ -123,6 +123,15 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
     check(Safety.isYes("Yes, go ahead") && Safety.isYes("haan") && !Safety.isYes("No"), "yes/no parsing")
     check(MainActor.assumeIsolated { Brain.json(from: "sure {\"say\":\"x\",\"actions\":[]} ok")?["say"] as? String == "x" }, "json in prose")
     check(MainActor.assumeIsolated { (Brain.json(from: "<invoke name=\"look\">")?["actions"] as? [[String: Any]])?.first?["do"] as? String == "look" }, "tool-call tag")
+    check(MainActor.assumeIsolated {
+        let r = Brain.json(from: "<invoke name=\"scroll\">\n<parameter name=\"dir\">up</parameter>\n</invoke>\n<invoke name=\"scroll\">\n<parameter name=\"dir\">up</parameter>\n</invoke>\n<invoke name=\"look\">\n</invoke>")
+        let a = r?["actions"] as? [[String: Any]] ?? []
+        return a.count == 3 && a[0]["dir"] as? String == "up" && a[2]["do"] as? String == "look"
+    }, "tool-call tags with parameters, several actions")
+    check(MainActor.assumeIsolated {
+        let a = (Brain.json(from: "<invoke name=\"wait\"><parameter name=\"ms\">800</parameter></invoke>")?["actions"] as? [[String: Any]])?.first
+        return a?["ms"] as? Int == 800
+    }, "tool-call number parameters")
     // Memory relevance: a maths question gets only core facts; food brings in the Swiggy facts.
     MainActor.assumeIsolated {
         let all = Memory.facts.count

@@ -375,6 +375,31 @@ enum AXEngine {
         return trimmed.isEmpty ? nil : trimmed
     }
 
+    /// Selection via a synthetic ⌘C, for apps that don't expose it over AX (WhatsApp, Slack, Electron…).
+    /// The user's clipboard is restored afterwards. Must run while `app` is still frontmost.
+    static func copiedSelection(of app: NSRunningApplication) -> String? {
+        let pb = NSPasteboard.general
+        let saved = pb.pasteboardItems?.map { item -> NSPasteboardItem in
+            let copy = NSPasteboardItem()
+            for type in item.types { if let data = item.data(forType: type) { copy.setData(data, forType: type) } }
+            return copy
+        } ?? []
+        let before = pb.changeCount
+        let source = CGEventSource(stateID: .privateState)   // ignore the ⌃⌥ the user may still be holding
+        for keyDown in [true, false] {
+            let e = CGEvent(keyboardEventSource: source, virtualKey: 8 /* c */, keyDown: keyDown)
+            e?.flags = .maskCommand
+            e?.postToPid(app.processIdentifier)
+        }
+        let deadline = Date().addingTimeInterval(0.25)
+        while pb.changeCount == before, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
+        guard pb.changeCount != before else { return nil }   // nothing selected → app copied nothing
+        let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        pb.clearContents()
+        if !saved.isEmpty { pb.writeObjects(saved) }
+        return text?.isEmpty == false ? text : nil
+    }
+
     /// The file the app's focused window has open (Preview, TextEdit, Pages, Word…), if it says.
     static func documentURL(of app: NSRunningApplication) -> URL? {
         let root = AXUIElementCreateApplication(app.processIdentifier)

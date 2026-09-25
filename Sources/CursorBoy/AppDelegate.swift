@@ -274,6 +274,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agent.targetApp = front
         // Whatever the user had highlighted goes along with their request.
         agent.selectedText = AXEngine.selectedText(of: front)
+        if agent.selectedText == nil, !Launcher.isBrowser(front) {
+            agent.selectedText = AXEngine.copiedSelection(of: front)
+        }
         if agent.selectedText == nil, Launcher.isBrowser(front), BrowserBridge.shared.isConnected {
             Task { [agent] in
                 if let text = await BrowserBridge.shared.selection(), agent?.isRunning == false { agent?.selectedText = text }

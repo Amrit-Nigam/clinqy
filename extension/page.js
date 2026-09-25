@@ -163,7 +163,9 @@ function readText() {
   function activeValue() {
     const el = document.activeElement;
     const editable = el && (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName));
-    return { editable: !!editable, value: editable ? String(el.isContentEditable ? el.innerText : el.value || "").slice(0, 400) : null };
+    // Code editors (Monaco on LeetCode, CodeMirror, Ace) re-indent what's typed.
+    const code = !!(el && el.closest && el.closest(".monaco-editor, .CodeMirror, .cm-editor, .ace_editor"));
+    return { editable: !!editable, code, value: editable ? String(el.isContentEditable ? el.innerText : el.value || "").slice(0, 400) : null };
   }
   function fillActive(text) {
     const el = document.activeElement;

@@ -1,0 +1,20 @@
+<!doctype html><html><head><title>monaco:</title><meta charset="utf-8">
+<script src="https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs/loader.js"></script></head>
+<body style="font-family:-apple-system;margin:30px">
+<h1>Two Sum</h1>
+<div id="ed" style="width:760px;height:360px;border:1px solid #ccc"></div>
+<script>
+// Like LeetCode: a Monaco editor (auto-indent, auto-closing brackets) with starter code.
+require.config({ paths: { vs: "https://cdn.jsdelivr.net/npm/monaco-editor@0.52.0/min/vs" } });
+require(["vs/editor/editor.main"], () => {
+  const ed = monaco.editor.create(document.getElementById("ed"), {
+    value: "class Solution:\n    def twoSum(self, nums, target):\n        pass\n", language: "python", automaticLayout: true });
+  const sync = () => {
+    const v = ed.getValue();
+    const ok = /def two_?sum/i.test(v) && /\n {4,}\S/.test(v) && !/pass\s*$/.test(v.trim());
+    document.title = "monaco:lines=" + v.split("\n").length + "|indented=" + ok + "|oneLine=" + (v.trim().split("\n").length === 1);
+    window.__code = v;
+  };
+  ed.onDidChangeModelContent(sync); sync();
+});
+</script></body></html>

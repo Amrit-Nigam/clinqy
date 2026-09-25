@@ -146,11 +146,34 @@ enum Brain {
            let obj = try? JSONSerialization.jsonObject(with: Data(reply[start...end].utf8)) as? [String: Any] {
             return obj
         }
-        // Sometimes the model writes a tool-call tag instead (`<invoke name="look">`): treat it as that action.
-        if let range = reply.range(of: #"<invoke name="([a-z_]+)""#, options: .regularExpression) {
-            let name = reply[range].replacingOccurrences(of: "<invoke name=\"", with: "").replacingOccurrences(of: "\"", with: "")
-            return ["say": "", "actions": [["do": name]], "done": false]
+        // Sometimes the model writes tool-call tags instead (`<invoke name="scroll"><parameter name="dir">up</parameter>…`):
+        // read every one, with its parameters, as an action.
+        return invokes(in: reply)
+    }
+
+    static func invokes(in reply: String) -> [String: Any]? {
+        guard let block = try? NSRegularExpression(pattern: #"<invoke name="([A-Za-z_]+)"\s*/?>(.*?)(?:</invoke>|(?=<invoke )|$)"#,
+                                                   options: [.dotMatchesLineSeparators]),
+              let param = try? NSRegularExpression(pattern: #"<parameter name="([A-Za-z_]+)">(.*?)</parameter>"#,
+                                                   options: [.dotMatchesLineSeparators]) else { return nil }
+        let ns = reply as NSString
+        var actions: [[String: Any]] = []
+        var done = false, say = ""
+        for m in block.matches(in: reply, range: NSRange(location: 0, length: ns.length)) {
+            let name = ns.substring(with: m.range(at: 1))
+            let body = m.range(at: 2).location == NSNotFound ? "" : ns.substring(with: m.range(at: 2))
+            var action: [String: Any] = ["do": name]
+            let bns = body as NSString
+            for p in param.matches(in: body, range: NSRange(location: 0, length: bns.length)) {
+                let key = bns.substring(with: p.range(at: 1))
+                let raw = bns.substring(with: p.range(at: 2)).trimmingCharacters(in: .whitespacesAndNewlines)
+                // Numbers, booleans, arrays arrive as JSON; anything else is text.
+                action[key] = (try? JSONSerialization.jsonObject(with: Data(raw.utf8), options: [.fragmentsAllowed])) ?? raw
+            }
+            if name == "done" || name == "finish" { done = true; say = action["say"] as? String ?? action["text"] as? String ?? say; continue }
+            actions.append(action)
         }
-        return nil
+        guard !actions.isEmpty || done else { return nil }
+        return ["say": say, "actions": actions, "done": done]
     }
 }

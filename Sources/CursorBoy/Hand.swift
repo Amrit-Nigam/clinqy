@@ -94,6 +94,16 @@ final class Hand {
     func type(_ text: String, in app: NSRunningApplication) async -> Bool {
         buddy.setTyping(true)
         defer { buddy.setTyping(false) }
+        // Multi-line text is still typed (that's the point of watching it), with Shift+Return for line breaks.
+        if text.contains("\n") {
+            AXEngine.targetPid = app.processIdentifier
+            defer { AXEngine.targetPid = nil }
+            AXEngine.selectAll()
+            try? await Task.sleep(for: .milliseconds(80))
+            let code = Self.codeEditorIDs.contains(app.bundleIdentifier ?? "")
+            await enterText(text, codeEditor: code)
+            return await landed(text, in: app)
+        }
         // Replace existing text only when there is some: ⌘A where there's nothing to select just beeps.
         if let existing = AXEngine.focusedValue(of: app), !existing.isEmpty {
             AXEngine.selectAll()
@@ -117,6 +127,36 @@ final class Hand {
         AXEngine.selectAll()
         AXEngine.press(0x33)
         return false
+    }
+
+    /// Apps whose editors auto-indent what's typed.
+    static let codeEditorIDs: Set<String> = [
+        "com.apple.dt.Xcode", "com.microsoft.VSCode", "com.todesktop.230313mzl4w4u92", "dev.zed.Zed",
+        "com.sublimetext.4", "com.jetbrains.intellij", "com.jetbrains.pycharm", "com.google.android.studio",
+    ]
+
+    /// Enters text into the focused field, always typed so it can be watched.
+    /// Line breaks are Shift+Return (a new line without sending in chat apps). In code editors, which re-indent
+    /// typed code, each line is typed without its leading spaces and the exact code is swapped in at the end.
+    func enterText(_ text: String, codeEditor: Bool = false) async {
+        guard text.contains("\n") else { return await keystrokes(text) }
+        let lines = text.components(separatedBy: "\n")
+        for (i, line) in lines.enumerated() {
+            if Task.isCancelled { return }
+            if i > 0 {
+                AXEngine.press(combo: "shift+return")
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+            await keystrokes(codeEditor ? line.trimmingCharacters(in: .whitespaces) : line)
+        }
+        if codeEditor {
+            // The editor's auto-indent and auto-closing brackets have had their say; now make it exactly right.
+            try? await Task.sleep(for: .milliseconds(200))
+            AXEngine.selectAll()
+            try? await Task.sleep(for: .milliseconds(60))
+            AXEngine.paste(text)
+            try? await Task.sleep(for: .milliseconds(150))
+        }
     }
 
     /// Types at a human rhythm (keys go wherever AXEngine.targetPid points).

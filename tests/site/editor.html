@@ -1,0 +1,16 @@
+<!doctype html><html><head><title>editor:</title><meta charset="utf-8"></head>
+<body style="font-family:-apple-system;max-width:680px;margin:40px auto">
+<h1>Scratchpad</h1>
+<label>Code <textarea id="code" rows="10" cols="70" style="font-family:monospace"></textarea></label>
+<p><label>Message <div id="msg" contenteditable="true" aria-label="Message" style="border:1px solid #aaa;min-height:60px;padding:6px"></div></label></p>
+<script>
+// Like a chat box: Return (without Shift) "sends" — that must not happen mid-message.
+let sent = 0;
+document.getElementById("msg").addEventListener("keydown", e => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); sent++; sync(); } });
+const sync = () => {
+  const code = document.getElementById("code").value, msg = document.getElementById("msg").innerText;
+  document.title = `editor:codeLines=${code ? code.split("\n").length : 0}|indented=${/\n( {2,}|\t)\S/.test(code)}|msgLines=${msg.trim() ? msg.trim().split("\n").length : 0}|msgMultiline=${msg.trim().split("\n").length > 2}|sent=${sent}`;
+};
+document.getElementById("code").addEventListener("input", sync);
+document.getElementById("msg").addEventListener("input", sync);
+</script></body></html>

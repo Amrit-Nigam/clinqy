@@ -205,7 +205,7 @@ final class Agent: ObservableObject {
         var repeats = 0
         var lastScreen = ""
 
-        for turn in 0..<30 {
+        for turn in 0..<50 {   // long forms take 30+ turns
             guard !Task.isCancelled else { return }
             let obs = await Observation.capture(app)
             if let page = obs.page {
@@ -288,7 +288,7 @@ final class Agent: ObservableObject {
             if actions.isEmpty { results.append("(no actions taken)") }
             message = "Results:\n" + results.joined(separator: "\n")
         }
-        finish(ok: false, "That took too many steps, so I stopped")
+        finish(ok: false, "Ran out of steps, so I stopped. Last done: \(steps.last?.text ?? "nothing"). Check the screen before retrying.")
     }
 
     /// After a task, keep anything lasting it revealed about the user (people, preferences, usual apps and
@@ -507,9 +507,10 @@ final class Agent: ObservableObject {
             if let old = (try? await BrowserBridge.shared.perform("value", on: page, ["index": el.index]))?["value"] as? String, !old.isEmpty {
                 _ = try? await BrowserBridge.shared.perform("fill", on: page, ["index": el.index, "text": ""])
             }
+            let isCode = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["code"] as? Bool ?? false
             buddy.setTyping(true)
             AXEngine.targetPid = app.processIdentifier
-            await hand.keystrokes(text)
+            await hand.enterText(text, codeEditor: isCode)
             AXEngine.targetPid = nil
             buddy.setTyping(false)
             // Keys queue up in the browser; wait until the field shows them before moving on (or focus could
@@ -555,9 +556,10 @@ final class Agent: ObservableObject {
                 AXEngine.targetPid = nil
                 try? await Task.sleep(for: .milliseconds(60))
             }
+            let isCode = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["code"] as? Bool ?? false
             buddy.setTyping(true)
             AXEngine.targetPid = app.processIdentifier
-            await hand.keystrokes(text)
+            await hand.enterText(text, codeEditor: isCode)
             AXEngine.targetPid = nil
             buddy.setTyping(false)
             if let value = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["value"] as? String,
@@ -619,58 +621,6 @@ final class Agent: ObservableObject {
             }
             guard let text, !text.isEmpty else { return end(line, fail("couldn't read any text here; try look")) }
             return end(line, .init(ok: true, summary: "text from \(source):\n\(text)"))
-
-        case "type" where action["id"] == nil && context.page != nil:
-            guard let text = action["text"] as? String, let page = context.page, let app = context.app else { return fail("type needs text") }
-            let line = begin("Type “\(text.prefix(40))”")
-            await Launcher.bringToFront(app)
-            let before = try? await BrowserBridge.shared.perform("activeValue", on: page)
-            guard before?["editable"] as? Bool == true else {
-                return end(line, fail("no text box on the page has focus; click one first (give its w-id)"))
-            }
-            if let existing = before?["value"] as? String, !existing.isEmpty {
-                AXEngine.targetPid = app.processIdentifier
-                AXEngine.selectAll()
-                AXEngine.targetPid = nil
-                try? await Task.sleep(for: .milliseconds(60))
-            }
-            buddy.setTyping(true)
-            AXEngine.targetPid = app.processIdentifier
-            await hand.keystrokes(text)
-            AXEngine.targetPid = nil
-            buddy.setTyping(false)
-            if let value = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["value"] as? String,
-               !AXEngine.similar(value, text) || value.count > text.count + 3 {
-                _ = try? await BrowserBridge.shared.perform("fillActive", on: page, ["text": text])
-            }
-            if action["submit"] as? Bool == true {
-                try? await Task.sleep(for: .milliseconds(120))
-                hand.press("return")
-                try? await Task.sleep(for: .milliseconds(500))
-            }
-            buddy.clearHighlight()
-            return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into the focused field\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
-
-        case "point" where Self.isWebRef(action["id"]), "mark" where Self.isWebRef(action["id"]):
-            guard let (el, rect) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
-            let line = begin("Show \(el.text.prefix(32))")
-            await buddy.mark(rect, label: action["label"] as? String)
-            hand.lingerBeforeHome = 3.5
-            return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
-
-        case "scroll" where context.page != nil:
-            let up = (action["dir"] as? String)?.lowercased() == "up"
-            let line = begin("Scroll \(up ? "up" : "down")")
-            if let web = context.webArea { await buddy.travel(to: CGPoint(x: web.midX, y: web.midY)) }
-            _ = try? await BrowserBridge.shared.perform("scroll", on: context.page!, ["dy": up ? -600 : 600])
-            try? await Task.sleep(for: .milliseconds(450))
-            return end(line, .init(ok: true, summary: "scrolled \(up ? "up" : "down")"))
-
-        case "read":
-            guard let page = context.page else { return fail("reading needs a web page with the CursorBoy extension") }
-            let line = begin("Read the page")
-            guard let r = try? await BrowserBridge.shared.perform("read", on: page) else { return end(line, fail("couldn't read the page")) }
-            return end(line, .init(ok: true, summary: "page text:\n\(r["text"] as? String ?? "")"))
 
         case "click" where action["id"] == nil:
             // By position on the last screenshot, for things with no element (canvas, custom-drawn UI, text links).
@@ -798,7 +748,7 @@ final class Agent: ObservableObject {
             guard let reply, !reply.isEmpty, !Task.isCancelled else {
                 return end(line, fail("the user didn't answer; stop here and say what's still needed"))
             }
-            if sensitive { secrets.append(reply) }
+            if sensitive { secrets.append(reply) } else { log("  user answered: \(reply.prefix(200))") }
             if !options.isEmpty, Safety.isYes(reply) { userConfirmed = true }
             phase = .acting
             buddy.mood = .acting

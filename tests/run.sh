@@ -62,6 +62,8 @@ case_ dropdown     form.html   "set the city to Pune"                           
 case_ pay-declined pay.html    "click the pay button"                             "title:pay:unpaid"   "No"
 case_ pay-asked    pay.html    "buy this mouse"                                   "title:pay:PAID"     "Yes, go ahead"
 case_ read-pdf     resume.pdf  "what's the mobile number on this resume?"         "answer:98450 12345"
+case_ multiline-chat editor.html "in the Message box, write a 4-stop train schedule, one stop per line, but don't send it" "title:msgMultiline=true|sent=0"
+case_ code-editor  monaco.html "replace the code in this editor with a Python solution to Two Sum using a dictionary" "title:indented=true|oneLine=false"
 
 # Watch & learn: act like the user (real input via the debug binary), learn a skill, then run it with new values.
 watch_learn() {
