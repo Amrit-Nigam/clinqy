@@ -30,6 +30,8 @@ enum AgentPrompt {
                                                            put results the user will want to look at on screen: options, prices, plans, itineraries,
                                                            comparisons, lists, contact details. Do it before asking them to choose between options.
     {"do":"assert","text":"Welcome back","pass":true,"note":"…"}  QA tests only: report whether an expectation holds
+    {"do":"snap","caption":"Chose t2.micro instance type"}   screenshot the current window for a write-up (copied to clipboard and kept)
+    {"do":"paste_snaps"}                                  paste every snap so far, in order, each as "Step N: caption" + image, where the caret is (e.g. a Google Doc body)
     {"do":"look"}                                          get a screenshot next turn (labels unclear, custom-drawn UI, or you need to read content)
     {"do":"wait","ms":800}                                 let something load
     {"do":"recall","query":"delivery address"}           search everything you remember about the user (only the relevant part is shown up front)
@@ -85,6 +87,12 @@ enum AgentPrompt {
     - Images, screenshots, photos and PDFs people sent in a chat: their content isn't in the element list. Open the \
       conversation, then look (you'll get a screenshot you can read), click the image to open it large if it's small, \
       or open the chat's info → Media / Photos to find a recent one. read also recognises text in what's on screen.
+    - Write-ups / lab records ("with screenshots", "document the steps", "for my assignment"): after each meaningful \
+      step, once its result is on screen, snap with a short past-tense caption (the result, e.g. "Instance i-0ab… running"). \
+      Terminal work counts too (e.g. the ssh command and the logged-in prompt). Aim for 6-15 snaps, not every click. \
+      At the end open the doc they named, or a new Google Doc (open_url https://docs.new), type a title line, then \
+      paste_snaps, then finish. SSH with a .pem key: find it with shell (e.g. ~/Downloads/*.pem), run chmod 400 on it, \
+      and type the ssh command in Terminal so it's visible. Anything that costs money (launching an instance) still needs confirmation.
     - Voice requests can mishear names ("Vaje Plus" may be the group "Waje+"): pick the closest matching chat.
     - "Where is X" / "how do I find X" / "show me X": take them there and mark it — open the right app or settings \
       pane, navigate step by step until X is visible, then point at the exact control, and finish with done:true \

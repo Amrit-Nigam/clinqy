@@ -15,13 +15,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pressedAt: Date?
     private var holdTimer: Timer?
     private var holdToTalk = false
+    private let overlay = AnnotationOverlay()
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buddy = Buddy()
         agent = Agent(buddy: buddy)
         voice = Voice()
         panel = CommandPanel(agent: agent, voice: voice, onMic: { [weak self] in self?.toggleMic() },
-                             onWatch: { [weak self] in self?.startWatching() })
+                             onWatch: { [weak self] in self?.startWatching() },
+                             onCircle: { [weak self] in self?.startCircling() })
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
         agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
@@ -64,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let menu = NSMenu()
         menu.addItem(withTitle: "Open CursorBoy  (⌃⌥)", action: #selector(togglePanel), keyEquivalent: "")
         menu.addItem(withTitle: "Talk  (hold ⌃⌥)", action: #selector(toggleMic), keyEquivalent: "")
+        menu.addItem(withTitle: "Circle Something…", action: #selector(startCircling), keyEquivalent: "")
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(.separator())
@@ -159,6 +162,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         island.hide()
         panel.showCentered()
         Task { await Skills.shared.learn(from: recording) }
+    }
+
+    // MARK: - Circle to point
+
+    /// Hides the bar, lets the user draw a loop around something, then brings the bar back with it attached.
+    /// While a task runs, the circle goes in as added context instead.
+    @objc func startCircling() {
+        rememberTarget()
+        panel.orderOut(nil)
+        overlay.begin { [weak self] circled in
+            guard let self else { return }
+            self.agent.targetApp?.activate()
+            guard let circled else { if !self.agent.isRunning { self.panel.showCentered() }; return }
+            if self.agent.isRunning {
+                let r = circled.rect
+                self.agent.addContext("I circled this area of the screen: x \(Int(r.minX))–\(Int(r.maxX)), y \(Int(r.minY))–\(Int(r.maxY)) (screen points).")
+            } else {
+                self.agent.annotation = circled
+                self.panel.showCentered()
+            }
+        }
     }
 
     // MARK: - QA and schedules

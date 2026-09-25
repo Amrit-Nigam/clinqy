@@ -44,6 +44,8 @@ final class Agent: ObservableObject {
     var targetApp: NSRunningApplication?
     /// Text the user had selected when they summoned CursorBoy; sent along with the request.
     @Published var selectedText: String?
+    /// An area the user circled on screen before asking; sent as a marked screenshot on the first turn.
+    @Published var annotation: Annotation?
     var onStart: () -> Void = {}
     var onFinish: (_ answer: String, _ ok: Bool) -> Void = { _, _ in }
     /// Test mode: mirror progress to stdout with timings.
@@ -58,6 +60,8 @@ final class Agent: ObservableObject {
     fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
+    /// Step screenshots taken this run with snap, for paste_snaps.
+    private var snaps: [(caption: String, png: Data)] = []
     /// The browser tab this task opened (the only tab it may navigate in place).
     private var ownedTab: Int?
     /// The user already said yes to a confirmation in this run.
@@ -139,6 +143,7 @@ final class Agent: ObservableObject {
         task = Task {
             await run(request)
             selectedText = nil
+            annotation = nil
             continuation = nil
         }
     }
@@ -154,6 +159,7 @@ final class Agent: ObservableObject {
         input = ""
         narration = ""
         openedTab = false
+        snaps = []
         addedNotes = []
         ownedTab = nil
         userConfirmed = false
@@ -164,7 +170,7 @@ final class Agent: ObservableObject {
         buddy.clearMark()
         onStart()
         startWatchdog()
-        Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")")
+        Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")\(annotation.map { " [circled: \(Int($0.rect.width))×\(Int($0.rect.height)) at \(Int($0.rect.minX)),\(Int($0.rect.minY))]" } ?? "")")
     }
 
     func cancel() {
@@ -213,8 +219,17 @@ final class Agent: ObservableObject {
                 log("  page: \(page.title.prefix(50)) · \(page.elements.count) elements\(fields.isEmpty ? "" : " · fields: \(fields.prefix(300))")")
             }
             if obs.elements.count < 6 || failures >= 2 { wantsLook = true }
+            // The first look shows what the user circled; after that it's just in the request text.
+            let circled = turn == 0 ? annotation : nil
+            if let circled {
+                wantsLook = true
+                let inside = obs.elements.enumerated().filter { circled.rect.intersects($0.element.frame) }.map { "e\($0.offset)" }
+                message += "\nInside the circled area: " + (inside.isEmpty ? "no listed elements (use the screenshot)." : inside.prefix(30).joined(separator: ", "))
+            }
             var image: String?
-            if wantsLook, let shotApp = obs.app { image = await Screenshot.annotated(app: shotApp, elements: obs.elements) }
+            if wantsLook, let shotApp = obs.app {
+                image = await Screenshot.annotated(app: shotApp, elements: obs.elements, circled: circled)
+            }
             wantsLook = false
             // An unchanged screen is one line, not the whole list again (less to read, faster replies).
             let screen = obs.text == lastScreen && image == nil ? "Screen: unchanged since your last look." : obs.text
@@ -225,7 +240,7 @@ final class Agent: ObservableObject {
                     + addedNotes.map { "- \($0)" }.joined(separator: "\n") + "\n\n" + message
                 addedNotes = []
             }
-            let turnText = message + "\n\n" + screen + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)" : "")
+            let turnText = message + "\n\n" + screen + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.\(circled != nil ? " The yellow loop is what the user circled." : ""))" : "")
 
             phase = .thinking
             buddy.mood = .thinking
@@ -327,6 +342,11 @@ final class Agent: ObservableObject {
         """
         if let selected = selectedText, !selected.isEmpty {
             text += "\nSelected text (the user highlighted this before asking; \"this\", \"it\", \"that\" usually mean it):\n\"\"\"\n\(selected.prefix(4000))\n\"\"\""
+        }
+        if let circled = annotation {
+            let r = circled.rect
+            text += "\nThe user circled an area on screen before asking (\"this\", \"here\", \"that\" usually mean it): "
+                + "x \(Int(r.minX))–\(Int(r.maxX)), y \(Int(r.minY))–\(Int(r.maxY)) in screen points. It's the yellow loop on the first screenshot."
         }
         if let earlier = continuation {
             text += """
@@ -559,7 +579,9 @@ final class Agent: ObservableObject {
             let isCode = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["code"] as? Bool ?? false
             buddy.setTyping(true)
             AXEngine.targetPid = app.processIdentifier
-            await hand.enterText(text, codeEditor: isCode)
+            // Document editors (Google Docs) take the caret into an iframe: paste the whole text at once there.
+            if before?["frame"] as? Bool == true { AXEngine.paste(text) }
+            else { await hand.enterText(text, codeEditor: isCode) }
             AXEngine.targetPid = nil
             buddy.setTyping(false)
             if let value = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["value"] as? String,
@@ -785,6 +807,49 @@ final class Agent: ObservableObject {
             try? await Task.sleep(for: .milliseconds(ms))
             if let app = context.app { context.fingerprint = await AXEngine.fingerprintAsync(of: app) }
             return .init(ok: true, summary: "waited \(ms) ms")
+
+        case "snap":
+            // A step screenshot for a write-up: copied like ⌃⌘⇧4 (clipboard only, no file) and kept for paste_snaps.
+            guard let app = context.app else { return fail("no app to screenshot") }
+            let caption = (action["caption"] as? String) ?? "Step \(snaps.count + 1)"
+            let line = begin("Screenshot: \(caption.prefix(40))")
+            try? await Task.sleep(for: .milliseconds(300))   // let the last step finish drawing
+            guard let png = await Screenshot.windowPNG(app: app) else { return end(line, fail("couldn't capture the window (Screen Recording permission?)")) }
+            snaps.append((caption, png))
+            let board = NSPasteboard.general
+            board.clearContents()
+            board.setData(png, forType: .png)
+            return end(line, .init(ok: true, summary: "screenshot \(snaps.count) taken (\(caption.prefix(60).debugDescription)) and copied"))
+
+        case "paste_snaps":
+            // Into the document that has the caret: each caption, then its screenshot, in order.
+            guard let app = context.app else { return fail("no app") }
+            guard !snaps.isEmpty else { return fail("no screenshots taken yet; use snap first") }
+            let line = begin("Paste \(snaps.count) screenshots")
+            await Launcher.bringToFront(app)
+            let board = NSPasteboard.general
+            let saved = board.string(forType: .string)
+            AXEngine.targetPid = app.processIdentifier
+            defer { AXEngine.targetPid = nil }
+            for (i, snap) in snaps.enumerated() {
+                guard !Task.isCancelled else { break }
+                board.clearContents()
+                board.setString("Step \(i + 1): \(snap.caption)", forType: .string)
+                AXEngine.press(0x09, flags: .maskCommand)
+                try? await Task.sleep(for: .milliseconds(250))
+                AXEngine.pressReturn()
+                board.clearContents()
+                board.setData(snap.png, forType: .png)
+                AXEngine.press(0x09, flags: .maskCommand)
+                try? await Task.sleep(for: .milliseconds(1800))   // Google Docs uploads the image
+                AXEngine.pressReturn()
+                AXEngine.pressReturn()
+                try? await Task.sleep(for: .milliseconds(150))
+            }
+            board.clearContents()
+            if let saved { board.setString(saved, forType: .string) }
+            context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+            return end(line, .init(ok: true, summary: "pasted \(snaps.count) captioned screenshots where the caret was"))
 
         case "remember":
             guard let fact = action["fact"] as? String else { return fail("remember needs fact") }

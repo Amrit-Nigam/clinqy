@@ -14,7 +14,25 @@ enum Screenshot {
         return CGPoint(x: frame.minX + x * frame.width / size.width, y: frame.minY + y * frame.height / size.height)
     }
 
-    static func annotated(app: NSRunningApplication, elements: [UIElementInfo]) async -> String? {
+    /// A clean, full-resolution PNG of the app's main window (what ⌃⌘⇧4 on that window would copy).
+    static func windowPNG(app: NSRunningApplication) async -> Data? {
+        guard CGPreflightScreenCaptureAccess(),
+              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
+              let window = content.windows
+                .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 })
+                .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+        else { return nil }
+        let config = SCStreamConfiguration()
+        let scale = min(2, 2000 / window.frame.width)
+        config.width = Int(window.frame.width * scale)
+        config.height = Int(window.frame.height * scale)
+        config.showsCursor = false
+        guard let image = try? await SCScreenshotManager.captureImage(
+            contentFilter: SCContentFilter(desktopIndependentWindow: window), configuration: config) else { return nil }
+        return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
+    }
+
+    static func annotated(app: NSRunningApplication, elements: [UIElementInfo], circled: Annotation? = nil) async -> String? {
         guard CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
               let window = content.windows
@@ -62,6 +80,17 @@ enum Screenshot {
             NSColor.systemRed.setFill()
             NSBezierPath(rect: tagRect).fill()
             tag.draw(at: CGPoint(x: tagRect.minX + 2, y: tagRect.minY))
+        }
+        // What the user circled, drawn the way they drew it.
+        if let circled, let first = circled.points.first {
+            let local = { (p: CGPoint) in CGPoint(x: (p.x - window.frame.minX) * sx, y: CGFloat(height) - (p.y - window.frame.minY) * sy) }
+            let loop = NSBezierPath()
+            loop.move(to: local(first))
+            circled.points.dropFirst().forEach { loop.line(to: local($0)) }
+            loop.lineWidth = 4
+            loop.lineJoinStyle = .round
+            NSColor.systemYellow.setStroke()
+            loop.stroke()
         }
         NSGraphicsContext.restoreGraphicsState()
 

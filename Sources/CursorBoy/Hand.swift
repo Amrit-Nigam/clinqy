@@ -94,6 +94,15 @@ final class Hand {
     func type(_ text: String, in app: NSRunningApplication) async -> Bool {
         buddy.setTyping(true)
         defer { buddy.setTyping(false) }
+        // Browser editors whose text Accessibility can't see (Google Docs shows only zero-width spaces): typing
+        // can't be checked, and the check-then-clear fallback would wipe the document. Paste it once, fast.
+        let invisible = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{FEFF}"))
+        if Launcher.isBrowser(app), (AXEngine.focusedValue(of: app) ?? "").trimmingCharacters(in: invisible).isEmpty {
+            AXEngine.targetPid = app.processIdentifier
+            defer { AXEngine.targetPid = nil }
+            AXEngine.paste(text)
+            return true
+        }
         // Multi-line text is still typed (that's the point of watching it), with Shift+Return for line breaks.
         if text.contains("\n") {
             AXEngine.targetPid = app.processIdentifier

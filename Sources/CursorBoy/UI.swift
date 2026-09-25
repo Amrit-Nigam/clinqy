@@ -7,7 +7,8 @@ import SwiftUI
 final class CommandPanel: NSPanel {
     static let size = NSSize(width: 660, height: 460)
 
-    init(agent: Agent, voice: Voice, onMic: @escaping () -> Void, onWatch: @escaping () -> Void = {}) {
+    init(agent: Agent, voice: Voice, onMic: @escaping () -> Void, onWatch: @escaping () -> Void = {},
+         onCircle: @escaping () -> Void = {}) {
         super.init(contentRect: NSRect(origin: .zero, size: Self.size),
                    styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
                    backing: .buffered, defer: false)
@@ -21,6 +22,7 @@ final class CommandPanel: NSPanel {
         appearance = NSAppearance(named: .darkAqua)
         var view = CommandView(agent: agent, voice: voice, onMic: onMic, onClose: { [weak self] in self?.orderOut(nil) })
         view.onWatch = onWatch
+        view.onCircle = onCircle
         contentView = NSHostingView(rootView: view)
     }
 
@@ -153,6 +155,8 @@ struct CommandView: View {
     @StateObject private var skillsTab = Hover()
     /// Starts Watch & Learn (set by the app delegate).
     var onWatch: () -> Void = {}
+    /// Lets the user circle something on screen (set by the app delegate).
+    var onCircle: () -> Void = {}
     @StateObject private var historyTab = Hover()
     @ObservedObject private var whisper = Whisper.shared
     let onMic: () -> Void
@@ -184,6 +188,12 @@ struct CommandView: View {
                 }
                 if let selected = agent.selectedText, !agent.isRunning {
                     SelectionChip(text: selected) { agent.selectedText = nil }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 12)
+                        .transition(.opacity)
+                }
+                if let circled = agent.annotation, !agent.isRunning {
+                    ContextChip(icon: "lasso", text: "Circled area · \(Int(circled.rect.width))×\(Int(circled.rect.height))") { agent.annotation = nil }
                         .padding(.horizontal, 18)
                         .padding(.top, 12)
                         .transition(.opacity)
@@ -344,6 +354,15 @@ struct CommandView: View {
             Hint(keys: "⌃⌥", text: "open")
             Hint(keys: "hold ⌃⌥", text: "talk")
             Spacer()
+            Button(action: onCircle) {
+                HStack(spacing: 4) {
+                    Image(systemName: "lasso").font(.system(size: 11))
+                    Text("Circle").font(.system(size: 11))
+                }
+                .foregroundStyle(DS.tertiary)
+            }
+            .buttonStyle(.plain)
+            .help("Circle something on screen to point CursorBoy at it")
             Button(action: onWatch) {
                 HStack(spacing: 4) {
                     Circle().fill(Color.red.opacity(0.85)).frame(width: 7, height: 7)

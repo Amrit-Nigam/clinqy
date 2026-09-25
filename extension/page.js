@@ -71,7 +71,8 @@ function snapshot() {
     viewport: { w: vw, h: vh },
     // Where the viewport sits on screen (for browsers that don't expose it to Accessibility).
     screen: { x: screenX, y: screenY, ow: outerWidth, oh: outerHeight, zoom: devicePixelRatio },
-    scroll: { y: scrollY, max: document.documentElement.scrollHeight - vh },
+    scroll: (() => { const el = scroller(); return el ? { y: el.scrollTop, max: el.scrollHeight - el.clientHeight }
+                                                     : { y: scrollY, max: document.documentElement.scrollHeight - vh }; })(),
     headings, elements: out,
   };
 }
@@ -162,6 +163,8 @@ function readText() {
   }
   function activeValue() {
     const el = document.activeElement;
+    // Editors like Google Docs keep the caret in an iframe: keys typed now land there, but its text can't be read.
+    if (el && el.tagName === "IFRAME") return { editable: true, code: false, value: null, frame: true };
     const editable = el && (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName));
     // Code editors (Monaco on LeetCode, CodeMirror, Ace) re-indent what's typed.
     const code = !!(el && el.closest && el.closest(".monaco-editor, .CodeMirror, .cm-editor, .ace_editor"));
@@ -192,7 +195,26 @@ function readText() {
     return { sig: JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
       el && el.value, location.href, document.body ? document.body.innerText.length : 0, document.activeElement === el]) };
   }
-  function scroll(dy) { window.scrollBy({ top: dy, behavior: "smooth" }); return { y: scrollY }; }
+  // Apps like the AWS console scroll an inner panel, not the window: scroll whichever actually moves.
+  function scroller() {
+    const root = document.scrollingElement || document.documentElement;
+    if (root.scrollHeight > innerHeight + 4) return null;
+    let best = null, area = 0;
+    for (const el of document.querySelectorAll("*")) {
+      if (el.scrollHeight <= el.clientHeight + 4) continue;
+      const o = getComputedStyle(el).overflowY;
+      if (o !== "auto" && o !== "scroll" && o !== "overlay") continue;
+      const r = el.getBoundingClientRect(), a = r.width * r.height;
+      if (a > area) { best = el; area = a; }
+    }
+    return best;
+  }
+  function scroll(dy) {
+    const el = scroller();
+    if (el) { el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop }; }
+    window.scrollBy({ top: dy, behavior: "instant" });
+    return { y: scrollY };
+  }
   function selection() { return String(window.getSelection() || "").slice(0, 8000); }
 
   window.__cursorboy = { snapshot, click, focus, fill, readText, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
