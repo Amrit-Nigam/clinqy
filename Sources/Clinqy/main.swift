@@ -1,7 +1,20 @@
 import AVFoundation
 import AppKit
 
-// Terminal run: `CursorBoy --run <bundle-id|-> "<task>"` executes the task and prints a timed log.
+// Clinqy was called CursorBoy: carry its memory, history, skills, workflows, models and settings over once.
+do {
+    let fm = FileManager.default, home = fm.homeDirectoryForCurrentUser
+    let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+    for (old, new) in [(support.appendingPathComponent("CursorBoy"), support.appendingPathComponent("Clinqy")),
+                       (home.appendingPathComponent(".config/cursorboy"), home.appendingPathComponent(".config/clinqy")),
+                       (home.appendingPathComponent("Library/Logs/CursorBoy"), home.appendingPathComponent("Library/Logs/Clinqy"))]
+    where fm.fileExists(atPath: old.path) && !fm.fileExists(atPath: new.path) {
+        try? fm.createDirectory(at: new.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.moveItem(at: old, to: new)
+    }
+}
+
+// Terminal run: `Clinqy --run <bundle-id|-> "<task>"` executes the task and prints a timed log.
 if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--run" {
     let args = CommandLine.arguments
     let app = NSApplication.shared
@@ -34,7 +47,7 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--run" {
     app.run()
 }
 
-// Voice check: `CursorBoy --transcribe <audio file>` runs a file through the Whisper model.
+// Voice check: `Clinqy --transcribe <audio file>` runs a file through the Whisper model.
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--transcribe" {
     let path = CommandLine.arguments[2]
     Task { @MainActor in
@@ -66,7 +79,7 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--transcribe" 
     RunLoop.main.run()
 }
 
-// `--chord [key]`: taps Control+Option like a user (optionally with another key, which must NOT open CursorBoy).
+// `--chord [key]`: taps Control+Option like a user (optionally with another key, which must NOT open Clinqy).
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--chord" {
     let src = CGEventSource(stateID: .hidSystemState)
     func flags(_ code: CGKeyCode, _ down: Bool, _ f: CGEventFlags) {
@@ -109,7 +122,7 @@ if CommandLine.arguments.count >= 3, ["--click-label", "--type", "--key"].contai
     exit(0)
 }
 
-// `CursorBoy --selftest`: fast checks of logic that needs no UI (safety rules, reply parsing).
+// `Clinqy --selftest`: fast checks of logic that needs no UI (safety rules, reply parsing).
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
     var failures = 0
     func check(_ ok: Bool, _ what: String) { print((ok ? "ok   " : "FAIL ") + what); if !ok { failures += 1 } }
@@ -176,7 +189,7 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
     exit(failures == 0 ? 0 : 1)
 }
 
-// `CursorBoy --snapshots`: what each connected browser reports for its active tab (debugging the extension).
+// `Clinqy --snapshots`: what each connected browser reports for its active tab (debugging the extension).
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--snapshots" {
     Task { @MainActor in
         BrowserBridge.shared.start()
@@ -187,7 +200,7 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--snapshots" {
     RunLoop.main.run()
 }
 
-// `CursorBoy --reload-extension`: reloads the browser extension everywhere it's connected.
+// `Clinqy --reload-extension`: reloads the browser extension everywhere it's connected.
 if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--reload-extension" {
     Task { @MainActor in
         BrowserBridge.shared.start()

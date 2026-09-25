@@ -1,7 +1,7 @@
 import AppKit
 import Network
 
-/// Talks to the CursorBoy browser extension over a localhost WebSocket. The extension reads the live page
+/// Talks to the Clinqy browser extension over a localhost WebSocket. The extension reads the live page
 /// (exact buttons, links, fields and where they are) and performs precise clicks and fills in it.
 /// Only browser-extension origins may connect, so web pages can't reach this server.
 @MainActor

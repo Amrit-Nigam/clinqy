@@ -1,8 +1,8 @@
-# CursorBoy
+# Clinqy
 
-**Your Mac, on autopilot — and you can watch it work.**
+**Your cursor's clingy partner.** Your Mac, on autopilot — and you can watch it work.
 
-CursorBoy is a macOS menu-bar assistant that uses your Mac the way you would. Press **⌃⌥**, type or say what you want, and a small glowing companion cursor goes and does it on screen. It clicks the Dock, types into the address bar, ticks the checkboxes and fills the form. It asks you before anything consequential, remembers useful things about you, and can learn a task by watching you do it once.
+Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press **⌃⌥**, type or say what you want, and a small glowing companion cursor goes and does it on screen. It clicks the Dock, types into the address bar, ticks the checkboxes and fills the form. It asks you before anything consequential, remembers useful things about you, and can learn a task by watching you do it once.
 
 ```
 "book me a flight to Mumbai"         "where's the brightness setting?"
@@ -40,16 +40,16 @@ CursorBoy is a macOS menu-bar assistant that uses your Mac the way you would. Pr
 
 - macOS 14+ on Apple silicon (tested on an M4)
 - Swift 5.9+ (Xcode Command Line Tools are enough)
-- [Claude Code](https://claude.com/claude-code) installed and logged in (`claude` on your PATH). CursorBoy uses your Claude login.
+- [Claude Code](https://claude.com/claude-code) installed and logged in (`claude` on your PATH). Clinqy uses your Claude login.
 - Chrome, Arc, Brave or Edge for the browser extension (optional but recommended)
 
 ## Build & run
 
 ```bash
-./build.sh run        # builds build/CursorBoy.app, signs it, and launches it
+./build.sh run        # builds build/Clinqy.app, signs it, and launches it
 ```
 
-On first launch, grant the permissions CursorBoy asks for (menu bar icon → **Check Permissions…**):
+On first launch, grant the permissions Clinqy asks for (menu bar icon → **Check Permissions…**):
 
 | Permission | Why |
 |---|---|
@@ -58,7 +58,7 @@ On first launch, grant the permissions CursorBoy asks for (menu bar icon → **C
 | Microphone & Speech Recognition | Voice input |
 | Automation | AppleScript fallback for scriptable apps |
 
-The first voice use downloads the Whisper model (~630 MB) into `~/Library/Application Support/CursorBoy/models`.
+The first voice use downloads the Whisper model (~630 MB) into `~/Library/Application Support/Clinqy/models`.
 
 ### Browser extension
 
@@ -66,7 +66,7 @@ The first voice use downloads the Whisper model (~630 MB) into `~/Library/Applic
 2. Turn on **Developer mode** and click **Load unpacked**.
 3. Pick the `extension/` folder in this repo.
 
-It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension origins are accepted. After updating the extension files, run `open "cursorboy://reload-extension"` to reload it in every connected browser.
+It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension origins are accepted. After updating the extension files, run `open "clinqy://reload-extension"` to reload it in every connected browser.
 
 ## Using it
 
@@ -83,29 +83,29 @@ It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension ori
 ### URL scheme (for scripting)
 
 ```
-cursorboy://run?task=<text>[&test=1]   run a task in the frontmost app (test=1: not saved to history or memory)
-cursorboy://answer?text=<text>         answer the current question
-cursorboy://add?text=<text>            add context to the running task
-cursorboy://cancel                     stop the current task
-cursorboy://qa?path=<file>|text=<test>&out=<report.json>[&relearn=1][&model=…]
-cursorboy://workflow?name=<name>[&<input>=<value>…]
-cursorboy://watch · cursorboy://stop-watching
-cursorboy://reload-extension
+clinqy://run?task=<text>[&test=1]   run a task in the frontmost app (test=1: not saved to history or memory)
+clinqy://answer?text=<text>         answer the current question
+clinqy://add?text=<text>            add context to the running task
+clinqy://cancel                     stop the current task
+clinqy://qa?path=<file>|text=<test>&out=<report.json>[&relearn=1][&model=…]
+clinqy://workflow?name=<name>[&<input>=<value>…]
+clinqy://watch · clinqy://stop-watching
+clinqy://reload-extension
 ```
 
-## The `cursorboy` command: QA and workflows for any coding agent
+## The `clinqy` command: QA and workflows for any coding agent
 
-`./build.sh` installs `cursorboy` to `~/.local/bin`. Any terminal or coding agent (Claude Code, Codex, Cursor…) can call it. It hands the job to the running app, which has the permissions, the browser extension and the cursor.
+`./build.sh` installs `clinqy` to `~/.local/bin`. Any terminal or coding agent (Claude Code, Codex, Cursor…) can call it. It hands the job to the running app, which has the permissions, the browser extension and the cursor.
 
 ```bash
-cursorboy qa tests/qa/                      # run every test in a folder
-cursorboy qa login.md --json                # one test, machine-readable report
-cursorboy qa "Go to https://example.com
+clinqy qa tests/qa/                      # run every test in a folder
+clinqy qa login.md --json                # one test, machine-readable report
+clinqy qa "Go to https://example.com
 Expect: Example Domain"                     # inline test
-cursorboy qa login.md --relearn --model opus
-cursorboy run "open github"                 # a task (not saved to history)
-cursorboy workflow "Fill form" "Your name=Priya"
-cursorboy workflows
+clinqy qa login.md --relearn --model opus
+clinqy run "open github"                 # a task (not saved to history)
+clinqy workflow "Fill form" "Your name=Priya"
+clinqy workflows
 ```
 
 **QA tests** are plain English, one step per line, with an optional `# Title`. Lines starting with **Expect / Check / Verify** are assertions:
@@ -118,7 +118,7 @@ Tick Keynote and Design panel
 Expect: the page title shows name=Amrit Nigam
 ```
 
-- **First run (learn):** the model carries out the test and compiles a **deterministic script** (actions, how to find each target, and checks). It's saved in `.cursorboy/` next to the test, so you can commit it.
+- **First run (learn):** the model carries out the test and compiles a **deterministic script** (actions, how to find each target, and checks). It's saved in `.clinqy/` next to the test, so you can commit it.
 - **Every run after that (replay):** **no model**. Each step is found by role and label, and each check is "this text is on screen". It's fast (about 4 s for the example), free and repeatable.
 - **UI changed? (heal):** if a step can't find its target, the model takes over from there only, the test still reports pass or fail, and the compiled script is updated.
 - **Result:** `PASS`/`FAIL` with each check and the steps before a failure. Exit code 0 means everything passed. `--json` gives the full report (name, passed, mode `replay`/`learned`/`healed`, durationMs, steps, checks, message).
@@ -130,11 +130,11 @@ Expect: the page title shows name=Amrit Nigam
 - **Daily…:** schedules it (for example 09:00, once a day).
 - **Delete.**
 
-From the terminal: `cursorboy workflow <name> "Input=value"`. A step that breaks is healed by the model, and the workflow is saved with the fix.
+From the terminal: `clinqy workflow <name> "Input=value"`. A step that breaks is healed by the model, and the workflow is saved with the fix.
 
 ## Configuration
 
-Optional `KEY=value` lines in `~/.config/cursorboy/env`:
+Optional `KEY=value` lines in `~/.config/clinqy/env`:
 
 | Key | Default | |
 |---|---|---|
@@ -148,17 +148,17 @@ Optional `KEY=value` lines in `~/.config/cursorboy/env`:
 
 | File | What |
 |---|---|
-| `~/.config/cursorboy/memory.md` | Facts CursorBoy remembers about you (edit freely, or menu → **Edit Memory…**) |
-| `~/Library/Application Support/CursorBoy/history.json` | Run history |
-| `~/Library/Application Support/CursorBoy/skills.json` | Learned skills |
-| `~/Library/Application Support/CursorBoy/workflows.json` | Saved workflows (and schedules) |
-| `~/Library/Logs/CursorBoy/agent.log` | Step-by-step log (secrets masked) |
+| `~/.config/clinqy/memory.md` | Facts Clinqy remembers about you (edit freely, or menu → **Edit Memory…**) |
+| `~/Library/Application Support/Clinqy/history.json` | Run history |
+| `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
+| `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
+| `~/Library/Logs/Clinqy/agent.log` | Step-by-step log (secrets masked) |
 
 ## Tests
 
 ```bash
 swift build --build-system native
-.build/debug/CursorBoy --selftest     # safety rules, reply parsing, scripting dictionaries
+.build/debug/Clinqy --selftest     # safety rules, reply parsing, scripting dictionaries
 tests/run.sh [filter]                 # end-to-end in Chrome against local pages in tests/site
 ```
 
@@ -175,7 +175,7 @@ Other debug commands: `--run <bundle-id|-> "<task>"` (run from the terminal with
 ## How it's built
 
 ```
-Sources/CursorBoy/
+Sources/Clinqy/
   Agent.swift        the loop: observe → Claude → act → report; actions, asking, history, memory
   AgentPrompt.swift  the system prompt (action vocabulary and rules)
   Brain.swift        persistent `claude -p` stream-json session, pre-warmed
@@ -191,8 +191,8 @@ Sources/CursorBoy/
   Recorder.swift, Skills.swift       watch & learn
   History.swift      run history and result cards
   Workflow.swift     deterministic workflows (steps + targets), store; replay/heal/QA live in Agent.swift
-bin/cursorboy        the command-line entry point (qa · run · workflow · workflows)
-tests/qa/            example plain-English QA tests (compiled scripts in tests/qa/.cursorboy/)
+bin/clinqy        the command-line entry point (qa · run · workflow · workflows)
+tests/qa/            example plain-English QA tests (compiled scripts in tests/qa/.clinqy/)
 ```
 
 ## Privacy

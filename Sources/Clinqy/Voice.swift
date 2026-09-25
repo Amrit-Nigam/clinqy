@@ -30,18 +30,18 @@ final class Voice: ObservableObject {
 
     func start(autoStop: Bool = true) {
         guard !isListening else { return }
-        guard Self.isSupported else { error = "Voice needs the CursorBoy app bundle (run ./build.sh run)"; return }
+        guard Self.isSupported else { error = "Voice needs the Clinqy app bundle (run ./build.sh run)"; return }
         error = nil
         SFSpeechRecognizer.requestAuthorization { status in
             Task { @MainActor in
                 guard status == .authorized else {
-                    self.error = "Allow Speech Recognition for CursorBoy in System Settings → Privacy & Security"
+                    self.error = "Allow Speech Recognition for Clinqy in System Settings → Privacy & Security"
                     return
                 }
                 AVCaptureDevice.requestAccess(for: .audio) { ok in
                     Task { @MainActor in
                         if ok { self.begin(autoStop: autoStop) } else {
-                            self.error = "Allow Microphone for CursorBoy in System Settings → Privacy & Security"
+                            self.error = "Allow Microphone for Clinqy in System Settings → Privacy & Security"
                         }
                     }
                 }

@@ -1,6 +1,6 @@
 import AppKit
 
-/// A spot the user circled on screen to point CursorBoy at ("this", "here", "that thing").
+/// A spot the user circled on screen to point Clinqy at ("this", "here", "that thing").
 /// Points are global top-left screen coordinates, the same space as element frames.
 struct Annotation: Equatable {
     let points: [CGPoint]

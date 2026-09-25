@@ -1,7 +1,7 @@
 import AppKit
 import ApplicationServices
 
-/// Every macOS permission CursorBoy uses, with a way to request each and check its status.
+/// Every macOS permission Clinqy uses, with a way to request each and check its status.
 enum Permissions {
     struct Item {
         let name: String

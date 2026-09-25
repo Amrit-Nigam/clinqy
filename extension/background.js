@@ -1,4 +1,4 @@
-// Connects to the CursorBoy app on this Mac and runs its requests against the active tab.
+// Connects to the Clinqy app on this Mac and runs its requests against the active tab.
 const URL_ = "ws://127.0.0.1:47823";
 let socket = null;
 
@@ -35,7 +35,7 @@ async function inPage(tab, name, args = []) {
   await chrome.scripting.executeScript({ target: { tabId: tab.id }, files: ["page.js"] });
   const [res] = await chrome.scripting.executeScript({
     target: { tabId: tab.id },
-    func: (n, a) => { const f = window.__cursorboy && window.__cursorboy[n]; if (!f) throw new Error("no page function " + n); return f(...a); },
+    func: (n, a) => { const f = window.__clinqy && window.__clinqy[n]; if (!f) throw new Error("no page function " + n); return f(...a); },
     args: [name, args],
   });
   if (res && res.error) throw new Error(String(res.error.message || res.error));
@@ -95,7 +95,7 @@ async function handle(msg) {
 }
 
 // ---- keep the connection up ----
-chrome.alarms.create("cursorboy-keepalive", { periodInMinutes: 0.5 });
+chrome.alarms.create("clinqy-keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(() => { connect(); send({ type: "ping" }); });
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);

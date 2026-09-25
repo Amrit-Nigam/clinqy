@@ -6,7 +6,7 @@ import AppKit
 final class Agent: ObservableObject {
     enum Phase: Equatable { case idle, listening, thinking, acting, waiting, done, failed }
 
-    /// Something CursorBoy needs from the user before it can go on (details, a choice, a confirmation).
+    /// Something Clinqy needs from the user before it can go on (details, a choice, a confirmation).
     struct Question: Equatable {
         let text: String
         let options: [String]
@@ -40,9 +40,9 @@ final class Agent: ObservableObject {
     private var runResult: ResultCard?
     var onAnswered: () -> Void = {}
 
-    /// The app the user was looking at when they summoned CursorBoy.
+    /// The app the user was looking at when they summoned Clinqy.
     var targetApp: NSRunningApplication?
-    /// Text the user had selected when they summoned CursorBoy; sent along with the request.
+    /// Text the user had selected when they summoned Clinqy; sent along with the request.
     @Published var selectedText: String?
     /// An area the user circled on screen before asking; sent as a marked screenshot on the first turn.
     @Published var annotation: Annotation?
@@ -80,7 +80,7 @@ final class Agent: ObservableObject {
     var lastTarget: WorkflowStep.Target?
     /// QA mode: the run is a UI test; checks are collected instead of asking the user anything.
     var qa: QAContext?
-    /// Use a different Claude model for this run (e.g. from `cursorboy qa --model`).
+    /// Use a different Claude model for this run (e.g. from `clinqy qa --model`).
     var modelOverride: String?
 
     /// Things the user added while the task was running; folded into the next step.
@@ -184,7 +184,7 @@ final class Agent: ObservableObject {
 
     fileprivate func run(_ request: String) async {
         guard AXEngine.isTrusted else {
-            return finish(ok: false, "Turn on Accessibility for CursorBoy in System Settings → Privacy & Security.")
+            return finish(ok: false, "Turn on Accessibility for Clinqy in System Settings → Privacy & Security.")
         }
         buddy.mood = .thinking
 
@@ -989,9 +989,9 @@ final class Agent: ObservableObject {
         Self.writeLog(line)
     }
 
-    /// Every run is also written to ~/Library/Logs/CursorBoy/agent.log (for debugging and tests).
+    /// Every run is also written to ~/Library/Logs/Clinqy/agent.log (for debugging and tests).
     private static let logURL: URL = {
-        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/CursorBoy")
+        let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Clinqy")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("agent.log")
     }()
@@ -1107,7 +1107,7 @@ struct QAContext {
     var checks: [Check] = []
 }
 
-/// What a QA run produced (written as JSON for the `cursorboy qa` command).
+/// What a QA run produced (written as JSON for the `clinqy qa` command).
 struct QAReport: Codable {
     let name: String
     let passed: Bool
@@ -1150,7 +1150,7 @@ extension Agent {
     func runQA(name: String, test: String, compiled: URL, relearn: Bool, model: String?, report out: URL) {
         guard !isRunning else {
             Self.writeReport(QAReport(name: name, passed: false, mode: "none", durationMs: 0, steps: [], checks: [],
-                                      message: "CursorBoy is busy with another task"), to: out)
+                                      message: "Clinqy is busy with another task"), to: out)
             return
         }
         prepare("QA: \(name)", test: true)
@@ -1203,7 +1203,7 @@ extension Agent {
     /// Returns true if the model had to step in.
     @discardableResult
     fileprivate func replayOrHeal(_ workflow: Workflow, params: [String: String], qaTest: String? = nil) async -> Bool {
-        guard AXEngine.isTrusted else { finish(ok: false, "Turn on Accessibility for CursorBoy."); return false }
+        guard AXEngine.isTrusted else { finish(ok: false, "Turn on Accessibility for Clinqy."); return false }
         guard !Safety.screenLocked else { finish(ok: false, "The Mac is locked — unlock it and run again"); return false }
         var app = targetApp ?? NSWorkspace.shared.frontmostApplication
         phase = .acting

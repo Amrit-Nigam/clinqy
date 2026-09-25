@@ -3,7 +3,7 @@ import SwiftUI
 
 // MARK: - Windows
 
-/// Spotlight-style command bar. Doesn't activate CursorBoy, so the app being controlled stays frontmost.
+/// Spotlight-style command bar. Doesn't activate Clinqy, so the app being controlled stays frontmost.
 final class CommandPanel: NSPanel {
     static let size = NSSize(width: 660, height: 460)
 
@@ -40,7 +40,7 @@ final class CommandPanel: NSPanel {
     }
 }
 
-/// A small click-through status capsule at the top of the screen while CursorBoy works.
+/// A small click-through status capsule at the top of the screen while Clinqy works.
 final class IslandPanel: NSPanel {
     private var hideWork: DispatchWorkItem?
 
@@ -362,7 +362,7 @@ struct CommandView: View {
                 .foregroundStyle(DS.tertiary)
             }
             .buttonStyle(.plain)
-            .help("Circle something on screen to point CursorBoy at it")
+            .help("Circle something on screen to point Clinqy at it")
             Button(action: onWatch) {
                 HStack(spacing: 4) {
                     Circle().fill(Color.red.opacity(0.85)).frame(width: 7, height: 7)
@@ -371,7 +371,7 @@ struct CommandView: View {
                 .foregroundStyle(DS.tertiary)
             }
             .buttonStyle(.plain)
-            .help("Show CursorBoy how to do something: it watches, then learns it as a skill")
+            .help("Show Clinqy how to do something: it watches, then learns it as a skill")
             Button { withAnimation(.easeOut(duration: 0.15)) { skillsTab.on.toggle(); historyTab.on = false } } label: {
                 HStack(spacing: 4) {
                     Image(systemName: "graduationcap").font(.system(size: 11))
@@ -396,7 +396,7 @@ struct CommandView: View {
     }
 }
 
-/// What CursorBoy needs from the user, with quick-choice buttons.
+/// What Clinqy needs from the user, with quick-choice buttons.
 private struct QuestionCard: View {
     let question: Agent.Question
     let onChoose: (String) -> Void

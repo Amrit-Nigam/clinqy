@@ -1,15 +1,15 @@
 #!/bin/zsh
-# End-to-end tests for CursorBoy in Chrome, against local pages only (tests/site).
-# Needs: CursorBoy.app running (./build.sh run) and the extension installed in Chrome.
+# End-to-end tests for Clinqy in Chrome, against local pages only (tests/site).
+# Needs: Clinqy.app running (./build.sh run) and the extension installed in Chrome.
 # Usage: tests/run.sh [name-filter]
 set -u
 cd "$(dirname "$0")"
-LOG=~/Library/Logs/CursorBoy/agent.log
+LOG=~/Library/Logs/Clinqy/agent.log
 BASE=http://127.0.0.1:8765
 FILTER=${1:-}
 PASS=0; FAIL=0
 
-pgrep -x CursorBoy >/dev/null || { echo "CursorBoy isn't running (./build.sh run)"; exit 1; }
+pgrep -x Clinqy >/dev/null || { echo "Clinqy isn't running (./build.sh run)"; exit 1; }
 python3 -m http.server 8765 --bind 127.0.0.1 --directory site >/dev/null 2>&1 &
 SERVER=$!
 trap 'kill $SERVER 2>/dev/null; osascript -e "tell application \"Google Chrome\" to close (every window whose URL of active tab starts with \"$BASE\")" >/dev/null 2>&1' EXIT
@@ -30,13 +30,13 @@ case_() {
   local url=$(chrome "get URL of active tab of front window")
   if [[ $front != "Google Chrome" || $url != $BASE/* ]]; then echo "SKIP  $name (test page not in front: $front $url)"; return; fi
   local start=$(wc -l < $LOG) t0=$(date +%s)
-  open -g "cursorboy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1"
+  open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1"
   local answered=0
   for i in $(seq 1 90); do
     sleep 1
     local out=$(tail -n +$((start+1)) $LOG)
     if [[ -n $reply && $answered == 0 && $out == *"Ask:"* || -n $reply && $answered == 0 && $out == *"About to click"* ]]; then
-      sleep 1; open -g "cursorboy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$reply")"; answered=1
+      sleep 1; open -g "clinqy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$reply")"; answered=1
     fi
     echo $out | grep -qE "\] (✓|✗)" && break
   done
@@ -68,36 +68,36 @@ case_ code-editor  monaco.html "replace the code in this editor with a Python so
 # Watch & learn: act like the user (real input via the debug binary), learn a skill, then run it with new values.
 watch_learn() {
   [[ -n $FILTER && watch-learn != *$FILTER* ]] && return
-  local B=../.build/debug/CursorBoy
+  local B=../.build/debug/Clinqy
   [[ -x $B ]] || { echo "SKIP  watch-learn (swift build first)"; return; }
-  local SK=~/Library/Application\ Support/CursorBoy/skills.json
-  local before=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/CursorBoy/skills.json');print(len(json.load(open(p))) if os.path.exists(p) else 0)")
+  local SK=~/Library/Application\ Support/Clinqy/skills.json
+  local before=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/Clinqy/skills.json');print(len(json.load(open(p))) if os.path.exists(p) else 0)")
   chrome "set URL of active tab of front window to \"$BASE/form.html\""; chrome "activate"; sleep 2.5
-  open -g "cursorboy://watch"; sleep 1.5
+  open -g "clinqy://watch"; sleep 1.5
   $B --click-label "Your name" >/dev/null && sleep 0.4 && $B --type "Amrit Nigam"; sleep 0.4
   $B --click-label "Keynote" >/dev/null; sleep 0.4; $B --click-label "Great" >/dev/null; sleep 0.6
-  open -g "cursorboy://stop-watching"
+  open -g "clinqy://stop-watching"
   local name=""
   for i in $(seq 1 30); do sleep 1
-    name=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/CursorBoy/skills.json');d=json.load(open(p)) if os.path.exists(p) else [];print(d[0]['name'] if len(d)>$before else '')")
+    name=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/Clinqy/skills.json');d=json.load(open(p)) if os.path.exists(p) else [];print(d[0]['name'] if len(d)>$before else '')")
     [[ -n $name ]] && break
   done
   if [[ -z $name ]]; then FAIL=$((FAIL+1)); echo "FAIL  watch-learn      no skill learned"; return; fi
   case_ skill-run form.html "Use the skill “$name”." "title:name=Priya" "name Priya, session Swift workshop, rating Okay"
   # Leave the user's skills as they were.
-  python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/CursorBoy/skills.json');d=json.load(open(p));json.dump([s for s in d if s['name']!='$name'],open(p,'w'))"
+  python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/Clinqy/skills.json');d=json.load(open(p));json.dump([s for s in d if s['name']!='$name'],open(p,'w'))"
   PASS=$((PASS+1)); echo "PASS  watch-learn      learned “$name”"
 }
 watch_learn
 
-# The cursorboy command: learn a QA test, then it must replay with no model.
+# The clinqy command: learn a QA test, then it must replay with no model.
 qa_cli() {
   [[ -n $FILTER && qa-cli != *$FILTER* ]] && return
   local out
-  out=$(../bin/cursorboy qa qa/feedback-form.md --relearn 2>&1 | head -1)
+  out=$(../bin/clinqy qa qa/feedback-form.md --relearn 2>&1 | head -1)
   if [[ $out != PASS* ]]; then FAIL=$((FAIL+1)); echo "FAIL  qa-learn         $out"; return; fi
   PASS=$((PASS+1)); echo "PASS  qa-learn         ${out#PASS  }"
-  out=$(../bin/cursorboy qa qa/feedback-form.md 2>&1 | head -1)
+  out=$(../bin/clinqy qa qa/feedback-form.md 2>&1 | head -1)
   if [[ $out == PASS*"(replay"* ]]; then PASS=$((PASS+1)); echo "PASS  qa-replay        ${out#PASS  }"
   else FAIL=$((FAIL+1)); echo "FAIL  qa-replay        $out"; fi
 }

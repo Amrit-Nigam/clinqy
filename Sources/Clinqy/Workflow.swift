@@ -75,7 +75,7 @@ struct Workflow: Codable, Identifiable, Equatable {
     var defaults: [String: String]? = nil
 
     /// Builds a workflow from a finished run: typed text becomes a named parameter (the field's label),
-    /// defaulting to what was typed, so `cursorboy workflow <name> "Your name=Priya"` works.
+    /// defaulting to what was typed, so `clinqy workflow <name> "Your name=Priya"` works.
     static func from(_ entry: History.Entry) -> Workflow? {
         guard var steps = entry.trace, !steps.isEmpty else { return nil }
         var params: [String] = []
@@ -102,7 +102,7 @@ final class Workflows: ObservableObject {
 
     private let url: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CursorBoy", isDirectory: true)
+            .appendingPathComponent("Clinqy", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("workflows.json")
     }()

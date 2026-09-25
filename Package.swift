@@ -2,7 +2,7 @@
 import PackageDescription
 
 let package = Package(
-    name: "CursorBoy",
+    name: "Clinqy",
     platforms: [.macOS(.v14)],
     dependencies: [
         // Local Whisper speech-to-text on Apple silicon (Core ML), the same model family Superwhisper uses.
@@ -10,9 +10,9 @@ let package = Package(
     ],
     targets: [
         .executableTarget(
-            name: "CursorBoy",
+            name: "Clinqy",
             dependencies: [.product(name: "WhisperKit", package: "WhisperKit")],
-            path: "Sources/CursorBoy",
+            path: "Sources/Clinqy",
             linkerSettings: [
                 .linkedFramework("Carbon"),
                 .linkedFramework("ApplicationServices"),

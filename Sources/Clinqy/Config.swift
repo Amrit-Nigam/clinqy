@@ -1,10 +1,10 @@
 import Foundation
 
-/// Reads settings from the environment, falling back to ~/.config/cursorboy/env (KEY=VALUE lines).
+/// Reads settings from the environment, falling back to ~/.config/clinqy/env (KEY=VALUE lines).
 enum Config {
     private static let fileValues: [String: String] = {
         let url = FileManager.default.homeDirectoryForCurrentUser
-            .appendingPathComponent(".config/cursorboy/env")
+            .appendingPathComponent(".config/clinqy/env")
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [:] }
         var values: [String: String] = [:]
         for line in text.split(separator: "\n") {

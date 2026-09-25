@@ -8,7 +8,7 @@ final class ClaudeSession: @unchecked Sendable {
 
         var errorDescription: String? {
             switch self {
-            case .notInstalled: return "Claude CLI not found. Install Claude Code, or set CLAUDE_PATH in ~/.config/cursorboy/env"
+            case .notInstalled: return "Claude CLI not found. Install Claude Code, or set CLAUDE_PATH in ~/.config/clinqy/env"
             case .failed(let message):
                 return message.contains("Not logged in") ? "Claude CLI isn't logged in. Run `claude` in a terminal once and log in." : message
             case .died: return "The Claude process stopped unexpectedly"

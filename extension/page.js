@@ -1,7 +1,7 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  if (window.__cursorboy) return;
+  if (window.__clinqy) return;
 
 function snapshot() {
   const sel = [
@@ -64,7 +64,7 @@ function snapshot() {
     picked.push(el);
     if (out.length >= 220) break;
   }
-  window.__cursorboyList = picked;
+  window.__clinqyList = picked;
   const headings = [...document.querySelectorAll("h1,h2,h3")].map((h) => h.innerText.trim()).filter(Boolean).slice(0, 12);
   return {
     url: location.href, title: document.title, focused: document.hasFocus(),
@@ -78,7 +78,7 @@ function snapshot() {
 }
 
 function target(index) {
-  const el = (window.__cursorboyList || [])[index];
+  const el = (window.__clinqyList || [])[index];
   if (!el || !el.isConnected) throw new Error("element w" + index + " is gone; take a new look");
   return el;
 }
@@ -149,13 +149,13 @@ function readText() {
 
 
   function isActive(i) {
-    const el = (window.__cursorboyList || [])[i];
+    const el = (window.__clinqyList || [])[i];
     if (!el) return { active: false };
     const inner = editableOf(el), a = document.activeElement;
     return { active: !!a && (a === inner || inner.contains(a)) && document.hasFocus() };
   }
   function value(i) {
-    const el = (window.__cursorboyList || [])[i];
+    const el = (window.__clinqyList || [])[i];
     if (!el) return { value: null };
     const f = editableOf(el);
     return { value: f.tagName === "SELECT" ? (f.options[f.selectedIndex] ? f.options[f.selectedIndex].text.trim() : "")
@@ -182,7 +182,7 @@ function readText() {
     return { value: String(el.isContentEditable ? el.innerText : el.value || "").slice(0, 400) };
   }
   function prepare(i) {
-    const el = (window.__cursorboyList || [])[i];
+    const el = (window.__clinqyList || [])[i];
     if (!el) return { ok: false };
     const field = editableOf(el);
     const all = field.form ? [...field.form.querySelectorAll("input, textarea")] : [field];
@@ -190,7 +190,7 @@ function readText() {
     return { ok: true };
   }
   function state(i) {
-    const el = (window.__cursorboyList || [])[i];
+    const el = (window.__clinqyList || [])[i];
     const a = (n) => el && el.getAttribute(n);
     return { sig: JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
       el && el.value, location.href, document.body ? document.body.innerText.length : 0, document.activeElement === el]) };
@@ -217,5 +217,5 @@ function readText() {
   }
   function selection() { return String(window.getSelection() || "").slice(0, 8000); }
 
-  window.__cursorboy = { snapshot, click, focus, fill, readText, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
+  window.__clinqy = { snapshot, click, focus, fill, readText, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
 })();

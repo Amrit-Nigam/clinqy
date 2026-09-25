@@ -62,9 +62,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "CursorBoy")
+        statusItem.button?.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Clinqy")
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open CursorBoy  (⌃⌥)", action: #selector(togglePanel), keyEquivalent: "")
+        menu.addItem(withTitle: "Open Clinqy  (⌃⌥)", action: #selector(togglePanel), keyEquivalent: "")
         menu.addItem(withTitle: "Talk  (hold ⌃⌥)", action: #selector(toggleMic), keyEquivalent: "")
         menu.addItem(withTitle: "Circle Something…", action: #selector(startCircling), keyEquivalent: "")
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
@@ -86,22 +86,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// `cursorboy://run?task=…` runs a task in whatever app is in front (used for scripting and tests).
+    /// `clinqy://run?task=…` runs a task in whatever app is in front (used for scripting and tests).
     func application(_ application: NSApplication, open urls: [URL]) {
-        for url in urls where url.scheme == "cursorboy" && url.host == "reload-extension" {
+        for url in urls where url.scheme == "clinqy" && url.host == "reload-extension" {
             Task { Agent.writeLog("extension reloaded in \(await BrowserBridge.shared.reloadAll()) browser(s)") }
         }
-        for url in urls where url.scheme == "cursorboy" && url.host == "answer" {
+        for url in urls where url.scheme == "clinqy" && url.host == "answer" {
             agent.answer(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value)
         }
-        for url in urls where url.scheme == "cursorboy" && url.host == "cancel" { agent.cancel() }
-        for url in urls where url.scheme == "cursorboy" && url.host == "add" {
+        for url in urls where url.scheme == "clinqy" && url.host == "cancel" { agent.cancel() }
+        for url in urls where url.scheme == "clinqy" && url.host == "add" {
             agent.addContext(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value ?? "")
         }
-        for url in urls where url.scheme == "cursorboy" && url.host == "watch" { rememberTarget(); startWatching() }
-        for url in urls where url.scheme == "cursorboy" && url.host == "stop-watching" { stopWatching() }
-        for url in urls where url.scheme == "cursorboy" && url.host == "qa" { startQA(url) }
-        for url in urls where url.scheme == "cursorboy" && url.host == "workflow" {
+        for url in urls where url.scheme == "clinqy" && url.host == "watch" { rememberTarget(); startWatching() }
+        for url in urls where url.scheme == "clinqy" && url.host == "stop-watching" { stopWatching() }
+        for url in urls where url.scheme == "clinqy" && url.host == "qa" { startQA(url) }
+        for url in urls where url.scheme == "clinqy" && url.host == "workflow" {
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             guard let name = items.first(where: { $0.name == "name" })?.value, let wf = Workflows.shared.named(name) else { continue }
             var params: [String: String] = [:]
@@ -109,7 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             rememberTarget()
             agent.runWorkflow(wf, params: params)
         }
-        for url in urls where url.scheme == "cursorboy" && url.host == "run" {
+        for url in urls where url.scheme == "clinqy" && url.host == "run" {
             guard let task = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "task" })?.value else { continue }
             rememberTarget()
@@ -124,13 +124,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setStatusIcon(running: Bool) {
         guard let button = statusItem.button else { return }
         if running {
-            button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop CursorBoy")
+            button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop Clinqy")
             button.contentTintColor = .systemRed
             statusItem.menu = nil
             button.target = self
             button.action = #selector(stopFromMenuBar)
         } else {
-            button.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "CursorBoy")
+            button.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Clinqy")
             button.contentTintColor = nil
             button.action = nil
             statusItem.menu = menu
@@ -187,11 +187,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - QA and schedules
 
-    /// cursorboy://qa?path=<test file>|text=<inline test>&out=<report.json>[&relearn=1][&model=…][&name=…]
+    /// clinqy://qa?path=<test file>|text=<inline test>&out=<report.json>[&relearn=1][&model=…][&name=…]
     private func startQA(_ url: URL) {
         let q = Dictionary((URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") },
                            uniquingKeysWith: { a, _ in a })
-        let out = URL(fileURLWithPath: q["out"] ?? NSTemporaryDirectory() + "cursorboy-qa.json")
+        let out = URL(fileURLWithPath: q["out"] ?? NSTemporaryDirectory() + "clinqy-qa.json")
         var name = q["name"] ?? "Inline test"
         var test = q["text"] ?? ""
         var compiled: URL
@@ -203,13 +203,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             if let title = lines.first(where: { $0.hasPrefix("# ") }) { name = String(title.dropFirst(2)) }
             else { name = file.deletingPathExtension().lastPathComponent }
             test = lines.filter { !$0.hasPrefix("# ") }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
-            // Compiled scripts live next to the tests, in .cursorboy/, so they can be committed with them.
-            compiled = file.deletingLastPathComponent().appendingPathComponent(".cursorboy")
+            // Compiled scripts live next to the tests, in .clinqy/, so they can be committed with them.
+            compiled = file.deletingLastPathComponent().appendingPathComponent(".clinqy")
                 .appendingPathComponent(file.deletingPathExtension().lastPathComponent + ".json")
         } else {
             let key = SHA256.hash(data: Data(test.utf8)).prefix(10).map { String(format: "%02x", $0) }.joined()
             compiled = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-                .appendingPathComponent("CursorBoy/qa/\(key).json")
+                .appendingPathComponent("Clinqy/qa/\(key).json")
         }
         guard !test.isEmpty else {
             Agent.writeReport(QAReport(name: name, passed: false, mode: "none", durationMs: 0, steps: [], checks: [],
@@ -324,7 +324,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func openMemory() {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/cursorboy/memory.md")
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.md")
         if !FileManager.default.fileExists(atPath: url.path) {
             try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
             try? "".write(to: url, atomically: true, encoding: .utf8)
@@ -335,14 +335,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func checkPermissions() {
         let lines = Permissions.all.map { "\($0.granted() ? "✅" : "❌")  \($0.name): \($0.why)" }
         let alert = NSAlert()
-        alert.messageText = Permissions.allGranted ? "All permissions granted" : "CursorBoy needs these permissions"
+        alert.messageText = Permissions.allGranted ? "All permissions granted" : "Clinqy needs these permissions"
         alert.informativeText = lines.joined(separator: "\n") + """
 
 
         Claude CLI: \(ClaudeSession.claudePath ?? "❌ not found")
 
         After enabling something in System Settings, click Check Again. \
-        Screen Recording may need CursorBoy to be restarted.
+        Screen Recording may need Clinqy to be restarted.
         """
         alert.addButton(withTitle: "Check Again")
         let missing = Permissions.all.first { !$0.granted() }

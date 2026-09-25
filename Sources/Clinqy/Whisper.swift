@@ -2,7 +2,7 @@ import AppKit
 import WhisperKit
 
 /// Local Whisper speech-to-text (WhisperKit, Core ML on Apple silicon). The model is downloaded once into
-/// CursorBoy's own Application Support folder and loaded while the app runs; nothing leaves the Mac.
+/// Clinqy's own Application Support folder and loaded while the app runs; nothing leaves the Mac.
 @MainActor
 final class Whisper: ObservableObject {
     static let shared = Whisper()
@@ -19,7 +19,7 @@ final class Whisper: ObservableObject {
 
     private static let modelsDir: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("CursorBoy/models", isDirectory: true)
+            .appendingPathComponent("Clinqy/models", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
@@ -84,7 +84,7 @@ final class Whisper: ObservableObject {
         if let tokenizer = kit.tokenizer {
             let names = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
                 .compactMap(\.cleanName).prefix(20).joined(separator: ", ")
-            prompt = tokenizer.encode(text: " CursorBoy, WhatsApp, YouTube, Google, GitHub, \(names).")
+            prompt = tokenizer.encode(text: " Clinqy, WhatsApp, YouTube, Google, GitHub, \(names).")
                 .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
         }
         let options = DecodingOptions(task: .transcribe, language: nil, temperature: 0,

@@ -2,7 +2,7 @@ import AppKit
 import QuartzCore
 
 /// The companion: a small glowing triangle that rides just below-right of your mouse, pointing at it.
-/// When CursorBoy acts it leaves your side, flies an arc to each target the way a hand would travel,
+/// When Clinqy acts it leaves your side, flies an arc to each target the way a hand would travel,
 /// points, clicks, types — then flies home. It draws on a click-through overlay on every screen.
 @MainActor
 final class Buddy {

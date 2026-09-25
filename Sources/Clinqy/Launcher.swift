@@ -123,7 +123,7 @@ enum Shell {
 /// Durable facts the agent learns about the user ("mom = WhatsApp chat 'Mom ❤️'"), one per line.
 enum Memory {
     private static let url = FileManager.default.homeDirectoryForCurrentUser
-        .appendingPathComponent(".config/cursorboy/memory.md")
+        .appendingPathComponent(".config/clinqy/memory.md")
 
     static var facts: [String] {
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return [] }
