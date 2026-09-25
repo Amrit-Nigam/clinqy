@@ -1,35 +1,55 @@
-import Carbon
+import AppKit
 
-/// Registers a single global hotkey via Carbon (works without Input Monitoring permission),
-/// reporting both press and release so it can drive hold-to-talk.
+/// A modifier-only hotkey: Control + Option pressed together, with nothing else.
+/// Reports press and release (for tap vs. hold). If any other key is pressed while they're held, the chord
+/// belongs to some other shortcut (e.g. ⌃⌥← in a window manager), so it's reported as `onOtherKey` instead.
+@MainActor
 final class HotKey {
-    private var ref: EventHotKeyRef?
-    private var handler: EventHandlerRef?
     private let onPress: () -> Void
     private let onRelease: () -> Void
+    private let onOtherKey: () -> Void
+    private var monitors: [Any] = []
+    private var down = false
+    private var spoiled = false
 
-    init(keyCode: UInt32, modifiers: UInt32, onPress: @escaping () -> Void, onRelease: @escaping () -> Void = {}) {
+    private static let wanted: NSEvent.ModifierFlags = [.control, .option]
+    private static let relevant: NSEvent.ModifierFlags = [.control, .option, .command, .shift, .function]
+
+    init(onPress: @escaping () -> Void, onRelease: @escaping () -> Void, onOtherKey: @escaping () -> Void = {}) {
         self.onPress = onPress
         self.onRelease = onRelease
-        var specs = [
-            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed)),
-            EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyReleased)),
-        ]
-        let selfPtr = Unmanaged.passUnretained(self).toOpaque()
-        InstallEventHandler(GetApplicationEventTarget(), { _, event, userData in
-            guard let userData, let event else { return noErr }
-            let hotKey = Unmanaged<HotKey>.fromOpaque(userData).takeUnretainedValue()
-            let pressed = GetEventKind(event) == UInt32(kEventHotKeyPressed)
-            DispatchQueue.main.async { pressed ? hotKey.onPress() : hotKey.onRelease() }
-            return noErr
-        }, 2, &specs, selfPtr, &handler)
+        self.onOtherKey = onOtherKey
+        // Global: while other apps are active. Local: while our own panel is key.
+        if let m = NSEvent.addGlobalMonitorForEvents(matching: [.flagsChanged, .keyDown], handler: { [weak self] e in
+            let type = e.type, flags = e.modifierFlags
+            MainActor.assumeIsolated { self?.handle(type, flags) }
+        }) { monitors.append(m) }
+        if let m = NSEvent.addLocalMonitorForEvents(matching: [.flagsChanged, .keyDown], handler: { [weak self] e in
+            let type = e.type, flags = e.modifierFlags
+            MainActor.assumeIsolated { self?.handle(type, flags) }
+            return e
+        }) { monitors.append(m) }
+    }
 
-        let id = EventHotKeyID(signature: OSType(0x43424F59), id: 1) // "CBOY"
-        RegisterEventHotKey(keyCode, modifiers, id, GetApplicationEventTarget(), 0, &ref)
+    private func handle(_ type: NSEvent.EventType, _ flags: NSEvent.ModifierFlags) {
+        if type == .keyDown {
+            // Another key during the chord: it's someone else's shortcut.
+            if down, !spoiled { spoiled = true; onOtherKey() }
+            return
+        }
+        let mods = flags.intersection(Self.relevant)
+        if !down, mods == Self.wanted {
+            down = true
+            spoiled = false
+            onPress()
+        } else if down, mods != Self.wanted {
+            down = false
+            if !spoiled { onRelease() }
+        }
     }
 
     deinit {
-        if let ref { UnregisterEventHotKey(ref) }
-        if let handler { RemoveEventHandler(handler) }
+        let ms = monitors
+        DispatchQueue.main.async { ms.forEach { NSEvent.removeMonitor($0) } }
     }
 }

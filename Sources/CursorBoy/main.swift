@@ -66,6 +66,26 @@ if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--transcribe" 
     RunLoop.main.run()
 }
 
+// `--chord [key]`: taps Control+Option like a user (optionally with another key, which must NOT open CursorBoy).
+if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--chord" {
+    let src = CGEventSource(stateID: .hidSystemState)
+    func flags(_ code: CGKeyCode, _ down: Bool, _ f: CGEventFlags) {
+        let e = CGEvent(keyboardEventSource: src, virtualKey: code, keyDown: down)
+        e?.type = .flagsChanged
+        e?.flags = f
+        e?.post(tap: .cghidEventTap)
+        usleep(40_000)
+    }
+    flags(0x3B, true, .maskControl)                               // control down
+    flags(0x3A, true, [.maskControl, .maskAlternate])             // option down
+    if CommandLine.arguments.count >= 3 { AXEngine.press(combo: "ctrl+opt+" + CommandLine.arguments[2]) }
+    usleep(120_000)
+    flags(0x3A, false, .maskControl)                              // option up
+    flags(0x3B, false, [])                                        // control up
+    usleep(300_000)
+    exit(0)
+}
+
 // Test helpers that act like the user (real input events): --click-label <text>, --type <text>, --key <combo>.
 if CommandLine.arguments.count >= 3, ["--click-label", "--type", "--key"].contains(CommandLine.arguments[1]) {
     let arg = CommandLine.arguments[2]

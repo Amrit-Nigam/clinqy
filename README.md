@@ -2,7 +2,7 @@
 
 **Your Mac, on autopilot — and you can watch it work.**
 
-CursorBoy is a macOS menu-bar assistant that uses your Mac the way you would. Press **⌥Space**, type or say what you want, and a small glowing companion cursor goes and does it on screen. It clicks the Dock, types into the address bar, ticks the checkboxes and fills the form. It asks you before anything consequential, remembers useful things about you, and can learn a task by watching you do it once.
+CursorBoy is a macOS menu-bar assistant that uses your Mac the way you would. Press **⌃⌥**, type or say what you want, and a small glowing companion cursor goes and does it on screen. It clicks the Dock, types into the address bar, ticks the checkboxes and fills the form. It asks you before anything consequential, remembers useful things about you, and can learn a task by watching you do it once.
 
 ```
 "book me a flight to Mumbai"         "where's the brightness setting?"
@@ -22,7 +22,7 @@ CursorBoy is a macOS menu-bar assistant that uses your Mac the way you would. Pr
   - Web pages through a **browser extension**: exact elements, verified typing that survives autofill, dropdowns, reading.
   - Documents through PDFKit, and scans or images through on-device OCR.
   - Scriptable apps through their **AppleScript dictionaries**, used as a fallback or when you ask for "in the background".
-- **Voice.** Hold ⌥Space and talk. Apple dictation shows a live preview, and **local Whisper** (large-v3 turbo via WhisperKit) writes the final text on-device.
+- **Voice.** Hold ⌃⌥ and talk. Apple dictation shows a live preview, and **local Whisper** (large-v3 turbo via WhisperKit) writes the final text on-device.
 - **Asks when it needs you.** It asks for details, choices and passwords (hidden input), with quick-choice buttons or a voice answer.
 - **Safety enforced in code:**
   - Clicks on Pay, Buy, Book, Send, Submit, Delete and similar need your OK, unless you asked for exactly that.
@@ -32,7 +32,7 @@ CursorBoy is a macOS menu-bar assistant that uses your Mac the way you would. Pr
 - **Result cards.** Options, prices, plans and summaries appear in a card you can copy from.
 - **History.** Every run is saved. You can **Continue** from one or **Run again**.
 - **Memory.** After each task it keeps lasting facts about you (people, preferences, usual apps). It never saves passwords, card numbers or OTPs.
-- **Watch & learn.** Click *Watch & learn*, do a task yourself, and press ⌥Space to stop. It becomes a reusable **skill** with fill-in parameters.
+- **Watch & learn.** Click *Watch & learn*, do a task yourself, and press ⌃⌥ to stop. It becomes a reusable **skill** with fill-in parameters.
 - **Selected text.** Whatever you had highlighted is sent along with your request.
 - **Never touches your tabs.** Websites open in new tabs. It only reuses tabs it opened itself.
 
@@ -72,12 +72,12 @@ It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension ori
 
 | | |
 |---|---|
-| **⌥Space** (tap) | Open the command bar |
-| **⌥Space** (hold) | Talk; release to send |
-| **⌥Space** while working | Tap: add context or change the plan mid-task · hold: say it |
+| **⌃⌥** (tap Control + Option together) | Open the command bar |
+| **⌃⌥** (hold) | Talk; release to send |
+| **⌃⌥** while working | Tap: add context or change the plan mid-task · hold: say it |
 | **⏹** (command bar or menu bar) | Stop the current task |
 | **Esc** | Close the command bar |
-| **Watch & learn** | Record yourself doing a task; ⌥Space or ⏹ to stop and learn it |
+| **Watch & learn** | Record yourself doing a task; ⌃⌥ or ⏹ to stop and learn it |
 | **Skills / History** | Footer tabs in the command bar |
 
 ### URL scheme (for scripting)

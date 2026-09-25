@@ -337,8 +337,8 @@ struct CommandView: View {
 
     private var footer: some View {
         HStack(spacing: 14) {
-            Hint(keys: "⌥ Space", text: "open")
-            Hint(keys: "hold ⌥ Space", text: "talk")
+            Hint(keys: "⌃⌥", text: "open")
+            Hint(keys: "hold ⌃⌥", text: "talk")
             Spacer()
             Button(action: onWatch) {
                 HStack(spacing: 4) {
@@ -606,7 +606,7 @@ struct IslandView: View {
 
     private var text: String {
         if voice.isListening { return voice.transcript.isEmpty ? "Listening…" : voice.transcript }
-        if Recorder.shared.isRecording { return "Watching you… do the task, then ⌥Space or ⏹ to stop" }
+        if Recorder.shared.isRecording { return "Watching you… do the task, then ⌃⌥ or ⏹ to stop" }
         if voice.isTranscribing { return "Transcribing…" }
         if let q = agent.question { return "Needs your input: \(q.text)" }
         return agent.narration.isEmpty ? "Thinking…" : agent.narration
@@ -623,7 +623,7 @@ struct IslandView: View {
                 .contentTransition(.opacity)
                 .animation(.easeOut(duration: 0.2), value: text)
             if agent.isRunning {
-                Text("⌥Space to add · ⏹ to stop").font(.system(size: 11)).foregroundStyle(DS.tertiary)
+                Text("⌃⌥ to add · ⏹ to stop").font(.system(size: 11)).foregroundStyle(DS.tertiary)
             }
         }
         .padding(.horizontal, 14)
@@ -860,7 +860,7 @@ struct SkillsView: View {
 
     var body: some View {
         if skills.all.isEmpty {
-            Text("No skills yet. Click “Watch & learn”, do the task yourself, then press ⌥Space to stop — I'll learn it.")
+            Text("No skills yet. Click “Watch & learn”, do the task yourself, then press ⌃⌥ to stop — I'll learn it.")
                 .font(.system(size: 13)).foregroundStyle(DS.tertiary)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .fixedSize(horizontal: false, vertical: true)

@@ -60,8 +60,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "CursorBoy")
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open CursorBoy  (⌥Space)", action: #selector(togglePanel), keyEquivalent: "")
-        menu.addItem(withTitle: "Talk  (hold ⌥Space)", action: #selector(toggleMic), keyEquivalent: "")
+        menu.addItem(withTitle: "Open CursorBoy  (⌃⌥)", action: #selector(togglePanel), keyEquivalent: "")
+        menu.addItem(withTitle: "Talk  (hold ⌃⌥)", action: #selector(toggleMic), keyEquivalent: "")
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(.separator())
@@ -70,10 +70,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.menu = menu
         self.menu = menu
 
-        // ⌥Space: tap opens the bar, hold talks, and while working it stops.
-        hotKey = HotKey(keyCode: UInt32(kVK_Space), modifiers: UInt32(optionKey),
-                        onPress: { [weak self] in self?.hotKeyDown() },
-                        onRelease: { [weak self] in self?.hotKeyUp() })
+        // ⌃⌥ (Control + Option on their own): tap opens the bar, hold talks.
+        hotKey = HotKey(onPress: { [weak self] in self?.hotKeyDown() },
+                        onRelease: { [weak self] in self?.hotKeyUp() },
+                        onOtherKey: { [weak self] in self?.hotKeyAbandoned() })
 
         if !Permissions.allGranted {
             Permissions.requestMissing()
@@ -153,9 +153,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Hotkey
 
     private func hotKeyDown() {
-        // While watching, ⌥Space stops the recording and learns from it.
+        // While watching, ⌃⌥ stops the recording and learns from it.
         if Recorder.shared.isRecording { stopWatching(); return }
-        // While working, ⌥Space no longer stops (⏹ does): tap opens the bar to add context, hold talks.
+        // While working, ⌃⌥ no longer stops (⏹ does): tap opens the bar to add context, hold talks.
         guard pressedAt == nil else { return }   // key repeat
         pressedAt = Date()
         holdTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
@@ -168,6 +168,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self.island.show()
             }
         }
+    }
+
+    /// ⌃⌥ turned out to be part of another shortcut (⌃⌥ + some key): undo anything it started.
+    private func hotKeyAbandoned() {
+        holdTimer?.invalidate()
+        if holdToTalk {
+            voice.cancel()
+            island.hide()
+            buddy.mood = agent.isRunning ? .acting : .idle
+        }
+        pressedAt = nil
+        holdToTalk = false
     }
 
     private func hotKeyUp() {
