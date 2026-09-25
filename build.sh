@@ -42,6 +42,10 @@ else
 fi
 echo "Built $APP"
 
+# The `cursorboy` command (for terminals and coding agents), on the PATH next to `claude`.
+mkdir -p "$HOME/.local/bin"
+ln -sf "$PWD/bin/cursorboy" "$HOME/.local/bin/cursorboy"
+
 if [[ "${1:-}" == "run" ]]; then
   pkill -x CursorBoy 2>/dev/null && sleep 1 || true
   open "$APP"

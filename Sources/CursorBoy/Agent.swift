@@ -53,9 +53,9 @@ final class Agent: ObservableObject {
 
     private let buddy: Buddy
     private let hand: Hand
-    private var task: Task<Void, Never>?
+    fileprivate var task: Task<Void, Never>?
     private var session: ClaudeSession?
-    private var started = Date()
+    fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
     /// The browser tab this task opened (the only tab it may navigate in place).
@@ -69,6 +69,15 @@ final class Agent: ObservableObject {
     }
 
     var isRunning: Bool { phase == .thinking || phase == .acting || phase == .waiting }
+
+    /// What this run actually did, step by step, in a replayable form (saved as a workflow / QA script).
+    var trace: [WorkflowStep] = []
+    /// How the last resolved element can be found again (set whenever an action resolves its target).
+    var lastTarget: WorkflowStep.Target?
+    /// QA mode: the run is a UI test; checks are collected instead of asking the user anything.
+    var qa: QAContext?
+    /// Use a different Claude model for this run (e.g. from `cursorboy qa --model`).
+    var modelOverride: String?
 
     /// Things the user added while the task was running; folded into the next step.
     private var addedNotes: [String] = []
@@ -87,6 +96,7 @@ final class Agent: ObservableObject {
 
     /// Pauses for the user's answer to `text` (nil = no answer / cancelled).
     private func askUser(_ text: String, options: [String] = [], sensitive: Bool = false) async -> String? {
+        if qa != nil { return options.first }   // tests run unattended: take the first (go-ahead) option
         let previous = phase
         phase = .waiting
         buddy.bubble("need your input", for: 4)
@@ -123,10 +133,22 @@ final class Agent: ObservableObject {
     }
 
     func submit(_ raw: String, test: Bool = false) {
-        isTest = test || echo
         let request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
+        prepare(request, test: test)
+        task = Task {
+            await run(request)
+            selectedText = nil
+            continuation = nil
+        }
+    }
+
+    /// Resets per-run state; shared by requests, workflow replays and QA runs.
+    fileprivate func prepare(_ request: String, test: Bool) {
+        isTest = test || echo
         started = Date()
+        trace = []
+        lastTarget = nil
         steps = []
         answer = ""
         input = ""
@@ -143,11 +165,6 @@ final class Agent: ObservableObject {
         onStart()
         startWatchdog()
         Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")")
-        task = Task {
-            await run(request)
-            selectedText = nil
-            continuation = nil
-        }
     }
 
     func cancel() {
@@ -159,14 +176,14 @@ final class Agent: ObservableObject {
 
     // MARK: - Loop
 
-    private func run(_ request: String) async {
+    fileprivate func run(_ request: String) async {
         guard AXEngine.isTrusted else {
             return finish(ok: false, "Turn on Accessibility for CursorBoy in System Settings → Privacy & Security.")
         }
         buddy.mood = .thinking
 
         // Don't start clicking around during a call or meeting unless the user says so.
-        if Safety.micInUse {
+        if Safety.micInUse, qa == nil {
             let reply = await askUser("You seem to be on a call (the mic is in use). Should I go ahead and use the screen?",
                                       options: ["Go ahead", "Not now"])
             guard let reply, reply.lowercased().hasPrefix("go") || Safety.isYes(reply) else {
@@ -176,7 +193,7 @@ final class Agent: ObservableObject {
         }
 
         let session: ClaudeSession
-        do { session = try Brain.session() } catch { return finish(ok: false, error.localizedDescription) }
+        do { session = try Brain.session(model: modelOverride) } catch { return finish(ok: false, error.localizedDescription) }
         self.session = session
         defer { session.close() }
 
@@ -249,7 +266,9 @@ final class Agent: ObservableObject {
                     results.append("(stopped before step \(i + 1): the user added something — see above)")
                     break
                 }
+                lastTarget = nil
                 let result = await perform(action, context: &context)
+                if result.ok { record(action) }
                 if case .look = result.effect { wantsLook = true }
                 results.append("\(i + 1). \(result.summary)")
                 if !result.ok { failures += 1; break }
@@ -350,7 +369,7 @@ final class Agent: ObservableObject {
         var effect: Effect = .none
     }
 
-    private func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
+    fileprivate func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let kind = (action["do"] as? String ?? "").lowercased()
         switch kind {
         case "open_app":
@@ -365,8 +384,15 @@ final class Agent: ObservableObject {
             guard let raw = action["url"] as? String,
                   let url = URL(string: raw.contains("://") ? raw : "https://\(raw)") else { return fail("bad url") }
             let line = begin("Go to \(url.host ?? raw)")
-            // Already there: nothing to open.
-            if let page = context.page, let host = url.host?.replacingOccurrences(of: "www.", with: ""),
+            // Already there: nothing to open (in a QA test the page is always loaded fresh).
+            if qa != nil, let page = context.page, page.url.hasPrefix(url.absoluteString) || url.absoluteString.hasPrefix(page.url),
+               let tab = await BrowserBridge.shared.activeTab() {
+                await BrowserBridge.shared.tabCommand("navigate", on: tab, ["url": url.absoluteString])
+                try? await Task.sleep(for: .milliseconds(1200))
+                await refresh(&context)
+                return end(line, .init(ok: true, summary: "reloaded \(url.absoluteString)"))
+            }
+            if qa == nil, let page = context.page, let host = url.host?.replacingOccurrences(of: "www.", with: ""),
                page.url.contains(host), url.path.count <= 1 || page.url.contains(url.path) {
                 return end(line, .init(ok: true, summary: "already on \(page.url)"))
             }
@@ -745,6 +771,19 @@ final class Agent: ObservableObject {
             hand.lingerBeforeHome = 3.5
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
 
+        case "ask" where qa != nil:
+            return fail("this is an unattended test — nobody can answer; assert the missing information as a failed check and finish")
+
+        case "assert":
+            // QA: the model's verdict on an expectation, kept as a deterministic "text is visible" check.
+            let text = (action["text"] as? String) ?? ""
+            let pass = action["pass"] as? Bool ?? false
+            let note = (action["note"] as? String) ?? ""
+            let line = begin("Check “\(text.prefix(50))”")
+            qa?.checks.append(.init(text: text, pass: pass, note: note))
+            buddy.signal(pass)
+            return end(line, .init(ok: true, summary: "recorded check: \(pass ? "PASS" : "FAIL") \(text)"))
+
         case "ask":
             guard let text = action["question"] as? String, !text.isEmpty else { return fail("ask needs a question") }
             let options = (action["options"] as? [String]) ?? []
@@ -817,6 +856,7 @@ final class Agent: ObservableObject {
         let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
         let rect = CGRect(x: web.minX + el.rect.minX * sx, y: web.minY + el.rect.minY * sy,
                           width: el.rect.width * sx, height: el.rect.height * sy)
+        lastTarget = .init(kind: "web", role: el.role, label: el.text)
         return (el, rect.intersection(web).isNull ? rect : rect.intersection(web))
     }
 
@@ -839,6 +879,7 @@ final class Agent: ObservableObject {
         guard let app = context.app, let ref = ref as? String,
               let n = Int(ref.trimmingCharacters(in: CharacterSet(charactersIn: "eE"))), n < context.elements.count else { return nil }
         let wanted = context.elements[n]
+        lastTarget = .init(kind: "ax", role: wanted.role, label: wanted.label)
         if await AXEngine.fingerprintAsync(of: app) == context.fingerprint { return wanted }
         // The screen moved on. The same element is usually still alive (maybe shifted); else find its twin.
         if let frame = AXEngine.liveFrame(of: wanted.element), frame.width > 2, frame.height > 2 {
@@ -878,7 +919,7 @@ final class Agent: ObservableObject {
         return result
     }
 
-    private func finish(ok: Bool, _ text: String) {
+    fileprivate func finish(ok: Bool, _ text: String) {
         guard isRunning else { return }
         phase = ok ? .done : .failed
         narration = text
@@ -898,7 +939,8 @@ final class Agent: ObservableObject {
             onResult()
         }
         if !isTest { History.shared.add(.init(date: started, request: request, answer: text, ok: ok,
-                                 steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult)) }
+                                 steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult,
+                                 trace: trace.isEmpty ? nil : trace)) }
         session = nil
         onFinish(text, ok)
     }
@@ -923,7 +965,7 @@ final class Agent: ObservableObject {
         }
     }
 
-    private func log(_ text: String) {
+    fileprivate func log(_ text: String) {
         lastProgress = Date()
         var text = text
         for secret in secrets where secret.count >= 3 { text = text.replacingOccurrences(of: secret, with: "••••") }
@@ -1039,4 +1081,223 @@ extension UIElementInfo {
 
 extension NSRunningApplication {
     var cleanName: String? { localizedName?.replacingOccurrences(of: "\u{200E}", with: "") }
+}
+
+
+// MARK: - Workflows: record, replay without a model, heal with one
+
+struct QAContext {
+    struct Check: Codable { let text: String; let pass: Bool; let note: String }
+    let name: String
+    var checks: [Check] = []
+}
+
+/// What a QA run produced (written as JSON for the `cursorboy qa` command).
+struct QAReport: Codable {
+    let name: String
+    let passed: Bool
+    /// "replay" (no model), "learned" (first run, model), "healed" (replay fixed by the model)
+    let mode: String
+    let durationMs: Int
+    let steps: [String]
+    let checks: [QAContext.Check]
+    let message: String
+}
+
+extension Agent {
+    /// Adds a successful action to the trace in a replayable form.
+    fileprivate func record(_ action: [String: Any]) {
+        guard let kind = (action["do"] as? String)?.lowercased(),
+              ["open_app", "open_url", "click", "type", "key", "scroll", "applescript", "assert"].contains(kind) else { return }
+        var step = WorkflowStep(action: kind == "assert" ? "expect" : kind)
+        step.name = action["name"] as? String
+        step.url = action["url"] as? String
+        step.text = action["text"] as? String
+        step.keys = action["keys"] as? String
+        step.dir = action["dir"] as? String
+        step.script = action["script"] as? String
+        step.submit = action["submit"] as? Bool
+        if action["id"] != nil { step.target = lastTarget }
+        if kind == "assert", action["pass"] as? Bool != true { return }   // only checks that held become expectations
+        if kind == "click", step.target == nil { return }                 // position clicks can't be replayed reliably
+        trace.append(step)
+    }
+
+    /// Replays a saved workflow with no model; if a step breaks, the model finishes the job and the workflow is updated.
+    func runWorkflow(_ workflow: Workflow, params given: [String: String] = [:]) {
+        guard !isRunning else { return }
+        let params = (workflow.defaults ?? [:]).merging(given) { _, new in new }
+        prepare("Workflow: \(workflow.name)", test: false)
+        task = Task { await replayOrHeal(workflow, params: params) }
+    }
+
+    /// Runs a UI test: replays its compiled script (no model) or learns it (first run / --relearn), then writes a report.
+    func runQA(name: String, test: String, compiled: URL, relearn: Bool, model: String?, report out: URL) {
+        guard !isRunning else {
+            Self.writeReport(QAReport(name: name, passed: false, mode: "none", durationMs: 0, steps: [], checks: [],
+                                      message: "CursorBoy is busy with another task"), to: out)
+            return
+        }
+        prepare("QA: \(name)", test: true)
+        qa = QAContext(name: name)
+        modelOverride = model
+        buddy.qaMode = true
+        let started = Date()
+        task = Task {
+            var mode = "learned"
+            if !relearn, let data = try? Data(contentsOf: compiled),
+               let saved = try? JSONDecoder.iso8601.decode(Workflow.self, from: data) {
+                mode = await replayOrHeal(saved, params: [:], qaTest: test) ? "healed" : "replay"
+            } else {
+                await run(Self.qaPrompt(name: name, test: test))
+            }
+            let finishedOK = phase == .done
+            let checks = qa?.checks ?? []
+            let passed = finishedOK && !checks.contains { !$0.pass }
+            // Keep (or refresh) the compiled script when this run went through with the model.
+            if finishedOK, mode != "replay", !trace.isEmpty {
+                let wf = Workflow(name: name, summary: "QA test", params: [], steps: trace, created: Date())
+                try? FileManager.default.createDirectory(at: compiled.deletingLastPathComponent(), withIntermediateDirectories: true)
+                try? JSONEncoder.iso8601.encode(wf).write(to: compiled, options: .atomic)
+            }
+            Self.writeReport(QAReport(name: name, passed: passed, mode: mode, durationMs: Int(Date().timeIntervalSince(started) * 1000),
+                                      steps: steps.map(\.text), checks: checks, message: answer), to: out)
+            buddy.qaMode = false
+            qa = nil
+            modelOverride = nil
+        }
+    }
+
+    static func writeReport(_ report: QAReport, to url: URL) {
+        try? JSONEncoder.iso8601.encode(report).write(to: url, options: .atomic)
+    }
+
+    static func qaPrompt(name: String, test: String) -> String {
+        """
+        QA TEST “\(name)”. You are an automated UI tester. Carry out these steps exactly as written, in order:
+        \(test)
+
+        For every line that states an expectation (Expect / Check / Verify / Should…), look at the screen and report it
+        with {"do":"assert","text":"<the expected text, as it would literally appear on screen>","pass":true|false,"note":"<what you saw>"}.
+        Prefer exact on-screen text (a heading, label, value, title or URL), so the check can be repeated automatically.
+        Nobody is watching: never ask anything. If a step can't be done, assert it as failed with a note, then finish.
+        Finish with done:true and a one-line verdict.
+        """
+    }
+
+    /// Returns true if the model had to step in.
+    @discardableResult
+    fileprivate func replayOrHeal(_ workflow: Workflow, params: [String: String], qaTest: String? = nil) async -> Bool {
+        guard AXEngine.isTrusted else { finish(ok: false, "Turn on Accessibility for CursorBoy."); return false }
+        guard !Safety.screenLocked else { finish(ok: false, "The Mac is locked — unlock it and run again"); return false }
+        var app = targetApp ?? NSWorkspace.shared.frontmostApplication
+        phase = .acting
+        buddy.mood = .acting
+        log("replay “\(workflow.name)” · \(workflow.steps.count) steps, no model")
+        for (i, step) in workflow.steps.enumerated() {
+            guard !Task.isCancelled else { return false }
+            narration = step.summary
+            if step.action == "expect" {
+                let want = step.action(params: params, id: nil)["text"] as? String ?? ""
+                var pass = false
+                for _ in 0..<5 {
+                    if await Self.textVisible(want, app: app) { pass = true; break }
+                    try? await Task.sleep(for: .milliseconds(600))
+                }
+                steps.append(Step(text: "Check “\(want.prefix(50))”", state: pass ? .ok : .failed))
+                log("  \(pass ? "✓" : "✗") expect \(want)")
+                buddy.signal(pass)
+                if qa != nil {
+                    qa?.checks.append(.init(text: want, pass: pass, note: pass ? "" : "not visible on screen"))
+                    trace.append(step)
+                    continue
+                }
+                if !pass { return await heal(workflow, from: i, reason: "expected “\(want)” isn't on screen", params: params, qaTest: qaTest) }
+                continue
+            }
+            // Find the step's target on the current screen (UIs load at their own pace: retry a little).
+            var obs = await Observation.capture(app)
+            var id: String?
+            if let target = step.target {
+                for attempt in 0..<5 {
+                    if attempt > 0 { try? await Task.sleep(for: .milliseconds(500)); obs = await Observation.capture(app) }
+                    id = Self.find(target, in: obs)
+                    if id != nil { break }
+                }
+                guard id != nil else {
+                    return await heal(workflow, from: i, reason: "couldn't find \(target.role) “\(target.label)”", params: params, qaTest: qaTest)
+                }
+            }
+            var context = ActionContext(app: obs.app, elements: obs.elements, fingerprint: obs.fingerprint,
+                                        page: obs.page, webArea: obs.webArea)
+            lastTarget = nil
+            let result = await perform(step.action(params: params, id: id), context: &context)
+            guard result.ok else { return await heal(workflow, from: i, reason: result.summary, params: params, qaTest: qaTest) }
+            trace.append(step)
+            app = context.app
+        }
+        if var updated = Workflows.shared.all.first(where: { $0.id == workflow.id }) {
+            updated.runs += 1
+            Workflows.shared.update(updated)
+        }
+        finish(ok: true, qa != nil ? "Test finished (replayed, no model)" : "Done: \(workflow.name)")
+        return false
+    }
+
+    /// A step broke: the model finishes from there, and the workflow is saved with the fixed steps.
+    private func heal(_ workflow: Workflow, from index: Int, reason: String, params: [String: String], qaTest: String?) async -> Bool {
+        log("  heal from step \(index + 1): \(reason)")
+        steps.append(Step(text: "Step \(index + 1) changed (\(reason.prefix(60))) — adapting", state: .info))
+        let remaining = workflow.steps[index...].enumerated().map { "\($0.offset + 1). \($0.element.summary)" }.joined(separator: "\n")
+        var request = """
+        You're continuing the saved workflow “\(workflow.name)”. Steps before this point already ran. It got stuck at: \
+        \(workflow.steps[index].summary) — \(reason). Finish it from there, adapting to what's on screen now. Remaining steps:
+        \(remaining)
+        """
+        if !params.isEmpty { request += "\nValues: " + params.map { "\($0.key) = \($0.value)" }.joined(separator: ", ") }
+        if let qaTest { request = Self.qaPrompt(name: qa?.name ?? workflow.name, test: qaTest) + "\n\n" + request }
+        phase = .thinking
+        await run(request)
+        // Only keep the healed version if it still does the whole job (a model that gave up mustn't shrink it).
+        let doneSteps = workflow.steps.prefix(index).filter { $0.action != "expect" }.count
+        let enough = trace.count > doneSteps && Double(trace.count) >= Double(workflow.steps.count) * 0.6
+        if phase == .done, qa == nil, enough, var healed = Workflows.shared.all.first(where: { $0.id == workflow.id }) {
+            healed.steps = trace
+            healed.healedAt = Date()
+            healed.runs += 1
+            Workflows.shared.update(healed)
+            log("  workflow updated with the fixed steps")
+        }
+        return true
+    }
+
+    /// The element on screen matching a saved target: exact role+label first, then the label alone, then containment.
+    static func find(_ target: WorkflowStep.Target, in obs: Observation) -> String? {
+        let want = target.label.lowercased()
+        if target.kind == "web", let page = obs.page {
+            let els = page.elements
+            let hit = els.first { $0.role == target.role && $0.text.lowercased() == want }
+                ?? els.first { $0.text.lowercased() == want }
+                ?? els.first { $0.role == target.role && !want.isEmpty && $0.text.lowercased().contains(want) }
+            return hit.map { "w\($0.index)" }
+        }
+        let els = obs.elements
+        let i = els.firstIndex { $0.role == target.role && $0.label.lowercased() == want }
+            ?? els.firstIndex { $0.label.lowercased() == want }
+            ?? els.firstIndex { $0.role == target.role && !want.isEmpty && $0.label.lowercased().contains(want) }
+        return i.map { "e\($0)" }
+    }
+
+    /// Deterministic check: does this text appear on screen (page text, element labels, window title)?
+    static func textVisible(_ text: String, app: NSRunningApplication?) async -> Bool {
+        let want = text.lowercased().trimmingCharacters(in: .whitespaces)
+        guard !want.isEmpty, let app else { return false }
+        let obs = await Observation.capture(app)
+        if obs.text.lowercased().contains(want) { return true }
+        if let page = obs.page {
+            if page.title.lowercased().contains(want) || page.url.lowercased().contains(want) { return true }
+            if let r = try? await BrowserBridge.shared.perform("read", on: page), (r["text"] as? String ?? "").lowercased().contains(want) { return true }
+        }
+        return (await Reader.ocr(app))?.lowercased().contains(want) ?? false
+    }
 }

@@ -88,5 +88,18 @@ watch_learn() {
 }
 watch_learn
 
+# The cursorboy command: learn a QA test, then it must replay with no model.
+qa_cli() {
+  [[ -n $FILTER && qa-cli != *$FILTER* ]] && return
+  local out
+  out=$(../bin/cursorboy qa qa/feedback-form.md --relearn 2>&1 | head -1)
+  if [[ $out != PASS* ]]; then FAIL=$((FAIL+1)); echo "FAIL  qa-learn         $out"; return; fi
+  PASS=$((PASS+1)); echo "PASS  qa-learn         ${out#PASS  }"
+  out=$(../bin/cursorboy qa qa/feedback-form.md 2>&1 | head -1)
+  if [[ $out == PASS*"(replay"* ]]; then PASS=$((PASS+1)); echo "PASS  qa-replay        ${out#PASS  }"
+  else FAIL=$((FAIL+1)); echo "FAIL  qa-replay        $out"; fi
+}
+qa_cli
+
 echo "\n$PASS passed, $FAIL failed"
 (( FAIL == 0 ))

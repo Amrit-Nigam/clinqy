@@ -1,0 +1,57 @@
+{
+  "created" : "2026-09-25T07:03:25Z",
+  "id" : "DAC99298-B142-4C6A-BA93-B2963BF915CA",
+  "name" : "Feedback form: name and sessions",
+  "params" : [
+
+  ],
+  "runs" : 0,
+  "steps" : [
+    {
+      "action" : "open_url",
+      "url" : "http:\/\/127.0.0.1:8765\/form.html"
+    },
+    {
+      "action" : "type",
+      "target" : {
+        "kind" : "web",
+        "label" : "Your name",
+        "role" : "text"
+      },
+      "text" : "Amrit Nigam"
+    },
+    {
+      "action" : "click",
+      "target" : {
+        "kind" : "web",
+        "label" : "Keynote",
+        "role" : "checkbox"
+      }
+    },
+    {
+      "action" : "click",
+      "target" : {
+        "kind" : "web",
+        "label" : "Design panel",
+        "role" : "checkbox"
+      }
+    },
+    {
+      "action" : "click",
+      "target" : {
+        "kind" : "web",
+        "label" : "Great",
+        "role" : "radio"
+      }
+    },
+    {
+      "action" : "expect",
+      "text" : "name=Amrit Nigam"
+    },
+    {
+      "action" : "expect",
+      "text" : "Keynote,Design panel"
+    }
+  ],
+  "summary" : "QA test"
+}

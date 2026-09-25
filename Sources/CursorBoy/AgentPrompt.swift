@@ -29,6 +29,7 @@ enum AgentPrompt {
     {"do":"show","title":"Flights DEL → BOM, 3 Oct","items":[{"title":"IndiGo 6E 204","subtitle":"07:10 → 09:15 · nonstop","detail":"₹5,430","link":"https://…"}],"text":"optional notes, markdown ok"}
                                                            put results the user will want to look at on screen: options, prices, plans, itineraries,
                                                            comparisons, lists, contact details. Do it before asking them to choose between options.
+    {"do":"assert","text":"Welcome back","pass":true,"note":"…"}  QA tests only: report whether an expectation holds
     {"do":"look"}                                          get a screenshot next turn (labels unclear, custom-drawn UI, or you need to read content)
     {"do":"wait","ms":800}                                 let something load
     {"do":"recall","query":"delivery address"}           search everything you remember about the user (only the relevant part is shown up front)

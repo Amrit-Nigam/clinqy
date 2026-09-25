@@ -14,6 +14,8 @@ final class History: ObservableObject {
         let steps: [String]
         let app: String?
         let result: ResultCard?
+        /// What the run did, replayable (lets it be saved as a workflow).
+        var trace: [WorkflowStep]? = nil
     }
 
     @Published private(set) var entries: [Entry] = []

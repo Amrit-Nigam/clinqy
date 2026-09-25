@@ -1,4 +1,5 @@
 import AppKit
+import CryptoKit
 import Carbon
 
 @MainActor
@@ -27,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Brain.prewarm()
         Whisper.shared.prepare()
         BrowserBridge.shared.start()
+        startScheduler()
 
         agent.onStart = { [weak self] in
             guard let self else { return }
@@ -95,6 +97,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         for url in urls where url.scheme == "cursorboy" && url.host == "watch" { rememberTarget(); startWatching() }
         for url in urls where url.scheme == "cursorboy" && url.host == "stop-watching" { stopWatching() }
+        for url in urls where url.scheme == "cursorboy" && url.host == "qa" { startQA(url) }
+        for url in urls where url.scheme == "cursorboy" && url.host == "workflow" {
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard let name = items.first(where: { $0.name == "name" })?.value, let wf = Workflows.shared.named(name) else { continue }
+            var params: [String: String] = [:]
+            for item in items where item.name != "name" { params[item.name] = item.value ?? "" }
+            rememberTarget()
+            agent.runWorkflow(wf, params: params)
+        }
         for url in urls where url.scheme == "cursorboy" && url.host == "run" {
             guard let task = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "task" })?.value else { continue }
@@ -148,6 +159,63 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         island.hide()
         panel.showCentered()
         Task { await Skills.shared.learn(from: recording) }
+    }
+
+    // MARK: - QA and schedules
+
+    /// cursorboy://qa?path=<test file>|text=<inline test>&out=<report.json>[&relearn=1][&model=…][&name=…]
+    private func startQA(_ url: URL) {
+        let q = Dictionary((URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") },
+                           uniquingKeysWith: { a, _ in a })
+        let out = URL(fileURLWithPath: q["out"] ?? NSTemporaryDirectory() + "cursorboy-qa.json")
+        var name = q["name"] ?? "Inline test"
+        var test = q["text"] ?? ""
+        var compiled: URL
+        if let path = q["path"], !path.isEmpty {
+            let file = URL(fileURLWithPath: path)
+            let content = (try? String(contentsOf: file, encoding: .utf8)) ?? ""
+            // A "# Title" line names the test; everything else is the steps.
+            let lines = content.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+            if let title = lines.first(where: { $0.hasPrefix("# ") }) { name = String(title.dropFirst(2)) }
+            else { name = file.deletingPathExtension().lastPathComponent }
+            test = lines.filter { !$0.hasPrefix("# ") }.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+            // Compiled scripts live next to the tests, in .cursorboy/, so they can be committed with them.
+            compiled = file.deletingLastPathComponent().appendingPathComponent(".cursorboy")
+                .appendingPathComponent(file.deletingPathExtension().lastPathComponent + ".json")
+        } else {
+            let key = SHA256.hash(data: Data(test.utf8)).prefix(10).map { String(format: "%02x", $0) }.joined()
+            compiled = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("CursorBoy/qa/\(key).json")
+        }
+        guard !test.isEmpty else {
+            Agent.writeReport(QAReport(name: name, passed: false, mode: "none", durationMs: 0, steps: [], checks: [],
+                                       message: "empty test"), to: out)
+            return
+        }
+        rememberTarget()
+        agent.runQA(name: name, test: test, compiled: compiled, relearn: q["relearn"] == "1",
+                    model: q["model"].flatMap { $0.isEmpty ? nil : $0 }, report: out)
+    }
+
+    /// Runs workflows scheduled for this minute (checked every 30 s; once a day each).
+    private var scheduler: Timer?
+
+    private func startScheduler() {
+        scheduler = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, !self.agent.isRunning else { return }
+                let now = Date()
+                let hm = now.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
+                for var wf in Workflows.shared.all where wf.schedule == hm {
+                    if let last = wf.lastScheduledRun, Calendar.current.isDate(last, inSameDayAs: now) { continue }
+                    wf.lastScheduledRun = now
+                    Workflows.shared.update(wf)
+                    Agent.writeLog("scheduled: \(wf.name) at \(hm)")
+                    self.agent.runWorkflow(wf)
+                    break
+                }
+            }
+        }
     }
 
     // MARK: - Hotkey

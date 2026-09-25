@@ -131,7 +131,8 @@ enum Brain {
     }
 
     /// Hands out the warm session (or a fresh one) and starts warming the next.
-    static func session() throws -> ClaudeSession {
+    static func session(model override: String? = nil) throws -> ClaudeSession {
+        if let override, override != model { return try ClaudeSession(system: AgentPrompt.system, model: override) }
         let s: ClaudeSession
         if let w = warm, w.isAlive { s = w } else { s = try ClaudeSession(system: AgentPrompt.system, model: model) }
         warm = nil

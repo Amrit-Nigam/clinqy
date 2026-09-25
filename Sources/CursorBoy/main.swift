@@ -137,6 +137,19 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
         check(all < 8 || math.facts.count < all / 2, "irrelevant facts are left out")
         check(!Memory.facts.contains { $0.contains("Swiggy") } || food.facts.contains { $0.contains("Swiggy") }, "food request brings in Swiggy facts")
     }
+    // Workflows: a saved run turns typed text into a named parameter with the original as default.
+    MainActor.assumeIsolated {
+        var type = WorkflowStep(action: "type"); type.text = "Amrit Nigam"
+        type.target = .init(kind: "web", role: "text", label: "Your name")
+        var click = WorkflowStep(action: "click"); click.target = .init(kind: "web", role: "checkbox", label: "Keynote")
+        let entry = History.Entry(date: Date(), request: "fill the form", answer: "done", ok: true, steps: [], app: nil,
+                                  result: nil, trace: [type, click])
+        let wf = Workflow.from(entry)
+        check(wf?.params == ["Your name"] && wf?.defaults?["Your name"] == "Amrit Nigam" && wf?.steps[0].text == "{Your name}",
+              "saved workflow parameterizes typed text")
+        let action = wf?.steps[0].action(params: ["Your name": "Priya"], id: "w5")
+        check(action?["text"] as? String == "Priya" && action?["id"] as? String == "w5", "parameters fill in on replay")
+    }
     // Scripting dictionaries: Notes should describe its note class and the make command.
     if let notes = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
         let sem = DispatchSemaphore(value: 0)

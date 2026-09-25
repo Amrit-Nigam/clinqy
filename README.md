@@ -87,9 +87,50 @@ cursorboy://run?task=<text>[&test=1]   run a task in the frontmost app (test=1: 
 cursorboy://answer?text=<text>         answer the current question
 cursorboy://add?text=<text>            add context to the running task
 cursorboy://cancel                     stop the current task
+cursorboy://qa?path=<file>|text=<test>&out=<report.json>[&relearn=1][&model=…]
+cursorboy://workflow?name=<name>[&<input>=<value>…]
 cursorboy://watch · cursorboy://stop-watching
 cursorboy://reload-extension
 ```
+
+## The `cursorboy` command: QA and workflows for any coding agent
+
+`./build.sh` installs `cursorboy` to `~/.local/bin`. Any terminal or coding agent (Claude Code, Codex, Cursor…) can call it. It hands the job to the running app, which has the permissions, the browser extension and the cursor.
+
+```bash
+cursorboy qa tests/qa/                      # run every test in a folder
+cursorboy qa login.md --json                # one test, machine-readable report
+cursorboy qa "Go to https://example.com
+Expect: Example Domain"                     # inline test
+cursorboy qa login.md --relearn --model opus
+cursorboy run "open github"                 # a task (not saved to history)
+cursorboy workflow "Fill form" "Your name=Priya"
+cursorboy workflows
+```
+
+**QA tests** are plain English, one step per line, with an optional `# Title`. Lines starting with **Expect / Check / Verify** are assertions:
+
+```markdown
+# Feedback form: name and sessions
+Go to http://127.0.0.1:8765/form.html
+Type Amrit Nigam as the name
+Tick Keynote and Design panel
+Expect: the page title shows name=Amrit Nigam
+```
+
+- **First run (learn):** the model carries out the test and compiles a **deterministic script** (actions, how to find each target, and checks). It's saved in `.cursorboy/` next to the test, so you can commit it.
+- **Every run after that (replay):** **no model**. Each step is found by role and label, and each check is "this text is on screen". It's fast (about 4 s for the example), free and repeatable.
+- **UI changed? (heal):** if a step can't find its target, the model takes over from there only, the test still reports pass or fail, and the compiled script is updated.
+- **Result:** `PASS`/`FAIL` with each check and the steps before a failure. Exit code 0 means everything passed. `--json` gives the full report (name, passed, mode `replay`/`learned`/`healed`, durationMs, steps, checks, message).
+- Tests run unattended: the agent never asks questions, doesn't touch History or memory, and loads pages fresh.
+- **QA cursor:** during tests the companion becomes an **amber targeting reticle with a "QA" tag**. Checks flash ✓ (green pop) or ✕ (red shake).
+
+**Workflows (routines without a model).** Every successful run records exactly what it did. In **History**, hover a run and click **Save workflow**. Typed text becomes named inputs, defaulting to the original values. Saved workflows appear under **Skills → Workflows**:
+- **Run:** replays it with no model.
+- **Daily…:** schedules it (for example 09:00, once a day).
+- **Delete.**
+
+From the terminal: `cursorboy workflow <name> "Input=value"`. A step that breaks is healed by the model, and the workflow is saved with the fix.
 
 ## Configuration
 
@@ -110,6 +151,7 @@ Optional `KEY=value` lines in `~/.config/cursorboy/env`:
 | `~/.config/cursorboy/memory.md` | Facts CursorBoy remembers about you (edit freely, or menu → **Edit Memory…**) |
 | `~/Library/Application Support/CursorBoy/history.json` | Run history |
 | `~/Library/Application Support/CursorBoy/skills.json` | Learned skills |
+| `~/Library/Application Support/CursorBoy/workflows.json` | Saved workflows (and schedules) |
 | `~/Library/Logs/CursorBoy/agent.log` | Step-by-step log (secrets masked) |
 
 ## Tests
@@ -148,6 +190,9 @@ Sources/CursorBoy/
   Voice.swift, Whisper.swift         push-to-talk, on-device Whisper
   Recorder.swift, Skills.swift       watch & learn
   History.swift      run history and result cards
+  Workflow.swift     deterministic workflows (steps + targets), store; replay/heal/QA live in Agent.swift
+bin/cursorboy        the command-line entry point (qa · run · workflow · workflows)
+tests/qa/            example plain-English QA tests (compiled scripts in tests/qa/.cursorboy/)
 ```
 
 ## Privacy

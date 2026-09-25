@@ -20,6 +20,17 @@ final class Buddy {
     /// Microphone level 0…1 while listening.
     var level: CGFloat = 0
 
+    /// QA mode: the companion becomes an amber targeting reticle with a "QA" tag.
+    var qaMode = false
+
+    /// A check result: green flash + pop when it held, red flash + shake when it didn't.
+    func signal(_ ok: Bool) {
+        let now = CACurrentMediaTime()
+        flash = (ok, now)
+        if ok { pop = now } else { shakeStart = now }
+    }
+    private var flash: (Bool, CFTimeInterval)?
+
     private enum Mode { case following, flying, parked, returning }
     private var mode: Mode = .following
 
@@ -292,6 +303,8 @@ final class Buddy {
             bubbleAge: now - bubbleAppeared,
             level: level,
             mark: mark.map { ($0, now - $0.began) },
+            qa: qaMode,
+            flash: flash.flatMap { now - $0.1 < 0.7 ? ($0.0, now - $0.1) : nil },
             offstage: offstage)
         for stage in stages { stage.render(frame, bubbleWidth: &bubbleWidth, dt: dt) }
     }
@@ -328,11 +341,15 @@ private struct Frame {
     let bubbleAge: CFTimeInterval
     let level: CGFloat
     let mark: (Buddy.Mark, CFTimeInterval)?
+    let qa: Bool
+    let flash: (Bool, CFTimeInterval)?
     let offstage: CGFloat
 }
 
 enum Palette {
     static let accent = NSColor(red: 0.23, green: 0.51, blue: 1.0, alpha: 1)
+    /// QA mode accent (amber).
+    static let qa: (r: CGFloat, g: CGFloat, b: CGFloat) = (1.0, 0.62, 0.04)
 
     static func rgba(for mood: Buddy.Mood) -> (r: CGFloat, g: CGFloat, b: CGFloat) {
         switch mood {
@@ -356,6 +373,10 @@ private final class Stage {
     private let root = CALayer()
     private let body = CALayer()          // positioned at the tip, rotated to the heading
     private let triangle = CAShapeLayer()
+    private let reticle = CAShapeLayer()
+    private let qaTag = CALayer()
+    private let qaText = CATextLayer()
+    private var qaAlpha: CGFloat = 0
     private let spinner = CAShapeLayer()
     private let bars = (0..<5).map { _ in CALayer() }
     private let rippleLayers = (0..<4).map { _ in CAShapeLayer() }
@@ -442,6 +463,37 @@ private final class Stage {
         triangle.shadowOpacity = 0.85
         body.addSublayer(triangle)
 
+        // QA reticle: a ring with four ticks and a centre dot, centred on the target.
+        let ret = CGMutablePath()
+        ret.addEllipse(in: CGRect(x: -9, y: -9, width: 18, height: 18))
+        for (dx, dy) in [(0.0, -1.0), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] as [(CGFloat, CGFloat)] {
+            ret.move(to: CGPoint(x: dx * 5, y: dy * 5))
+            ret.addLine(to: CGPoint(x: dx * 13, y: dy * 13))
+        }
+        ret.addEllipse(in: CGRect(x: -1.6, y: -1.6, width: 3.2, height: 3.2))
+        reticle.path = ret
+        reticle.fillColor = nil
+        reticle.lineWidth = 2
+        reticle.lineCap = .round
+        reticle.shadowOffset = .zero
+        reticle.shadowOpacity = 0.9
+        reticle.shadowRadius = 6
+        reticle.opacity = 0
+        body.addSublayer(reticle)
+
+        qaTag.bounds = CGRect(x: 0, y: 0, width: 24, height: 14)
+        qaTag.cornerRadius = 4
+        qaTag.opacity = 0
+        qaText.string = "QA"
+        qaText.fontSize = 9
+        qaText.font = NSFont.systemFont(ofSize: 9, weight: .heavy)
+        qaText.alignmentMode = .center
+        qaText.foregroundColor = NSColor.black.cgColor
+        qaText.frame = CGRect(x: 0, y: 1, width: 24, height: 12)
+        qaText.contentsScale = scale
+        qaTag.addSublayer(qaText)
+        root.addSublayer(qaTag)
+
         // Thinking: a comet arc spinning where the triangle was.
         spinner.path = CGPath(ellipseIn: CGRect(x: -9, y: -9, width: 18, height: 18), transform: nil)
         spinner.fillColor = nil
@@ -487,7 +539,8 @@ private final class Stage {
     func render(_ f: Frame, bubbleWidth: inout CGFloat, dt: CGFloat) {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        let want = Palette.rgba(for: f.mood)
+        var want = f.qa && f.mood != .success && f.mood != .failure ? Palette.qa : Palette.rgba(for: f.mood)
+        if let (ok, age) = f.flash, age < 0.7 { want = Palette.rgba(for: ok ? .success : .failure) }
         let k = min(1, dt * 8)
         color = (color.r + (want.r - color.r) * k, color.g + (want.g - color.g) * k, color.b + (want.b - color.b) * k)
         let accent = CGColor(red: color.r, green: color.g, blue: color.b, alpha: 1)
@@ -519,7 +572,17 @@ private final class Stage {
         triangle.strokeColor = accent
         triangle.shadowColor = accent
         triangle.shadowRadius = 6 + (f.scale - 1) * 26
-        triangle.opacity = Float(shapeAlpha)
+        ease(&qaAlpha, f.qa ? 1 : 0, 10)
+        triangle.opacity = Float(shapeAlpha * (1 - qaAlpha))
+        reticle.opacity = Float(shapeAlpha * qaAlpha)
+        reticle.strokeColor = accent
+        reticle.fillColor = nil
+        reticle.shadowColor = accent
+        // The reticle doesn't lean like an arrow; it sits square on its target.
+        reticle.transform = CATransform3DMakeRotation(-f.angle, 0, 0, 1)
+        qaTag.position = CGPoint(x: p.x + 24, y: p.y - 14)
+        qaTag.backgroundColor = accent
+        qaTag.opacity = Float(qaAlpha * (1 - CGFloat(0)))
 
         // The spinner and bars sit where the triangle's body is, not its tip.
         let center = CGPoint(x: p.x + 9, y: p.y + 9)

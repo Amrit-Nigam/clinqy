@@ -33,8 +33,12 @@ function snapshot() {
     const covered = top && !(el === top || el.contains(top) || top.contains(el));
     const tag = el.tagName.toLowerCase();
     const role = el.getAttribute("role") || (tag === "a" ? "link" : tag === "input" ? (el.type || "text") : tag);
-    const text = (el.getAttribute("aria-label") || el.innerText || el.getAttribute("placeholder") || el.title ||
-      el.getAttribute("alt") || (tag === "input" && el.type !== "password" ? el.value : "") || el.name || "")
+    // Fields are named by their label, never by what's typed in them (so a name stays stable run to run).
+    const isField = tag === "input" || tag === "textarea" || tag === "select";
+    const labelText = isField && el.labels && el.labels[0] ? el.labels[0].innerText.replace(el.innerText || "", "") : "";
+    const text = (el.getAttribute("aria-label") || (isField ? "" : el.innerText) || labelText || el.getAttribute("placeholder") ||
+      el.title || el.getAttribute("alt") || el.name || (tag === "button" || tag === "a" ? el.innerText : "") ||
+      (tag === "input" && el.type === "submit" ? el.value : "") || "")
       .replace(/\s+/g, " ").trim().slice(0, 100);
     const editable = tag === "input" || tag === "textarea" || el.isContentEditable || /textbox|combobox|searchbox/.test(role);
     if (!text && !editable) continue;

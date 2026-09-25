@@ -275,6 +275,10 @@ struct CommandView: View {
             SkillsView(onRun: { skill in
                 skillsTab.on = false
                 agent.submit("Use the skill “\(skill.name)”.")
+            }, onRunWorkflow: { wf in
+                skillsTab.on = false
+                onClose()
+                agent.runWorkflow(wf)
             })
         } else if historyTab.on && agent.question == nil && !voice.isListening {
             HistoryView(
@@ -820,6 +824,10 @@ private struct HistoryRow: View {
             if hover.on {
                 HStack(spacing: 4) {
                     if let onShowResult { SmallButton(title: "Result", action: onShowResult) }
+                    if entry.ok, let wf = Workflow.from(entry) {
+                        SmallButton(title: "Save workflow") { Workflows.shared.add(wf) }
+                            .help("Replay this exactly, without the model: \(wf.steps.count) steps")
+                    }
                     SmallButton(title: "Continue", action: onContinue)
                     SmallButton(title: "Run again", action: onRunAgain)
                     Button(action: onDelete) { Image(systemName: "trash").font(.system(size: 10)) }
@@ -856,9 +864,29 @@ private struct SmallButton: View {
 
 struct SkillsView: View {
     @ObservedObject var skills = Skills.shared
+    @ObservedObject var workflows = Workflows.shared
     let onRun: (Skills.Skill) -> Void
+    var onRunWorkflow: (Workflow) -> Void = { _ in }
 
     var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            if !workflows.all.isEmpty {
+                Text("WORKFLOWS · replay without the model").font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.tertiary)
+                ScrollView {
+                    LazyVStack(alignment: .leading, spacing: 4) {
+                        ForEach(workflows.all) { wf in
+                            WorkflowRow(workflow: wf, onRun: { onRunWorkflow(wf) }, onDelete: { workflows.remove(wf) })
+                        }
+                    }
+                }
+                .frame(maxHeight: 130)
+                Text("SKILLS · learned by watching").font(.system(size: 10, weight: .semibold)).foregroundStyle(DS.tertiary)
+            }
+            skillList
+        }
+    }
+
+    @ViewBuilder private var skillList: some View {
         if skills.all.isEmpty {
             Text("No skills yet. Click “Watch & learn”, do the task yourself, then press ⌃⌥ to stop — I'll learn it.")
                 .font(.system(size: 13)).foregroundStyle(DS.tertiary)
@@ -909,5 +937,58 @@ private struct SkillRow: View {
         .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.white.opacity(hover.on ? 0.07 : 0)))
         .contentShape(Rectangle())
         .onHover { hover.on = $0 }
+    }
+}
+
+
+private struct WorkflowRow: View {
+    let workflow: Workflow
+    let onRun: () -> Void
+    let onDelete: () -> Void
+    @StateObject private var hover = Hover()
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 10) {
+            Image(systemName: "bolt.horizontal.circle").font(.system(size: 12)).foregroundStyle(Color(nsColor: Palette.accent)).padding(.top, 2)
+            VStack(alignment: .leading, spacing: 2) {
+                Text(workflow.name).font(.system(size: 13, weight: .medium)).foregroundStyle(DS.text).lineLimit(1)
+                Text("\(workflow.steps.count) steps · run \(workflow.runs)×" + (workflow.schedule.map { " · daily \($0)" } ?? "")
+                     + (workflow.params.isEmpty ? "" : " · inputs: " + workflow.params.joined(separator: ", ")))
+                    .font(.system(size: 12)).foregroundStyle(DS.tertiary).lineLimit(1)
+            }
+            Spacer(minLength: 6)
+            if hover.on {
+                HStack(spacing: 4) {
+                    SmallButton(title: "Run", action: onRun)
+                    SmallButton(title: workflow.schedule == nil ? "Daily…" : "Schedule…") { Self.schedule(workflow) }
+                    Button(action: onDelete) { Image(systemName: "trash").font(.system(size: 10)) }
+                        .buttonStyle(.plain).foregroundStyle(DS.tertiary)
+                }
+            }
+        }
+        .padding(.horizontal, 10).padding(.vertical, 7)
+        .background(RoundedRectangle(cornerRadius: 9, style: .continuous).fill(Color.white.opacity(hover.on ? 0.07 : 0)))
+        .contentShape(Rectangle())
+        .onHover { hover.on = $0 }
+    }
+
+    /// Asks for a daily time ("09:00"), or clears the schedule.
+    @MainActor static func schedule(_ workflow: Workflow) {
+        let alert = NSAlert()
+        alert.messageText = "Run “\(workflow.name)” every day at…"
+        alert.informativeText = "24-hour time, like 09:00. Leave empty to turn the schedule off."
+        let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
+        field.stringValue = workflow.schedule ?? "09:00"
+        alert.accessoryView = field
+        alert.addButton(withTitle: "Save")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let value = field.stringValue.trimmingCharacters(in: .whitespaces)
+        var updated = workflow
+        if value.isEmpty { updated.schedule = nil }
+        else if value.range(of: #"^([01]\d|2[0-3]):[0-5]\d$"#, options: .regularExpression) != nil { updated.schedule = value }
+        else { return }
+        Workflows.shared.update(updated)
     }
 }

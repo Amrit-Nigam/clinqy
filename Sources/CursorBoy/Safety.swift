@@ -1,4 +1,5 @@
 import CoreAudio
+import CoreGraphics
 import Foundation
 
 /// Guard rails enforced in code, not left to the model: confirm consequential clicks, notice live calls.
@@ -38,6 +39,11 @@ enum Safety {
         let a = answer.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
         return ["yes", "y", "ok", "okay", "sure", "go", "go ahead", "do it", "confirm", "haan", "ha", "han", "yep", "yeah"]
             .contains(where: { a == $0 || a.hasPrefix($0 + " ") || a.hasPrefix($0 + ",") })
+    }
+
+    /// True while the screen is locked (nothing on screen can be used).
+    static var screenLocked: Bool {
+        (CGSessionCopyCurrentDictionary() as? [String: Any])?["CGSSessionScreenIsLocked"] as? Bool ?? false
     }
 
     /// True if another app is using the microphone right now (a call, a meeting).
