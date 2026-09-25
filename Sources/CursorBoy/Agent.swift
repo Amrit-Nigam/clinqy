@@ -70,6 +70,21 @@ final class Agent: ObservableObject {
 
     var isRunning: Bool { phase == .thinking || phase == .acting || phase == .waiting }
 
+    /// Things the user added while the task was running; folded into the next step.
+    private var addedNotes: [String] = []
+
+    /// Steer a running task: more context or a change of plan, picked up at the next step.
+    func addContext(_ raw: String) {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, isRunning else { return }
+        if question != nil { return answer(text) }   // waiting on a question: this is the answer
+        addedNotes.append(text)
+        steps.append(Step(text: "You: \(text)", state: .info))
+        input = ""
+        lastProgress = Date()
+        log("  + user added: \(text)")
+    }
+
     /// Pauses for the user's answer to `text` (nil = no answer / cancelled).
     private func askUser(_ text: String, options: [String] = [], sensitive: Bool = false) async -> String? {
         let previous = phase
@@ -117,6 +132,7 @@ final class Agent: ObservableObject {
         input = ""
         narration = ""
         openedTab = false
+        addedNotes = []
         ownedTab = nil
         userConfirmed = false
         secrets = []
@@ -186,6 +202,12 @@ final class Agent: ObservableObject {
             // An unchanged screen is one line, not the whole list again (less to read, faster replies).
             let screen = obs.text == lastScreen && image == nil ? "Screen: unchanged since your last look." : obs.text
             lastScreen = obs.text
+            // Anything the user added mid-task comes first: it can change the plan.
+            if !addedNotes.isEmpty {
+                message = "The user added while you were working (take it into account; it may change the plan):\n"
+                    + addedNotes.map { "- \($0)" }.joined(separator: "\n") + "\n\n" + message
+                addedNotes = []
+            }
             let turnText = message + "\n\n" + screen + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)" : "")
 
             phase = .thinking
@@ -222,6 +244,11 @@ final class Agent: ObservableObject {
                                         page: obs.page, webArea: obs.webArea)
             for (i, action) in actions.enumerated() {
                 guard !Task.isCancelled else { return }
+                // The user added something mid-batch: the rest of this plan may be outdated, re-plan first.
+                if !addedNotes.isEmpty {
+                    results.append("(stopped before step \(i + 1): the user added something — see above)")
+                    break
+                }
                 let result = await perform(action, context: &context)
                 if case .look = result.effect { wantsLook = true }
                 results.append("\(i + 1). \(result.summary)")
@@ -230,6 +257,10 @@ final class Agent: ObservableObject {
             }
             app = context.app
             // A final reply may carry last actions; finish once they ran (unless one failed).
+            if isDone, failures == 0, !addedNotes.isEmpty {
+                message = "Results:\n" + results.joined(separator: "\n") + "\n(You were about to finish, but the user added something.)"
+                continue
+            }
             if isDone, failures == 0 {
                 finish(ok: true, say.isEmpty ? "Done" : say)
                 await learn(from: session)

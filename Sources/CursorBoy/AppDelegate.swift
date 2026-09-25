@@ -52,7 +52,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let self else { return }
             self.buddy.mood = .idle
             // A spoken reply to a question answers it; otherwise it's a new request.
-            if self.agent.question != nil { self.agent.answer(text) } else { self.agent.submit(text) }
+            if self.agent.question != nil { self.agent.answer(text) }
+            else if self.agent.isRunning { self.agent.addContext(text) }
+            else { self.agent.submit(text) }
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -88,6 +90,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             agent.answer(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value)
         }
         for url in urls where url.scheme == "cursorboy" && url.host == "cancel" { agent.cancel() }
+        for url in urls where url.scheme == "cursorboy" && url.host == "add" {
+            agent.addContext(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value ?? "")
+        }
         for url in urls where url.scheme == "cursorboy" && url.host == "watch" { rememberTarget(); startWatching() }
         for url in urls where url.scheme == "cursorboy" && url.host == "stop-watching" { stopWatching() }
         for url in urls where url.scheme == "cursorboy" && url.host == "run" {
@@ -150,8 +155,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func hotKeyDown() {
         // While watching, ⌥Space stops the recording and learns from it.
         if Recorder.shared.isRecording { stopWatching(); return }
-        // While working, ⌥Space stops it — unless it's waiting on you, then it opens/talks as usual.
-        if agent.isRunning, agent.question == nil { agent.cancel(); return }
+        // While working, ⌥Space no longer stops (⏹ does): tap opens the bar to add context, hold talks.
         guard pressedAt == nil else { return }   // key repeat
         pressedAt = Date()
         holdTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
@@ -184,7 +188,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     private func rememberTarget() {
-        guard agent.question == nil else { return }   // answering, not starting something new
+        guard agent.question == nil, !agent.isRunning else { return }   // answering or steering, not starting anew
         let front = NSWorkspace.shared.frontmostApplication
         guard let front, front.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
         agent.targetApp = front

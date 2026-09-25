@@ -74,7 +74,8 @@ It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension ori
 |---|---|
 | **⌥Space** (tap) | Open the command bar |
 | **⌥Space** (hold) | Talk; release to send |
-| **⌥Space** while working | Stop (or click the red ⏹ in the menu bar) |
+| **⌥Space** while working | Tap: add context or change the plan mid-task · hold: say it |
+| **⏹** (command bar or menu bar) | Stop the current task |
 | **Esc** | Close the command bar |
 | **Watch & learn** | Record yourself doing a task; ⌥Space or ⏹ to stop and learn it |
 | **Skills / History** | Footer tabs in the command bar |
@@ -84,6 +85,7 @@ It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension ori
 ```
 cursorboy://run?task=<text>[&test=1]   run a task in the frontmost app (test=1: not saved to history or memory)
 cursorboy://answer?text=<text>         answer the current question
+cursorboy://add?text=<text>            add context to the running task
 cursorboy://cancel                     stop the current task
 cursorboy://watch · cursorboy://stop-watching
 cursorboy://reload-extension

@@ -238,13 +238,16 @@ struct CommandView: View {
                         .focused($focused)
                         .onSubmit { agent.answer(agent.input) }
                 } else {
-                    TextField("", text: $agent.input, prompt: Text(agent.question != nil ? "Your answer" : agent.isRunning ? agent.narration : "What should I do?").foregroundStyle(DS.tertiary))
+                    TextField("", text: $agent.input, prompt: Text(agent.question != nil ? "Your answer" : agent.isRunning ? "Add to this task or change the plan…" : "What should I do?").foregroundStyle(DS.tertiary))
                         .textFieldStyle(.plain)
                         .font(.system(size: 20, weight: .regular))
                         .foregroundStyle(DS.text)
                         .focused($focused)
-                        .disabled(agent.isRunning && agent.question == nil)
-                        .onSubmit { agent.question != nil ? agent.answer(agent.input) : agent.submit(agent.input) }
+                        .onSubmit {
+                            if agent.question != nil { agent.answer(agent.input) }
+                            else if agent.isRunning { agent.addContext(agent.input); onClose() }
+                            else { agent.submit(agent.input) }
+                        }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -620,7 +623,7 @@ struct IslandView: View {
                 .contentTransition(.opacity)
                 .animation(.easeOut(duration: 0.2), value: text)
             if agent.isRunning {
-                Text("⌥Space or ⏹ in menu bar stops").font(.system(size: 11)).foregroundStyle(DS.tertiary)
+                Text("⌥Space to add · ⏹ to stop").font(.system(size: 11)).foregroundStyle(DS.tertiary)
             }
         }
         .padding(.horizontal, 14)
