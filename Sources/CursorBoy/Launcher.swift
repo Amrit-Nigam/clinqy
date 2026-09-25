@@ -130,6 +130,66 @@ enum Memory {
         return text.split(separator: "\n").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "- ")) }.filter { !$0.isEmpty }
     }
 
+    /// Facts always worth sending: who the user is and how to reach/represent them.
+    private static let corePattern = #"(?i)\b(the user is|name is|phone number|mobile number|default browser|messages people|based in|resume)\b"#
+
+    /// Related words, so "order food" finds Swiggy and "apply" finds the resume.
+    private static let related: [String: [String]] = [
+        "food": ["swiggy", "zomato", "order", "eat", "hungry", "meal", "delivery", "protein", "subway"],
+        "order": ["swiggy", "zomato", "food", "amazon", "buy", "delivery"],
+        "apply": ["resume", "college", "cgpa", "internship", "internships", "experience", "linkedin", "github", "portfolio", "student", "won", "preference"],
+        "application": ["resume", "college", "cgpa", "internships", "linkedin", "github", "portfolio", "student", "won", "preference"],
+        "internship": ["resume", "internships", "cgpa", "college", "student", "linkedin", "github", "stack"],
+        "form": ["resume", "college", "linkedin", "github", "preference", "email"],
+        "job": ["resume", "internship", "experience", "linkedin"],
+        "mail": ["gmail", "email", "account"], "gmail": ["email", "account", "somaiya"],
+        "sign": ["account", "password", "incognito", "2-step", "verification", "email"],
+        "login": ["account", "password", "incognito", "email"],
+        "call": ["phone", "whatsapp", "meet"], "message": ["whatsapp", "chat"], "text": ["whatsapp", "chat"],
+        "crypto": ["wallet", "okx", "testnet", "web3", "faucet"], "wallet": ["okx", "crypto"],
+        "game": ["miaoo", "cat"], "cat": ["miaoo"],
+        "music": ["youtube", "spotify", "lofi"], "play": ["youtube", "spotify", "miaoo"],
+        "phone": ["iphone", "mirroring"], "iphone": ["mirroring"],
+        "family": ["mother", "father", "find"], "mom": ["mother"], "mother": ["find"], "dad": ["father"],
+        "college": ["kjsce", "somaiya", "lms", "codecell"], "class": ["kjsce", "somaiya", "lms", "meet"],
+        "deliver": ["address"], "address": ["delivery", "swiggy"],
+        "code": ["cursor", "github", "project"], "github": ["code", "repo"],
+    ]
+
+    private static let stop: Set<String> = ["the", "and", "for", "with", "that", "this", "from", "into", "open", "please",
+                                            "can", "you", "me", "my", "his", "her", "use", "get", "go", "to", "a", "an", "is"]
+
+    private static func words(_ text: String) -> Set<String> {
+        Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count >= 3 && !stop.contains($0) })
+    }
+
+    /// The facts worth sending for this request: the core ones plus those sharing words (or related words) with it.
+    static func relevant(to context: String, limit: Int = 15) -> (facts: [String], omitted: Int) {
+        let all = facts
+        var want = words(context)
+        for w in want { for (key, more) in related where w.hasPrefix(key) || key.hasPrefix(w) && w.count >= 4 { want.formUnion(more) } }
+        var chosen: [String] = []
+        var scored: [(String, Int)] = []
+        for fact in all {
+            if fact.range(of: corePattern, options: .regularExpression) != nil { chosen.append(fact); continue }
+            let fw = words(fact)
+            let score = fw.filter { f in want.contains { f.hasPrefix($0) || $0.hasPrefix(f) && f.count >= 4 } }.count
+            if score > 0 { scored.append((fact, score)) }
+        }
+        chosen += scored.sorted { $0.1 > $1.1 }.prefix(max(0, limit - chosen.count)).map(\.0)
+        return (chosen, all.count - chosen.count)
+    }
+
+    /// Searches everything remembered (for the agent's recall action).
+    static func search(_ query: String) -> [String] {
+        let q = query.trimmingCharacters(in: .whitespaces)
+        if q.isEmpty { return facts }
+        let hits = relevant(to: q, limit: 40).facts.filter { fact in
+            fact.range(of: corePattern, options: .regularExpression) == nil || !words(fact).isDisjoint(with: words(q))
+        }
+        return hits.isEmpty ? relevant(to: q, limit: 40).facts : hits
+    }
+
     static func add(_ fact: String) {
         var all = facts.filter { $0 != fact }
         all.append(fact)

@@ -123,6 +123,20 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
     check(Safety.isYes("Yes, go ahead") && Safety.isYes("haan") && !Safety.isYes("No"), "yes/no parsing")
     check(MainActor.assumeIsolated { Brain.json(from: "sure {\"say\":\"x\",\"actions\":[]} ok")?["say"] as? String == "x" }, "json in prose")
     check(MainActor.assumeIsolated { (Brain.json(from: "<invoke name=\"look\">")?["actions"] as? [[String: Any]])?.first?["do"] as? String == "look" }, "tool-call tag")
+    // Memory relevance: a maths question gets only core facts; food brings in the Swiggy facts.
+    MainActor.assumeIsolated {
+        let all = Memory.facts.count
+        let math = Memory.relevant(to: "what's 15% of 2400")
+        let food = Memory.relevant(to: "order me something to eat")
+        if ProcessInfo.processInfo.environment["CB_MEMDUMP"] != nil {
+            for (name, r) in [("maths", math), ("food", food), ("apply", Memory.relevant(to: "fill this internship application form"))] {
+                print("  [\(name)]"); r.facts.forEach { print("    - \($0.prefix(90))") }
+            }
+        }
+        print("     memory: \(all) facts · maths sends \(math.facts.count) · food sends \(food.facts.count)")
+        check(all < 8 || math.facts.count < all / 2, "irrelevant facts are left out")
+        check(!Memory.facts.contains { $0.contains("Swiggy") } || food.facts.contains { $0.contains("Swiggy") }, "food request brings in Swiggy facts")
+    }
     // Scripting dictionaries: Notes should describe its note class and the make command.
     if let notes = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
         let sem = DispatchSemaphore(value: 0)

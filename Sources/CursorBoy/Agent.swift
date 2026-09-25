@@ -322,8 +322,11 @@ final class Agent: ObservableObject {
         if !skills.isEmpty {
             text += "\nSkills the user taught you (follow the matching one's steps when a request fits; ask for any missing parameters):\n" + skills
         }
-        let facts = Memory.facts
+        // Only the memory that matters for this request (plus core facts); the rest is one recall away.
+        let context = [request, targetApp?.cleanName ?? "", selectedText ?? "", continuation?.request ?? ""].joined(separator: " ")
+        let (facts, omitted) = Memory.relevant(to: context)
         if !facts.isEmpty { text += "\nThings you remember about the user:\n" + facts.map { "- \($0)" }.joined(separator: "\n") }
+        if omitted > 0 { text += "\n(\(omitted) more remembered facts not shown — use recall if you need something about the user that isn't here.)" }
         return text
     }
 
@@ -770,6 +773,13 @@ final class Agent: ObservableObject {
             result = card
             onResult()
             return .init(ok: true, summary: "shown to the user on screen")
+
+        case "recall":
+            let query = (action["query"] as? String) ?? ""
+            let line = begin("Recall \(query.prefix(40))")
+            let hits = Memory.search(query)
+            return end(line, .init(ok: true, summary: hits.isEmpty ? "nothing remembered about that"
+                                   : "remembered:\n" + hits.map { "- \($0)" }.joined(separator: "\n")))
 
         case "dictionary":
             // The app's own scripting vocabulary, for an applescript fallback.

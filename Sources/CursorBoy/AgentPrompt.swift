@@ -31,6 +31,7 @@ enum AgentPrompt {
                                                            comparisons, lists, contact details. Do it before asking them to choose between options.
     {"do":"look"}                                          get a screenshot next turn (labels unclear, custom-drawn UI, or you need to read content)
     {"do":"wait","ms":800}                                 let something load
+    {"do":"recall","query":"delivery address"}           search everything you remember about the user (only the relevant part is shown up front)
     {"do":"remember","fact":"mom = WhatsApp chat 'Mom ❤️'"} save a lasting fact about the user right away (who's who, preferences, usual apps/places); use "Things you remember" before asking
     {"do":"dictionary"}                                    the frontmost app's AppleScript vocabulary (only for apps marked "(scriptable)")
     {"do":"applescript","script":"..."} / {"do":"shell","cmd":"..."}   invisible, so not the default. Use AppleScript on a scriptable app \
