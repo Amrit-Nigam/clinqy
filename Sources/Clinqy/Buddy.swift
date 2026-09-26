@@ -199,6 +199,9 @@ final class Buddy {
     /// Fades out the frame around the element just used (the UI has usually moved on).
     func clearHighlight() { highlight = nil }
 
+    /// Recent positions (global), for the short streak drawn behind the buddy as it moves.
+    private var trail: [(CGPoint, CFTimeInterval)] = []
+
     private func finishFlight() {
         flight?.done?.resume()
         flight = nil
@@ -291,8 +294,11 @@ final class Buddy {
         let leave = resting && (mouseIdle > 3 || (mouseIdle > 0.6 && keyIdle < 1.0))
         // Exit slowly (floating up), come back quickly (dropping in).
         offstage += ((leave ? 1 : 0) - offstage) * min(1, dt * (leave ? 3.2 : 14))
+        // Only when Clinqy moves it itself (not while it's just following the user's mouse).
+        if flight != nil, mode != .returning { trail.append((pos, now)) }
+        trail.removeAll { now - $0.1 > 0.1 }
         let frame = Frame(
-            now: now, pos: pos, angle: angle, scale: scale, speed: hypot(vel.dx, vel.dy), mood: mood,
+            now: now, pos: pos, trail: trail.map(\.0), angle: angle, scale: scale, speed: hypot(vel.dx, vel.dy), mood: mood,
             shake: now - shakeStart < 0.45 ? now - shakeStart : nil,
             press: now - pressStart < 0.26 ? now - pressStart : nil,
             pop: now - pop < 0.5 ? now - pop : nil,
@@ -326,6 +332,8 @@ final class Buddy {
 private struct Frame {
     let now: CFTimeInterval
     let pos: CGPoint
+    /// Oldest to newest, the last ~0.1 s.
+    let trail: [CGPoint]
     let angle: CGFloat
     let scale: CGFloat
     let speed: CGFloat
@@ -372,6 +380,7 @@ private final class Stage {
     private let origin: CGPoint
     private let root = CALayer()
     private let body = CALayer()          // positioned at the tip, rotated to the heading
+    private let streak = CAShapeLayer()   // short tapered trail while moving
     private let triangle = CAShapeLayer()
     private let reticle = CAShapeLayer()
     private let qaTag = CALayer()
@@ -415,6 +424,7 @@ private final class Stage {
         root.frame = view.bounds
         root.isGeometryFlipped = true
         window.contentView = view
+        root.insertSublayer(streak, at: 0)
         let scale = screen.backingScaleFactor
         root.contentsScale = scale
 
@@ -639,8 +649,38 @@ private final class Stage {
         bubble.borderColor = accent.copy(alpha: 0.45)
         text.string = label
         text.frame = CGRect(x: 12, y: 6, width: max(0, bubbleWidth - 20), height: 18)
+        renderStreak(f, accent: accent, local: local)
         renderMark(f, accent: accent, local: local)
         CATransaction.commit()
+    }
+
+    /// A thin ribbon along the last few positions: widest at the buddy, tapering to nothing. Only shows while moving.
+    private func renderStreak(_ f: Frame, accent: CGColor, local: (CGPoint) -> CGPoint) {
+        // From the arrow's body rather than its very tip, so it reads as trailing behind.
+        let pts = f.trail.map { local(CGPoint(x: $0.x + 5, y: $0.y + 6)) }
+        var length: CGFloat = 0
+        for i in pts.indices.dropFirst() { length += hypot(pts[i].x - pts[i - 1].x, pts[i].y - pts[i - 1].y) }
+        guard pts.count > 2, length > 6, f.offstage < 0.95 else { streak.opacity = 0; return }
+        var left: [CGPoint] = [], right: [CGPoint] = []
+        for i in pts.indices {
+            let a = pts[max(0, i - 1)], b = pts[min(pts.count - 1, i + 1)]
+            let d = max(0.001, hypot(b.x - a.x, b.y - a.y))
+            let w = 1.6 * CGFloat(i) / CGFloat(pts.count - 1)   // half-width: 0 at the tail, 1.6 at the head
+            let n = CGPoint(x: -(b.y - a.y) / d * w, y: (b.x - a.x) / d * w)
+            left.append(CGPoint(x: pts[i].x + n.x, y: pts[i].y + n.y))
+            right.append(CGPoint(x: pts[i].x - n.x, y: pts[i].y - n.y))
+        }
+        let path = CGMutablePath()
+        path.addLines(between: left + right.reversed())
+        path.closeSubpath()
+        streak.path = path
+        streak.fillColor = accent
+        streak.shadowColor = accent
+        streak.shadowRadius = 3
+        streak.shadowOpacity = 0.6
+        streak.shadowOffset = .zero
+        // Fainter on slow drifts, a touch stronger on quick moves.
+        streak.opacity = Float((1 - f.offstage) * min(0.55, 0.15 + length / 300))
     }
 
     /// The marker: a slightly wobbly, overlapping loop drawn like a pen stroke, then a curved arrow.

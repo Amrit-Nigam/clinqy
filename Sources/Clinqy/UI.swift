@@ -114,7 +114,8 @@ extension Agent.Phase {
 
 // MARK: - Orb
 
-/// The living dot: breathes when idle, swirls when thinking, swells with your voice.
+/// The living dot, an Apple Watch–style "breathe" flower: six petals bloom out and back,
+/// faster while working, swelling with your voice; tinted by mood (teal/cyan when idle).
 private struct Orb: View {
     let mood: Buddy.Mood
     var level: CGFloat = 0
@@ -123,26 +124,37 @@ private struct Orb: View {
     var body: some View {
         TimelineView(.animation) { context in
             let t = context.date.timeIntervalSinceReferenceDate
-            let base = mood == .idle ? Color(red: 0.58, green: 0.56, blue: 1.0) : DS.color(mood)
             let busy = mood == .thinking || mood == .acting
-            let breathe = 1 + 0.05 * sin(t * (busy ? 5 : 1.6))
-            let swell = mood == .listening ? 1 + level * 0.45 : 1
+            let period = busy ? 1.4 : 3.0
+            // 0 → 1 → 0 with ease-in-out, like the original keyframes.
+            let bloom = CGFloat(0.5 - 0.5 * cos(t.truncatingRemainder(dividingBy: period) / period * 2 * .pi))
+            let open = mood == .listening ? max(bloom, min(1, level * 1.6)) : bloom
+            let (a, b) = colors
+            let petal = size * 0.42
             ZStack {
-                Circle()
-                    .fill(base.opacity(0.28))
-                    .scaleEffect(1.25 * swell * breathe)
-                    .blur(radius: 6)
-                Circle()
-                    .fill(AngularGradient(colors: [base, base.opacity(0.35), .white.opacity(0.9), base],
-                                          center: .center, angle: .radians(busy ? t * 4 : t * 0.6)))
-                    .scaleEffect(breathe * (mood == .listening ? 1 + level * 0.2 : 1))
-                Circle()
-                    .fill(RadialGradient(colors: [.white.opacity(0.55), .clear], center: .init(x: 0.35, y: 0.3),
-                                         startRadius: 0, endRadius: size * 0.5))
+                ForEach(0..<6, id: \.self) { i in
+                    let angle = Double(i) * .pi / 3
+                    Circle()
+                        .fill((i.isMultiple(of: 2) ? a : b).opacity(0.7))
+                        .frame(width: petal, height: petal)
+                        .scaleEffect(0.45 + 0.75 * open)
+                        .offset(x: cos(angle) * size * 0.3 * open, y: sin(angle) * size * 0.3 * open)
+                        .blendMode(.plusLighter)
+                }
             }
+            .rotationEffect(.radians(t * (busy ? 1.2 : 0.15) + Double(open) * .pi / 3))
+            .shadow(color: a.opacity(0.35 + 0.45 * open), radius: 2 + 6 * open)
             .frame(width: size, height: size)
             .animation(.easeInOut(duration: 0.35), value: mood)
         }
+    }
+
+    private var colors: (Color, Color) {
+        if mood == .idle {
+            return (Color(red: 0.18, green: 0.83, blue: 0.75), Color(red: 0.13, green: 0.83, blue: 0.93))
+        }
+        let base = DS.color(mood)
+        return (base, Color(NSColor(base).blended(withFraction: 0.35, of: .white) ?? NSColor(base)))
     }
 }
 
