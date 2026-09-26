@@ -222,8 +222,7 @@ struct CommandView: View {
             }
             .background(
                 RoundedRectangle(cornerRadius: DS.corner, style: .continuous)
-                    .fill(.ultraThinMaterial)
-                    .overlay(RoundedRectangle(cornerRadius: DS.corner, style: .continuous).fill(Color.black.opacity(0.62)))
+                    .fill(Color(white: 0.09))
             )
             .overlay(RoundedRectangle(cornerRadius: DS.corner, style: .continuous).strokeBorder(DS.hairline))
             .clipShape(RoundedRectangle(cornerRadius: DS.corner, style: .continuous))
