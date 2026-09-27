@@ -41,6 +41,10 @@ enum AgentPrompt {
                                                            protect (password) · unlock (password) · watermark (text) · page_numbers · ocr (scan → searchable) ·
                                                            info (pages, size). Optional out:"<path>"; by default it saves next to the original
                                                            (name-compressed.pdf …) and never overwrites. Pages are 1-based, "8-" = to the end, "last" works.
+    {"do":"media","op":"combine","files":["~/Downloads/a.mp4","~/Downloads/b.mp4"]}   video/audio jobs in the background, no time limit
+                                                           (mp4, mov, m4v, m4a, mp3, wav…). ops: combine (files in order; no re-encoding when the clips match) ·
+                                                           trim (start/end: seconds or "1:30") · compress (level:"light"/"recommended"/"extreme") · to_mp4 ·
+                                                           to_audio (→ .m4a) · info (length, size, resolution). Optional out:"<path>"; saves next to the original.
     {"do":"email","to":["a@b.com"],"subject":"…","body":"…","files":["~/Desktop/a.pdf"],"draft":false}
                                                            email with attachments, sent by the Mail app in the background (no window). draft:true opens it
                                                            in Mail for the user to check instead. Use when they say email/mail/send a file to someone,
@@ -64,7 +68,8 @@ enum AgentPrompt {
     {"do":"dictionary"}                                    the frontmost app's AppleScript vocabulary (only for apps marked "(scriptable)")
     {"do":"applescript","script":"..."} / {"do":"shell","cmd":"..."}   invisible, so not the default. Use AppleScript on a scriptable app \
     (get its dictionary first) when clicking has failed twice, when the user asks for speed ("quickly", "in the background"), \
-    or for data with no window open (a reminder, a calendar event). Shell for lookups with no on-screen way. \
+    or for data with no window open (a reminder, a calendar event). Shell for lookups with no on-screen way; it stops after 20 s, so never use it for long jobs \
+    (video or audio conversion, big downloads) — use media or pdf. \
     Never use them to open apps or websites or to send messages to people.
 
     Finish with {"say":"<one short sentence: the result, or the answer to their question>","actions":[],"done":true}. \
@@ -135,7 +140,8 @@ enum AgentPrompt {
     - Files ("compress this PDF", "merge these", "convert to PDF", "make it smaller and send it to Rahul"): use pdf, \
       never an app or website. "this"/"these" = the files selected in Finder, or the file open in the front app; if none, \
       find it with shell (e.g. ls -t ~/Downloads ~/Desktop | head) or ask. Chain jobs using the path each result gives \
-      (merge → compress → email). Finish with the saved file name and its size.
+      (merge → compress → email). Videos and audio: use media. Finish with the saved file name and its size (and length \
+      for videos); only say it worked if the result says so.
     - Files ("compress this PDF", "merge these", "convert to PDF", "make it smaller and send it to Rahul"): use pdf, \
       never an app or website. "this"/"these" = the files selected in Finder, or the file open in the front app; if none, \
       find it with shell (e.g. ls -t ~/Downloads ~/Desktop | head) or ask. Chain jobs using the path each result gives \

@@ -1,6 +1,7 @@
 import AppKit
 import CryptoKit
 import Carbon
+import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate {
@@ -27,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
         agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
+        enableOpenAtLogin()
+        installEditMenu()
+        dismissOnOutsideClick()
         Brain.prewarm()
         Whisper.shared.prepare()
         BrowserBridge.shared.start()
@@ -70,6 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(.separator())
+        let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleOpenAtLogin(_:)), keyEquivalent: "")
+        login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for item in menu.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
         statusItem.menu = menu
@@ -312,6 +318,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     // MARK: - Menu actions
+
+    /// Clicking anywhere outside the command bar puts it away, like Spotlight. Not while it's asking a question
+    /// or listening (the answer is still needed). Clicks on Clinqy's own windows never reach a global monitor.
+    private func dismissOnOutsideClick() {
+        NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self, self.panel.isVisible, self.agent.question == nil, !self.voice.isListening else { return }
+                self.panel.orderOut(nil)
+            }
+        }
+    }
+
+    /// A menu-bar app has no main menu, and without an Edit menu ⌘V/⌘C/⌘X/⌘A/⌘Z never reach text fields.
+    /// This one is never shown; it only carries the shortcuts.
+    private func installEditMenu() {
+        let edit = NSMenu(title: "Edit")
+        edit.addItem(withTitle: "Undo", action: Selector(("undo:")), keyEquivalent: "z")
+        edit.addItem(withTitle: "Redo", action: Selector(("redo:")), keyEquivalent: "Z")
+        edit.addItem(.separator())
+        edit.addItem(withTitle: "Cut", action: #selector(NSText.cut(_:)), keyEquivalent: "x")
+        edit.addItem(withTitle: "Copy", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+        edit.addItem(withTitle: "Paste", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+        edit.addItem(withTitle: "Select All", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+        let editItem = NSMenuItem(title: "Edit", action: nil, keyEquivalent: "")
+        editItem.submenu = edit
+        let main = NSMenu()
+        main.addItem(NSMenuItem(title: "Clinqy", action: nil, keyEquivalent: ""))
+        main.addItem(editItem)
+        NSApp.mainMenu = main
+    }
+
+    /// Starts with the Mac by default (installed copy only), unless the user switched it off in the menu.
+    private func enableOpenAtLogin() {
+        guard Bundle.main.bundlePath.hasPrefix("/Applications/"),
+              !UserDefaults.standard.bool(forKey: "openAtLoginOff"),
+              SMAppService.mainApp.status != .enabled else { return }
+        try? SMAppService.mainApp.register()
+    }
+
+    @objc func toggleOpenAtLogin(_ item: NSMenuItem) {
+        let on = SMAppService.mainApp.status == .enabled
+        do {
+            if on { try SMAppService.mainApp.unregister() } else { try SMAppService.mainApp.register() }
+            UserDefaults.standard.set(on, forKey: "openAtLoginOff")
+        } catch {
+            NSLog("Clinqy: open at login: \(error)")
+        }
+        item.state = SMAppService.mainApp.status == .enabled ? .on : .off
+    }
 
     @objc func togglePanel() {
         if panel.isVisible { panel.orderOut(nil); return }

@@ -191,8 +191,13 @@ final class Agent: ObservableObject {
         }
         buddy.mood = .thinking
 
-        // Don't start clicking around during a call or meeting unless the user says so.
-        if Safety.micInUse, qa == nil {
+        // Don't start clicking around during a call or meeting unless the user says so (or told Clinqy it's fine,
+        // e.g. the remembered fact "OK to work during calls and screen sharing").
+        let callsOK = Memory.facts.contains { fact in
+            let f = fact.lowercased()
+            return f.contains("ok to work") && (f.contains("call") || f.contains("screen shar"))
+        }
+        if Safety.micInUse, qa == nil, !callsOK {
             let reply = await askUser("You seem to be on a call (the mic is in use). Should I go ahead and use the screen?",
                                       options: ["Go ahead", "Not now"])
             guard let reply, reply.lowercased().hasPrefix("go") || Safety.isYes(reply) else {
@@ -728,7 +733,7 @@ final class Agent: ObservableObject {
         case "shell":
             guard let cmd = action["cmd"] as? String else { return fail("shell needs cmd") }
             let line = begin("Look something up")
-            let r = await Shell.run("/bin/zsh", ["-lc", cmd])
+            let r = await Shell.run("/bin/zsh", ["-lc", cmd], timeout: 20)
             return end(line, .init(ok: r.status == 0, summary: "exit \(r.status)\(r.output.isEmpty ? "" : ": \(r.output.prefix(2000))")"))
 
         case "pdf":
@@ -739,6 +744,25 @@ final class Agent: ObservableObject {
             let line = begin("PDF: \(op.replacingOccurrences(of: "_", with: " ")) \(files.count == 1 ? files[0].lastPathComponent : "\(files.count) files")")
             do {
                 return end(line, .init(ok: true, summary: try await Pdf.run(op, files: files, options: action)))
+            } catch {
+                return end(line, fail(error.localizedDescription))
+            }
+
+        case "media":
+            // Video/audio jobs with AVFoundation: no time limit, and progress keeps the watchdog from stopping long exports.
+            guard let op = (action["op"] as? String)?.lowercased() else { return fail("media needs op") }
+            let paths = (action["files"] as? [String]) ?? (action["file"] as? String).map { [$0] } ?? []
+            let files = paths.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            let title = "Video: \(op.replacingOccurrences(of: "_", with: " ")) \(files.count == 1 ? files[0].lastPathComponent : "\(files.count) files")"
+            let line = begin(title)
+            do {
+                let summary = try await Media.run(op, files: files, options: action) { [weak self] p in
+                    guard let self, line < self.steps.count else { return }
+                    self.lastProgress = Date()
+                    self.steps[line].text = "\(title) · \(Int(p * 100))%"
+                }
+                if line < steps.count { steps[line].text = title }
+                return end(line, .init(ok: true, summary: summary))
             } catch {
                 return end(line, fail(error.localizedDescription))
             }
