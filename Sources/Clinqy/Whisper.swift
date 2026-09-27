@@ -79,12 +79,15 @@ final class Whisper: ObservableObject {
     /// Transcribes 16 kHz mono samples. Returns nil if the model isn't ready or heard nothing.
     func transcribe(_ samples: [Float]) async -> String? {
         guard let kit, samples.count > 16_000 / 4 else { return nil }
-        // A hint prompt of the user's app names helps Whisper spell them ("WhatsApp", not "What's app").
+        // A hint prompt of the user's app and people names helps Whisper spell them ("WhatsApp", not "What's app";
+        // "Waje+", not "Vaje Plus"). Whisper keeps the prompt's tail, so remembered names go last.
         var prompt: [Int]?
         if let tokenizer = kit.tokenizer {
-            let names = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
-                .compactMap(\.cleanName).prefix(20).joined(separator: ", ")
-            prompt = tokenizer.encode(text: " Clinqy, WhatsApp, YouTube, Google, GitHub, \(names).")
+            let apps = NSWorkspace.shared.runningApplications.filter { $0.activationPolicy == .regular }
+                .compactMap(\.cleanName).prefix(20)
+            let people = NameHints.promptNames()
+            let names = (["Clinqy", "WhatsApp", "YouTube", "Google", "GitHub"] + apps).filter { !people.contains($0) } + people
+            prompt = tokenizer.encode(text: " " + names.joined(separator: ", ") + ".")
                 .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
         }
         let options = DecodingOptions(task: .transcribe, language: nil, temperature: 0,

@@ -152,6 +152,7 @@ final class Voice: ObservableObject {
         request.shouldReportPartialResults = true
         if recognizer.supportsOnDeviceRecognition { request.requiresOnDeviceRecognition = true }
         request.addsPunctuation = true
+        request.contextualStrings = NameHints.vocabulary   // the user's people, chats and places
         self.request = request
         feed.set(request)
         partial = ""
@@ -225,7 +226,7 @@ final class Voice: ObservableObject {
         request = nil
         feed.set(nil)
         commitPartial()
-        let preview = transcript.trimmingCharacters(in: .whitespacesAndNewlines)
+        let preview = NameHints.correct(transcript.trimmingCharacters(in: .whitespacesAndNewlines))
         let samples = feed.takeSamples()
         guard Whisper.shared.isReady else {
             if !preview.isEmpty { onFinal(preview) }
@@ -236,7 +237,7 @@ final class Voice: ObservableObject {
         Task {
             let text = await Whisper.shared.transcribe(samples)
             isTranscribing = false
-            let final = text ?? preview
+            let final = text.map(NameHints.correct) ?? preview
             if !final.isEmpty {
                 transcript = final
                 onFinal(final)

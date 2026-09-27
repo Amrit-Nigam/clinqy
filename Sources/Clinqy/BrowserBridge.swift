@@ -28,6 +28,16 @@ final class BrowserBridge {
         let scrollMax: Double
         let headings: [String]
         let elements: [PageElement]
+        /// Error/status messages showing on the page ("This is a required question").
+        var messages: [String] = []
+        /// Visible text that isn't an element (confirmations, details, prices).
+        var text = ""
+        /// Fields/buttons above and below the visible part (so the model knows to scroll).
+        var above = 0, below = 0
+        /// document.readyState ("loading" = still arriving).
+        var ready = "complete"
+        /// Why the page couldn't be read, when it couldn't (never just "0 elements").
+        var problem: String?
         /// Viewport's on-screen rect estimated from window geometry (fallback when Accessibility can't say).
         let estimatedArea: CGRect?
     }
@@ -77,8 +87,12 @@ final class BrowserBridge {
         conn.stateUpdateHandler = { [weak self] state in
             MainActor.assumeIsolated {
                 switch state {
-                case .ready: self?.connections[key] = conn
-                case .failed, .cancelled: self?.connections[key] = nil
+                case .ready:
+                    self?.connections[key] = conn
+                    self?.identify(conn, key: key)
+                case .failed, .cancelled:
+                    self?.connections[key] = nil
+                    self?.owners[key] = nil
                 default: break
                 }
             }
@@ -91,6 +105,9 @@ final class BrowserBridge {
         conn.receiveMessage { [weak self] data, _, _, error in
             MainActor.assumeIsolated {
                 guard let self else { return }
+                if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any], msg["type"] as? String == "hello" {
+                    self.checkVersion(msg["version"] as? String ?? "", on: conn)
+                }
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let id = msg["id"] as? String, let cont = self.pending.removeValue(forKey: id) {
                     if msg["ok"] as? Bool == true {
@@ -121,6 +138,18 @@ final class BrowserBridge {
         }
     }
 
+    /// The extension version this app was built with (extension/manifest.json). A browser still running an older
+    /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
+    static let extensionVersion = "1.4.0"
+    private var reloadAsked: Set<String> = []
+
+    private func checkVersion(_ version: String, on conn: NWConnection) {
+        guard version != Self.extensionVersion, !reloadAsked.contains(version) else { return }
+        reloadAsked.insert(version)
+        Agent.writeLog("browser extension v\(version) connected, app expects v\(Self.extensionVersion): reloading it")
+        Task { _ = try? await request(conn, ["cmd": "reload"], timeout: 5) }
+    }
+
     /// Asks every connected browser to reload the extension (after it's been updated on disk).
     func reloadAll() async -> Int {
         var n = 0
@@ -142,8 +171,8 @@ final class BrowserBridge {
     }
 
     /// Text selected on the page in the focused browser window, if any.
-    func selection() async -> String? {
-        for (_, conn) in connections {
+    func selection(in app: NSRunningApplication? = nil) async -> String? {
+        for (_, conn) in candidates(for: app) {
             guard let r = try? await request(conn, ["cmd": "selection"], timeout: 1.2), r["focused"] as? Bool == true else { continue }
             let text = (r["text"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             return text.isEmpty ? nil : text
@@ -154,8 +183,8 @@ final class BrowserBridge {
     struct TabInfo { let id: Int; let url: String; let connection: ObjectIdentifier }
 
     /// The active tab of the focused browser window.
-    func activeTab() async -> TabInfo? {
-        for (key, conn) in connections {
+    func activeTab(in app: NSRunningApplication? = nil) async -> TabInfo? {
+        for (key, conn) in candidates(for: app) {
             guard let r = try? await request(conn, ["cmd": "tabInfo"], timeout: 1.5), r["focused"] as? Bool == true,
                   let id = r["id"] as? Int else { continue }
             return TabInfo(id: id, url: r["url"] as? String ?? "", connection: key)
@@ -175,24 +204,57 @@ final class BrowserBridge {
     // MARK: - Page API
 
     /// Snapshot of the page in the focused browser window (asks every connected browser; the focused one answers for itself).
-    func snapshot() async -> Page? {
-        for (key, conn) in connections {
-            guard let r = try? await request(conn, ["cmd": "snapshot"]), r["focused"] as? Bool == true else { continue }
+    /// Which browser each connection comes from (its app bundle path, e.g. /Applications/Arc.app), found from
+    /// the process on the other end. A page must only ever be read from the browser that's actually in front:
+    /// with Chrome in front and only Arc connected, Arc's tab must not be mistaken for Chrome's.
+    private var owners: [ObjectIdentifier: String] = [:]
+
+    private func identify(_ conn: NWConnection, key: ObjectIdentifier) {
+        guard case let .hostPort(_, port) = conn.endpoint else { return }
+        Task.detached {
+            let r = await Shell.run("/usr/sbin/lsof", ["-nP", "-iTCP:\(port.rawValue)", "-sTCP:ESTABLISHED", "-Fp"], timeout: 5)
+            let me = ProcessInfo.processInfo.processIdentifier
+            let pids = r.output.split(separator: "\n").filter { $0.hasPrefix("p") }.compactMap { Int32($0.dropFirst()) }.filter { $0 != me }
+            var bundle: String?
+            for pid in pids {
+                var buf = [CChar](repeating: 0, count: 4096)
+                guard proc_pidpath(pid, &buf, UInt32(buf.count)) > 0 else { continue }
+                let path = String(cString: buf)
+                if let r = path.range(of: ".app/") { bundle = String(path[..<r.lowerBound]) + ".app"; break }
+            }
+            let owner = bundle
+            await MainActor.run { self.owners[key] = owner ?? "?" }
+        }
+    }
+
+    /// Connections to ask about `app` (a browser): its own; while a connection is still being identified, that
+    /// one too; none if this browser has no extension connected. nil app = any (the focused window decides).
+    private func candidates(for app: NSRunningApplication?) -> [(ObjectIdentifier, NWConnection)] {
+        let all = connections.map { ($0.key, $0.value) }
+        guard let bundle = app?.bundleURL?.resolvingSymlinksInPath().path else { return all }
+        let own = all.filter { owners[$0.0] == bundle }
+        return own.isEmpty ? all.filter { owners[$0.0] == nil } : own
+    }
+
+    func snapshot(for app: NSRunningApplication? = nil) async -> Page? {
+        let pool = candidates(for: app)
+        for (key, conn) in pool {
+            guard let r = try? await request(conn, ["cmd": "snapshot"], timeout: 5), r["focused"] as? Bool == true else { continue }
             return parse(r, connection: key)
         }
-        // Nobody reports focus (e.g. the page hasn't got keyboard focus yet): use the only browser, if one.
-        if connections.count == 1, let (key, conn) = connections.first,
-           let r = try? await request(conn, ["cmd": "snapshot"]) {
+        // Nobody reports focus (e.g. the page hasn't got keyboard focus yet): use the only candidate, if one.
+        if pool.count == 1, let (key, conn) = pool.first,
+           let r = try? await request(conn, ["cmd": "snapshot"], timeout: 5) {
             return parse(r, connection: key)
         }
         return nil
     }
 
-    func perform(_ cmd: String, on page: Page, _ args: [String: Any] = [:]) async throws -> [String: Any] {
+    func perform(_ cmd: String, on page: Page, _ args: [String: Any] = [:], timeout: Double = 4) async throws -> [String: Any] {
         guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
         var body = args
         body["cmd"] = cmd
-        return try await request(conn, body, timeout: 4)
+        return try await request(conn, body, timeout: timeout)
     }
 
     /// The viewport sits at the bottom of the window, flush with its sides: window origin + the difference
@@ -211,10 +273,13 @@ final class BrowserBridge {
         let els = (r["elements"] as? [[String: Any]] ?? []).map { e -> PageElement in
             func d(_ k: String) -> Double { (e[k] as? NSNumber)?.doubleValue ?? 0 }
             var extra: [String] = []
+            if let q = e["q"] as? String { extra.append("in “\(q)”") }
+            if let frame = e["frame"] as? String { extra.append("inside \(frame)") }
+            if e["dropdown"] as? Bool == true { extra.append("dropdown") }
             if let v = e["value"] as? String { extra.append("value=\(v.debugDescription)") }
             if let p = e["placeholder"] as? String, (e["text"] as? String) != p { extra.append("placeholder=\(p.debugDescription)") }
             if let o = e["options"] as? String { extra.append("options: \(o)") }
-            for flag in ["focused", "checked", "selected", "disabled", "covered"] where e[flag] as? Bool == true { extra.append(flag) }
+            for flag in ["required", "invalid", "focused", "checked", "unchecked", "selected", "disabled", "covered"] where e[flag] as? Bool == true { extra.append(flag) }
             if let href = e["href"] as? String { extra.append("→ \(href)") }
             return PageElement(index: (e["i"] as? Int) ?? 0, role: e["role"] as? String ?? "?", text: e["text"] as? String ?? "",
                                rect: CGRect(x: d("x"), y: d("y"), width: d("w"), height: d("h")),
@@ -224,6 +289,8 @@ final class BrowserBridge {
                     viewport: CGSize(width: (vp?["w"] as? NSNumber)?.doubleValue ?? 1, height: (vp?["h"] as? NSNumber)?.doubleValue ?? 1),
                     scrollY: (scroll?["y"] as? NSNumber)?.doubleValue ?? 0, scrollMax: (scroll?["max"] as? NSNumber)?.doubleValue ?? 0,
                     headings: r["headings"] as? [String] ?? [], elements: els,
-                    estimatedArea: Self.estimate(r))
+                    messages: r["messages"] as? [String] ?? [], text: r["text"] as? String ?? "",
+                    above: r["above"] as? Int ?? 0, below: r["below"] as? Int ?? 0, ready: r["ready"] as? String ?? "complete",
+                    problem: r["error"] as? String, estimatedArea: Self.estimate(r))
     }
 }

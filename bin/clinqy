@@ -9,9 +9,14 @@
 #   clinqy run "<task>"              Do a task (not saved to history).
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
+#   clinqy stats [days]              Success rate, turns, time and screenshots per run (default: last 7 days).
+#   clinqy page [read|url]           What's in the focused browser tab, via the extension (read-only):
+#                                    its elements (w-ids, fields, values, errors) and visible text; read = full text.
+#   clinqy extension reload          Reload the browser extension from disk.
 set -u
 LOG=~/Library/Logs/Clinqy/agent.log
 WF=~/Library/Application\ Support/Clinqy/workflows.json
+TOKEN=$(cat ~/.config/clinqy/cli-token 2>/dev/null)
 enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1], safe=""))' "$1"; }
 
 ensure_app() {
@@ -57,7 +62,7 @@ case $cmd in
       if [[ $f == inline:* ]]; then q="text=$(enc "${f#inline:}")"; else q="path=$(enc "$f")"; fi
       [[ -n $model ]] && q+="&model=$(enc $model)"
       (( relearn )) && q+="&relearn=1"
-      open -g "clinqy://qa?$q&out=$(enc $out)"
+      open -g "clinqy://qa?$q&out=$(enc $out)&token=$TOKEN"
       for i in $(seq 1 900); do [[ -s $out ]] && break; sleep 1; done
       [[ -s $out ]] || { echo "TIMEOUT  ${f#inline:}"; failed=1; continue; }
       reports+=($out)
@@ -80,7 +85,7 @@ PY
   run)
     ensure_app
     start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://run?task=$(enc "$*")&test=1"
+    open -g "clinqy://run?task=$(enc "$*")&test=1&token=$TOKEN"
     wait_log $start ;;
   workflow)
     ensure_app
@@ -88,7 +93,7 @@ PY
     q="name=$(enc "$name")"
     for kv in "$@"; do q+="&$(enc "${kv%%=*}")=$(enc "${kv#*=}")"; done
     start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://workflow?$q"
+    open -g "clinqy://workflow?$q&token=$TOKEN"
     wait_log $start ;;
   workflows)
     python3 - "$WF" <<'PY'
@@ -100,5 +105,32 @@ for w in (json.load(open(p)) if os.path.exists(p) else []):
     print(f'{w["name"]}{params} — {len(w["steps"])} steps, run {w.get("runs", 0)}×{extra}')
 PY
     ;;
-  *) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
+  page)
+    ensure_app
+    id="p$$-$RANDOM"; f=~/Library/Application\ Support/Clinqy/cli/$id.txt
+    open -g "clinqy://browser?cmd=${1:-page}&id=$id&token=$TOKEN"
+    for i in $(seq 1 60); do [[ -f $f ]] && break; sleep 0.25; done
+    [[ -f $f ]] || { echo "No answer from Clinqy (is the browser open with the extension loaded?)"; exit 1; }
+    out=$(<$f); rm -f $f; print -r -- "$out"
+    [[ $out == ERROR:* ]] && exit 1; exit 0 ;;
+  extension)
+    ensure_app
+    open -g "clinqy://reload-extension?token=$TOKEN"; echo "Asked the browser(s) to reload the Clinqy extension." ;;
+  stats)
+    python3 - "${1:-7}" <<'PY'
+import json, os, sys, datetime as dt
+days = float(sys.argv[1]); path = os.path.expanduser("~/Library/Logs/Clinqy/runs.jsonl")
+if not os.path.exists(path): sys.exit("No runs recorded yet.")
+cut = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
+rows = [r for r in map(json.loads, open(path)) if dt.datetime.fromisoformat(r["date"].replace("Z", "+00:00")) >= cut]
+if not rows: sys.exit(f"No runs in the last {days:g} days.")
+done = [r for r in rows if not r.get("stopped")]
+ok = sum(r["ok"] for r in done); avg = lambda k, rs=rows: sum(r[k] for r in rs) / max(len(rs), 1)
+print(f"Last {days:g} days: {len(rows)} runs · {ok}/{len(done)} succeeded ({100*ok/max(len(done),1):.0f}%) · {len(rows)-len(done)} stopped by you")
+print(f"Per run: {avg('seconds'):.0f} s · {avg('turns'):.1f} turns ({avg('fast_turns'):.1f} by the fast helper) · {avg('screenshots'):.1f} screenshots · {avg('failed_steps'):.1f} failed steps")
+slow = sorted(rows, key=lambda r: -r["seconds"])[:5]
+print("Slowest:"); [print(f"  {r['seconds']:>6.0f} s  {r['turns']:>3} turns  {'✓' if r['ok'] else '✗'}  {r['request'][:70]}") for r in slow]
+PY
+    ;;
+  *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 esac

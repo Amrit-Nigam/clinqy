@@ -66,7 +66,7 @@ The first voice use downloads the Whisper model (~630 MB) into `~/Library/Applic
 2. Turn on **Developer mode** and click **Load unpacked**.
 3. Pick the `extension/` folder in this repo.
 
-It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension origins are accepted. After updating the extension files, run `open "clinqy://reload-extension"` to reload it in every connected browser.
+It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension origins are accepted. The app reloads the extension by itself when its version (in `manifest.json`) differs from the one the app was built with; `clinqy extension reload` forces it. Elements in embedded frames (e.g. a Greenhouse form inside a careers page) are listed and driven like the rest.
 
 ## Using it
 
@@ -82,6 +82,8 @@ It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension ori
 
 ### URL scheme (for scripting)
 
+Every link must carry `&token=<~/.config/clinqy/cli-token>` (`?token=` when it has no other parameters): web pages can open `clinqy://` links too, and must not be able to start tasks or answer questions. The `clinqy` command adds it for you.
+
 ```
 clinqy://run?task=<text>[&test=1]   run a task in the frontmost app (test=1: not saved to history or memory)
 clinqy://answer?text=<text>         answer the current question
@@ -91,6 +93,7 @@ clinqy://qa?path=<file>|text=<test>&out=<report.json>[&relearn=1][&model=…]
 clinqy://workflow?name=<name>[&<input>=<value>…]
 clinqy://watch · clinqy://stop-watching
 clinqy://reload-extension
+clinqy://browser?cmd=page|read|url&id=<id>  what's in the focused browser tab → Application Support/Clinqy/cli/<id>.txt
 ```
 
 ## The `clinqy` command: QA and workflows for any coding agent

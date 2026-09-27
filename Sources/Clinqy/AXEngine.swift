@@ -485,6 +485,10 @@ enum AXEngine {
         "\\": 0x2A, ",": 0x2B, "/": 0x2C, "n": 0x2D, "m": 0x2E, ".": 0x2F, "`": 0x32,
         "f1": 0x7A, "f2": 0x78, "f3": 0x63, "f4": 0x76, "f5": 0x60, "f6": 0x61, "f7": 0x62, "f8": 0x64,
         "f9": 0x65, "f10": 0x6D, "f11": 0x67, "f12": 0x6F,
+        // Names for keys the model spells out ("cmd+minus", "cmd+plus" for zoom).
+        "minus": 0x1B, "hyphen": 0x1B, "dash": 0x1B, "plus": 0x18, "equal": 0x18, "equals": 0x18, "comma": 0x2B,
+        "period": 0x2F, "dot": 0x2F, "slash": 0x2C, "backslash": 0x2A, "semicolon": 0x29, "quote": 0x27,
+        "backtick": 0x32, "grave": 0x32, "leftbracket": 0x21, "rightbracket": 0x1E, "spacebar": 0x31, "del": 0x33,
     ]
 
     /// Presses a combo like "cmd+shift+t", "return" or "ctrl+a". Returns false for an unknown key.

@@ -1,4 +1,5 @@
 import AppKit
+import UniformTypeIdentifiers
 
 /// Runs a request as a conversation with one Claude session: observe the screen → Claude picks actions →
 /// the buddy carries them out the way a person would (travel, point, click, type) → report → repeat.
@@ -130,6 +131,7 @@ final class Agent: ObservableObject {
         question = nil
         input = ""
         onAnswered()
+        if let text, !text.isEmpty { userAnswers.append(text) }
         waiter.resume(returning: text?.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
@@ -162,6 +164,10 @@ final class Agent: ObservableObject {
         input = ""
         narration = ""
         openedTab = false
+        checkedMemoryForAsk = false
+        turnCount = 0; fastTurnCount = 0; lookCount = 0
+        reviewedForm = false
+        userAnswers = []
         snaps = []
         addedNotes = []
         ownedTab = nil
@@ -213,10 +219,14 @@ final class Agent: ObservableObject {
 
         var app = targetApp ?? NSWorkspace.shared.frontmostApplication
         var message = intro(request)
+        let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.model)
+        defer { fast.close() }
+        message += fast.leadNote
         var wantsLook = false
         var failures = 0
         var lastSignature = ""
         var repeats = 0
+        var askedForAnswer = false
         var lastScreen = ""
 
         for turn in 0..<50 {   // long forms take 30+ turns
@@ -226,7 +236,10 @@ final class Agent: ObservableObject {
                 let fields = page.elements.filter(\.editable).map { "w\($0.index) \($0.extra)" }.joined(separator: " | ")
                 log("  page: \(page.title.prefix(50)) · \(page.elements.count) elements\(fields.isEmpty ? "" : " · fields: \(fields.prefix(300))")")
             }
-            if obs.elements.count < 6 || failures >= 2 { wantsLook = true }
+            // Auto-screenshot when there's little to go on. With the extension, the page's own list counts
+            // (the browser's toolbar controls alone say nothing about the page).
+            let known = obs.page.map { $0.elements.count } ?? obs.elements.count
+            if known < 6 || failures >= 2 { wantsLook = true }
             // The first look shows what the user circled; after that it's just in the request text.
             let circled = turn == 0 ? annotation : nil
             if let circled {
@@ -254,12 +267,15 @@ final class Agent: ObservableObject {
             buddy.mood = .thinking
             let t0 = Date()
             let reply: String
-            do { reply = try await session.send(turnText, image: image) } catch {
+            do { reply = try await fast.reply(to: turnText, message: message, image: image, failures: failures, lead: session) } catch {
                 if Task.isCancelled { return }
                 return finish(ok: false, error.localizedDescription)
             }
             if Task.isCancelled { return }
-            log("turn \(turn) · \(Int(Date().timeIntervalSince(t0) * 1000)) ms · \(reply.prefix(300))")
+            log("turn \(turn) · \(Int(Date().timeIntervalSince(t0) * 1000)) ms · \(fast.tag)\(reply.prefix(300))")
+            turnCount += 1
+            if fast.tag.hasPrefix("fast") { fastTurnCount += 1 }
+            if image != nil { lookCount += 1 }
 
             guard let json = Brain.json(from: reply) else {
                 message = "Your last reply wasn't a JSON object. Reply with JSON only."
@@ -270,8 +286,9 @@ final class Agent: ObservableObject {
             let isDone = json["done"] as? Bool == true
             if !say.isEmpty, !isDone { narration = say }
 
+            // Only the same actions three times in a row is a loop; turns with no actions (thinking, finishing) aren't.
             let signature = actions.map { "\($0)" }.joined()
-            repeats = signature == lastSignature ? repeats + 1 : 0
+            repeats = !actions.isEmpty && signature == lastSignature ? repeats + 1 : 0
             lastSignature = signature
             if repeats >= 2 { return finish(ok: false, "I kept trying the same thing, so I stopped") }
 
@@ -290,6 +307,13 @@ final class Agent: ObservableObject {
                     break
                 }
                 lastTarget = nil
+                var action = action
+                // click/type/open_* already wait for the screen to settle; a wait stacked on top is mostly dead time.
+                if (action["do"] as? String) == "wait", i > 0,
+                   ["click", "type", "open_url", "open_app", "key"].contains(actions[i - 1]["do"] as? String ?? ""),
+                   (action["ms"] as? Int ?? 600) > 1000 {
+                    action["ms"] = 1000
+                }
                 let result = await perform(action, context: &context)
                 if result.ok { record(action) }
                 if case .look = result.effect { wantsLook = true }
@@ -303,6 +327,14 @@ final class Agent: ObservableObject {
                 message = "Results:\n" + results.joined(separator: "\n") + "\n(You were about to finish, but the user added something.)"
                 continue
             }
+            // A question answered with a status label ("Your roll number") instead of the answer: ask once for the answer.
+            if isDone, failures == 0, !askedForAnswer, Self.isQuestion(request), Self.looksLikeLabel(say) {
+                askedForAnswer = true
+                message = (results.isEmpty ? "" : "Results:\n" + results.joined(separator: "\n") + "\n")
+                    + "Your final say (\"\(say)\") is a label, not the answer. The user asked a question: finish again with done:true "
+                    + "and a say that contains the answer itself, as a full sentence (e.g. \"Your roll number is 1601…\")."
+                continue
+            }
             if isDone, failures == 0 {
                 finish(ok: true, say.isEmpty ? "Done" : say)
                 await learn(from: session)
@@ -314,6 +346,88 @@ final class Agent: ObservableObject {
         finish(ok: false, "Ran out of steps, so I stopped. Last done: \(steps.last?.text ?? "nothing"). Check the screen before retrying.")
     }
 
+    private var checkedMemoryForAsk = false
+    /// This run's numbers for runs.jsonl: model turns, turns the fast helper took, screenshots sent.
+    private var turnCount = 0, fastTurnCount = 0, lookCount = 0
+
+    /// One JSON line per run in ~/Library/Logs/Clinqy/runs.jsonl (`clinqy stats` sums them up).
+    private func recordStats(ok: Bool, answer: String) {
+        let row: [String: Any] = [
+            "date": ISO8601DateFormatter().string(from: started), "request": String(request.prefix(160)), "ok": ok,
+            "stopped": !ok && answer == "Stopped", "seconds": (Date().timeIntervalSince(started) * 10).rounded() / 10,
+            "turns": turnCount, "fast_turns": fastTurnCount, "screenshots": lookCount,
+            "steps": steps.count, "failed_steps": steps.filter { $0.state == .failed }.count, "app": targetApp?.cleanName ?? "",
+        ]
+        guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]),
+              var line = String(data: data, encoding: .utf8) else { return }
+        line += "\n"
+        let url = Self.logURL.deletingLastPathComponent().appendingPathComponent("runs.jsonl")
+        if let handle = try? FileHandle(forWritingTo: url) {
+            handle.seekToEndOfFile()
+            handle.write(Data(line.utf8))
+            try? handle.close()
+        } else {
+            try? Data(line.utf8).write(to: url)
+        }
+    }
+    /// What the user typed in answer to questions this run (their own words, unlike anything read on screen).
+    private var userAnswers: [String] = []
+
+    /// The application tracker in the result card (menu: Applications…).
+    func showApplications() {
+        let card = Applications.card
+        result = card
+        onResult()
+    }
+    private var reviewedForm = false
+
+    /// Reads every answer on the page's form and shows it as a card: question → answer, empty required ones flagged.
+    private func reviewForm(_ page: BrowserBridge.Page) async -> ActionResult {
+        let line = begin("Review the form")
+        guard let r = try? await BrowserBridge.shared.perform("review", on: page, timeout: 8),
+              let items = r["items"] as? [[String: Any]], !items.isEmpty else { return end(line, fail("no form fields found on this page")) }
+        reviewedForm = true
+        let missing = r["missing"] as? [String] ?? []
+        let cards = items.map { i -> ResultCard.Item in
+            let q = i["q"] as? String ?? "?", a = i["answer"] as? String ?? ""
+            let flag = a.isEmpty ? (i["required"] as? Bool == true ? "⚠️ required — empty" : "(empty)") : nil
+            return ResultCard.Item(title: q, subtitle: a.isEmpty ? nil : a, detail: flag, link: nil)
+        }
+        let messages = r["messages"] as? [String] ?? []
+        let note = (missing.isEmpty ? "All required questions are answered." : "⚠️ \(missing.count) required unanswered: " + missing.joined(separator: "; "))
+            + (messages.isEmpty ? "" : "\nPage says: " + messages.joined(separator: " · "))
+        let card = ResultCard(title: "Check before submitting: \(String((r["title"] as? String ?? "form").prefix(50)))", text: note, items: cards)
+        runResult = card
+        result = card
+        onResult()
+        let summary = items.map { "- \($0["q"] as? String ?? "?"): \(($0["answer"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "(empty)")" }.joined(separator: "\n")
+        return end(line, .init(ok: true, summary: "review shown to the user. \(note)\n\(summary)"))
+    }
+
+    /// A question for the user's own details (name, email, phone, college…), which memory may already hold.
+    static func asksForPersonalDetails(_ question: String) -> Bool {
+        // Confirmations ("Submit with your resume attached?") aren't requests for details.
+        if question.range(of: #"(?i)\b(submit|send it|should i|shall i|go ahead|ready to|confirm|okay to|ok to)\b"#, options: .regularExpression) != nil { return false }
+        return question.range(of: #"(?i)\b(your|you)\b.*\b(name|e-?mail|phone|mobile|number|college|university|cgpa|gpa|degree|graduat|linkedin|github|portfolio|address|city|gender|birth|dob|age|skills?|stack|experience|resume|cv)\b"#,
+                       options: .regularExpression) != nil
+    }
+
+    /// "What is…?", "tell me…", "who/where/when/which/how…" — requests that want information back.
+    static func isQuestion(_ request: String) -> Bool {
+        let r = request.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        if r.hasSuffix("?") { return true }
+        return r.range(of: #"^(so |and |ok |okay )?(what|what's|whats|who|who's|where|when|which|how|tell me|do you know|remind me)\b"#,
+                       options: .regularExpression) != nil
+    }
+
+    /// A short title with nothing in it ("Your roll number", "Found it"): no digits, no verb like "is", few words.
+    static func looksLikeLabel(_ say: String) -> Bool {
+        let words = say.split(whereSeparator: \.isWhitespace)
+        guard !words.isEmpty, words.count <= 5, !say.contains(where: \.isNumber), !say.contains("@") else { return words.isEmpty }
+        let verbs: Set<String> = ["is", "are", "was", "were", "it's", "isn't", "can't", "don't", "no", "not", "yes", "has", "have"]
+        return !words.contains { verbs.contains($0.lowercased().trimmingCharacters(in: .punctuationCharacters)) }
+    }
+
     /// After a task, keep anything lasting it revealed about the user (people, preferences, usual apps and
     /// places), so next time is faster. Runs in the background once the user already has their answer.
     private func learn(from session: ClaudeSession) async {
@@ -323,6 +437,7 @@ final class Agent: ObservableObject {
         The task is finished. List lasting facts about the user that this task revealed and that would help future \
         tasks: people and where to reach them (which app/chat), preferences (seats, airlines, food, tone), usual apps, \
         home/work city, frequent places, accounts or usernames. Not passwords, card numbers, OTPs, one-off details, \
+        not job applications (the application tracker holds those), \
         or facts about the screen. Skip anything already known:
         \(known.isEmpty ? "(nothing yet)" : known.map { "- \($0)" }.joined(separator: "\n"))
         Reply with JSON only: {"facts":["short fact", ...]} — an empty list if nothing new.
@@ -335,6 +450,7 @@ final class Agent: ObservableObject {
             Memory.add(fact)
             log("🧠 remembered: \(fact)")
         }
+        await MemoryTidy.runIfDue()
     }
 
     private func intro(_ request: String) -> String {
@@ -377,7 +493,10 @@ final class Agent: ObservableObject {
         // Only the memory that matters for this request (plus core facts); the rest is one recall away.
         let context = [request, targetApp?.cleanName ?? "", selectedText ?? "", continuation?.request ?? ""].joined(separator: " ")
         let (facts, omitted) = Memory.relevant(to: context)
-        if !facts.isEmpty { text += "\nThings you remember about the user:\n" + facts.map { "- \($0)" }.joined(separator: "\n") }
+        let profile = facts.filter(Memory.isProfile), other = facts.filter { !Memory.isProfile($0) }
+        text += "\nThe user's profile (their own details: fill forms with these and never ask for them; the latest line wins if two disagree):\n"
+            + "- Full name: \(NSFullUserName())\n" + profile.map { "- \($0)" }.joined(separator: "\n")
+        if !other.isEmpty { text += "\nOther things you remember about the user:\n" + other.map { "- \($0)" }.joined(separator: "\n") }
         if omitted > 0 { text += "\n(\(omitted) more remembered facts not shown — use recall if you need something about the user that isn't here.)" }
         return text
     }
@@ -419,7 +538,7 @@ final class Agent: ObservableObject {
             let line = begin("Go to \(url.host ?? raw)")
             // Already there: nothing to open (in a QA test the page is always loaded fresh).
             if qa != nil, let page = context.page, page.url.hasPrefix(url.absoluteString) || url.absoluteString.hasPrefix(page.url),
-               let tab = await BrowserBridge.shared.activeTab() {
+               let tab = await BrowserBridge.shared.activeTab(in: context.app) {
                 await BrowserBridge.shared.tabCommand("navigate", on: tab, ["url": url.absoluteString])
                 try? await Task.sleep(for: .milliseconds(1200))
                 await refresh(&context)
@@ -457,7 +576,7 @@ final class Agent: ObservableObject {
             await refresh(&context)
             // With the extension we can check the page really opened; if the typed address went astray, go directly.
             if let page = context.page, let host = url.host?.replacingOccurrences(of: "www.", with: ""),
-               !page.url.contains(host), let tab = await BrowserBridge.shared.activeTab() {
+               !page.url.contains(host), let tab = await BrowserBridge.shared.activeTab(in: context.app) {
                 // Only ever redirect our own tab; otherwise open the page in a new one.
                 if tab.id == ownedTab {
                     await BrowserBridge.shared.tabCommand("navigate", on: tab, ["url": url.absoluteString])
@@ -492,6 +611,112 @@ final class Agent: ObservableObject {
             }
             buddy.clearHighlight()
             return end(line, .init(ok: true, summary: "clicked \(el.role) \(el.text.prefix(60).debugDescription) on the page"))
+
+        case "application":
+            // The application tracker: find before applying, record after filling/sending.
+            let op = (action["op"] as? String ?? "find").lowercased()
+            let company = (action["company"] as? String) ?? "", role = (action["role"] as? String) ?? ""
+            let link = action["url"] as? String
+            if op == "find" || op == "check" {
+                let query = (action["query"] as? String) ?? [company, role, link ?? ""].joined(separator: " ")
+                let hits = Applications.find(query)
+                return .init(ok: true, summary: hits.isEmpty ? "no earlier application matches \(query.debugDescription)"
+                             : "already in the tracker:\n" + hits.map { "- " + Applications.describe($0) }.joined(separator: "\n"))
+            }
+            if op == "list" || op == "show" {
+                let card = Applications.card
+                runResult = card
+                result = card
+                onResult()
+                steps.append(Step(text: "Showed \(card.title)", state: .info))
+                return .init(ok: true, summary: "tracker shown to the user:\n" + card.plain.prefix(3000))
+            }
+            guard !company.isEmpty else { return fail("application record needs company (and role)") }
+            let summary = Applications.record(company: company, role: role, url: link, status: (action["status"] as? String) ?? "",
+                                              resume: action["resume"] as? String, notes: action["notes"] as? String)
+            steps.append(Step(text: "Tracked: \(company) — \(role)", state: .info))
+            return .init(ok: true, summary: summary)
+
+        case "upload" where context.page != nil:
+            // Straight into the page's upload field (no Mac file picker): the extension builds the file from its bytes.
+            guard let path = (action["file"] ?? action["path"]) as? String else { return fail("upload needs file") }
+            let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+            guard let data = try? Data(contentsOf: url) else { return fail("can't read \(url.path)") }
+            guard data.count < 15_000_000 else { return fail("\(url.lastPathComponent) is too big to upload this way (\(data.count / 1_000_000) MB)") }
+            let page = context.page!
+            var index = -1
+            if Self.isWebRef(action["id"]) {
+                guard let (el, _) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
+                index = el.index
+            }
+            let line = begin("Upload \(url.lastPathComponent)")
+            let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+            do {
+                let r = try await BrowserBridge.shared.perform("upload", on: page, ["index": index, "name": url.lastPathComponent, "type": type,
+                                                                                    "data": data.base64EncodedString()], timeout: 20)
+                guard r["ok"] as? Bool == true else { return end(line, fail("the page didn't take the file")) }
+                try? await Task.sleep(for: .milliseconds(800))   // sites upload/parse it (Greenhouse fills fields from a resume)
+                return end(line, .init(ok: true, summary: "attached \(url.lastPathComponent) to the upload field (now holds: \((r["files"] as? [String] ?? []).joined(separator: ", ")))"))
+            } catch {
+                return end(line, fail("\(error.localizedDescription) — if the site uses its own picker (Google Forms uses Google Drive), click its upload button instead"))
+            }
+
+        case "review" where context.page != nil:
+            return await reviewForm(context.page!)
+
+        case "choose" where Self.isWebRef(action["id"]):
+            // A dropdown in one step: open it with a real click (type to filter if it's a search box), find the
+            // option by its text, click it, then check the field shows it. Works for native selects, Google Forms
+            // listboxes and React-style comboboxes (Greenhouse, Lever…).
+            guard let want = (action["option"] ?? action["text"]) as? String, !want.isEmpty else { return fail("choose needs option") }
+            guard let (el, rect) = webTarget(action["id"], context), let page = context.page, let app = context.app,
+                  let web = context.webArea else { return fail("page element \(action["id"] ?? "?") not found; look again") }
+            let line = begin("Choose “\(want.prefix(40))”")
+            await Launcher.bringToFront(app)
+            await buddy.travel(to: CGPoint(x: rect.midX, y: rect.midY), framing: rect)
+            let current = { (try? await BrowserBridge.shared.perform("chosen", on: page, ["index": el.index]))?["value"] as? String ?? "" }
+            if el.role == "select" {
+                do {
+                    let r = try await BrowserBridge.shared.perform("fill", on: page, ["index": el.index, "text": want])
+                    buddy.clearHighlight()
+                    return end(line, .init(ok: true, summary: "chose \((r["value"] as? String ?? want).debugDescription) in the dropdown"))
+                } catch { return end(line, fail(error.localizedDescription)) }
+            }
+            if AXEngine.similar(await current(), want) {
+                buddy.clearHighlight()
+                return end(line, .init(ok: true, summary: "\(want.debugDescription) was already chosen"))
+            }
+            await hand.click(at: CGPoint(x: rect.midX, y: rect.midY))
+            if el.editable {
+                // A search-as-you-type box: typing narrows the list to the option.
+                try? await Task.sleep(for: .milliseconds(150))
+                AXEngine.targetPid = app.processIdentifier
+                await hand.enterText(want, codeEditor: false)
+                AXEngine.targetPid = nil
+            }
+            var option: [String: Any]?
+            for _ in 0..<10 {
+                try? await Task.sleep(for: .milliseconds(200))
+                option = try? await BrowserBridge.shared.perform("findOption", on: page, ["text": want])
+                if option?["found"] as? Bool == true { break }
+            }
+            guard let option, option["found"] as? Bool == true,
+                  let x = (option["x"] as? NSNumber)?.doubleValue, let y = (option["y"] as? NSNumber)?.doubleValue,
+                  let w = (option["w"] as? NSNumber)?.doubleValue, let h = (option["h"] as? NSNumber)?.doubleValue else {
+                hand.press("esc")
+                let seen = (option?["options"] as? [String]) ?? []
+                return end(line, fail("no option like \(want.debugDescription)\(seen.isEmpty ? " appeared" : "; the options are: " + seen.joined(separator: " | "))"))
+            }
+            let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
+            await hand.click(at: CGPoint(x: web.minX + (x + w / 2) * sx, y: web.minY + (y + h / 2) * sy))
+            try? await Task.sleep(for: .milliseconds(350))
+            let now = await current()
+            buddy.clearHighlight()
+            let picked = option["text"] as? String ?? want
+            if !now.isEmpty, !AXEngine.similar(now, picked), !now.lowercased().contains(picked.lowercased()) {
+                return end(line, fail("clicked \(picked.debugDescription) but the field shows \(now.debugDescription)"))
+            }
+            return end(line, .init(ok: true, summary: "chose \(picked.debugDescription)\(now.isEmpty ? "" : " (field shows \(now.debugDescription))")"))
 
         case "type" where Self.isWebRef(action["id"]):
             guard let text = action["text"] as? String else { return fail("type needs text") }
@@ -581,7 +806,23 @@ final class Agent: ObservableObject {
             await Launcher.bringToFront(app)
             let before = try? await BrowserBridge.shared.perform("activeValue", on: page)
             guard before?["editable"] as? Bool == true else {
-                return end(line, fail("no text box on the page has focus; click one first (give its w-id)"))
+                // The caret is in something the page can't see: a native dialog over it (the upload picker's
+                // "Go to folder" box, a Save sheet) or a frame. Type there if the app says a text field has focus.
+                let role = AXEngine.focusedRole(of: app) ?? ""
+                guard ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role) else {
+                    return end(line, fail("no text box on the page has focus; click one first (give its w-id)"))
+                }
+                AXEngine.targetPid = app.processIdentifier
+                let landed = await hand.type(text, in: app)
+                AXEngine.targetPid = nil
+                guard landed else { return end(line, fail("the text didn't land in the focused field")) }
+                if action["submit"] as? Bool == true {
+                    try? await Task.sleep(for: .milliseconds(120))
+                    hand.press("return")
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
+                context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+                return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into the focused field (outside the page)\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
             }
             if let existing = before?["value"] as? String, !existing.isEmpty {
                 AXEngine.targetPid = app.processIdentifier
@@ -776,6 +1017,16 @@ final class Agent: ObservableObject {
             if let missing = files.first(where: { !FileManager.default.fileExists(atPath: $0.path) }) { return fail("no such file: \(missing.path)") }
             let draft = action["draft"] as? Bool ?? false
             let subject = (action["subject"] as? String) ?? files.first?.deletingPathExtension().lastPathComponent ?? ""
+            // An address the user never gave (not in their request, what they selected, their answers or memory) may
+            // come from a page or email trying to steer Clinqy: always confirm those, whatever the request said.
+            let known = ([request, selectedText ?? ""] + userAnswers + Memory.facts).joined(separator: "\n").lowercased()
+            let strangers = (to + cc).filter { !known.contains($0.lowercased()) }
+            if !draft, !strangers.isEmpty {
+                let reply = await askUser("Send this to \(strangers.joined(separator: ", "))? That address came from what I read, not from you.",
+                                          options: ["Yes, send it", "No"])
+                guard let reply, Safety.isYes(reply) else { return fail("the user didn't confirm sending to \(strangers.joined(separator: ", ")); don't send it") }
+                userAnswers.append(strangers.joined(separator: " "))
+            }
             if !draft, !(await confirmRisky("Send email")) { return fail("the user said not to send it") }
             let line = begin("\(draft ? "Draft" : "Email") \(to.joined(separator: ", "))\(files.isEmpty ? "" : " · \(files.count) attachment\(files.count == 1 ? "" : "s")")")
             let r = await Mailer.send(to: to, cc: cc, subject: subject, body: (action["body"] as? String) ?? "", attachments: files, draft: draft)
@@ -801,6 +1052,23 @@ final class Agent: ObservableObject {
             await buddy.mark(rect, label: action["label"] as? String)
             hand.lingerBeforeHome = 3.5
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
+
+        case "ask" where !reviewedForm && context.page != nil
+                && (action["question"] as? String ?? "").range(of: #"(?i)\b(submit|apply|send (the |this |my )?(form|application))\b"#, options: .regularExpression) != nil:
+            // Before "ready to submit?", show the user every answer on the form (and catch empty required ones).
+            reviewedForm = true   // once per run, whatever happens
+            let r = await reviewForm(context.page!)
+            guard r.ok else { return await perform(action, context: &context) }   // no form found: just ask
+            return .init(ok: false, summary: "NOT ASKED YET — the form review is on screen for the user:\n\(r.summary)\n"
+                         + "If a required answer is missing or wrong, fix it first; otherwise ask your question again.")
+
+        case "ask" where !checkedMemoryForAsk && Self.asksForPersonalDetails(action["question"] as? String ?? ""):
+            // Before bothering the user for their own details, look in memory once; they may already be there.
+            checkedMemoryForAsk = true
+            let hits = Memory.search(action["question"] as? String ?? "")
+            guard !hits.isEmpty else { return await perform(action, context: &context) }
+            return .init(ok: false, summary: "NOT ASKED — you already remember this about the user (use it, and ask only for what's truly missing):\n"
+                         + hits.prefix(15).map { "- \($0)" }.joined(separator: "\n"))
 
         case "ask" where qa != nil:
             return fail("this is an unattended test — nobody can answer; assert the missing information as a failed check and finish")
@@ -940,7 +1208,7 @@ final class Agent: ObservableObject {
         context.elements = scan.elements
         context.fingerprint = scan.fingerprint
         // Keep the web page current too, so page actions in the same turn see what's actually there.
-        if Launcher.isBrowser(app), BrowserBridge.shared.isConnected, let page = await BrowserBridge.shared.snapshot() {
+        if Launcher.isBrowser(app), BrowserBridge.shared.isConnected, let page = await BrowserBridge.shared.snapshot(for: app) {
             context.page = page
             context.webArea = await Task.detached { AXEngine.webAreaFrame(of: app) }.value ?? page.estimatedArea
         } else {
@@ -1012,6 +1280,7 @@ final class Agent: ObservableObject {
             result = runResult
             onResult()
         }
+        if !isTest { recordStats(ok: ok, answer: text) }
         if !isTest { History.shared.add(.init(date: started, request: request, answer: text, ok: ok,
                                  steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult,
                                  trace: trace.isEmpty ? nil : trace)) }
@@ -1057,6 +1326,12 @@ final class Agent: ObservableObject {
 
     static func writeLog(_ line: String) {
         guard let data = (line + "\n").data(using: .utf8) else { return }
+        // Keep one old log (agent.log.1) once this one passes 5 MB.
+        if let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size]) as? Int, size > 5_000_000 {
+            let old = logURL.appendingPathExtension("1")
+            try? FileManager.default.removeItem(at: old)
+            try? FileManager.default.moveItem(at: logURL, to: old)
+        }
         if let handle = try? FileHandle(forWritingTo: logURL) {
             handle.seekToEndOfFile()
             handle.write(data)
@@ -1089,7 +1364,12 @@ struct Observation {
         var page: BrowserBridge.Page?
         var webArea: CGRect?
         if Launcher.isBrowser(app), BrowserBridge.shared.isConnected {
-            page = await BrowserBridge.shared.snapshot()
+            page = await BrowserBridge.shared.snapshot(for: app)
+            // Still arriving (or nothing listed yet on a page that isn't blocked): give it a moment, once.
+            if let p = page, p.ready == "loading" || (p.elements.isEmpty && p.problem == nil) {
+                try? await Task.sleep(for: .milliseconds(700))
+                page = await BrowserBridge.shared.snapshot(for: app) ?? page
+            }
             if page != nil { webArea = await Task.detached { AXEngine.webAreaFrame(of: app) }.value ?? page?.estimatedArea }
             if webArea == nil { page = nil }
         }
@@ -1118,6 +1398,11 @@ struct Observation {
             Page elements (visible part):
             \(items.isEmpty ? "(none)" : items.joined(separator: "\n"))
             """
+            if !page.messages.isEmpty { text += "\nMessages on the page: " + page.messages.map { "“\($0)”" }.joined(separator: " · ") }
+            if page.above + page.below > 0 { text += "\nNot shown (scroll to reach): \(page.above) fields/buttons above, \(page.below) below." }
+            if !page.text.isEmpty { text += "\nText on screen: \(page.text)" }
+            if page.ready == "loading" { text += "\n(The page is still loading.)" }
+            if let problem = page.problem { text += "\n(Couldn't read the page: \(problem). Use look and click by position, or read.)" }
         } else if Launcher.isBrowser(app) {
             text += "\n(Browser extension not connected: page content comes from Accessibility only.)"
         }
@@ -1230,7 +1515,15 @@ extension Agent {
             let passed = finishedOK && !checks.contains { !$0.pass }
             // Keep (or refresh) the compiled script when this run went through with the model.
             if finishedOK, mode != "replay", !trace.isEmpty {
-                let wf = Workflow(name: name, summary: "QA test", params: [], steps: trace, created: Date())
+                // A replay must start from the test's own page, freshly loaded: if the model skipped "Go to" because
+                // the page was already open, the script would run on whatever an earlier test left behind.
+                var steps = trace
+                if let first = test.range(of: #"(?im)^\s*(?:go to|open|visit|navigate to)\s+(https?://\S+)"#, options: .regularExpression),
+                   let url = test[first].range(of: #"https?://\S+"#, options: .regularExpression).map({ String(test[first][$0]) }),
+                   steps.first?.action != "open_url" {
+                    steps.insert(WorkflowStep(action: "open_url", url: url), at: 0)
+                }
+                let wf = Workflow(name: name, summary: "QA test", params: [], steps: steps, created: Date())
                 try? FileManager.default.createDirectory(at: compiled.deletingLastPathComponent(), withIntermediateDirectories: true)
                 try? JSONEncoder.iso8601.encode(wf).write(to: compiled, options: .atomic)
             }

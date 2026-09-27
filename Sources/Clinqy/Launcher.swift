@@ -1,4 +1,5 @@
 import AppKit
+import NaturalLanguage
 
 /// Opening and focusing apps and URLs.
 @MainActor
@@ -130,18 +131,21 @@ enum Memory {
         return text.split(separator: "\n").map { $0.trimmingCharacters(in: CharacterSet(charactersIn: "- ")) }.filter { !$0.isEmpty }
     }
 
-    /// Facts always worth sending: who the user is and how to reach/represent them.
-    private static let corePattern = #"(?i)\b(the user is|name is|phone number|mobile number|default browser|messages people|based in|resume)\b"#
+    /// Profile facts, always sent: who the user is and how to reach/represent them (forms need all of these).
+    private static let corePattern = #"(?i)\b(the user is|name is|full name|phone|mobile|e-?mail|default browser|messages people|based in|lives in|resume|college|cgpa|gpa|degree|graduat|roll number|linkedin|github|portfolio|address|born|birthday|date of birth|gender|tech stack|skills|student at)\b"#
+
+    /// Below this size every fact goes along with every request (about 4k tokens); above it the most relevant are picked.
+    private static let sendAllBudget = 16_000
 
     /// Related words, so "order food" finds Swiggy and "apply" finds the resume.
     private static let related: [String: [String]] = [
         "food": ["swiggy", "zomato", "order", "eat", "hungry", "meal", "delivery", "protein", "subway"],
         "order": ["swiggy", "zomato", "food", "amazon", "buy", "delivery"],
-        "apply": ["resume", "college", "cgpa", "internship", "internships", "experience", "linkedin", "github", "portfolio", "student", "won", "preference"],
-        "application": ["resume", "college", "cgpa", "internships", "linkedin", "github", "portfolio", "student", "won", "preference"],
+        "apply": ["resume", "college", "cgpa", "internship", "internships", "experience", "linkedin", "github", "portfolio", "student", "won", "preference", "applied"],
+        "application": ["resume", "college", "cgpa", "internships", "linkedin", "github", "portfolio", "student", "won", "preference", "applied"],
         "internship": ["resume", "internships", "cgpa", "college", "student", "linkedin", "github", "stack"],
-        "form": ["resume", "college", "linkedin", "github", "preference", "email"],
-        "job": ["resume", "internship", "experience", "linkedin"],
+        "form": ["resume", "college", "linkedin", "github", "preference", "email", "applied"],
+        "job": ["resume", "internship", "experience", "linkedin", "applied"],
         "mail": ["gmail", "email", "account"], "gmail": ["email", "account", "somaiya"],
         "sign": ["account", "password", "incognito", "2-step", "verification", "email"],
         "login": ["account", "password", "incognito", "email"],
@@ -163,37 +167,66 @@ enum Memory {
         Set(text.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count >= 3 && !stop.contains($0) })
     }
 
-    /// The facts worth sending for this request: the core ones plus those sharing words (or related words) with it.
-    static func relevant(to context: String, limit: Int = 15) -> (facts: [String], omitted: Int) {
+    static func isProfile(_ fact: String) -> Bool { fact.range(of: corePattern, options: .regularExpression) != nil }
+
+    /// On-device sentence vectors (NaturalLanguage), so "fill this form" also finds "CGPA 8.96" without sharing a word.
+    private static let embedding = NLEmbedding.sentenceEmbedding(for: .english)
+
+    /// How well `fact` matches the request: shared (or related) words, plus meaning similarity.
+    private static func score(_ fact: String, want: Set<String>, context: String) -> Double {
+        let fw = words(fact)
+        let keyword = Double(fw.filter { f in want.contains { f.hasPrefix($0) || $0.hasPrefix(f) && f.count >= 4 } }.count)
+        var semantic = 0.0
+        if let embedding, !context.isEmpty {
+            let d = embedding.distance(between: context.lowercased(), and: fact.lowercased(), distanceType: .cosine)
+            if d.isFinite { semantic = max(0, 1.0 - d) * 3 }   // cosine distance 0…2 → 3 (same meaning) … 0
+        }
+        return keyword + semantic
+    }
+
+    /// The facts worth sending for this request: the profile always; everything else too while memory is small,
+    /// otherwise the best-matching ones.
+    static func relevant(to context: String, limit: Int = 40) -> (facts: [String], omitted: Int) {
         let all = facts
+        let profile = all.filter(isProfile)
+        let rest = all.filter { !isProfile($0) }
+        if all.joined().count <= sendAllBudget { return (profile + rest, 0) }
         var want = words(context)
         for w in want { for (key, more) in related where w.hasPrefix(key) || key.hasPrefix(w) && w.count >= 4 { want.formUnion(more) } }
-        var chosen: [String] = []
-        var scored: [(String, Int)] = []
-        for fact in all {
-            if fact.range(of: corePattern, options: .regularExpression) != nil { chosen.append(fact); continue }
-            let fw = words(fact)
-            let score = fw.filter { f in want.contains { f.hasPrefix($0) || $0.hasPrefix(f) && f.count >= 4 } }.count
-            if score > 0 { scored.append((fact, score)) }
-        }
-        chosen += scored.sorted { $0.1 > $1.1 }.prefix(max(0, limit - chosen.count)).map(\.0)
+        let ranked = rest.map { ($0, score($0, want: want, context: context)) }.filter { $0.1 > 0.6 }.sorted { $0.1 > $1.1 }
+        let chosen = profile + ranked.prefix(max(0, limit - profile.count)).map(\.0)
         return (chosen, all.count - chosen.count)
     }
 
-    /// Searches everything remembered (for the agent's recall action).
+    /// Searches everything remembered (for the agent's recall action), best matches first.
     static func search(_ query: String) -> [String] {
         let q = query.trimmingCharacters(in: .whitespaces)
         if q.isEmpty { return facts }
-        let hits = relevant(to: q, limit: 40).facts.filter { fact in
-            fact.range(of: corePattern, options: .regularExpression) == nil || !words(fact).isDisjoint(with: words(q))
+        var want = words(q)
+        for w in want { for (key, more) in related where w.hasPrefix(key) || key.hasPrefix(w) && w.count >= 4 { want.formUnion(more) } }
+        return facts.map { ($0, score($0, want: want, context: q)) }.filter { $0.1 > 0.9 }
+            .sorted { $0.1 > $1.1 }.prefix(25).map(\.0)
+    }
+
+    /// Replaces every fact (memory tidy-up), keeping the previous file as memory.backup-<date>.md (last 3 kept).
+    static func replaceAll(with facts: [String], backup: Bool) {
+        let fm = FileManager.default
+        if backup, fm.fileExists(atPath: url.path) {
+            let stamp = Date().formatted(.iso8601.year().month().day().dateSeparator(.dash).time(includingFractionalSeconds: false).timeSeparator(.omitted))
+            let copy = url.deletingLastPathComponent().appendingPathComponent("memory.backup-\(stamp).md")
+            try? fm.copyItem(at: url, to: copy)
+            let dir = url.deletingLastPathComponent()
+            let old = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasPrefix("memory.backup-") }.sorted()
+            for name in old.dropLast(3) { try? fm.removeItem(at: dir.appendingPathComponent(name)) }
         }
-        return hits.isEmpty ? relevant(to: q, limit: 40).facts : hits
+        try? (facts.map { "- \($0)" }.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 
     static func add(_ fact: String) {
         var all = facts.filter { $0 != fact }
         all.append(fact)
         try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? all.suffix(60).map { "- \($0)" }.joined(separator: "\n").write(to: url, atomically: true, encoding: .utf8)
+        // Never drop facts to make room (a cap here once silently deleted the user's email, CGPA and more).
+        try? (all.map { "- \($0)" }.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
     }
 }

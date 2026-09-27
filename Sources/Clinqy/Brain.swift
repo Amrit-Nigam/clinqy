@@ -144,6 +144,8 @@ enum Brain {
     static func json(from reply: String) -> [String: Any]? {
         if let start = reply.firstIndex(of: "{"), let end = reply.lastIndex(of: "}"), start < end,
            let obj = try? JSONSerialization.jsonObject(with: Data(reply[start...end].utf8)) as? [String: Any] {
+            // A bare action ({"do":"ask",…}) instead of the reply envelope: run it as the turn's only action.
+            if obj["do"] != nil, obj["actions"] == nil { return ["say": "", "actions": [obj], "done": false] }
             return obj
         }
         // Sometimes the model writes tool-call tags instead (`<invoke name="scroll"><parameter name="dir">up</parameter>…`):

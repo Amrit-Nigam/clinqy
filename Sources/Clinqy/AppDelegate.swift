@@ -29,6 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         resultPanel = ResultPanel(agent: agent)
         agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
         enableOpenAtLogin()
+        _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
         installEditMenu()
         dismissOnOutsideClick()
         Brain.prewarm()
@@ -73,6 +74,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Circle Something…", action: #selector(startCircling), keyEquivalent: "")
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
+        menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
+        menu.addItem(withTitle: "Tidy Memory", action: #selector(tidyMemory), keyEquivalent: "")
         menu.addItem(.separator())
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleOpenAtLogin(_:)), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
@@ -92,8 +95,31 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    /// `clinqy://run?task=…` runs a task in whatever app is in front (used for scripting and tests).
+    /// A secret only local programs can read (~/.config/clinqy/cli-token, owner-only). Every clinqy:// link must
+    /// carry it: any web page can open a clinqy:// link, and must never be able to start tasks, answer questions
+    /// ("Yes, send it") or write files.
+    static let cliToken: String = {
+        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/cli-token")
+        if let saved = try? String(contentsOf: url, encoding: .utf8).trimmingCharacters(in: .whitespacesAndNewlines), saved.count >= 32 {
+            return saved
+        }
+        let token = (0..<32).map { _ in String(format: "%02x", UInt8.random(in: 0...255)) }.joined()
+        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+        FileManager.default.createFile(atPath: url.path, contents: Data(token.utf8), attributes: [.posixPermissions: 0o600])
+        return token
+    }()
+
+    /// `clinqy://run?task=…&token=…` runs a task in whatever app is in front (used for scripting and tests).
     func application(_ application: NSApplication, open urls: [URL]) {
+        let urls = urls.filter { url in
+            let token = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "token" }?.value
+            guard url.scheme == "clinqy", token == Self.cliToken else {
+                Agent.writeLog("ignored a clinqy:// link without the right token (host: \(url.host ?? "?"))")
+                return false
+            }
+            return true
+        }
+        for url in urls where url.host == "browser" { Task { await answerBrowserQuery(url) } }
         for url in urls where url.scheme == "clinqy" && url.host == "reload-extension" {
             Task { Agent.writeLog("extension reloaded in \(await BrowserBridge.shared.reloadAll()) browser(s)") }
         }
@@ -122,6 +148,39 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             let test = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "test" }?.value == "1"
             agent.submit(task, test: test)
         }
+    }
+
+    /// `clinqy://browser?cmd=page|read|url&id=…`: what's in the focused browser tab, for the `clinqy page` command
+    /// (read-only). The answer goes to Application Support/Clinqy/cli/<id>.txt, which the command waits for.
+    private func answerBrowserQuery(_ url: URL) async {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard let id = items.first(where: { $0.name == "id" })?.value, id.range(of: #"^[A-Za-z0-9-]{1,40}$"#, options: .regularExpression) != nil
+        else { return }
+        let cmd = items.first { $0.name == "cmd" }?.value ?? "page"
+        var out: String
+        if !BrowserBridge.shared.isConnected {
+            out = "ERROR: the Clinqy browser extension isn't connected (open the browser; load extension/ from the repo)"
+        } else if let page = await BrowserBridge.shared.snapshot() {
+            switch cmd {
+            case "url": out = "\(page.title)\n\(page.url)"
+            case "read":
+                let r = try? await BrowserBridge.shared.perform("read", on: page, timeout: 8)
+                out = "\(page.title)\n\(page.url)\n\n\((r?["text"] as? String) ?? page.text)"
+            default:
+                var lines = ["\(page.title)", page.url]
+                if let problem = page.problem { lines.append("(can't read this page: \(problem))") }
+                lines += page.elements.map { "w\($0.index) \($0.role): \($0.text)\($0.extra.isEmpty ? "" : " [\($0.extra)]")" }
+                if !page.messages.isEmpty { lines.append("Messages: " + page.messages.joined(separator: " · ")) }
+                if page.above + page.below > 0 { lines.append("Not shown: \(page.above) fields/buttons above, \(page.below) below") }
+                if !page.text.isEmpty { lines.append("Text on screen: " + page.text) }
+                out = lines.joined(separator: "\n")
+            }
+        } else {
+            out = "ERROR: no focused browser tab (click into the browser window first)"
+        }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/cli", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try? out.write(to: dir.appendingPathComponent("\(id).txt"), atomically: true, encoding: .utf8)
     }
 
     /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
@@ -312,7 +371,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         if agent.selectedText == nil, Launcher.isBrowser(front), BrowserBridge.shared.isConnected {
             Task { [agent] in
-                if let text = await BrowserBridge.shared.selection(), agent?.isRunning == false { agent?.selectedText = text }
+                if let text = await BrowserBridge.shared.selection(in: front), agent?.isRunning == false { agent?.selectedText = text }
             }
         }
     }
@@ -379,6 +438,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         rememberTarget()
         if !panel.isVisible { panel.showCentered() }
         startListening(autoStop: true)
+    }
+
+    @objc func showApplications() { agent.showApplications() }
+
+    @objc func tidyMemory() {
+        Task {
+            let report = await MemoryTidy.run() ?? "Memory is already tidy (or the tidy-up would have lost details, so it was skipped)"
+            let alert = NSAlert()
+            alert.messageText = "Memory"
+            alert.informativeText = report
+            alert.runModal()
+        }
     }
 
     @objc func openMemory() {

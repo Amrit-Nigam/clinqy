@@ -1,42 +1,59 @@
 #!/bin/zsh
 # End-to-end tests for Clinqy in Chrome, against local pages only (tests/site).
-# Needs: Clinqy.app running (./build.sh run) and the extension installed in Chrome.
-# Usage: tests/run.sh [name-filter]
+# Needs: Clinqy.app running (./build.sh run) and the extension installed in the browser under test.
+# Usage: tests/run.sh [name-filter]          CLINQY_BROWSER=Arc tests/run.sh  (default: Google Chrome)
 set -u
 cd "$(dirname "$0")"
 LOG=~/Library/Logs/Clinqy/agent.log
 BASE=http://127.0.0.1:8765
 FILTER=${1:-}
+BROWSER=${CLINQY_BROWSER:-Google Chrome}
 PASS=0; FAIL=0
 
 pgrep -x Clinqy >/dev/null || { echo "Clinqy isn't running (./build.sh run)"; exit 1; }
 python3 -m http.server 8765 --bind 127.0.0.1 --directory site >/dev/null 2>&1 &
 SERVER=$!
-trap 'kill $SERVER 2>/dev/null; osascript -e "tell application \"Google Chrome\" to close (every window whose URL of active tab starts with \"$BASE\")" >/dev/null 2>&1' EXIT
-osascript -e 'tell application "Google Chrome" to make new window' -e 'tell application "Google Chrome" to activate' >/dev/null
+trap 'kill $SERVER 2>/dev/null; osascript -e "tell application \"$BROWSER\" to close (every window whose URL of active tab starts with \"$BASE\")" >/dev/null 2>&1
+      [[ $BROWSER == Arc ]] && osascript -e "tell application \"Arc\" to tell front window to close (every tab whose URL starts with \"$BASE\")" >/dev/null 2>&1' EXIT
+chrome() { osascript -e "tell application \"$BROWSER\" to $1" 2>/dev/null; }
+frontmost() { osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'; }
+# Open a test page. Arc ignores setting a tab's URL by script, so it gets a new tab each time.
+goto() {
+  if [[ $BROWSER == Arc ]]; then chrome "tell front window to make new tab with properties {URL:\"$1\"}" >/dev/null
+  else chrome "set URL of active tab of front window to \"$1\""; fi
+}
+# Bring the browser forward and wait until it really is (macOS ignores AppleScript "activate" from background scripts).
+front_chrome() {
+  for i in 1 2 3 4 5 6; do
+    open -a "$BROWSER"; sleep 0.5
+    [[ $(frontmost) == "$BROWSER" ]] && return 0
+  done
+  return 1
+}
+chrome "make new window" >/dev/null
+front_chrome || { echo "Couldn't bring $BROWSER to the front"; exit 1; }
 sleep 1
 touch $LOG
 
-chrome() { osascript -e "tell application \"Google Chrome\" to $1" 2>/dev/null; }
 
 # case <name> <page> <task> <check: title:<text> | answer:<text> | notitle:<text>> [auto-answer]
 case_() {
   local name=$1 page=$2 task=$3 check=$4 reply=${5:-}
   [[ -n $FILTER && $name != *$FILTER* ]] && return
-  chrome "set URL of active tab of front window to \"$BASE/$page\""
-  chrome "activate"
-  sleep 2.5
-  local front=$(osascript -e 'tell application "System Events" to get name of first process whose frontmost is true')
+  goto "$BASE/$page"
+  front_chrome
+  sleep 2
+  local front=$(frontmost)
   local url=$(chrome "get URL of active tab of front window")
-  if [[ $front != "Google Chrome" || $url != $BASE/* ]]; then echo "SKIP  $name (test page not in front: $front $url)"; return; fi
+  if [[ $front != "$BROWSER" || $url != $BASE/* ]]; then echo "SKIP  $name (test page not in front: $front $url)"; return; fi
   local start=$(wc -l < $LOG) t0=$(date +%s)
-  open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1"
+  open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1&token=$(cat ~/.config/clinqy/cli-token)"
   local answered=0
   for i in $(seq 1 90); do
     sleep 1
     local out=$(tail -n +$((start+1)) $LOG)
     if [[ -n $reply && $answered == 0 && $out == *"Ask:"* || -n $reply && $answered == 0 && $out == *"About to click"* ]]; then
-      sleep 1; open -g "clinqy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$reply")"; answered=1
+      sleep 1; open -g "clinqy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$reply")&token=$(cat ~/.config/clinqy/cli-token)"; answered=1
     fi
     echo $out | grep -qE "\] (✓|✗)" && break
   done
@@ -72,11 +89,13 @@ watch_learn() {
   [[ -x $B ]] || { echo "SKIP  watch-learn (swift build first)"; return; }
   local SK=~/Library/Application\ Support/Clinqy/skills.json
   local before=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/Clinqy/skills.json');print(len(json.load(open(p))) if os.path.exists(p) else 0)")
-  chrome "set URL of active tab of front window to \"$BASE/form.html\""; chrome "activate"; sleep 2.5
-  open -g "clinqy://watch"; sleep 1.5
+  goto "$BASE/form.html"; front_chrome; sleep 2
+  # Never type into whatever else is in front (an editor, a terminal).
+  [[ $(frontmost) == "$BROWSER" ]] || { echo "SKIP  watch-learn ($BROWSER not in front: $(frontmost))"; return; }
+  open -g "clinqy://watch?token=$(cat ~/.config/clinqy/cli-token)"; sleep 1.5
   $B --click-label "Your name" >/dev/null && sleep 0.4 && $B --type "Amrit Nigam"; sleep 0.4
   $B --click-label "Keynote" >/dev/null; sleep 0.4; $B --click-label "Great" >/dev/null; sleep 0.6
-  open -g "clinqy://stop-watching"
+  open -g "clinqy://stop-watching?token=$(cat ~/.config/clinqy/cli-token)"
   local name=""
   for i in $(seq 1 30); do sleep 1
     name=$(python3 -c "import json,os;p=os.path.expanduser('~/Library/Application Support/Clinqy/skills.json');d=json.load(open(p)) if os.path.exists(p) else [];print(d[0]['name'] if len(d)>$before else '')")
@@ -93,6 +112,7 @@ watch_learn
 # The clinqy command: learn a QA test, then it must replay with no model.
 qa_cli() {
   [[ -n $FILTER && qa-cli != *$FILTER* ]] && return
+  goto "$BASE/form.html"; front_chrome; sleep 2   # a fresh form, not one an earlier case filled
   local out
   out=$(../bin/clinqy qa qa/feedback-form.md --relearn 2>&1 | head -1)
   if [[ $out != PASS* ]]; then FAIL=$((FAIL+1)); echo "FAIL  qa-learn         $out"; return; fi
