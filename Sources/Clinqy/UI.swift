@@ -204,6 +204,13 @@ struct CommandView: View {
                         .padding(.top, 12)
                         .transition(.opacity)
                 }
+                if !agent.selectedFiles.isEmpty, !agent.isRunning {
+                    ContextChip(icon: "doc.on.doc", text: agent.selectedFiles.count == 1 ? agent.selectedFiles[0].lastPathComponent
+                                : "\(agent.selectedFiles.count) files · " + agent.selectedFiles.map(\.lastPathComponent).joined(separator: ", ")) { agent.selectedFiles = [] }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 12)
+                        .transition(.opacity)
+                }
                 if let circled = agent.annotation, !agent.isRunning {
                     ContextChip(icon: "lasso", text: "Circled area · \(Int(circled.rect.width))×\(Int(circled.rect.height))") { agent.annotation = nil }
                         .padding(.horizontal, 18)

@@ -296,6 +296,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let front = NSWorkspace.shared.frontmostApplication
         guard let front, front.bundleIdentifier != Bundle.main.bundleIdentifier else { return }
         agent.targetApp = front
+        // Files selected in Finder ride along instead of text ("compress this", "merge these").
+        agent.selectedFiles = front.bundleIdentifier == "com.apple.finder" ? AXEngine.copiedFiles(of: front) : []
+        guard agent.selectedFiles.isEmpty else { agent.selectedText = nil; return }
         // Whatever the user had highlighted goes along with their request.
         agent.selectedText = AXEngine.selectedText(of: front)
         if agent.selectedText == nil, !Launcher.isBrowser(front) {

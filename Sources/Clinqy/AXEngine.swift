@@ -378,6 +378,22 @@ enum AXEngine {
     /// Selection via a synthetic ⌘C, for apps that don't expose it over AX (WhatsApp, Slack, Electron…).
     /// The user's clipboard is restored afterwards. Must run while `app` is still frontmost.
     static func copiedSelection(of app: NSRunningApplication) -> String? {
+        copied(from: app) { pb in
+            let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            return text?.isEmpty == false ? text : nil
+        }
+    }
+
+    /// The files selected in Finder (or any app that copies files), read by a ⌘C like copiedSelection —
+    /// needs no Automation permission, unlike asking Finder with AppleScript.
+    static func copiedFiles(of app: NSRunningApplication) -> [URL] {
+        copied(from: app) { pb in
+            pb.readObjects(forClasses: [NSURL.self], options: [.urlReadingFileURLsOnly: true]) as? [URL]
+        } ?? []
+    }
+
+    /// Presses ⌘C in `app`, reads the pasteboard with `read`, then puts back what the user had copied.
+    private static func copied<T>(from app: NSRunningApplication, _ read: (NSPasteboard) -> T?) -> T? {
         let pb = NSPasteboard.general
         let saved = pb.pasteboardItems?.map { item -> NSPasteboardItem in
             let copy = NSPasteboardItem()
@@ -394,10 +410,10 @@ enum AXEngine {
         let deadline = Date().addingTimeInterval(0.25)
         while pb.changeCount == before, Date() < deadline { RunLoop.current.run(until: Date().addingTimeInterval(0.02)) }
         guard pb.changeCount != before else { return nil }   // nothing selected → app copied nothing
-        let text = pb.string(forType: .string)?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = read(pb)
         pb.clearContents()
         if !saved.isEmpty { pb.writeObjects(saved) }
-        return text?.isEmpty == false ? text : nil
+        return value
     }
 
     /// The file the app's focused window has open (Preview, TextEdit, Pages, Word…), if it says.

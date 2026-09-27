@@ -46,6 +46,8 @@ final class Agent: ObservableObject {
     @Published var selectedText: String?
     /// An area the user circled on screen before asking; sent as a marked screenshot on the first turn.
     @Published var annotation: Annotation?
+    /// Files the user had selected in Finder when they summoned Clinqy ("compress this", "merge these").
+    @Published var selectedFiles: [URL] = []
     var onStart: () -> Void = {}
     var onFinish: (_ answer: String, _ ok: Bool) -> Void = { _, _ in }
     /// Test mode: mirror progress to stdout with timings.
@@ -144,6 +146,7 @@ final class Agent: ObservableObject {
             await run(request)
             selectedText = nil
             annotation = nil
+            selectedFiles = []
             continuation = nil
         }
     }
@@ -170,7 +173,7 @@ final class Agent: ObservableObject {
         buddy.clearMark()
         onStart()
         startWatchdog()
-        Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")\(annotation.map { " [circled: \(Int($0.rect.width))×\(Int($0.rect.height)) at \(Int($0.rect.minX)),\(Int($0.rect.minY))]" } ?? "")")
+        Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")\(selectedFiles.isEmpty ? "" : " [files: \(selectedFiles.map(\.lastPathComponent).joined(separator: ", "))]")\(annotation.map { " [circled: \(Int($0.rect.width))×\(Int($0.rect.height)) at \(Int($0.rect.minX)),\(Int($0.rect.minY))]" } ?? "")")
     }
 
     func cancel() {
@@ -342,6 +345,11 @@ final class Agent: ObservableObject {
         """
         if let selected = selectedText, !selected.isEmpty {
             text += "\nSelected text (the user highlighted this before asking; \"this\", \"it\", \"that\" usually mean it):\n\"\"\"\n\(selected.prefix(4000))\n\"\"\""
+        }
+        if !selectedFiles.isEmpty {
+            text += "\nFiles selected in Finder (\"this\", \"these\", \"it\" usually mean them):\n" + selectedFiles.map { "- \($0.path)" }.joined(separator: "\n")
+        } else if let app = targetApp, let doc = AXEngine.documentURL(of: app), doc.isFileURL {
+            text += "\nFile open in \(app.cleanName ?? "the front app"): \(doc.path)"
         }
         if let circled = annotation {
             let r = circled.rect
@@ -722,6 +730,33 @@ final class Agent: ObservableObject {
             let line = begin("Look something up")
             let r = await Shell.run("/bin/zsh", ["-lc", cmd])
             return end(line, .init(ok: r.status == 0, summary: "exit \(r.status)\(r.output.isEmpty ? "" : ": \(r.output.prefix(2000))")"))
+
+        case "pdf":
+            // iLovePDF-style jobs, done in the background with PDFKit; no app opens.
+            guard let op = (action["op"] as? String)?.lowercased() else { return fail("pdf needs op") }
+            let paths = (action["files"] as? [String]) ?? (action["file"] as? String).map { [$0] } ?? []
+            let files = paths.map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            let line = begin("PDF: \(op.replacingOccurrences(of: "_", with: " ")) \(files.count == 1 ? files[0].lastPathComponent : "\(files.count) files")")
+            do {
+                return end(line, .init(ok: true, summary: try await Pdf.run(op, files: files, options: action)))
+            } catch {
+                return end(line, fail(error.localizedDescription))
+            }
+
+        case "email":
+            // Sent by the Mail app in the background (draft:true opens it for the user to review instead).
+            let list = { (key: String) in (action[key] as? [String]) ?? (action[key] as? String).map { [$0] } ?? [] }
+            let to = list("to"), cc = list("cc")
+            let files = list("files").map { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            guard !to.isEmpty, to.allSatisfy({ $0.contains("@") }) else { return fail("email needs to: real email addresses (recall or ask for them)") }
+            if let missing = files.first(where: { !FileManager.default.fileExists(atPath: $0.path) }) { return fail("no such file: \(missing.path)") }
+            let draft = action["draft"] as? Bool ?? false
+            let subject = (action["subject"] as? String) ?? files.first?.deletingPathExtension().lastPathComponent ?? ""
+            if !draft, !(await confirmRisky("Send email")) { return fail("the user said not to send it") }
+            let line = begin("\(draft ? "Draft" : "Email") \(to.joined(separator: ", "))\(files.isEmpty ? "" : " · \(files.count) attachment\(files.count == 1 ? "" : "s")")")
+            let r = await Mailer.send(to: to, cc: cc, subject: subject, body: (action["body"] as? String) ?? "", attachments: files, draft: draft)
+            return end(line, r.ok ? .init(ok: true, summary: draft ? "draft open in Mail for the user to review" : "sent from Mail to \(to.joined(separator: ", "))")
+                                  : fail("Mail couldn't send: \(r.message.prefix(300))"))
 
         case "point", "mark":
             // Mark an element, or a spot on the last screenshot (for things without an element).

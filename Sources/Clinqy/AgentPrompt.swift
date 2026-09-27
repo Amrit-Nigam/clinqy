@@ -32,6 +32,31 @@ enum AgentPrompt {
     {"do":"assert","text":"Welcome back","pass":true,"note":"…"}  QA tests only: report whether an expectation holds
     {"do":"snap","caption":"Chose t2.micro instance type"}   screenshot the current window for a write-up (copied to clipboard and kept)
     {"do":"paste_snaps"}                                  paste every snap so far, in order, each as "Step N: caption" + image, where the caret is (e.g. a Google Doc body)
+    {"do":"pdf","op":"compress","files":["~/Desktop/a.pdf"]}   PDF/file jobs, done instantly in the background (no app opens). ops:
+                                                           merge (files in order) · split (pages:"each" or "1-3,4-6") · extract (pages:"1-3,5") ·
+                                                           delete_pages (pages) · rotate (degrees:90, optional pages) · reorder (order:"3,1,2") ·
+                                                           compress (level:"recommended" or "extreme") · to_pdf (images, Word/RTF/TXT/HTML, PowerPoint/Excel/Keynote/
+                                                           Numbers/Pages; combine:true → one PDF) · to_images (format:"png"/"jpg", optional pages, dpi) · to_word (PDF → .docx; text and
+                                                           basic formatting, scans are read with OCR) · to_text ·
+                                                           protect (password) · unlock (password) · watermark (text) · page_numbers · ocr (scan → searchable) ·
+                                                           info (pages, size). Optional out:"<path>"; by default it saves next to the original
+                                                           (name-compressed.pdf …) and never overwrites. Pages are 1-based, "8-" = to the end, "last" works.
+    {"do":"email","to":["a@b.com"],"subject":"…","body":"…","files":["~/Desktop/a.pdf"],"draft":false}
+                                                           email with attachments, sent by the Mail app in the background (no window). draft:true opens it
+                                                           in Mail for the user to check instead. Use when they say email/mail/send a file to someone,
+                                                           unless they say Gmail (then do it in the browser). Needs real addresses: recall, else ask.
+    {"do":"pdf","op":"compress","files":["~/Desktop/a.pdf"]}   PDF/file jobs, done instantly in the background (no app opens). ops:
+                                                           merge (files in order) · split (pages:"each" or "1-3,4-6") · extract (pages:"1-3,5") ·
+                                                           delete_pages (pages) · rotate (degrees:90, optional pages) · reorder (order:"3,1,2") ·
+                                                           compress (level:"recommended" or "extreme") · to_pdf (images, Word/RTF/TXT/HTML, PowerPoint/Excel/Keynote/
+                                                           Numbers/Pages; combine:true → one PDF) · to_images (format:"png"/"jpg", optional pages, dpi) ·
+                                                           protect (password) · unlock (password) · watermark (text) · page_numbers · ocr (scan → searchable) ·
+                                                           info (pages, size). Optional out:"<path>"; by default it saves next to the original
+                                                           (name-compressed.pdf …) and never overwrites. Pages are 1-based, "8-" = to the end, "last" works.
+    {"do":"email","to":["a@b.com"],"subject":"…","body":"…","files":["~/Desktop/a.pdf"],"draft":false}
+                                                           email with attachments, sent by the Mail app in the background (no window). draft:true opens it
+                                                           in Mail for the user to check instead. Use when they say email/mail/send a file to someone,
+                                                           unless they say Gmail (then do it in the browser). Needs real addresses: recall, else ask.
     {"do":"look"}                                          get a screenshot next turn (labels unclear, custom-drawn UI, or you need to read content)
     {"do":"wait","ms":800}                                 let something load
     {"do":"recall","query":"delivery address"}           search everything you remember about the user (only the relevant part is shown up front)
@@ -107,6 +132,14 @@ enum AgentPrompt {
       At the end open the doc they named, or a new Google Doc (open_url https://docs.new), type a title line, then \
       paste_snaps, then finish. SSH with a .pem key: find it with shell (e.g. ~/Downloads/*.pem), run chmod 400 on it, \
       and type the ssh command in Terminal so it's visible. Anything that costs money (launching an instance) still needs confirmation.
+    - Files ("compress this PDF", "merge these", "convert to PDF", "make it smaller and send it to Rahul"): use pdf, \
+      never an app or website. "this"/"these" = the files selected in Finder, or the file open in the front app; if none, \
+      find it with shell (e.g. ls -t ~/Downloads ~/Desktop | head) or ask. Chain jobs using the path each result gives \
+      (merge → compress → email). Finish with the saved file name and its size.
+    - Files ("compress this PDF", "merge these", "convert to PDF", "make it smaller and send it to Rahul"): use pdf, \
+      never an app or website. "this"/"these" = the files selected in Finder, or the file open in the front app; if none, \
+      find it with shell (e.g. ls -t ~/Downloads ~/Desktop | head) or ask. Chain jobs using the path each result gives \
+      (merge → compress → email). Finish with the saved file name and its size.
     - Voice requests can mishear names ("Vaje Plus" may be the group "Waje+"): pick the closest matching chat.
     - "Where is X" / "how do I find X" / "show me X": take them there and mark it — open the right app or settings \
       pane, navigate step by step until X is visible, then point at the exact control, and finish with done:true \
