@@ -37,7 +37,12 @@ enum Safety {
     /// True when a confirmation answer means yes.
     static func isYes(_ answer: String) -> Bool {
         let a = answer.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
-        return ["yes", "y", "ok", "okay", "sure", "go", "go ahead", "do it", "confirm", "haan", "ha", "han", "yep", "yeah"]
+        // "ji nahi", "haan but don't send", "theek hai, rehne do": any no-word wins.
+        if a.range(of: #"\b(no|not|don'?t|dont|never|cancel|stop|nahi|nahin|nai|mat|rehne|rahne|ruko|मत|नहीं)\b"#, options: .regularExpression) != nil { return false }
+        return ["yes", "y", "ok", "okay", "sure", "go", "go ahead", "do it", "confirm", "yep", "yeah",
+                // Hindi / Hinglish
+                "haan", "ha", "han", "haanji", "haan ji", "ha ji", "ji", "ji haan", "theek hai", "thik hai", "thik h", "sahi hai",
+                "kar do", "kardo", "bhej do", "bhejdo", "chalega", "ho jaye", "हाँ", "हां", "जी", "ठीक है"]
             .contains(where: { a == $0 || a.hasPrefix($0 + " ") || a.hasPrefix($0 + ",") })
     }
 

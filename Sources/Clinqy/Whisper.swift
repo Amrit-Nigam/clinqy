@@ -17,6 +17,19 @@ final class Whisper: ObservableObject {
     static var variant: String { Config.value("WHISPER_MODEL") ?? "large-v3-v20240930_turbo_632MB" }
     static var enabled: Bool { Config.value("VOICE_ENGINE") != "apple" }
 
+    /// What the user speaks: auto (detect), en, hi (Hindi in Devanagari), hinglish (Hindi-English mix written in
+    /// Latin script, the way people text), or any Whisper language code. Menu → Voice Language, or VOICE_LANGUAGE.
+    static var language: String {
+        (UserDefaults.standard.string(forKey: "voiceLanguage") ?? Config.value("VOICE_LANGUAGE") ?? "auto")
+            .lowercased().trimmingCharacters(in: .whitespaces)
+    }
+
+    static let languages: [(code: String, name: String)] = [("auto", "Auto-detect"), ("en", "English"), ("hinglish", "Hinglish"), ("hi", "Hindi (हिन्दी)")]
+
+    /// A romanized Hinglish sample: as a prompt it steers Whisper to write Hindi words in Latin script instead of
+    /// Devanagari, or instead of translating them to English.
+    private static let hinglishPrompt = " Haan, mom ko WhatsApp pe message karo ki main das minute mein pahunch raha hoon. Kal wali meeting cancel kar do, aur Rahul ko resume bhej do."
+
     private static let modelsDir: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Clinqy/models", isDirectory: true)
@@ -87,14 +100,25 @@ final class Whisper: ObservableObject {
                 .compactMap(\.cleanName).prefix(20)
             let people = NameHints.promptNames()
             let names = (["Clinqy", "WhatsApp", "YouTube", "Google", "GitHub"] + apps).filter { !people.contains($0) } + people
-            prompt = tokenizer.encode(text: " " + names.joined(separator: ", ") + ".")
+            let lead = Self.language == "hinglish" ? Self.hinglishPrompt : ""
+            prompt = tokenizer.encode(text: lead + " " + names.joined(separator: ", ") + ".")
                 .filter { $0 < tokenizer.specialTokens.specialTokenBegin }
         }
-        let options = DecodingOptions(task: .transcribe, language: nil, temperature: 0,
-                                      usePrefillPrompt: true, detectLanguage: true,
-                                      skipSpecialTokens: true, withoutTimestamps: true, promptTokens: prompt)
-        let results = try? await kit.transcribe(audioArray: samples, decodeOptions: options)
-        let text = (results ?? []).map(\.text).joined(separator: " ")
+        let code: String? = switch Self.language {
+        case "auto", "": nil
+        case "hinglish": "en"   // Latin script; the prompt keeps the Hindi words as spoken
+        default: Self.language
+        }
+        func run(_ language: String?) async -> [TranscriptionResult] {
+            let options = DecodingOptions(task: .transcribe, language: language, temperature: 0,
+                                          usePrefillPrompt: true, detectLanguage: language == nil,
+                                          skipSpecialTokens: true, withoutTimestamps: true, promptTokens: prompt)
+            return (try? await kit.transcribe(audioArray: samples, decodeOptions: options)) ?? []
+        }
+        var results = await run(code)
+        // Auto-detect often takes spoken Hindi/Hinglish for Urdu and writes it in Urdu script: redo it as Hindi.
+        if code == nil, results.first?.language == "ur" { results = await run("hi") }
+        let text = results.map(\.text).joined(separator: " ")
             .replacingOccurrences(of: #"\[[^\]]*\]|\([^)]*\)"#, with: "", options: .regularExpression)   // [BLANK_AUDIO], (music)
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return text.isEmpty ? nil : text

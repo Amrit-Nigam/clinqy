@@ -211,6 +211,14 @@ struct CommandView: View {
                         .padding(.top, 12)
                         .transition(.opacity)
                 }
+                if let copied = agent.copied, agent.selectedText == nil, agent.selectedFiles.isEmpty, !agent.isRunning {
+                    ContextChip(icon: "doc.on.clipboard", text: "Copied \(Clipboard.describeAge(copied.age)) · "
+                                + (copied.text.map { $0.replacingOccurrences(of: "\n", with: " ") }
+                                   ?? copied.files.map(\.lastPathComponent).joined(separator: ", "))) { agent.copied = nil }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 12)
+                        .transition(.opacity)
+                }
                 if let circled = agent.annotation, !agent.isRunning {
                     ContextChip(icon: "lasso", text: "Circled area · \(Int(circled.rect.width))×\(Int(circled.rect.height))") { agent.annotation = nil }
                         .padding(.horizontal, 18)
@@ -233,7 +241,6 @@ struct CommandView: View {
             )
             .overlay(RoundedRectangle(cornerRadius: DS.corner, style: .continuous).strokeBorder(DS.hairline))
             .clipShape(RoundedRectangle(cornerRadius: DS.corner, style: .continuous))
-            .shadow(color: .black.opacity(0.35), radius: 30, y: 16)
             .padding(24)
             .animation(.spring(response: 0.35, dampingFraction: 0.85), value: showBody)
             .animation(.spring(response: 0.3, dampingFraction: 0.9), value: agent.steps.count)
@@ -266,7 +273,7 @@ struct CommandView: View {
                         .focused($focused)
                         .onSubmit { agent.answer(agent.input) }
                 } else {
-                    TextField("", text: $agent.input, prompt: Text(agent.question != nil ? "Your answer" : agent.isRunning ? "Add to this task or change the plan…" : "What should I do?").foregroundStyle(DS.tertiary))
+                    TextField("", text: $agent.input, prompt: Text(agent.question != nil ? "Your answer" : agent.isRunning ? "Add to this task or change the plan…" : agent.dryRun ? "What should I show you? (dry run)" : "What should I do?").foregroundStyle(DS.tertiary))
                         .textFieldStyle(.plain)
                         .font(.system(size: 20, weight: .regular))
                         .foregroundStyle(DS.text)
@@ -372,6 +379,15 @@ struct CommandView: View {
             Hint(keys: "⌃⌥", text: "open")
             Hint(keys: "hold ⌃⌥", text: "talk")
             Spacer()
+            Button { agent.dryRun.toggle() } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: agent.dryRun ? "eye.fill" : "eye").font(.system(size: 11))
+                    Text("Dry run").font(.system(size: 11))
+                }
+                .foregroundStyle(agent.dryRun ? Color(nsColor: Palette.accent) : DS.tertiary)
+            }
+            .buttonStyle(.plain)
+            .help("Dry run: Clinqy points at everything it would click and type, without doing it")
             Button(action: onCircle) {
                 HStack(spacing: 4) {
                     Image(systemName: "lasso").font(.system(size: 11))
@@ -646,7 +662,7 @@ struct IslandView: View {
     @ObservedObject var voice: Voice
 
     private var text: String {
-        if voice.isListening { return voice.transcript.isEmpty ? "Listening…" : voice.transcript }
+        if voice.isListening { return voice.transcript.isEmpty ? (voice.isFollowUp ? "Anything else? I'm listening…" : "Listening…") : voice.transcript }
         if Recorder.shared.isRecording { return "Watching you… do the task, then ⌃⌥ or ⏹ to stop" }
         if voice.isTranscribing { return "Transcribing…" }
         if let q = agent.question { return "Needs your input: \(q.text)" }
@@ -664,14 +680,13 @@ struct IslandView: View {
                 .contentTransition(.opacity)
                 .animation(.easeOut(duration: 0.2), value: text)
             if agent.isRunning {
-                Text("⌃⌥ to add · ⏹ to stop").font(.system(size: 11)).foregroundStyle(DS.tertiary)
+                Text(agent.runDry ? "dry run · ⏹ to stop" : "⌃⌥ to add · ⏹ to stop").font(.system(size: 11)).foregroundStyle(DS.tertiary)
             }
         }
         .padding(.horizontal, 14)
         .frame(height: 36)
         .background(Capsule().fill(Color.black.opacity(0.82)))
         .overlay(Capsule().strokeBorder(DS.hairline))
-        .shadow(color: .black.opacity(0.3), radius: 12, y: 6)
         .frame(width: 560, height: 60)
         .environment(\.colorScheme, .dark)
     }
@@ -767,7 +782,6 @@ struct ResultView: View {
                 )
                 .overlay(RoundedRectangle(cornerRadius: 18, style: .continuous).strokeBorder(DS.hairline))
                 .clipShape(RoundedRectangle(cornerRadius: 18, style: .continuous))
-                .shadow(color: .black.opacity(0.35), radius: 24, y: 12)
                 .padding(12)
             }
             Spacer(minLength: 0)

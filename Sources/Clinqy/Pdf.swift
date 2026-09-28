@@ -502,7 +502,7 @@ enum Pdf {
         return unique(source.deletingLastPathComponent().appendingPathComponent(stem + (suffix.map { "-\($0)" } ?? "") + ".\(ext)"))
     }
 
-    private static func unique(_ url: URL) -> URL {
+    static func unique(_ url: URL) -> URL {
         var candidate = url, n = 2
         while FileManager.default.fileExists(atPath: candidate.path) {
             let ext = url.pathExtension

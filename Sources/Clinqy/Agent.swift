@@ -49,6 +49,15 @@ final class Agent: ObservableObject {
     @Published var annotation: Annotation?
     /// Files the user had selected in Finder when they summoned Clinqy ("compress this", "merge these").
     @Published var selectedFiles: [URL] = []
+    /// What the user copied in the last few minutes, when nothing was selected: "this" may mean it.
+    struct Copied: Equatable { let text: String?; let files: [URL]; let age: TimeInterval }
+    @Published var copied: Copied?
+    /// Dry-run mode (sticky, from the command bar): the buddy shows every click and keystroke instead of doing it.
+    @Published var dryRun = UserDefaults.standard.bool(forKey: "dryRun") {
+        didSet { UserDefaults.standard.set(dryRun, forKey: "dryRun") }
+    }
+    /// This run is a dry run (the toggle, or a request starting "dry run:").
+    private(set) var runDry = false
     var onStart: () -> Void = {}
     var onFinish: (_ answer: String, _ ok: Bool) -> Void = { _, _ in }
     /// Test mode: mirror progress to stdout with timings.
@@ -88,6 +97,8 @@ final class Agent: ObservableObject {
 
     /// Things the user added while the task was running; folded into the next step.
     private var addedNotes: [String] = []
+    /// The last document this run read in full, kept in history so a follow-up ("now the answers") needn't find it again.
+    private var readText: String?
 
     /// Steer a running task: more context or a change of plan, picked up at the next step.
     func addContext(_ raw: String) {
@@ -141,21 +152,58 @@ final class Agent: ObservableObject {
     }
 
     func submit(_ raw: String, test: Bool = false) {
-        let request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        var request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
-        prepare(request, test: test)
+        // "dry run: book a cab" rehearses just this request.
+        var dry = dryRun
+        if let r = request.range(of: #"(?i)^\(?(dry[ -]?run|rehearse|practice run)\)?[:,\s-]+"#, options: .regularExpression) {
+            request.removeSubrange(r)
+            dry = true
+        }
+        // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
+        if continuation == nil, !test, let last = History.shared.entries.first,
+           Date().timeIntervalSince(last.date) < 20 * 60, Router.isFollowUp(request) {
+            continuation = last
+        }
+        let clear = { [weak self] in
+            self?.selectedText = nil
+            self?.annotation = nil
+            self?.selectedFiles = []
+            self?.copied = nil
+            self?.continuation = nil
+        }
+        // A saved workflow that does exactly this: replay it with no model (the model only heals a broken step).
+        if !test, !dry, let match = workflowFirst(request) {
+            prepare(request, test: false)
+            let params = (match.workflow.defaults ?? [:]).merging(match.params) { _, new in new }
+            steps.append(Step(text: "Saved workflow “\(match.workflow.name.prefix(40))” — no model needed", state: .info))
+            log("workflow-first: “\(match.workflow.name)” · params \(match.params)")
+            task = Task {
+                await replayOrHeal(match.workflow, params: params)
+                clear()
+            }
+            return
+        }
+        prepare(request, test: test, dry: dry)
         task = Task {
             await run(request)
-            selectedText = nil
-            annotation = nil
-            selectedFiles = []
-            continuation = nil
+            clear()
         }
     }
 
+    /// The saved workflow to replay for this request, when that's safe to do without the model: nothing selected,
+    /// copied, circled or continued that the model would need to see, and not a question or a request about "this".
+    private func workflowFirst(_ request: String) -> Router.Match? {
+        guard !["off", "0", "no", "false"].contains((Config.value("WORKFLOW_FIRST") ?? "on").lowercased()),
+              selectedText == nil, selectedFiles.isEmpty, annotation == nil, continuation == nil,
+              !Self.isQuestion(request), !Router.refersToContext(request), !Safety.micInUse else { return nil }
+        return Router.match(request, in: Workflows.shared.all)
+    }
+
     /// Resets per-run state; shared by requests, workflow replays and QA runs.
-    fileprivate func prepare(_ request: String, test: Bool) {
+    fileprivate func prepare(_ request: String, test: Bool, dry: Bool = false) {
         isTest = test || echo
+        runDry = dry
         started = Date()
         trace = []
         lastTarget = nil
@@ -170,6 +218,7 @@ final class Agent: ObservableObject {
         userAnswers = []
         snaps = []
         addedNotes = []
+        readText = nil
         ownedTab = nil
         userConfirmed = false
         secrets = []
@@ -179,7 +228,7 @@ final class Agent: ObservableObject {
         buddy.clearMark()
         onStart()
         startWatchdog()
-        Self.writeLog("=== \(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")\(selectedFiles.isEmpty ? "" : " [files: \(selectedFiles.map(\.lastPathComponent).joined(separator: ", "))]")\(annotation.map { " [circled: \(Int($0.rect.width))×\(Int($0.rect.height)) at \(Int($0.rect.minX)),\(Int($0.rect.minY))]" } ?? "")")
+        Self.writeLog("=== \(dry ? "[dry run] " : "")\(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")\(selectedFiles.isEmpty ? "" : " [files: \(selectedFiles.map(\.lastPathComponent).joined(separator: ", "))]")\(annotation.map { " [circled: \(Int($0.rect.width))×\(Int($0.rect.height)) at \(Int($0.rect.minX)),\(Int($0.rect.minY))]" } ?? "")")
     }
 
     func cancel() {
@@ -315,7 +364,7 @@ final class Agent: ObservableObject {
                     action["ms"] = 1000
                 }
                 let result = await perform(action, context: &context)
-                if result.ok { record(action) }
+                if result.ok, !runDry { record(action) }
                 if case .look = result.effect { wantsLook = true }
                 results.append("\(i + 1). \(result.summary)")
                 if !result.ok { failures += 1; break }
@@ -337,7 +386,7 @@ final class Agent: ObservableObject {
             }
             if isDone, failures == 0 {
                 finish(ok: true, say.isEmpty ? "Done" : say)
-                await learn(from: session)
+                if !runDry { await learn(from: session) }
                 return
             }
             if actions.isEmpty { results.append("(no actions taken)") }
@@ -472,6 +521,24 @@ final class Agent: ObservableObject {
         } else if let app = targetApp, let doc = AXEngine.documentURL(of: app), doc.isFileURL {
             text += "\nFile open in \(app.cleanName ?? "the front app"): \(doc.path)"
         }
+        // Only when the request points at it: a copied password or key shouldn't ride along with every request.
+        if selectedText == nil, selectedFiles.isEmpty, let copied,
+           Router.refersToContext(request) || request.range(of: #"(?i)\b(clipboard|copied|paste|pasted)\b"#, options: .regularExpression) != nil {
+            let when = Clipboard.describeAge(copied.age)
+            if let t = copied.text {
+                text += "\nClipboard (the user copied this \(when); nothing is selected, so \"this\", \"it\", \"that\" usually mean it — "
+                    + "but only if the request fits it, e.g. \"translate this\", \"reply to this\", \"add this to my tracker\"):\n\"\"\"\n\(t.prefix(4000))\n\"\"\""
+            }
+            if !copied.files.isEmpty {
+                text += "\nFiles on the clipboard (copied \(when); \"this\"/\"these\" may mean them):\n" + copied.files.map { "- \($0.path)" }.joined(separator: "\n")
+            }
+        }
+        if runDry {
+            text += "\nDRY RUN: the user wants to see what you'd do without anything happening. Clicks, typing, keys, choosing, "
+                + "uploads, emails, file/calendar changes and scripts are only shown on screen, not done — the screen won't change "
+                + "after them. Opening apps/websites, scrolling, reading and looking do happen. Plan the whole task as if each "
+                + "shown step worked, go as far as you can, then finish with done:true and a short summary of the plan."
+        }
         if let circled = annotation {
             let r = circled.rect
             text += "\nThe user circled an area on screen before asking (\"this\", \"here\", \"that\" usually mean it): "
@@ -485,10 +552,19 @@ final class Agent: ObservableObject {
             What happened: \(earlier.steps.suffix(12).joined(separator: "; "))
             Earlier result: \(earlier.answer)\(earlier.result.map { "\nEarlier output: \($0.plain.prefix(1500))" } ?? "")
             """
+            if let doc = earlier.readText {
+                text += "\nThe document the earlier task read (use this; don't open it again unless it's cut off):\n\(doc)"
+            }
+            if !earlier.ok {
+                text += "\nThe earlier task didn't finish. Pick up where it stopped (check what's already on screen, e.g. a half-typed message) instead of starting over."
+            }
         }
         let skills = Skills.shared.promptText
         if !skills.isEmpty {
             text += "\nSkills the user taught you (follow the matching one's steps when a request fits; ask for any missing parameters):\n" + skills
+            if let hint = Router.skillHint(request, names: Skills.shared.all.map(\.name)) {
+                text += "\n(This request looks like the skill “\(hint)”: use its steps unless it clearly doesn't fit.)"
+            }
         }
         // Only the memory that matters for this request (plus core facts); the rest is one recall away.
         let context = [request, targetApp?.cleanName ?? "", selectedText ?? "", continuation?.request ?? ""].joined(separator: " ")
@@ -523,6 +599,7 @@ final class Agent: ObservableObject {
 
     fileprivate func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let kind = (action["do"] as? String ?? "").lowercased()
+        if runDry, let shown = await rehearse(kind, action, context: &context) { return shown }
         switch kind {
         case "open_app":
             guard let name = action["name"] as? String else { return fail("open_app needs a name") }
@@ -875,7 +952,11 @@ final class Agent: ObservableObject {
             // A specific file (e.g. the user's resume from memory), read without opening it.
             if let path = action["path"] as? String {
                 let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-                guard let fileText = await Reader.fileText(url) else { return end(line, fail("couldn't read \(path)")) }
+                guard let fileText = await Reader.fileText(url) else {
+                    let sandboxed = url.path.contains("/Library/Containers/") || url.path.contains("/Library/Group Containers/")
+                    return end(line, fail("couldn't read \(path)" + (sandboxed ? " — it's inside another app's sandbox, which can't be read or copied by path. Open it in Preview and use read with no path (it copies all its text)" : "")))
+                }
+                readText = "\(url.lastPathComponent):\n\(fileText)"
                 return end(line, .init(ok: true, summary: "text of \(url.lastPathComponent):\n\(fileText)"))
             }
             if let page = context.page, !page.url.lowercased().hasSuffix(".pdf"), page.url.hasPrefix("http") || page.url.hasPrefix("file") {
@@ -891,11 +972,22 @@ final class Agent: ObservableObject {
                 text = doc.text
                 source = "the document \(doc.name)"
             }
+            // A document whose file is out of reach (a PDF from WhatsApp's sandbox opened in Preview): copy all its text
+            // instead of reading it a screenful at a time.
+            if short(text), let app = context.app,
+               app.bundleIdentifier == "com.apple.Preview" || AXEngine.documentURL(of: app) != nil {
+                await Launcher.bringToFront(app)
+                if let all = AXEngine.copiedAll(of: app), !short(all) {
+                    text = String(all.prefix(12_000))
+                    source = "the document (all its text)"
+                }
+            }
             if short(text), let app = context.app, let seen = await Reader.ocr(app) {
                 text = seen
                 source = "the screen (text recognition)"
             }
             guard let text, !text.isEmpty else { return end(line, fail("couldn't read any text here; try look")) }
+            if !source.hasPrefix("the screen") { readText = "\(source):\n\(text)" }
             return end(line, .init(ok: true, summary: "text from \(source):\n\(text)"))
 
         case "click" where action["id"] == nil:
@@ -1184,9 +1276,204 @@ final class Agent: ObservableObject {
             steps.append(Step(text: "Remembered: \(fact)", state: .info))
             return .init(ok: true, summary: "saved")
 
+        case "extract":
+            // Structured data out of the page's tables, a CSV, or a document/screen's text for the model to structure.
+            let line = begin("Extract data")
+            if let path = (action["path"] ?? action["file"]) as? String {
+                let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
+                if ["csv", "tsv"].contains(url.pathExtension.lowercased()), let rows = Tables.readDelimited(url) {
+                    return end(line, .init(ok: true, summary: "\(url.lastPathComponent): \(rows.count) rows\n"
+                        + rows.prefix(500).map { $0.joined(separator: " | ") }.joined(separator: "\n")))
+                }
+                guard let text = await Reader.fileText(url) else { return end(line, fail("couldn't read \(path)")) }
+                return end(line, .init(ok: true, summary: "text of \(url.lastPathComponent) (pick out the rows/fields yourself):\n\(text.prefix(12000))"))
+            }
+            if let page = context.page {
+                let tables = (try? await BrowserBridge.shared.perform("tables", on: page, timeout: 8))?["tables"] as? [[String: Any]] ?? []
+                if !tables.isEmpty {
+                    return end(line, .init(ok: true, summary: "\(tables.count) table\(tables.count == 1 ? "" : "s") on \(page.title.prefix(60).debugDescription):\n"
+                        + Tables.describe(tables).prefix(15000)))
+                }
+                let text = (try? await BrowserBridge.shared.perform("read", on: page))?["text"] as? String ?? page.text
+                return end(line, .init(ok: true, summary: "no tables on the page; its text (pick out the rows yourself):\n\(text.prefix(12000))"))
+            }
+            if let app = context.app, let doc = await Reader.documentText(of: app) {
+                return end(line, .init(ok: true, summary: "text of \(doc.name) (pick out the rows/fields yourself):\n\(doc.text.prefix(12000))"))
+            }
+            if let app = context.app, let seen = await Reader.ocr(app) {
+                return end(line, .init(ok: true, summary: "text on screen (pick out the rows yourself):\n\(seen.prefix(12000))"))
+            }
+            return end(line, fail("nothing to extract from here; give path, or open the page/file first"))
+
+        case "table":
+            // Rows written out: a CSV file, a new Numbers/Excel document, or the clipboard for pasting into cells.
+            guard let raw = action["rows"] as? [[Any]], !raw.isEmpty else { return fail("table needs rows: [[\"header\", …], [\"value\", …]]") }
+            let rows = raw.map { $0.map { v in (v as? String) ?? (v as? NSNumber)?.stringValue ?? (v is NSNull ? "" : "\(v)") } }
+            let to = (action["to"] as? String ?? "csv").lowercased()
+            let line = begin("Table → \(to) (\(rows.count) rows)")
+            do {
+                let summary = try await Tables.save(rows, to: to, path: action["path"] as? String, title: action["title"] as? String,
+                                                    append: action["append"] as? Bool ?? false)
+                if to == "numbers" || to == "excel" {
+                    try? await Task.sleep(for: .milliseconds(1200))
+                    context.app = NSWorkspace.shared.frontmostApplication
+                    await refresh(&context)
+                }
+                return end(line, .init(ok: true, summary: summary))
+            } catch { return end(line, fail(error.localizedDescription)) }
+
+        case "event", "calendar":
+            let op = (action["op"] as? String ?? "create").lowercased()
+            let line = begin(op == "create" || op == "add" ? "Calendar: \((action["title"] as? String ?? "event").prefix(40))" : "Calendar: \(op)")
+            if op == "delete" || op == "remove", !(await confirmRisky("Delete event")) { return end(line, fail("the user said not to delete it")) }
+            do { return end(line, .init(ok: true, summary: try await Events.event(action))) }
+            catch { return end(line, fail(error.localizedDescription)) }
+
+        case "reminder":
+            let op = (action["op"] as? String ?? "create").lowercased()
+            let line = begin(op == "create" || op == "add" ? "Reminder: \((action["title"] as? String ?? "").prefix(40))" : "Reminders: \(op)")
+            do { return end(line, .init(ok: true, summary: try await Events.reminder(action))) }
+            catch { return end(line, fail(error.localizedDescription)) }
+
+        case "files":
+            return await files(action)
+
         default:
             return fail("unknown action \(kind.debugDescription)")
         }
+    }
+
+    /// Finder jobs without Finder: Spotlight search, listing, renaming/moving (undoable), sorting a folder, trash.
+    private func files(_ action: [String: Any]) async -> ActionResult {
+        let op = (action["op"] as? String ?? "find").lowercased()
+        let path = { (s: String) in URL(fileURLWithPath: (s as NSString).expandingTildeInPath) }
+        let list = { (key: String) in ((action[key] as? [String]) ?? (action[key] as? String).map { [$0] } ?? []).map(path) }
+        let folder = (action["folder"] as? String).map(path)
+        switch op {
+        case "find", "search":
+            let query = action["query"] as? String
+            let line = begin("Find files\(query.map { ": \($0.prefix(30))" } ?? "")")
+            let hits = await Files.find(query: query, kind: action["kind"] as? String, from: action["from"] as? String,
+                                        days: (action["days"] as? NSNumber)?.intValue, folder: folder,
+                                        limit: min(50, (action["limit"] as? NSNumber)?.intValue ?? 20))
+            return end(line, .init(ok: true, summary: hits.isEmpty ? "no files match (try fewer words, another kind, or more days)"
+                                   : "\(hits.count) files, newest first:\n" + hits.map(Files.describe).joined(separator: "\n")))
+
+        case "list":
+            guard let folder else { return fail("files list needs folder") }
+            let line = begin("List \(folder.lastPathComponent)")
+            do { return end(line, .init(ok: true, summary: try Files.list(folder, sort: (action["sort"] as? String ?? "date").lowercased(), limit: 60))) }
+            catch { return end(line, fail(error.localizedDescription)) }
+
+        case "rename", "move":
+            var pairs: [(URL, URL)] = []
+            if op == "rename" {
+                for r in action["renames"] as? [[String: Any]] ?? [] {
+                    guard let from = (r["from"] as? String).map(path), let to = r["to"] as? String, !to.isEmpty else { continue }
+                    pairs.append((from, to.contains("/") ? path(to) : from.deletingLastPathComponent().appendingPathComponent(to)))
+                }
+            } else {
+                guard let dest = (action["to"] as? String).map(path) else { return fail("files move needs to (a folder)") }
+                pairs = list("files").map { ($0, dest.appendingPathComponent($0.lastPathComponent)) }
+            }
+            guard !pairs.isEmpty else { return fail(op == "rename" ? "files rename needs renames: [{\"from\": path, \"to\": new name}]" : "files move needs files") }
+            let line = begin("\(op == "rename" ? "Rename" : "Move") \(pairs.count) file\(pairs.count == 1 ? "" : "s")")
+            do {
+                let (done, skipped) = try Files.apply(pairs)
+                return end(line, .init(ok: !done.isEmpty, summary: "\(op == "rename" ? "renamed" : "moved") \(done.count): "
+                    + done.prefix(30).map { "\($0.0.lastPathComponent) → \($0.1.path)" }.joined(separator: "; ")
+                    + (skipped.isEmpty ? "" : ". Skipped: " + skipped.joined(separator: "; ")) + ". (files undo puts them back)"))
+            } catch { return end(line, fail(error.localizedDescription)) }
+
+        case "organize", "sort", "tidy":
+            let target = folder ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Downloads")
+            let apply = action["apply"] as? Bool ?? false
+            let line = begin("\(apply ? "Sort" : "Plan sorting") \(target.lastPathComponent)")
+            do {
+                let plan = try Files.organizePlan(target)
+                guard !plan.isEmpty else { return end(line, .init(ok: true, summary: "nothing to sort in \(target.path)")) }
+                let groups = Dictionary(grouping: plan) { $0.1.deletingLastPathComponent().lastPathComponent }
+                    .map { "\($0.key): \($0.value.count)" }.sorted().joined(separator: ", ")
+                guard apply else {
+                    return end(line, .init(ok: true, summary: "plan for \(target.path) (\(plan.count) files into subfolders): \(groups). "
+                                           + "Nothing moved yet — confirm with the user, then files organize with apply:true."))
+                }
+                let (done, skipped) = try Files.apply(plan)
+                return end(line, .init(ok: true, summary: "sorted \(done.count) files in \(target.path) into \(groups)"
+                                       + (skipped.isEmpty ? "" : ". Skipped: " + skipped.prefix(10).joined(separator: "; ")) + ". (files undo puts them back)"))
+            } catch { return end(line, fail(error.localizedDescription)) }
+
+        case "undo":
+            let line = begin("Undo the last file changes")
+            do { return end(line, .init(ok: true, summary: try Files.undo())) } catch { return end(line, fail(error.localizedDescription)) }
+
+        case "trash", "delete":
+            let urls = list("files")
+            guard !urls.isEmpty else { return fail("files trash needs files") }
+            let line = begin("Move \(urls.count) to Trash")
+            guard await confirmRisky("Move to Trash") else { return end(line, fail("the user said not to delete them")) }
+            return end(line, .init(ok: true, summary: await Files.trash(urls)))
+
+        case "reveal", "show":
+            let urls = list("files").filter { FileManager.default.fileExists(atPath: $0.path) }
+            guard !urls.isEmpty else { return fail("files reveal needs files that exist") }
+            let line = begin("Show in Finder")
+            NSWorkspace.shared.activateFileViewerSelecting(urls)
+            return end(line, .init(ok: true, summary: "selected \(urls.count) in a Finder window"))
+
+        default:
+            return fail("files op: find, list, rename, move, organize, undo, trash or reveal")
+        }
+    }
+
+    /// Dry run: instead of acting, mark the target and say what would happen. nil = this action is safe to really do
+    /// (opening, scrolling, reading, asking, anything that only looks).
+    private func rehearse(_ kind: String, _ action: [String: Any], context: inout ActionContext) async -> ActionResult? {
+        let lookOnly: Set<String> = ["open_app", "open_url", "scroll", "look", "read", "wait", "recall", "dictionary", "ask", "show",
+                                     "point", "mark", "review", "assert", "extract"]
+        let readOps: [String: Set<String>] = ["event": ["list", "find", "search", "free", "busy"], "calendar": ["list", "find", "search", "free", "busy"],
+                                              "reminder": ["list"], "files": ["find", "search", "list", "reveal", "show"],
+                                              "application": ["find", "check", "list", "show"], "pdf": ["info"], "media": ["info"]]
+        let op = (action["op"] as? String ?? "").lowercased()
+        if lookOnly.contains(kind) || readOps[kind]?.contains(op) == true { return nil }
+        if kind == "files", op == "organize" || op == "sort" || op == "tidy", action["apply"] as? Bool != true { return nil }   // only plans
+
+        let text = (action["text"] as? String).map { "“\($0.prefix(40))”" } ?? ""
+        var what: String
+        switch kind {
+        case "click": what = "click"
+        case "type": what = "type \(text)"
+        case "choose": what = "choose “\((action["option"] as? String ?? "").prefix(40))”"
+        case "upload": what = "upload \(((action["file"] as? String) ?? "").split(separator: "/").last ?? "a file")"
+        case "key": what = "press \(action["keys"] as? String ?? "?")"
+        case "email": what = "email \((action["to"] as? [String] ?? []).joined(separator: ", "))"
+        case "event", "calendar": what = "add “\(action["title"] as? String ?? "")” to the calendar at \(action["start"] as? String ?? "?")"
+        case "reminder": what = "\(op.isEmpty ? "add" : op) reminder “\(action["title"] as? String ?? "")”"
+        case "table": what = "write \((action["rows"] as? [Any])?.count ?? 0) rows to \(action["to"] as? String ?? "csv")"
+        case "applescript", "shell": what = "run a \(kind == "shell" ? "command" : "script")"
+        default: what = "\(kind)\(op.isEmpty ? "" : " \(op)")"
+        }
+        var rect: CGRect?
+        var name: String?
+        if action["id"] != nil {
+            if Self.isWebRef(action["id"]), let (el, r) = webTarget(action["id"], context) { rect = r; name = el.text }
+            else if !Self.isWebRef(action["id"]), let el = await resolve(action["id"], context: &context) { rect = el.frame; name = el.shortLabel }
+            else { return fail("element \(action["id"] ?? "?") isn't on screen") }
+        } else if kind == "click", let x = (action["x"] as? NSNumber)?.doubleValue, let y = (action["y"] as? NSNumber)?.doubleValue,
+                  let p = Screenshot.screenPoint(x: x, y: y) {
+            rect = CGRect(x: p.x - 18, y: p.y - 18, width: 36, height: 36)
+        }
+        let target = name.map { " · \($0.prefix(30))" } ?? ""
+        let line = begin("Would \(what)\(target)")
+        if let rect {
+            await buddy.mark(rect, label: String(("would " + what).prefix(24)))
+            try? await Task.sleep(for: .milliseconds(700))   // long enough to see each one
+        } else {
+            buddy.bubble("would \(what)", for: 2)
+            try? await Task.sleep(for: .milliseconds(500))
+        }
+        hand.lingerBeforeHome = 3.5
+        return end(line, .init(ok: true, summary: "DRY RUN — not done: would \(what)\(target). The screen didn't change; plan the next step as if it had worked."))
     }
 
     static func isWebRef(_ ref: Any?) -> Bool { (ref as? String)?.lowercased().hasPrefix("w") == true }
@@ -1281,9 +1568,9 @@ final class Agent: ObservableObject {
             onResult()
         }
         if !isTest { recordStats(ok: ok, answer: text) }
-        if !isTest { History.shared.add(.init(date: started, request: request, answer: text, ok: ok,
+        if !isTest { History.shared.add(.init(date: started, request: runDry ? "Dry run: \(request)" : request, answer: text, ok: ok,
                                  steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult,
-                                 trace: trace.isEmpty ? nil : trace)) }
+                                 trace: trace.isEmpty ? nil : trace, readText: readText.map { String($0.prefix(8_000)) })) }
         session = nil
         onFinish(text, ok)
     }

@@ -412,6 +412,25 @@ function chosen(i) {
   return { value: sel ? optionText(sel) : squash(el.innerText).slice(0, 100) };
 }
 
+// Every data table on the page as rows of cell text: <table>s and ARIA grids (Google Sheets-style apps, React
+// data grids). Layout tables (one row or one column) are skipped. Header row first when there is one.
+function tables() {
+  const out = [];
+  const cells = (row) => [...row.querySelectorAll(":scope > th, :scope > td, :scope > [role=cell], :scope > [role=gridcell], :scope > [role=columnheader], :scope > [role=rowheader]")]
+    .map((c) => squash(c.innerText));
+  const nameOf = (t) => squash((t.querySelector("caption") || {}).innerText || t.getAttribute("aria-label") || labelledBy(t)
+    || ((t.previousElementSibling && /^H[1-6]$/.test(t.previousElementSibling.tagName)) ? t.previousElementSibling.innerText : "")).slice(0, 80);
+  for (const t of document.querySelectorAll("table, [role=table], [role=grid], [role=treegrid]")) {
+    if (t.parentElement && t.parentElement.closest("table, [role=table], [role=grid]")) continue;   // nested: the outer one has it
+    const rows = [...t.querySelectorAll("tr, [role=row]")].filter((r) => r.closest("table, [role=table], [role=grid], [role=treegrid]") === t)
+      .map(cells).filter((r) => r.some((c) => c));
+    if (rows.length < 2 || Math.max(...rows.map((r) => r.length)) < 2) continue;
+    out.push({ name: nameOf(t), rows: rows.slice(0, 500), more: Math.max(0, rows.length - 500) });
+    if (out.length >= 10) break;
+  }
+  return { url: location.href, title: document.title, tables: out };
+}
+
 function readText() {
   const main = document.querySelector("main, article, [role=main]") || document.body;
   return { url: location.href, title: document.title, text: main.innerText.replace(/\n{3,}/g, "\n\n").slice(0, 8000) };
@@ -488,5 +507,5 @@ function readText() {
   }
   function selection() { return String(window.getSelection() || "").slice(0, 8000); }
 
-  window.__clinqy = { snapshot, click, focus, fill, findOption, chosen, upload, review, readText, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
+  window.__clinqy = { snapshot, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
 })();

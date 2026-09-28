@@ -103,6 +103,18 @@ final class Hand {
             AXEngine.paste(text)
             return true
         }
+        // Long text (an answer list, a write-up) is pasted: typing 2,000 characters takes minutes and trips the
+        // watchdog halfway, leaving half a message behind. Pasted line breaks don't send in chat apps.
+        if text.count > 300, !Self.codeEditorIDs.contains(app.bundleIdentifier ?? "") {
+            AXEngine.targetPid = app.processIdentifier
+            defer { AXEngine.targetPid = nil }
+            if !(AXEngine.focusedValue(of: app) ?? "").isEmpty {
+                AXEngine.selectAll()
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+            AXEngine.paste(text)
+            return await landed(text, in: app)
+        }
         // Multi-line text is still typed (that's the point of watching it), with Shift+Return for line breaks.
         if text.contains("\n") {
             AXEngine.targetPid = app.processIdentifier

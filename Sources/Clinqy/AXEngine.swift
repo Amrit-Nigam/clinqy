@@ -384,6 +384,19 @@ enum AXEngine {
         }
     }
 
+    /// All the text of the document in front (Preview, Quick Look…): ⌘A then ⌘C. For documents whose file is
+    /// out of reach (e.g. a PDF inside WhatsApp's sandbox, which even `cp` can't copy). Must run while `app` is frontmost.
+    static func copiedAll(of app: NSRunningApplication) -> String? {
+        let source = CGEventSource(stateID: .privateState)
+        for keyDown in [true, false] {
+            let e = CGEvent(keyboardEventSource: source, virtualKey: 0 /* a */, keyDown: keyDown)
+            e?.flags = .maskCommand
+            e?.postToPid(app.processIdentifier)
+        }
+        usleep(150_000)
+        return copiedSelection(of: app)
+    }
+
     /// The files selected in Finder (or any app that copies files), read by a ⌘C like copiedSelection —
     /// needs no Automation permission, unlike asking Finder with AppleScript.
     static func copiedFiles(of app: NSRunningApplication) -> [URL] {

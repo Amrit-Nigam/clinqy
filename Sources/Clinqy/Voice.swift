@@ -14,11 +14,28 @@ final class Voice: ObservableObject {
     /// Called with the final transcript when listening stops on its own (silence) or via `stop()`.
     var onFinal: (String) -> Void = { _ in }
     var onLevel: (CGFloat) -> Void = { _ in }
+    /// Called when a follow-up listen (`giveUpAfter`) heard nothing and closed the mic.
+    var onGaveUp: () -> Void = {}
+    /// True while the mic is open only for a possible follow-up after a finished task.
+    @Published private(set) var isFollowUp = false
 
     private let engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognition: SFSpeechRecognitionTask?
-    private let recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    private var recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+
+    /// Apple dictation (the live preview) in the user's voice language: Indian English hears Hinglish best.
+    private static func recognizer(for language: String) -> SFSpeechRecognizer? {
+        let id: String? = switch language {
+        case "hinglish": "en-IN"
+        case "hi": "hi-IN"
+        case "en": Locale.current.region?.identifier == "IN" ? "en-IN" : nil
+        case "auto", "": nil
+        default: language
+        }
+        return id.flatMap { SFSpeechRecognizer(locale: Locale(identifier: $0)) }
+            ?? SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
+    }
     private var lastChange = Date()
     private var silenceTimer: Timer?
     private var delivered = false
@@ -28,8 +45,10 @@ final class Voice: ObservableObject {
         Bundle.main.object(forInfoDictionaryKey: "NSSpeechRecognitionUsageDescription") != nil
     }
 
-    func start(autoStop: Bool = true) {
+    /// `giveUpAfter`: close the mic quietly if nothing is said within that many seconds (follow-up listening).
+    func start(autoStop: Bool = true, giveUpAfter: TimeInterval? = nil) {
         guard !isListening else { return }
+        isFollowUp = giveUpAfter != nil
         guard Self.isSupported else { error = "Voice needs the Clinqy app bundle (run ./build.sh run)"; return }
         error = nil
         SFSpeechRecognizer.requestAuthorization { status in
@@ -40,7 +59,7 @@ final class Voice: ObservableObject {
                 }
                 AVCaptureDevice.requestAccess(for: .audio) { ok in
                     Task { @MainActor in
-                        if ok { self.begin(autoStop: autoStop) } else {
+                        if ok { self.begin(autoStop: autoStop, giveUpAfter: giveUpAfter) } else {
                             self.error = "Allow Microphone for Clinqy in System Settings → Privacy & Security"
                         }
                     }
@@ -95,7 +114,8 @@ final class Voice: ObservableObject {
     private var committed = ""
     private var partial = ""
 
-    private func begin(autoStop: Bool) {
+    private func begin(autoStop: Bool, giveUpAfter: TimeInterval? = nil) {
+        recognizer = Self.recognizer(for: Whisper.language)
         guard let recognizer, recognizer.isAvailable else { error = "Speech recognition isn't available right now"; return }
         transcript = ""
         committed = ""
@@ -133,12 +153,18 @@ final class Voice: ObservableObject {
         startSegment(recognizer)
 
         silenceTimer?.invalidate()
+        let opened = Date()
         if autoStop {
             // Hands-free: stop after a real pause once something has been said.
             silenceTimer = Timer.scheduledTimer(withTimeInterval: 0.2, repeats: true) { [weak self] _ in
                 MainActor.assumeIsolated {
-                    guard let self, self.isListening, !self.transcript.isEmpty,
-                          Date().timeIntervalSince(self.lastChange) > 2.0 else { return }
+                    guard let self, self.isListening else { return }
+                    if let giveUpAfter, self.transcript.isEmpty, Date().timeIntervalSince(opened) > giveUpAfter {
+                        self.cancel()
+                        self.onGaveUp()
+                        return
+                    }
+                    guard !self.transcript.isEmpty, Date().timeIntervalSince(self.lastChange) > 2.0 else { return }
                     self.stop()
                 }
             }
@@ -210,6 +236,7 @@ final class Voice: ObservableObject {
 
     private func teardownAudio() {
         silenceTimer?.invalidate()
+        isFollowUp = false
         if engine.isRunning { engine.stop() }
         engine.inputNode.removeTap(onBus: 0)
         isListening = false

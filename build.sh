@@ -32,6 +32,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   </dict></array>
   <key>NSMicrophoneUsageDescription</key><string>Clinqy listens while you hold ⌥Space so you can talk to it.</string>
   <key>NSSpeechRecognitionUsageDescription</key><string>Clinqy turns what you say into requests.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key><string>Clinqy adds and looks up events when you ask ("schedule a call with Priya Thursday afternoon").</string>
+  <key>NSRemindersFullAccessUsageDescription</key><string>Clinqy adds and checks off reminders when you ask.</string>
 </dict>
 </plist>
 PLIST

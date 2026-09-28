@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var holdTimer: Timer?
     private var holdToTalk = false
     private let overlay = AnnotationOverlay()
+    /// The current request was spoken (so a follow-up can be spoken too).
+    private var voiceRun = false
+    /// The mic is open for a follow-up after a finished task ("now email that to Rahul").
+    private var followUpOpen = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         buddy = Buddy()
@@ -35,6 +39,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         Brain.prewarm()
         Whisper.shared.prepare()
         BrowserBridge.shared.start()
+        Clipboard.start()
         startScheduler()
 
         agent.onStart = { [weak self] in
@@ -44,10 +49,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.panel.orderOut(nil)
             self.island.show()
         }
-        agent.onFinish = { [weak self] _, _ in
+        agent.onFinish = { [weak self] _, ok in
             guard let self else { return }
             self.setStatusIcon(running: false)
             self.island.show(for: 4.5)
+            let spoken = self.voiceRun
+            self.voiceRun = false
+            if spoken, ok, !self.agent.isTest { self.listenForFollowUp() }
         }
         // Paused for the user's input: bring the bar up with the question; hide it again once answered.
         agent.onQuestion = { [weak self] in
@@ -60,10 +68,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         voice.onFinal = { [weak self] text in
             guard let self else { return }
             self.buddy.mood = .idle
-            // A spoken reply to a question answers it; otherwise it's a new request.
-            if self.agent.question != nil { self.agent.answer(text) }
-            else if self.agent.isRunning { self.agent.addContext(text) }
-            else { self.agent.submit(text) }
+            let followUp = self.followUpOpen
+            self.followUpOpen = false
+            // A spoken reply to a question answers it; while working it steers; otherwise it's a new request.
+            if self.agent.question != nil {
+                self.agent.answer(text)
+            } else if self.agent.isRunning {
+                self.agent.addContext(text)
+            } else if followUp, Router.isDismissal(text) {
+                self.agent.continuation = nil
+                self.island.hide()
+            } else {
+                self.voiceRun = true
+                self.agent.submit(text)
+            }
+        }
+        voice.onGaveUp = { [weak self] in
+            guard let self else { return }
+            self.followUpOpen = false
+            if !self.agent.isRunning { self.agent.continuation = nil }
+            self.buddy.mood = .idle
+            self.island.hide()
         }
 
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
@@ -77,6 +102,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
         menu.addItem(withTitle: "Tidy Memory", action: #selector(tidyMemory), keyEquivalent: "")
         menu.addItem(.separator())
+        let dry = menu.addItem(withTitle: "Dry Run (show, don't act)", action: #selector(toggleDryRun(_:)), keyEquivalent: "")
+        dry.state = agent.dryRun ? .on : .off
+        let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
+        let languages = NSMenu()
+        for (code, name) in Whisper.languages {
+            let item = languages.addItem(withTitle: name, action: #selector(setVoiceLanguage(_:)), keyEquivalent: "")
+            item.representedObject = code
+            item.target = self
+            item.state = Whisper.language == code ? .on : .off
+        }
+        language.submenu = languages
+        menu.addItem(language)
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleOpenAtLogin(_:)), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
@@ -145,8 +182,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             guard let task = URLComponents(url: url, resolvingAgainstBaseURL: false)?
                 .queryItems?.first(where: { $0.name == "task" })?.value else { continue }
             rememberTarget()
-            let test = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "test" }?.value == "1"
-            agent.submit(task, test: test)
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            let test = items.first { $0.name == "test" }?.value == "1"
+            let dry = items.first { $0.name == "dry" }?.value == "1"
+            agent.submit(dry ? "dry run: " + task : task, test: test)
         }
     }
 
@@ -356,6 +395,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         voice.start(autoStop: autoStop)
     }
 
+    /// After a spoken task, keep listening a few seconds for a follow-up that builds on it ("now email that to
+    /// Rahul"), without pressing ⌃⌥ again. Silence closes the mic. FOLLOW_UP=off turns it off.
+    private func listenForFollowUp() {
+        guard !["off", "0", "no", "false"].contains((Config.value("FOLLOW_UP") ?? "on").lowercased()) else { return }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            guard let self, !self.agent.isRunning, self.agent.question == nil, !self.voice.isListening,
+                  !Recorder.shared.isRecording, !self.panel.isVisible else { return }
+            self.agent.continuation = History.shared.entries.first
+            self.followUpOpen = true
+            self.island.show()
+            self.buddy.mood = .listening
+            self.voice.start(autoStop: true, giveUpAfter: 5)
+        }
+    }
+
     private func rememberTarget() {
         guard agent.question == nil, !agent.isRunning else { return }   // answering or steering, not starting anew
         let front = NSWorkspace.shared.frontmostApplication
@@ -363,11 +417,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agent.targetApp = front
         // Files selected in Finder ride along instead of text ("compress this", "merge these").
         agent.selectedFiles = front.bundleIdentifier == "com.apple.finder" ? AXEngine.copiedFiles(of: front) : []
+        agent.copied = nil
         guard agent.selectedFiles.isEmpty else { agent.selectedText = nil; return }
         // Whatever the user had highlighted goes along with their request.
         agent.selectedText = AXEngine.selectedText(of: front)
         if agent.selectedText == nil, !Launcher.isBrowser(front) {
             agent.selectedText = AXEngine.copiedSelection(of: front)
+        }
+        // Nothing highlighted: something they copied a moment ago may be what "this" means.
+        if agent.selectedText == nil, let c = Clipboard.recent() {
+            agent.copied = .init(text: c.text, files: c.files, age: c.age)
         }
         if agent.selectedText == nil, Launcher.isBrowser(front), BrowserBridge.shared.isConnected {
             Task { [agent] in
@@ -442,6 +501,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc func showApplications() { agent.showApplications() }
 
+    @objc func toggleDryRun(_ item: NSMenuItem) {
+        agent.dryRun.toggle()
+        item.state = agent.dryRun ? .on : .off
+    }
+
+    @objc func setVoiceLanguage(_ item: NSMenuItem) {
+        guard let code = item.representedObject as? String else { return }
+        UserDefaults.standard.set(code, forKey: "voiceLanguage")
+        for other in item.menu?.items ?? [] { other.state = (other.representedObject as? String) == code ? .on : .off }
+    }
+
     @objc func tidyMemory() {
         Task {
             let report = await MemoryTidy.run() ?? "Memory is already tidy (or the tidy-up would have lost details, so it was skipped)"
@@ -469,6 +539,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
 
         Claude CLI: \(ClaudeSession.claudePath ?? "❌ not found")
+        Calendars & Reminders: \(Events.hasAccess ? "✅" : "asked the first time you schedule something")
 
         After enabling something in System Settings, click Check Again. \
         Screen Recording may need Clinqy to be restarted.

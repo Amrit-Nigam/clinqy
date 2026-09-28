@@ -172,6 +172,39 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
         let action = wf?.steps[0].action(params: ["Your name": "Priya"], id: "w5")
         check(action?["text"] as? String == "Priya" && action?["id"] as? String == "w5", "parameters fill in on replay")
     }
+    // Workflow-first: a saved run replays for the same request, with typed values read out of the new words.
+    MainActor.assumeIsolated {
+        var type = WorkflowStep(action: "type"); type.text = "{Your name}"
+        type.target = .init(kind: "web", role: "text", label: "Your name")
+        var msg = WorkflowStep(action: "type"); msg.text = "{message}"
+        let wf = Workflow(name: "Type Amrit Nigam as the name", summary: "", params: ["Your name"], steps: [type], created: Date(),
+                          defaults: ["Your name": "Amrit Nigam"])
+        let chat = Workflow(name: "message mom I'll be late", summary: "", params: ["message"], steps: [msg], created: Date(),
+                            defaults: ["message": "I'll be late"])
+        let open = Workflow(name: "open my github profile", summary: "", params: [], steps: [WorkflowStep(action: "open_url", url: "https://github.com")], created: Date())
+        let all = [wf, chat, open]
+        check(Router.match("type Priya Sharma as the name", in: all)?.params["Your name"] == "Priya Sharma", "workflow-first fills a parameter")
+        check(Router.match("Please message mom I'm stuck in traffic.", in: all)?.params["message"] == "I'm stuck in traffic", "workflow-first: filler and punctuation ignored")
+        check(Router.match("open my GitHub profile", in: all)?.workflow.name == "open my github profile", "workflow-first: exact request, no parameters")
+        check(Router.match("open my github settings", in: all) == nil, "workflow-first: a different request doesn't match")
+        check(Router.match("message dad I'll be late", in: all) == nil, "workflow-first: only parameters may differ")
+        check(Router.refersToContext("reply to this") && Router.refersToContext("translate it") && !Router.refersToContext("open my github profile"), "requests about \"this\" need the model")
+    }
+    check(Router.isDismissal("no thanks") && Router.isDismissal("kuch nahi") && Router.isDismissal("bas")
+          && !Router.isDismissal("now email that to Rahul"), "follow-up dismissals")
+    check(Safety.isYes("haan ji") && Safety.isYes("theek hai") && Safety.isYes("bhej do") && !Safety.isYes("ji nahi") && !Safety.isYes("haan but don't send"),
+          "Hinglish yes/no")
+    // Dates for the calendar come as local "yyyy-MM-dd HH:mm".
+    MainActor.assumeIsolated {
+        let d = Events.date("2026-10-02 15:30")
+        let c = d.map { Calendar.current.dateComponents([.year, .month, .day, .hour, .minute], from: $0) }
+        check(c?.year == 2026 && c?.month == 10 && c?.day == 2 && c?.hour == 15 && c?.minute == 30, "calendar date parsing")
+        check(Events.date("2026-10-02") != nil && Events.date("next thursday") == nil, "date-only and nonsense dates")
+    }
+    // Tables: CSV round-trips quotes, commas and newlines.
+    let rows = [["Vendor", "Note", "Amount"], ["Swiggy, Inc", "said \"hi\"\nthen left", "540"]]
+    check(Tables.parse(Tables.csv(rows)) == rows, "CSV round trip")
+    check(MainActor.assumeIsolated { Files.kindQuery("pdf").contains("com.adobe.pdf") && Files.kindQuery(".key").contains("*.key") }, "file kinds for Spotlight")
     // Scripting dictionaries: Notes should describe its note class and the make command.
     if let notes = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
         let sem = DispatchSemaphore(value: 0)

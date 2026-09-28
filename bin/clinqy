@@ -6,7 +6,7 @@
 #       .clinqy/ next to the test); later runs replay it with no model, healing only broken steps.
 #       Test files: optional "# Title", then one step per line; lines starting with Expect/Check/Verify
 #       are assertions. Exit code 0 = all passed, 1 = something failed.
-#   clinqy run "<task>"              Do a task (not saved to history).
+#   clinqy run [--dry] "<task>"      Do a task (not saved to history). --dry: point at each click/keystroke, don't do it.
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
 #   clinqy stats [days]              Success rate, turns, time and screenshots per run (default: last 7 days).
@@ -84,8 +84,10 @@ PY
     exit $failed ;;
   run)
     ensure_app
+    dry=""
+    [[ ${1:-} == --dry ]] && { dry="&dry=1"; shift; }
     start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://run?task=$(enc "$*")&test=1&token=$TOKEN"
+    open -g "clinqy://run?task=$(enc "$*")&test=1$dry&token=$TOKEN"
     wait_log $start ;;
   workflow)
     ensure_app

@@ -246,6 +246,15 @@ async function handle(msg) {
       }
       return top;
     }
+    case "tables": {
+      // The page's tables plus those in embedded forms/frames that belong to it.
+      const top = await call(tab.id, 0, "tables");
+      const offsets = (await mapFor(tab.id)).offsets || {};
+      for (const { frameId, result } of await callAll(tab.id, "tables")) {
+        if (frameId !== 0 && offsets[frameId]) top.tables = top.tables.concat(result.tables.map((t) => ({ ...t, frame: result.url })));
+      }
+      return top;
+    }
     case "activeValue": {
       const { frameId, info } = await focusedFrame(tab.id);
       focusFrames.set(tab.id, frameId);

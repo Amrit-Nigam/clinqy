@@ -33,7 +33,14 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 - **History.** Every run is saved. You can **Continue** from one or **Run again**.
 - **Memory.** After each task it keeps lasting facts about you (people, preferences, usual apps). It never saves passwords, card numbers or OTPs.
 - **Watch & learn.** Click *Watch & learn*, do a task yourself, and press ⌃⌥ to stop. It becomes a reusable **skill** with fill-in parameters.
-- **Selected text.** Whatever you had highlighted is sent along with your request.
+- **Selected text and the clipboard.** Whatever you had highlighted is sent along with your request. With nothing highlighted, something you copied in the last 10 minutes counts as "this" ("translate this", "reply to this", "add this to my tracker"). Clipboard text is only sent when the request points at it, and password-manager copies are never kept.
+- **Saved workflows first.** If a request matches a saved workflow (same words, only the typed values differ: "message mom I'm stuck in traffic" vs. the saved "message mom I'll be late"), it's replayed with no model. The model only steps in to heal a step whose target is gone. Turn it off with `WORKFLOW_FIRST=off`.
+- **Calendar & Reminders.** Events and reminders go straight through EventKit, with no clicking through Calendar. "Schedule a call with Priya Thursday afternoon" checks your free time and books the first slot that fits.
+- **Files.** Finds files through Spotlight: name, content, the site a download came from, who sent it ("the PDF I got from HR last week"). It also renames in bulk, moves files and sorts Downloads into subfolders. Every rename or move can be undone. Deleting only moves to the Trash.
+- **Moving data between apps.** It pulls tables out of a web page, a PDF or a CSV and writes them into a CSV, a new Numbers or Excel document, the clipboard (paste into any spreadsheet), or a web form.
+- **Dry run.** Toggle **Dry run** in the command bar (or start a request with "dry run:") and the companion points at everything it would click and type, without doing it. Opening apps and sites, scrolling and reading still happen so it can plan the whole path.
+- **Follow-ups by voice.** After a spoken task finishes, the mic stays open for 5 s: "now email that to Rahul" builds on what just happened. Silence, "no thanks" or "bas" closes it. `FOLLOW_UP=off` turns it off.
+- **Hindi and Hinglish.** Menu → **Voice Language**: Auto-detect, English, Hinglish (Hindi-English written in Latin letters, the way people text) or Hindi. Requests in any of these are understood, and replies and messages keep your style.
 - **Never touches your tabs.** Websites open in new tabs. It only reuses tabs it opened itself.
 
 ## Requirements
@@ -57,6 +64,7 @@ On first launch, grant the permissions Clinqy asks for (menu bar icon → **Chec
 | Screen Recording | Screenshots and OCR when the Accessibility tree isn't enough |
 | Microphone & Speech Recognition | Voice input |
 | Automation | AppleScript fallback for scriptable apps |
+| Calendars & Reminders | Adding and finding events and reminders (asked the first time you schedule something) |
 
 The first voice use downloads the Whisper model (~630 MB) into `~/Library/Application Support/Clinqy/models`.
 
@@ -85,7 +93,7 @@ It connects to the app on `ws://127.0.0.1:47823`, and only browser-extension ori
 Every link must carry `&token=<~/.config/clinqy/cli-token>` (`?token=` when it has no other parameters): web pages can open `clinqy://` links too, and must not be able to start tasks or answer questions. The `clinqy` command adds it for you.
 
 ```
-clinqy://run?task=<text>[&test=1]   run a task in the frontmost app (test=1: not saved to history or memory)
+clinqy://run?task=<text>[&test=1][&dry=1]   run a task in the frontmost app (test=1: not saved to history or memory; dry=1: dry run)
 clinqy://answer?text=<text>         answer the current question
 clinqy://add?text=<text>            add context to the running task
 clinqy://cancel                     stop the current task
@@ -107,6 +115,7 @@ clinqy qa "Go to https://example.com
 Expect: Example Domain"                     # inline test
 clinqy qa login.md --relearn --model opus
 clinqy run "open github"                 # a task (not saved to history)
+clinqy run --dry "book a cab home"       # show every click and keystroke, do none
 clinqy workflow "Fill form" "Your name=Priya"
 clinqy workflows
 ```
@@ -146,6 +155,10 @@ Optional `KEY=value` lines in `~/.config/clinqy/env`:
 | `CLAUDE_EFFORT` | `low` | `low` is noticeably faster per step |
 | `WHISPER_MODEL` | `large-v3-v20240930_turbo_632MB` | Any WhisperKit variant |
 | `VOICE_ENGINE` | whisper | Set `apple` to use only Apple dictation |
+| `VOICE_LANGUAGE` | `auto` | `auto`, `en`, `hinglish`, `hi`, or any Whisper code (the menu setting wins) |
+| `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
+| `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
+| `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |
 
 ### Your data (all local)
 
@@ -155,6 +168,8 @@ Optional `KEY=value` lines in `~/.config/clinqy/env`:
 | `~/Library/Application Support/Clinqy/history.json` | Run history |
 | `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
 | `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
+| `~/Library/Application Support/Clinqy/applications.json` | Job applications Clinqy filled or sent |
+| `~/Library/Application Support/Clinqy/file-moves/` | Renames/moves it made, for `files undo` |
 | `~/Library/Logs/Clinqy/agent.log` | Step-by-step log (secrets masked) |
 
 ## Tests
@@ -194,6 +209,15 @@ Sources/Clinqy/
   Recorder.swift, Skills.swift       watch & learn
   History.swift      run history and result cards
   Workflow.swift     deterministic workflows (steps + targets), store; replay/heal/QA live in Agent.swift
+  Router.swift       before the model: saved-workflow matching, follow-up dismissals
+  FastLane.swift     routine steps on a faster model, handed back to the main one on anything risky
+  Events.swift       calendar events and reminders (EventKit)
+  Files.swift        Spotlight file search, rename/move/organize with undo, trash
+  Tables.swift       extract tables and write rows (CSV, Numbers/Excel, clipboard)
+  Clipboard.swift    what the user copied recently ("this" when nothing is selected)
+  Pdf.swift, Media.swift             PDF and video/audio jobs in the background
+  NameHints.swift, MemoryTidy.swift  name-aware voice correction; memory clean-up
+  Applications.swift                 job-application tracker
 bin/clinqy        the command-line entry point (qa · run · workflow · workflows)
 tests/qa/            example plain-English QA tests (compiled scripts in tests/qa/.clinqy/)
 ```

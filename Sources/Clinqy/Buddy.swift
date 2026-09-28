@@ -530,10 +530,6 @@ private final class Stage {
         bubble.backgroundColor = NSColor(white: 0.08, alpha: 0.92).cgColor
         bubble.borderWidth = 0.5
         bubble.borderColor = NSColor(white: 1, alpha: 0.12).cgColor
-        bubble.shadowColor = NSColor.black.cgColor
-        bubble.shadowOpacity = 0.3
-        bubble.shadowRadius = 8
-        bubble.shadowOffset = CGSize(width: 0, height: 3)
         bubble.opacity = 0
         root.addSublayer(bubble)
         text.contentsScale = scale

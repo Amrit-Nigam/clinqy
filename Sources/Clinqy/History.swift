@@ -16,6 +16,8 @@ final class History: ObservableObject {
         let result: ResultCard?
         /// What the run did, replayable (lets it be saved as a workflow).
         var trace: [WorkflowStep]? = nil
+        /// The document the run read, for a follow-up task to use without reopening it.
+        var readText: String? = nil
     }
 
     @Published private(set) var entries: [Entry] = []
