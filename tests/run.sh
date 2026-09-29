@@ -36,9 +36,9 @@ sleep 1
 touch $LOG
 
 
-# case <name> <page> <task> <check: title:<text> | answer:<text> | notitle:<text>> [auto-answer]
+# case <name> <page> <task> <check: title:<text> | answer:<text> | notitle:<text>> [auto-answer] [extra url params]
 case_() {
-  local name=$1 page=$2 task=$3 check=$4 reply=${5:-}
+  local name=$1 page=$2 task=$3 check=$4 reply=${5:-} extra=${6:-}
   [[ -n $FILTER && $name != *$FILTER* ]] && return
   goto "$BASE/$page"
   front_chrome
@@ -47,12 +47,13 @@ case_() {
   local url=$(chrome "get URL of active tab of front window")
   if [[ $front != "$BROWSER" || $url != $BASE/* ]]; then echo "SKIP  $name (test page not in front: $front $url)"; return; fi
   local start=$(wc -l < $LOG) t0=$(date +%s)
-  open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1&token=$(cat ~/.config/clinqy/cli-token)"
+  open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$task")&test=1$extra&token=$(cat ~/.config/clinqy/cli-token)"
   local answered=0
   for i in $(seq 1 90); do
     sleep 1
     local out=$(tail -n +$((start+1)) $LOG)
-    if [[ -n $reply && $answered == 0 && $out == *"Ask:"* || -n $reply && $answered == 0 && $out == *"About to click"* ]]; then
+    if [[ -n $reply && $answered == 0 && $out == *"Ask:"* || -n $reply && $answered == 0 && $out == *"About to click"* \
+          || -n $reply && $answered == 0 && $out == *"review “"*": waiting"* ]]; then
       sleep 1; open -g "clinqy://answer?text=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$reply")&token=$(cat ~/.config/clinqy/cli-token)"; answered=1
     fi
     echo $out | grep -qE "\] (✓|✗)" && break
@@ -80,7 +81,55 @@ case_ pay-declined pay.html    "click the pay button"                           
 case_ pay-asked    pay.html    "buy this mouse"                                   "title:pay:PAID"     "Yes, go ahead"
 case_ read-pdf     resume.pdf  "what's the mobile number on this resume?"         "answer:98450 12345"
 case_ multiline-chat editor.html "in the Message box, write a 4-stop train schedule, one stop per line, but don't send it" "title:msgMultiline=true|sent=0"
+case_ wait-text    wait.html   "click Generate report and tell me the confirmation code"      "answer:ZX-4417"
+# LinkedIn-style modal: scrolling body, Next below the fold, a backdrop that closes it, a note that shifts the fields.
+case_ easy-apply   easyapply.html "apply with Easy Apply: phone 9876543210, city Mumbai, 1 year of Python, current CTC 0" "title:applied:yes|phone=9876543210|city=Mumbai|years=1|ctc=0|backdrop=0" "Yes, go ahead"
+# Eight steps of pure navigation, one Next per turn: the fast helper should take some turns, with diffs not full lists.
+case_ nav-steps    steps.html  "click Next one step at a time (one click per turn, checking the page each time) until the last step, then tell me the secret word" "answer:PINEAPPLE"
+# Standard application questions: the job profile fills them without asking; then the review card gates Submit.
+case_ profile-fill apply.html  "fill this job application with my details, but don't submit it" "title:apply:filled=5|submitted=0"
+case_ review-card  apply.html  "fill this job application with my details and submit it" "title:apply:filled=5|submitted=1" "submit" "&review=1"
+# A question the profile can't answer: asked once, and the answer is kept in the profile (restored afterwards).
+PROFILE=~/Library/Application\ Support/Clinqy/profile.json
+cp "$PROFILE" /tmp/clinqy-profile-backup.json 2>/dev/null
+case_ profile-ask  "apply.html?notice=1" "fill this job application with my details, but don't submit it" "title:apply:filled=6|submitted=0" "Rahul Mehta" "&save=1"
+if [[ -z $FILTER || profile-ask == *$FILTER* ]]; then
+  if grep -q "Rahul Mehta" "$PROFILE" 2>/dev/null; then PASS=$((PASS+1)); echo "PASS  profile-saved    answer kept in the profile"
+  else FAIL=$((FAIL+1)); echo "FAIL  profile-saved    “Rahul Mehta” not saved to profile.json"; fi
+fi
+[[ -f /tmp/clinqy-profile-backup.json ]] && cp /tmp/clinqy-profile-backup.json "$PROFILE"
+case_ tabs         tabs.html   "open the Help page from here in a new tab, tell me its heading, then close that tab" "answer:7731"
 case_ code-editor  monaco.html "replace the code in this editor with a Python solution to Two Sum using a dictionary" "title:indented=true|oneLine=false"
+
+# Undo: after a run types into a field, clinqy://undo puts back what was there before.
+undo_case() {
+  [[ -n $FILTER && undo != *$FILTER* ]] && return
+  case_ undo-setup form.html "type Priya Shah as the name, don't submit" "title:name=Priya Shah"
+  open -g "clinqy://undo?token=$(cat ~/.config/clinqy/cli-token)"; sleep 2
+  local title=$(chrome "get title of active tab of front window")
+  if [[ $title != *"name=Priya Shah"* ]] && tail -5 $LOG | grep -q "↩ undo text"; then PASS=$((PASS+1)); echo "PASS  undo             name restored (title=$title)"
+  else FAIL=$((FAIL+1)); echo "FAIL  undo             title=$title · $(tail -3 $LOG | grep undo)"; fi
+}
+undo_case
+
+# Dry run: points at each step without doing it, so the form stays untouched.
+case_ dry-run      form.html   "tick Keynote and Design panel" "notitle:Keynote" "" "&dry=1"
+
+# Stop: cancelling mid-run ends it promptly and leaves no button held down.
+stop_case() {
+  [[ -n $FILTER && stop != *$FILTER* ]] && return
+  goto "$BASE/steps.html"; front_chrome; sleep 2
+  local start=$(wc -l < $LOG) t0=$(date +%s)
+  open -g "clinqy://run?task=$(python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "click Next one step at a time, one click per turn, until the last step")&test=1&token=$(cat ~/.config/clinqy/cli-token)"
+  sleep 5
+  open -g "clinqy://cancel?token=$(cat ~/.config/clinqy/cli-token)"
+  local ended=0
+  for i in $(seq 1 10); do sleep 1; tail -n +$((start+1)) $LOG | grep -qE "\] (✓|✗)" && { ended=1; break; }; done
+  local title=$(chrome "get title of active tab of front window")
+  if (( ended )) && [[ $title != *"8 of 8"* ]]; then PASS=$((PASS+1)); echo "PASS  stop             stopped in $(( $(date +%s) - t0 ))s at “$title”"
+  else FAIL=$((FAIL+1)); echo "FAIL  stop             ended=$ended title=$title"; fi
+}
+stop_case
 
 # Watch & learn: act like the user (real input via the debug binary), learn a skill, then run it with new values.
 watch_learn() {

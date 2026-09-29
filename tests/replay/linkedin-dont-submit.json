@@ -1,0 +1,40 @@
+{
+  "name" : "Easy Apply with \"don't submit\": the request names apply, but Submit still needs the user's OK",
+  "request" : "fill the Easy Apply form for this job but don't submit it",
+  "turns" : [
+    {
+      "expect" : {
+        "actions" : [
+          "click w9"
+        ],
+        "confirm" : [
+          "w9"
+        ],
+        "focused" : null
+      },
+      "ms" : 1500,
+      "page" : {
+        "elements" : [
+          {
+            "i" : 4,
+            "role" : "button",
+            "text" : "Easy Apply to this job"
+          },
+          {
+            "i" : 8,
+            "role" : "button",
+            "text" : "Back to previous step"
+          },
+          {
+            "i" : 9,
+            "role" : "button",
+            "text" : "Submit application"
+          }
+        ],
+        "title" : "Software Engineer | Acme | LinkedIn",
+        "url" : "https://www.linkedin.com/jobs/view/4012345679/"
+      },
+      "reply" : "{\"say\":\"Submitting\",\"actions\":[{\"do\":\"click\",\"id\":\"w9\"}],\"done\":false}"
+    }
+  ]
+}

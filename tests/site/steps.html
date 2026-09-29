@@ -1,0 +1,25 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Onboarding step 1 of 8</title>
+<style>body { font: 16px system-ui; margin: 40px; } li { margin: 4px 0; } button { font-size: 16px; padding: 6px 14px; margin: 4px; }</style></head>
+<body>
+<h1 id="h">Step 1 of 8</h1>
+<p id="info">Nothing to fill in here — just continue.</p>
+<ul>
+  <li><a href="#terms">Terms</a></li><li><a href="#privacy">Privacy</a></li><li><a href="#help">Help centre</a></li>
+</ul>
+<button id="back">Back</button> <button id="skip" disabled>Skip</button> <button id="next">Next</button>
+<script>
+// Eight near-identical steps: pure navigation, so the fast helper should take over and only small diffs change.
+let step = 1;
+const words = ["", "", "", "", "", "", "", "", "PINEAPPLE"];
+function show() {
+  document.getElementById("h").textContent = `Step ${step} of 8`;
+  document.getElementById("info").textContent = step === 8 ? `Done. The secret word is ${words[8]}.` : "Nothing to fill in here — just continue.";
+  document.getElementById("next").style.display = step === 8 ? "none" : "";
+  document.title = `Onboarding step ${step} of 8`;
+}
+document.getElementById("next").onclick = () => { if (step < 8) step++; show(); };
+document.getElementById("back").onclick = () => { if (step > 1) step--; show(); };
+show();
+</script>
+</body></html>

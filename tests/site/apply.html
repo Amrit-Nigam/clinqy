@@ -1,0 +1,40 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>apply:filled=0|submitted=0</title>
+<style>body { font: 16px system-ui; margin: 40px; max-width: 560px; } label { display: block; margin: 14px 0 4px; }
+input { width: 100%; padding: 8px; box-sizing: border-box; } button { margin-top: 20px; font-size: 16px; padding: 8px 18px; }</style></head>
+<body>
+<h1>Apply: Product Intern at Beta Labs</h1>
+<form id="f" onsubmit="return false">
+  <label for="name">Full name *</label><input id="name" name="name" required>
+  <label for="email">Email *</label><input id="email" name="email" type="email" required>
+  <label for="linkedin">LinkedIn profile URL *</label><input id="linkedin" name="linkedin" required>
+  <label for="city">Current city *</label><input id="city" name="city" required>
+  <label for="stipend">Expected stipend *</label><input id="stipend" name="stipend" required>
+  <button id="submit" type="submit">Submit application</button>
+</form>
+<script>
+// Standard application questions the job profile should answer without asking. The title records how many
+// fields are filled and whether it was submitted (and with how many filled).
+const f = document.getElementById("f");
+// ?notice=1 adds a question only the user can answer, so the agent has to ask (and the answer gets saved).
+if (new URLSearchParams(location.search).has("notice")) {
+  const l = document.createElement("label"); l.htmlFor = "referrer"; l.textContent = "Referrer’s name *";
+  const i = document.createElement("input"); i.id = i.name = "referrer"; i.required = true;
+  f.insertBefore(i, document.getElementById("submit")); f.insertBefore(l, i);
+}
+let submitted = 0;
+function record() {
+  const filled = [...f.querySelectorAll("input")].filter((i) => i.value.trim()).length;
+  document.title = `apply:filled=${filled}|submitted=${submitted}`;
+}
+f.addEventListener("input", record);
+f.addEventListener("change", record);
+document.getElementById("submit").onclick = () => {
+  const missing = [...f.querySelectorAll("[required]")].filter((i) => !i.value.trim());
+  if (missing.length) { missing[0].setAttribute("aria-invalid", "true"); return; }
+  submitted++;
+  record();
+};
+record();
+</script>
+</body></html>
