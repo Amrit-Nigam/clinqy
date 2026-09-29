@@ -4,6 +4,8 @@ import Foundation
 /// to a faster model, so long runs don't pay the main model's latency for every mechanical step.
 /// The lead opts in per turn with a "routine" plan; the helper gets that plan, recent steps and the screen,
 /// may only use harmless actions, and hands back on anything risky, unclear, failed, repeated or final.
+/// The lead rarely writes a plan itself, so a streak of pure navigation turns (scroll, look, Next, esc) starts
+/// a shorter, navigation-only stint on its own (FAST_AUTO=off turns that off).
 /// Everything the helper did is replayed to the lead at its next turn, so the lead's context stays whole.
 /// FAST_MODEL=haiku (default) picks the helper model; FAST_MODEL=off turns it off.
 @MainActor
@@ -16,12 +18,25 @@ final class FastLane {
 
     /// Most helper turns in a row before the lead checks in again.
     static let maxStint = 6
+    /// Same, for a stint started on its own (the lead didn't plan it, so it checks in sooner).
+    static let maxAutoStint = 4
+
+    /// Whether navigation streaks start a helper stint without the lead asking.
+    static var autoDelegates: Bool {
+        !["off", "none", "no", "0", "false"].contains((Config.value("FAST_AUTO") ?? "on").lowercased())
+    }
 
     private let model: String?
     private let intro: String
     private var session: ClaudeSession?
     /// The lead's routine plan; set = the next turns go to the helper.
     private var plan: String?
+    /// The current stint was started on its own: the helper may only navigate (no typing, no picking options).
+    private var auto = false
+    /// Navigation-only lead turns in a row; `autoAfter` of them start an automatic stint.
+    private var routineStreak = 0
+    /// Raised each time an automatic stint hands back without doing anything, so a bad fit isn't retried every turn.
+    private var autoAfter = 2
     private var stintTurns = 0
     private var stintFailures = 0
     private var briefed = false
@@ -52,7 +67,8 @@ final class FastLane {
 
         Routine steps: when the next steps are purely mechanical and already decided (filling the remaining fields of \
         a form with values you know, ticking options you've chosen, scrolling on through a form), you may add \
-        "routine":"<those steps, with the exact values to use>" to your reply. A faster helper then carries them out and \
+        "routine":"<those steps, with the exact values to use>" to your reply (or "routine":true to just keep \
+        scrolling and clicking Next/Continue the way you are). A faster helper then carries them out and \
         you get its steps and results before anything else is decided. Never mark as routine anything that needs a \
         choice or a detail you don't have yet, or that submits, sends, pays, books, deletes, posts, uploads, asks the \
         user or finishes the task.
@@ -86,7 +102,8 @@ final class FastLane {
         if turnText.hasPrefix("The user added") { return "the user added something" }
         if stintTurns == 0, failures > 0 { return "the lead's last step failed" }
         if stintFailures >= 2 { return "steps failed twice" }
-        if stintTurns >= Self.maxStint { return "\(Self.maxStint) routine steps done, checking in" }
+        let most = auto ? Self.maxAutoStint : Self.maxStint
+        if stintTurns >= most { return "\(most) routine steps done, checking in" }
         return nil
     }
 
@@ -98,7 +115,7 @@ final class FastLane {
             briefed = true
         }
         if stintTurns == 0 {
-            text += "The lead's routine steps for you: \(plan)\n"
+            text += (auto ? "The lead didn't plan this; it was just navigating. " : "") + "The lead's routine steps for you: \(plan)\n"
             if !recent.isEmpty { text += "Recent steps:\n" + recent.suffix(4).map { "- \($0)" }.joined(separator: "\n") + "\n" }
             text += "\n"
         }
@@ -116,7 +133,7 @@ final class FastLane {
         let say = json["say"] as? String ?? ""
         let actions = json["actions"] as? [[String: Any]] ?? []
         if json["handback"] as? Bool == true { end("the helper handed back: \(say.prefix(80))"); return nil }
-        if let bad = actions.first(where: { !Self.isSafe($0, labels: labels) }) {
+        if let bad = actions.first(where: { !Self.isSafe($0, labels: labels, navOnly: auto) }) {
             end("the helper wanted \(Self.brief(bad))")
             return nil
         }
@@ -155,14 +172,15 @@ final class FastLane {
         let actions = json?["actions"] as? [[String: Any]] ?? []
         lastSignature = actions.map { "\($0)" }.joined()
         lastTurn = json.map { "\($0["say"] as? String ?? ""): " + actions.map(Self.brief).joined(separator: ", ") }
-        // A new routine plan starts a new stint; a turn without one keeps the lead in charge.
-        if model != nil, json?["done"] as? Bool != true, let routine = json?["routine"] as? String,
-           !routine.trimmingCharacters(in: .whitespaces).isEmpty {
-            plan = routine
-            stintTurns = 0
-            stintFailures = 0
-            // Start the helper's process now, while the lead's actions run.
-            if session?.isAlive != true, let model { session = try? ClaudeSession(system: Self.system, model: model) }
+        // A routine plan starts a new stint, and so does a streak of pure navigation; anything else keeps the lead in charge.
+        let say = json?["say"] as? String ?? ""
+        let finishing = json?["done"] as? Bool == true
+        routineStreak = !actions.isEmpty && actions.allSatisfy({ Self.isNavigation($0, labels: labels) }) ? routineStreak + 1 : 0
+        if model != nil, !finishing, let routine = json.flatMap({ Self.routine(in: $0, say: say, actions: actions) }) {
+            // "routine":true names no steps, so it gets the same navigation-only limits as an automatic stint.
+            start(routine, auto: json?["routine"] is Bool)
+        } else if model != nil, !finishing, Self.autoDelegates, routineStreak >= autoAfter {
+            start(Self.keepGoing(say: say, actions: actions), auto: true)
         } else {
             plan = nil
         }
@@ -184,24 +202,83 @@ final class FastLane {
         if turnText.contains("\nFrontmost app: ") || turnText.hasPrefix("Frontmost app: ") { labels = Self.labels(in: turnText) }
     }
 
-    private func end(_ why: String) {
-        plan = nil
+    private func start(_ routine: String, auto: Bool) {
+        plan = routine
+        self.auto = auto
         stintTurns = 0
+        stintFailures = 0
+        routineStreak = 0
+        // Start the helper's process now, while the lead's actions run.
+        if session?.isAlive != true, let model { session = try? ClaudeSession(system: Self.system, model: model) }
+    }
+
+    private func end(_ why: String) {
+        // An automatic stint that did nothing was a bad fit: wait for a longer streak before the next one.
+        if auto, stintTurns == 0 { autoAfter = min(autoAfter + 1, 5) }
+        plan = nil
+        auto = false
+        stintTurns = 0
+        routineStreak = 0
         handback = why
+    }
+
+    /// The lead's plan from "routine": a string, a list of steps, or true for "keep navigating like this".
+    nonisolated static func routine(in json: [String: Any], say: String, actions: [[String: Any]]) -> String? {
+        switch json["routine"] {
+        case let s as String:
+            let t = s.trimmingCharacters(in: .whitespaces)
+            return t.isEmpty || ["false", "no", "none", "null"].contains(t.lowercased()) ? nil : t
+        case let list as [String]:
+            let steps = list.map { $0.trimmingCharacters(in: .whitespaces) }.filter { !$0.isEmpty }
+            return steps.isEmpty ? nil : steps.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: " ")
+        case let yes as Bool where yes:
+            return keepGoing(say: say, actions: actions)
+        default:
+            return nil
+        }
+    }
+
+    /// The plan for "keep navigating the way the lead was".
+    nonisolated static func keepGoing(say: String, actions: [[String: Any]]) -> String {
+        "Carry on the way the lead has been going (\"\(say)\": \(actions.map(brief).joined(separator: ", "))). " + navRules
     }
 
     // MARK: - Rules
 
     /// Words on a control that commit, leave or open something the lead should decide on.
-    nonisolated private static let riskyLabel = #"(?i)\b(submit|send|pay|payment|buy|purchase|order|checkout|check out|book|reserve|confirm|delete|remove|trash|erase|discard|post|publish|tweet|share|apply|sign ?up|register|sign ?in|log ?in|log ?out|sign ?out|transfer|withdraw|donate|reply|forward|unsubscribe|cancel|deactivate|save|upload|attach|browse|add file|allow|approve|accept|agree|install|download|close|quit|finish|done)\b"#
+    nonisolated static let riskyLabel = #"(?i)\b(submit|send|pay|payment|buy|purchase|order|checkout|check out|book|reserve|confirm|delete|remove|trash|erase|discard|post|publish|tweet|share|apply|sign ?up|register|sign ?in|log ?in|log ?out|sign ?out|transfer|withdraw|donate|reply|forward|unsubscribe|cancel|deactivate|save|upload|attach|browse|add file|allow|approve|accept|agree|install|download|close|quit|finish|done)\b"#
     nonisolated private static let safeKinds: Set<String> = ["click", "type", "choose", "key", "scroll", "wait", "look", "read", "recall"]
     nonisolated private static let safeKeys: Set<String> = ["tab", "shift+tab", "up", "down", "left", "right", "esc", "escape",
                                                 "pageup", "pagedown", "page_up", "page_down", "home", "end"]
 
-    /// Whether the helper may run this action on its own.
-    nonisolated static func isSafe(_ action: [String: Any], labels: [String: String]) -> Bool {
+    /// Buttons that only move on through a page or form, or wave a popup away.
+    nonisolated private static let navLabel = #"(?i)\b(next|continue|show more|see more|load more|view more|read more|more|expand|review|got it|ok|okay|dismiss|not now|no thanks|maybe later)\b"#
+    nonisolated private static let navKinds: Set<String> = ["click", "key", "scroll", "wait", "look", "read", "recall"]
+
+    /// What a navigation-only stint may do.
+    nonisolated static let navRules = """
+    You may only scroll, wait, look, press tab/arrows/esc (to wave a popup away), and click buttons like Next, \
+    Continue or Show more. Don't type anything and don't pick or tick any option. Hand back as soon as a field \
+    needs filling, a choice is needed, anything looks unexpected, or you reach a review, submit or final step.
+    """
+
+    /// A lead step that only moves on (scroll, look, wait, safe keys, clicking Next/Continue/Show more):
+    /// a streak of these is what an automatic stint takes over.
+    nonisolated static func isNavigation(_ action: [String: Any], labels: [String: String]) -> Bool {
+        ["click", "key", "scroll", "wait", "look"].contains((action["do"] as? String ?? "").lowercased())
+            && isSafe(action, labels: labels, navOnly: true)
+    }
+
+    /// Whether the helper may run this action on its own; `navOnly` for a stint the lead didn't plan in words
+    /// (no typing or choosing, and clicks only on Next/Continue-style buttons).
+    nonisolated static func isSafe(_ action: [String: Any], labels: [String: String], navOnly: Bool = false) -> Bool {
         let kind = (action["do"] as? String ?? "").lowercased()
-        guard safeKinds.contains(kind) else { return false }
+        guard safeKinds.contains(kind), !navOnly || navKinds.contains(kind) else { return false }
+        if navOnly, kind == "click" {
+            // "Continue with Google" signs in and "Continue to payment" pays: only plain navigation labels count.
+            guard let id = action["id"] as? String, let line = labels[id], line.range(of: navLabel, options: .regularExpression) != nil,
+                  line.range(of: #"(?i)\bcontinue (with|to|as)\b"#, options: .regularExpression) == nil else { return false }
+        }
         let id = action["id"] as? String
         // Know what it's touching, and that it isn't a commit button.
         func harmless(_ id: String?) -> Bool {
