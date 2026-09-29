@@ -73,11 +73,13 @@ async function callAll(tabId, name, args = []) {
 }
 
 // ---- element ids across frames ----
-// A snapshot numbers the top page's elements first, then each visible frame's; commands with an index are
-// routed to the frame (and that frame's own index) the id came from. Kept in session storage too, so a
-// restarted worker still knows.
+// A snapshot lists the top page's elements first, then each visible frame's; commands with an id are routed to
+// the frame (and that frame's own index) the id came from. Ids are stable on a page: an element keeps its w-id
+// from look to look (matched by page.js's key), so a form that shifts by one field doesn't renumber everything
+// and an old id never silently means a different element. A new page (address) starts again from 0. Kept in
+// session storage too, so a restarted worker still knows.
 
-const maps = new Map();   // tabId → { items: [[frameId, local]], offsets: {frameId: {x, y}} }
+const maps = new Map();   // tabId → { items: {id: [frameId, local]}, offsets: {frameId: {x, y}}, page, keys: {key: id}, next }
 const focusFrames = new Map();   // tabId → frame that had the caret at the last activeValue
 
 async function saveMap(tabId, map) {
@@ -95,8 +97,33 @@ async function mapFor(tabId) {
 }
 
 async function route(tabId, index) {
-  const it = (await mapFor(tabId)).items[index];
-  return it ? { frameId: it[0], local: it[1] } : { frameId: 0, local: index };
+  const it = ((await mapFor(tabId)).items || {})[index];
+  if (!it) throw new Error("element w" + index + " isn't on the page now; take a new look");
+  return { frameId: it[0], local: it[1] };
+}
+
+const pageOf = (url) => { try { const u = new URL(url); return u.origin + u.pathname; } catch { return url || ""; } };
+
+// Gives each listed element its w-id: the one its key had on this page before, else the next unused number.
+// Keys seen earlier on the page are remembered (scrolled away and back = same id); ids are never reused for
+// another key, so they only grow (renumbered from 0 on a new page, or if they ever pass 999).
+function assignIds(prev, url, list) {
+  const page = pageOf(url);
+  const same = prev && prev.page === page && prev.keys && (prev.next || 0) < 1000;
+  const keys = same ? { ...prev.keys } : {};
+  let next = same ? prev.next || 0 : 0;
+  const used = new Set(), items = {};
+  for (const { key, frameId, local, e } of list) {
+    let id = key != null ? keys[key] : undefined;
+    if (id === undefined || used.has(id)) { id = next++; if (key != null && keys[key] === undefined) keys[key] = id; }
+    used.add(id);
+    items[id] = [frameId, local];
+    e.i = id;
+  }
+  // Remember a bounded number of keys (oldest dropped first).
+  const all = Object.keys(keys);
+  if (all.length > 1500) for (const k of all.slice(0, all.length - 1500)) delete keys[k];
+  return { items, page, keys, next };
 }
 
 const samePage = (a, b) => {
@@ -105,7 +132,7 @@ const samePage = (a, b) => {
 
 async function snapshot(tab) {
   const top = await call(tab.id, 0, "snapshot");
-  const items = top.elements.map((e) => [0, e.i]);
+  const list = top.elements.map((e) => ({ key: e.key, frameId: 0, local: e.i, e }));
   const offsets = { 0: { x: 0, y: 0 } };
   const elements = top.elements;
   const extraText = [];
@@ -127,31 +154,84 @@ async function snapshot(tab) {
       for (const e of sub.elements) {
         const x = e.x + f.x, y = e.y + f.y;
         if (y + e.h < 0 || y > top.viewport.h || x + e.w < 0 || x > top.viewport.w) continue;
-        items.push([frameId, e.i]);
-        elements.push({ ...e, i: elements.length, x, y, frame: host });
+        const moved = { ...e, x, y, frame: host };
+        elements.push(moved);
+        list.push({ key: e.key != null ? host + "|" + e.key : null, frameId, local: e.i, e: moved });
       }
       top.messages = (top.messages || []).concat(sub.messages || []);
       if (sub.text) extraText.push(`[${host}] ${sub.text}`);
       top.below = (top.below || 0) + (sub.below || 0);
+      top.above = (top.above || 0) + (sub.above || 0);
+      if (sub.panes && sub.panes.length) top.panes = (top.panes || []).concat(sub.panes.map((p) => ({ ...p, frame: host })));
     }
   }
-  await saveMap(tab.id, { items, offsets });
+  await saveMap(tab.id, { ...assignIds(await mapFor(tab.id), top.url, list), offsets });
   if (extraText.length) top.text = [top.text, ...extraText].filter(Boolean).join(" · ").slice(0, 2200);
-  return { ...top, elements };
+  return { ...top, elements, tabId: tab.id, active: !!tab.active };
 }
 
-// The frame that has the caret: the top page, or a frame inside it when the top page's focus is on an <iframe>.
+// The frame that has the caret: the top page, or a frame inside it when the top page's focus is on an <iframe>
+// (at any depth: only the frame that holds the caret reports focus without pointing at a frame of its own).
+// Blank/srcdoc frames count too — rich-text editors (TinyMCE, CKEditor) type into one.
 async function focusedFrame(tabId) {
   const top = await call(tabId, 0, "activeValue");
   if (!top.frame) return { frameId: 0, info: top };
-  for (const { frameId, result } of await callAll(tabId, "activeValue")) {
-    if (frameId !== 0 && result.hasFocus && result.editable && !result.frame && /^https?:/.test(result.url || "")) return { frameId, info: result };
-  }
+  const frames = (await callAll(tabId, "activeValue")).filter(({ frameId, result }) =>
+    frameId !== 0 && /^(https?:|about:|file:)/.test(result.url || "") && !result.frame);
+  const hit = frames.find(({ result }) => result.hasFocus && result.editable) || frames.find(({ result }) => result.hasFocus);
+  if (hit) return { frameId: hit.frameId, info: { ...hit.result, inFrame: true } };
   return { frameId: 0, info: top };   // e.g. Google Docs' own typing frame: keys land there, the app pastes
 }
 
+// ---- tabs ----
+// Tabs Clinqy opened (only those may be closed by it), kept across worker restarts.
+async function openedTabs() {
+  try { return new Set((await chrome.storage.session.get("opened")).opened || []); } catch { return new Set(); }
+}
+async function setOpened(set) {
+  try { await chrome.storage.session.set({ opened: [...set] }); } catch {}
+}
+
+chrome.tabs.onRemoved.addListener(async (tabId) => {
+  maps.delete(tabId);
+  focusFrames.delete(tabId);
+  try { await chrome.storage.session.remove("map" + tabId); } catch {}
+  const mine = await openedTabs();
+  if (mine.delete(tabId)) await setOpened(mine);
+});
+
+async function tabCommand(msg) {
+  const tabId = Number(msg.tabId);
+  switch (msg.cmd) {
+    case "tabs": {
+      // The tabs of the window in front, in strip order.
+      const cur = await activeTab();
+      const mine = await openedTabs();
+      const list = await chrome.tabs.query({ windowId: cur.windowId });
+      return { windowId: cur.windowId, tabs: list.map((t) => ({ id: t.id, title: (t.title || "").slice(0, 100), url: (t.url || t.pendingUrl || "").slice(0, 200),
+                                                                active: !!t.active, opened: mine.has(t.id), loading: t.status === "loading" })) };
+    }
+    case "switchTab": {
+      const t = await chrome.tabs.update(tabId, { active: true });
+      try { await chrome.windows.update(t.windowId, { focused: true }); } catch {}
+      return { id: t.id, title: t.title || "", url: t.url || t.pendingUrl || "" };
+    }
+    case "closeTab": {
+      const mine = await openedTabs();
+      if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it stays open");
+      await chrome.tabs.remove(tabId);
+      mine.delete(tabId);
+      await setOpened(mine);
+      return { closed: tabId };
+    }
+  }
+  return null;
+}
+
 async function handle(msg) {
-  const tab = await activeTab();
+  if (/^(tabs|switchTab|closeTab)$/.test(msg.cmd)) return await tabCommand(msg);
+  // A command may name its tab (a snapshot of a background tab, acting on a tab the app pinned); else the one in front.
+  const tab = msg.tabId != null && msg.cmd !== "goBack" ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
   if (msg.cmd === "version") return { version: chrome.runtime.getManifest().version };
   if (msg.cmd === "selection") {
@@ -166,6 +246,9 @@ async function handle(msg) {
   }
   if (msg.cmd === "newTab") {
     const t = await chrome.tabs.create({ url: msg.url, active: true });
+    const mine = await openedTabs();
+    mine.add(t.id);
+    await setOpened(mine);
     return { id: t.id };
   }
   if (msg.cmd === "goBack") {
@@ -191,6 +274,9 @@ async function handle(msg) {
       // "Focused" = this browser's window is the focused one (the page itself may not have keyboard focus
       // right after typing in the address bar). A page that can't be read says why instead of looking empty.
       const win = await chrome.windows.get(tab.windowId);
+      // A discarded (memory-saver) tab has no page to script until it's shown again.
+      if (tab.discarded) return { url: tab.url, title: tab.title, focused: !!win.focused, elements: [], tabId: tab.id, active: !!tab.active,
+                                  error: "this tab is asleep (discarded by the browser); switch to it first" };
       try { return { ...(await snapshot(tab)), focused: !!win.focused }; }
       catch (e) {
         const why = String(e && e.message || e);
