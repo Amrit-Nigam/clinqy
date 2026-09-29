@@ -144,6 +144,24 @@ Expect: the page title shows name=Amrit Nigam
 
 From the terminal: `clinqy workflow <name> "Input=value"`. A step that breaks is healed by the model, and the workflow is saved with the fix.
 
+**How runs are going.** `Clinqy stats [days]` gives the success rate (overall and per app), the slowest runs, a per-turn breakdown of model time vs action time (from `agent.log`), and the most common failure reasons and failed steps. `Clinqy stats --last` shows the latest run turn by turn.
+
+## MCP server (Claude Code, Codex, Cursor…)
+
+`Clinqy mcp` runs Clinqy as a stdio [MCP](https://modelcontextprotocol.io) server with no extra dependencies. Register it in Claude Code with:
+
+```bash
+claude mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp
+```
+
+| Tool | Read-only | What it does |
+|---|---|---|
+| `clinqy_run` | no | Carries out a plain-English task (`task`, optional `dry`, `timeout` in s, default 300) and returns the steps and the final answer. It isn't saved to History or memory. |
+| `clinqy_look` | yes | What's in front: the browser tab through the extension (`mode`: `page`, `read` or `url`), or the app's window and controls through Accessibility |
+| `clinqy_stats` | yes | The `stats` report (`days`, `last`) |
+
+The server hands tasks to the running app with `clinqy://` links, the same way the `clinqy` command does, and starts the app if it isn't running. It handles one task at a time. If the client cancels a call, the task is stopped in the app.
+
 ## Configuration
 
 Optional `KEY=value` lines in `~/.config/clinqy/env`:
@@ -176,9 +194,21 @@ Optional `KEY=value` lines in `~/.config/clinqy/env`:
 
 ```bash
 swift build --build-system native
-.build/debug/Clinqy --selftest     # safety rules, reply parsing, scripting dictionaries
+.build/debug/Clinqy --selftest     # safety rules, reply parsing, stats parsing, replay fixtures, scripting dictionaries
+.build/debug/Clinqy replay tests/replay   # recorded runs re-checked offline
 tests/run.sh [filter]                 # end-to-end in Chrome against local pages in tests/site
 ```
+
+**Replay fixtures** (`tests/replay/*.json`) are recorded runs: the page snapshots the extension sent, plus the model's reply for each turn. Replaying them needs no browser, model or screen. Each turn is checked against pure code:
+- how the reply is parsed into actions
+- which clicks need your OK
+- which elements kept or changed their w-id since the previous snapshot (drift)
+- what was added, removed or changed
+- which field has focus
+
+`expect` holds the known-good answers. `Clinqy replay <file> --bless` writes the current answers into it. To record live runs, set `REPLAY_RECORD=on` in `~/.config/clinqy/env`. Fixtures go to `~/Library/Logs/Clinqy/replays/`. They hold whatever the page showed, so strip personal data before committing one.
+
+`Clinqy watch <app> <text> [--gone] [--timeout s]` waits until text appears in an app, or with `--gone` until it disappears. It listens for Accessibility notifications and falls back to polling. It's handy for checking what `Watch.until` sees.
 
 `tests/run.sh` needs the app running and the extension in Chrome. It opens its own Chrome window and refuses to act unless its test page is in front. It covers:
 - checkboxes that only accept real clicks, radio buttons, text fields and dropdowns
@@ -218,6 +248,10 @@ Sources/Clinqy/
   Pdf.swift, Media.swift             PDF and video/audio jobs in the background
   NameHints.swift, MemoryTidy.swift  name-aware voice correction; memory clean-up
   Applications.swift                 job-application tracker
+  MCPServer.swift    `Clinqy mcp`: stdio MCP server relaying to the running app
+  Watch.swift        wait for text to appear/vanish via AXObserver notifications (polling fallback)
+  Stats.swift        `Clinqy stats`: runs.jsonl + per-turn timings from agent.log
+  Replay.swift       offline replay of recorded page snapshots + replies (tests/replay)
 bin/clinqy        the command-line entry point (qa · run · workflow · workflows)
 tests/qa/            example plain-English QA tests (compiled scripts in tests/qa/.clinqy/)
 ```

@@ -541,7 +541,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func openProfile() { Profile.open() }
 
     @objc func showStats() {
-        agent.result = Stats.card
+        agent.result = StatsCard.card
         agent.onResult()
     }
 
