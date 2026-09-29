@@ -104,6 +104,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(.separator())
         let dry = menu.addItem(withTitle: "Dry Run (show, don't act)", action: #selector(toggleDryRun(_:)), keyEquivalent: "")
         dry.state = agent.dryRun ? .on : .off
+        let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
+        follow.state = buddy.followsMouse ? .on : .off
         let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
         let languages = NSMenu()
         for (code, name) in Whisper.languages {
@@ -504,6 +506,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     @objc func toggleDryRun(_ item: NSMenuItem) {
         agent.dryRun.toggle()
         item.state = agent.dryRun ? .on : .off
+    }
+
+    @objc func toggleFollowCursor(_ item: NSMenuItem) {
+        buddy.followsMouse.toggle()
+        item.state = buddy.followsMouse ? .on : .off
     }
 
     @objc func setVoiceLanguage(_ item: NSMenuItem) {

@@ -149,7 +149,8 @@ final class FastLane {
             unreported = []
             handback = nil
         }
-        let reply = try await lead.send(text, image: image)
+        // A last-line reminder: without it the model often writes a fake <invoke> tool call first, costing seconds a turn.
+        let reply = try await lead.send(text + "\n\nReply with the JSON object only — no tool-call or XML tags.", image: image)
         let json = Brain.json(from: reply)
         let actions = json?["actions"] as? [[String: Any]] ?? []
         lastSignature = actions.map { "\($0)" }.joined()

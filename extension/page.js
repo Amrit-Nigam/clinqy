@@ -243,6 +243,19 @@ function target(index) {
   throw new Error("element w" + index + " is gone (the page changed); take a new look");
 }
 
+// Where the element is right now (brought into view first), and whether a real mouse click at its centre would
+// land on it — not on a popup's backdrop, which on LinkedIn/Indeed closes the popup instead.
+function locate(index) {
+  const el = target(index);
+  el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  const onScreen = r.width >= 1 && r.height >= 1 && cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight;
+  const top = onScreen ? document.elementFromPoint(cx, cy) : null;
+  const hit = !!top && (el === top || el.contains(top) || top.contains(el));
+  return { x: r.left, y: r.top, w: r.width, h: r.height, hit };
+}
+
 function click(index) {
   const el = target(index);
   el.scrollIntoView({ block: "nearest", inline: "nearest" });
@@ -507,5 +520,5 @@ function readText() {
   }
   function selection() { return String(window.getSelection() || "").slice(0, 8000); }
 
-  window.__clinqy = { snapshot, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
+  window.__clinqy = { snapshot, locate, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
 })();

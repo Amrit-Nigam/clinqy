@@ -140,7 +140,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.5.0"
+    static let extensionVersion = "1.5.1"
     private var reloadAsked: Set<String> = []
 
     private func checkVersion(_ version: String, on conn: NWConnection) {

@@ -201,6 +201,14 @@ async function handle(msg) {
     }
     case "click": case "focus": case "value": case "isActive": case "prepare": case "state": case "chosen":
       return await indexed(msg.cmd);
+    case "locate": {
+      // In top-page coordinates, so a frame's element (LinkedIn's Easy Apply form) is placed right too.
+      const { frameId, local } = await route(tab.id, msg.index);
+      const r = await call(tab.id, frameId, "locate", [local]);
+      const o = ((await mapFor(tab.id)).offsets || {})[frameId];
+      if (!o) return { ...r, hit: frameId === 0 && r.hit };
+      return { ...r, x: r.x + o.x, y: r.y + o.y };
+    }
     case "fill": return await indexed("fill", [msg.text]);
     case "upload": {
       if (msg.index >= 0) return await indexed("upload", [msg.name, msg.type, msg.data]);

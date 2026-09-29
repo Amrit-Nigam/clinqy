@@ -20,6 +20,11 @@ final class Buddy {
     /// Microphone level 0…1 while listening.
     var level: CGFloat = 0
 
+    /// Off: the companion stays hidden while Clinqy is idle and only appears when it listens, thinks or acts.
+    var followsMouse = UserDefaults.standard.object(forKey: "buddyFollowsMouse") as? Bool ?? true {
+        didSet { UserDefaults.standard.set(followsMouse, forKey: "buddyFollowsMouse") }
+    }
+
     /// QA mode: the companion becomes an amber targeting reticle with a "QA" tag.
     var qaMode = false
 
@@ -291,7 +296,7 @@ final class Buddy {
         let mouseIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .mouseMoved)
         let keyIdle = CGEventSource.secondsSinceLastEventType(.combinedSessionState, eventType: .keyDown)
         let resting = mode == .following && flight == nil && mood == .idle && bubbleText == nil && mark == nil
-        let leave = resting && (mouseIdle > 3 || (mouseIdle > 0.6 && keyIdle < 1.0))
+        let leave = resting && (!followsMouse || mouseIdle > 3 || (mouseIdle > 0.6 && keyIdle < 1.0))
         // Exit slowly (floating up), come back quickly (dropping in).
         offstage += ((leave ? 1 : 0) - offstage) * min(1, dt * (leave ? 3.2 : 14))
         // Only when Clinqy moves it itself (not while it's just following the user's mouse).

@@ -675,13 +675,26 @@ final class Agent: ObservableObject {
             let page = context.page!
             let state = { (try? await BrowserBridge.shared.perform("state", on: page, ["index": el.index]))?["sig"] as? String }
             let before = await state()
-            await hand.click(at: CGPoint(x: rect.midX, y: rect.midY))
-            var after = await state()
-            for _ in 0..<3 where before != nil && before == after {
-                try? await Task.sleep(for: .milliseconds(120))
-                after = await state()
+            // Where it is now: the listed position goes stale when a popup re-lays out, and a mouse click that
+            // misses lands on the backdrop (LinkedIn's Easy Apply then closes and asks to save the application).
+            var point = CGPoint(x: rect.midX, y: rect.midY), mouse = true
+            if let spot = try? await BrowserBridge.shared.perform("locate", on: page, ["index": el.index]),
+               let web = context.webArea, let hit = spot["hit"] as? Bool {
+                func d(_ k: String) -> Double { (spot[k] as? NSNumber)?.doubleValue ?? 0 }
+                let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
+                point = CGPoint(x: web.minX + (d("x") + d("w") / 2) * sx, y: web.minY + (d("y") + d("h") / 2) * sy)
+                mouse = hit && web.contains(point)
             }
-            if before != nil, before == after {
+            var after = before
+            if mouse {
+                await hand.click(at: point)
+                after = await state()
+                for _ in 0..<3 where before != nil && before == after {
+                    try? await Task.sleep(for: .milliseconds(120))
+                    after = await state()
+                }
+            }
+            if !mouse || (before != nil && before == after) {
                 do { _ = try await BrowserBridge.shared.perform("click", on: page, ["index": el.index]) }
                 catch { return end(line, fail(error.localizedDescription)) }
                 try? await Task.sleep(for: .milliseconds(250))
