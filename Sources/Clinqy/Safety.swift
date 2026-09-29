@@ -1,3 +1,5 @@
+import AppKit
+import ApplicationServices
 import CoreAudio
 import CoreGraphics
 import Foundation
@@ -63,5 +65,118 @@ enum Safety {
         address.mSelector = kAudioDevicePropertyDeviceIsRunningSomewhere
         guard AudioObjectGetPropertyData(device, &address, 0, nil, &size, &running) == noErr else { return false }
         return running != 0
+    }
+
+    // MARK: - Secure input
+
+    /// Pid of the process holding Secure Event Input (a focused password field, Terminal's Secure Keyboard Entry).
+    static var secureInputPID: pid_t? {
+        guard let pid = (CGSessionCopyCurrentDictionary() as? [String: Any])?["kCGSSessionSecureInputPID"] as? Int,
+              pid > 0 else { return nil }
+        return pid_t(pid)
+    }
+
+    /// Why typing mustn't happen right now, or nil. While another process holds secure input, keystrokes are
+    /// headed into (or around) a password prompt, exactly where synthetic typing must never go.
+    static func secureInputBlock() -> String? {
+        guard let pid = secureInputPID, pid != getpid() else { return nil }
+        let owner = NSRunningApplication(processIdentifier: pid)?.cleanName ?? "Another app"
+        return "\(owner) has a password field focused (secure input is on), so I won't type. "
+            + "Enter it yourself, or leave that field and run again."
+    }
+
+    // MARK: - Sensitive apps
+
+    /// Apps that hold secrets or money, by bundle-id prefix (a vendor prefix covers its helpers too).
+    private static let sensitiveBundles = [
+        "com.1password", "com.agilebits", "com.bitwarden", "com.lastpass", "com.dashlane", "com.nordpass",
+        "org.keepassxc", "com.apple.keychainaccess", "com.apple.Passwords", "com.apple.SecurityAgent",
+        "com.apple.LocalAuthentication", "com.apple.loginwindow",
+        // Banking and payments.
+        "com.chase", "com.bankofamerica", "com.wellsfargo", "com.citi", "com.capitalone", "com.usaa",
+        "com.americanexpress", "com.schwab", "com.fidelity", "com.vanguard", "com.paypal", "com.venmo",
+        "com.revolut", "com.monzo", "com.wise", "com.hdfcbank", "com.icicibank", "com.sbi", "com.axisbank",
+        "com.kotak", "net.one97.paytm", "com.phonepe", "com.zerodha",
+    ].map { $0.lowercased() }
+
+    /// True for password managers, keychain/auth prompts and banking apps, unless ALLOW_SENSITIVE_APPS=1.
+    static func isSensitive(_ app: NSRunningApplication) -> Bool {
+        if ["1", "true", "yes", "on"].contains(Config.value("ALLOW_SENSITIVE_APPS")?.lowercased() ?? "") { return false }
+        return isSensitive(bundleID: app.bundleIdentifier, name: app.cleanName)
+    }
+
+    static func isSensitive(bundleID: String?, name: String?) -> Bool {
+        let id = (bundleID ?? "").lowercased()
+        if sensitiveBundles.contains(where: { id == $0 || id.hasPrefix($0 + ".") }) { return true }
+        let n = (name ?? "").lowercased()
+        return ["1password", "bitwarden", "lastpass", "dashlane", "keychain access", "keepassxc"].contains(where: n.contains)
+            || n.range(of: #"\bbank(ing)?\b"#, options: .regularExpression) != nil
+    }
+
+    /// Message for refusing to act inside a sensitive app, or nil.
+    static func sensitiveBlock(_ app: NSRunningApplication) -> String? {
+        guard isSensitive(app) else { return nil }
+        return "\(app.cleanName ?? "That app") holds passwords or money, so I don't click or type in it. Please do this step yourself."
+    }
+
+    // MARK: - System chords
+
+    /// Chords that lock, log out or force-quit: (modifiers, key, words the user would have used to ask).
+    private static let systemChords: [(Set<String>, String, [String])] = [
+        (["cmd", "ctrl"], "q", ["lock"]),
+        (["cmd", "shift"], "q", ["log out", "logout", "log off", "sign out"]),
+        (["cmd", "opt", "shift"], "q", ["log out", "logout", "log off", "sign out"]),
+        (["cmd", "opt"], "esc", ["force quit", "force-quit", "forcequit"]),
+    ]
+
+    /// If `combo` is a session-ending chord the request didn't ask for, says so; nil when it may be pressed.
+    static func blockedChord(_ combo: String, request: String) -> String? {
+        var mods = Set<String>(), key = ""
+        for part in combo.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init) {
+            switch part {
+            case "cmd", "command", "⌘": mods.insert("cmd")
+            case "shift", "⇧": mods.insert("shift")
+            case "opt", "option", "alt", "⌥": mods.insert("opt")
+            case "ctrl", "control", "⌃": mods.insert("ctrl")
+            case "escape": key = "esc"
+            default: key = part
+            }
+        }
+        let asked = request.lowercased()
+        for (chordMods, chordKey, words) in systemChords where chordMods == mods && chordKey == key {
+            // Whole words: "clock" or "block" isn't asking to lock the screen.
+            let wanted = words.contains {
+                asked.range(of: #"\b"# + NSRegularExpression.escapedPattern(for: $0) + #"\b"#, options: .regularExpression) != nil
+            }
+            if wanted { return nil }
+            return "\(combo) locks, logs out or force-quits; not pressed because the request didn't ask for that"
+        }
+        return nil
+    }
+
+    // MARK: - Redaction
+
+    static let redactedMark = "«redacted»"
+
+    /// True for password fields, whose value must never reach the model, logs or history.
+    static func isSecureField(_ element: AXUIElement) -> Bool {
+        func string(_ name: String) -> String? {
+            var value: CFTypeRef?
+            guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+            return value as? String
+        }
+        return string(kAXSubroleAttribute) == "AXSecureTextField" || string(kAXRoleAttribute) == "AXSecureTextField"
+    }
+
+    /// `value` as it may be shown to the model: masked for password fields.
+    static func redacted(_ value: String?, of element: AXUIElement) -> String? {
+        guard let value, !value.isEmpty, isSecureField(element) else { return value }
+        return redactedMark
+    }
+
+    /// Same, for callers that already read the role and subrole.
+    static func redacted(_ value: String?, role: String?, subrole: String?) -> String? {
+        guard let value, !value.isEmpty, role == "AXSecureTextField" || subrole == "AXSecureTextField" else { return value }
+        return redactedMark
     }
 }
