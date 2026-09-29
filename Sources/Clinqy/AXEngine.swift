@@ -101,8 +101,11 @@ enum AXEngine {
 
             if actionableRoles.contains(role), let frame = frame(position: v[2], size: v[3]),
                frame.width > 2, frame.height > 2, screenBounds.intersects(frame) {
+                // A password field's value never reaches the model: not as its label, not as its value.
+                let secure = role == "AXSecureTextField" || v[1] as? String == "AXSecureTextField"
+                let raw: Any? = secure ? Safety.redacted(v[8] as? String, role: role, subrole: v[1] as? String) : v[8]
                 let label = label(element: element, role: role, title: v[4] as? String, desc: v[5] as? String,
-                                  help: v[6] as? String, placeholder: v[7] as? String, value: v[8] as? String)
+                                  help: v[6] as? String, placeholder: v[7] as? String, value: raw as? String)
                 // Unlabeled images/rows/cells are noise; unlabeled inputs are still useful.
                 let input = isInput(role)
                 let key = "\(role)|\(label)|\(Int(frame.minX)),\(Int(frame.minY)),\(Int(frame.width)),\(Int(frame.height))"
@@ -118,7 +121,7 @@ enum AXEngine {
                         label: label.isEmpty ? "(unlabeled \(role.dropFirst(2)))" : label,
                         frame: frame, element: element,
                         ref: n == 1 ? base : "\(base)~\(n)",
-                        value: valueText(v[8], role: role), inDialog: inDialog))
+                        value: valueText(raw, role: role), inDialog: inDialog))
                 }
             }
 
@@ -271,7 +274,7 @@ enum AXEngine {
     private static func label(of element: AXUIElement, role: String) -> String {
         let v = attrs(element, [kAXTitleAttribute, kAXDescriptionAttribute, kAXHelpAttribute, kAXPlaceholderValueAttribute, kAXValueAttribute])
         return label(element: element, role: role, title: v[0] as? String, desc: v[1] as? String,
-                     help: v[2] as? String, placeholder: v[3] as? String, value: v[4] as? String)
+                     help: v[2] as? String, placeholder: v[3] as? String, value: Safety.redacted(v[4] as? String, of: element))
     }
 
     private static func label(element: AXUIElement, role: String, title: String?, desc: String?, help: String?,
@@ -359,6 +362,13 @@ enum AXEngine {
         let root = AXUIElementCreateApplication(app.processIdentifier)
         guard let f: AXUIElement = attr(root, kAXFocusedUIElementAttribute) else { return nil }
         return attr(f, kAXValueAttribute)
+    }
+
+    /// The focused value as it may be shown to the model or logged (a password field's is masked).
+    static func focusedValueShown(of app: NSRunningApplication) -> String? {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let f: AXUIElement = attr(root, kAXFocusedUIElementAttribute) else { return nil }
+        return Safety.redacted(attr(f, kAXValueAttribute), of: f)
     }
 
     private static let fingerprintAttrs = [kAXRoleAttribute, kAXTitleAttribute, kAXDescriptionAttribute, kAXValueAttribute]
@@ -473,72 +483,6 @@ enum AXEngine {
         var names: CFArray?
         guard AXUIElementCopyActionNames(element, &names) == .success else { return [] }
         return names as? [String] ?? []
-    }
-
-    /// Selects a row, list item or cell through kAXSelected — Catalyst and sandboxed apps (Messages, WhatsApp)
-    /// drop synthetic clicks there and offer no AXPress. A cell hands off to its row. Read back to be sure.
-    static func setSelected(_ element: AXUIElement) -> Bool {
-        var current: AXUIElement? = element
-        for _ in 0..<3 {
-            guard let el = current else { break }
-            var settable: DarwinBoolean = false
-            if AXUIElementIsAttributeSettable(el, kAXSelectedAttribute as CFString, &settable) == .success, settable.boolValue {
-                AXUIElementSetAttributeValue(el, kAXSelectedAttribute as CFString, kCFBooleanTrue)
-                return (attr(el, kAXSelectedAttribute) as Bool?) == true
-            }
-            // Tables that won't select a row directly may still take it as their selected rows.
-            if let parent: AXUIElement = attr(el, kAXParentAttribute),
-               AXUIElementIsAttributeSettable(parent, kAXSelectedRowsAttribute as CFString, &settable) == .success, settable.boolValue,
-               AXUIElementSetAttributeValue(parent, kAXSelectedRowsAttribute as CFString, [el] as CFArray) == .success {
-                return true
-            }
-            current = attr(el, kAXParentAttribute)
-        }
-        return false
-    }
-
-    /// Opens an element's context menu through Accessibility (no right-click needed).
-    static func showMenu(_ element: AXUIElement) -> Bool {
-        guard actions(of: element).contains(kAXShowMenuAction as String) else { return false }
-        return AXUIElementPerformAction(element, kAXShowMenuAction as CFString) == .success
-    }
-
-    /// Named custom actions an element offers (WhatsApp's chat rows: "Pin", "Archive", "Unread"…); AX lists them
-    /// as "Name:Pin\nTarget:…\nSelector:…".
-    static func customActions(of element: AXUIElement) -> [String] {
-        actions(of: element).compactMap { raw in
-            guard raw.hasPrefix("Name:") else { return nil }
-            return raw.split(separator: "\n").first.map { $0.dropFirst(5).replacingOccurrences(of: "\u{200E}", with: "") }
-        }
-    }
-
-    /// Performs a custom action by its name (case-insensitive).
-    static func perform(_ name: String, on element: AXUIElement) -> Bool {
-        guard let raw = actions(of: element).first(where: { raw in
-            raw.hasPrefix("Name:") && raw.split(separator: "\n").first.map {
-                $0.dropFirst(5).replacingOccurrences(of: "\u{200E}", with: "").caseInsensitiveCompare(name) == .orderedSame
-            } == true
-        }) else { return false }
-        return AXUIElementPerformAction(element, raw as CFString) == .success
-    }
-
-    /// Presses the nearest ancestor that can be pressed: the label or image inside a button often can't be.
-    static func pressAncestor(of element: AXUIElement, hops: Int = 6) -> Bool {
-        var current: AXUIElement? = attr(element, kAXParentAttribute)
-        for _ in 0..<hops {
-            guard let el = current else { return false }
-            if (attr(el, kAXRoleAttribute) as String?) == "AXWindow" { return false }
-            if axPress(el) { return true }
-            current = attr(el, kAXParentAttribute)
-        }
-        return false
-    }
-
-    /// Best AX-only activation: press, else select (rows, cells, list items), else press an ancestor.
-    static func activate(_ element: AXUIElement, role: String) -> Bool {
-        if axPress(element) { return true }
-        if ["AXRow", "AXCell", "AXStaticText", "AXGroup", "AXImage"].contains(role), setSelected(element) { return true }
-        return pressAncestor(of: element)
     }
 
     /// Gives keyboard focus to a text box through Accessibility.

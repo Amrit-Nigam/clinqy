@@ -164,8 +164,7 @@ enum Profile {
 
     /// The saved answer to a form question, if the profile has one: a close earlier question first (the user's own
     /// wording for that exact question wins), then the matching profile field. nil when nothing fits.
-    static func answer(for question: String) -> String? {
-        let p = current
+    static func answer(for question: String, in p: Data = current) -> String? {
         let q = question.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !q.isEmpty else { return nil }
         if let best = p.qa.map({ ($0, similarity(q, $0.question)) }).max(by: { $0.1 < $1.1 }), best.1 >= 0.6,

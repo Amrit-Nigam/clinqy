@@ -177,6 +177,8 @@ Optional `KEY=value` lines in `~/.config/clinqy/env`:
 | `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
 | `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
 | `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |
+| `FAST_AUTO` | on | `off`: the fast model only takes over when the main model plans routine steps |
+| `REPLAY_RECORD` | off | `on`: record each run as an offline replay fixture |
 
 ### Your data (all local)
 

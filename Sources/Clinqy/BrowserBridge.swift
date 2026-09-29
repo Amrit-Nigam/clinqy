@@ -154,7 +154,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.6.0"
+    static let extensionVersion = "1.6.1"
     private var reloadAsked: Set<String> = []
 
     private func checkVersion(_ version: String, on conn: NWConnection) {
@@ -325,19 +325,6 @@ final class BrowserBridge {
 
     // MARK: - Snapshot diffs
 
-    /// The page last shown to the model, per browser tab (see noteShown).
-    private var shown: [String: Page] = [:]
-    private static func tabKey(_ page: Page) -> String { "\(page.connection.hashValue)-\(page.tabId ?? -1)" }
-
-    /// Remember `page` as what the model has now seen of its tab (call after a full listing or a diff went out).
-    func noteShown(_ page: Page) {
-        guard page.problem == nil else { return }
-        shown[Self.tabKey(page)] = page
-    }
-
-    /// What the model last saw of the same tab, if anything.
-    func lastShown(like page: Page) -> Page? { shown[Self.tabKey(page)] }
-
     /// Compact changes from `previous` to `current`, one per line: "+ w12 button: Next [..]" (new), "- w7 link: Jobs"
     /// (gone), "~ w3 value \"\" → \"360000\"", "~ w5 now covered", plus new/cleared messages and heading changes.
     /// "" = nothing changed. nil = the page changed too much for a diff to help (another address or tab, a page
@@ -400,6 +387,7 @@ final class BrowserBridge {
     }
 
     private func parse(_ r: [String: Any], connection: ObjectIdentifier) -> Page {
+        Replay.Recorder.shared.page(r)
         let vp = r["viewport"] as? [String: Any]
         let scroll = r["scroll"] as? [String: Any]
         let els = (r["elements"] as? [[String: Any]] ?? []).map { e -> PageElement in

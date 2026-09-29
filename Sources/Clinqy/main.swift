@@ -293,6 +293,76 @@ if command == "selftest" {
               && runs[0].stepFailures.count == 1 && runs[0].ok == true, "stats: per-turn model vs action time")
         check(Stats.reason("couldn't find “Next” (w12)") == Stats.reason("couldn't find “Submit” (w3)"), "stats: similar failures group")
     }
+    // Safety: a "don't" about any of a control's words wins over another word the request used ("Easy Apply").
+    check(Safety.needsConfirmation(label: "Submit application", request: "fill the Easy Apply form but don't submit it") != nil
+          && Safety.needsConfirmation(label: "Submit application", request: "fill the easy apply form, don’t submit") != nil
+          && Safety.needsConfirmation(label: "Submit application", request: "apply to this job with my details") == nil, "negated verb blocks submit")
+    check(Safety.blockedChord("cmd+ctrl+q", request: "open spotify") != nil && Safety.blockedChord("ctrl+cmd+q", request: "lock my screen") == nil
+          && Safety.blockedChord("cmd+ctrl+q", request: "set a clock alarm") != nil && Safety.blockedChord("cmd+q", request: "quit notes") == nil,
+          "session-ending chords only when asked")
+    // Desktop diffs: what changed by stable ref, and none at all once positional ids have shifted.
+    do {
+        let el = AXUIElementCreateApplication(getpid())
+        func e(_ i: Int, _ role: String, _ label: String, _ ref: String, _ value: String? = nil) -> UIElementInfo {
+            UIElementInfo(id: "e\(i)", role: role, label: label, frame: .zero, element: el, ref: ref, value: value)
+        }
+        let before = [e(0, "AXButton", "Send", "a"), e(1, "AXTextField", "Message", "b", "h"), e(2, "AXButton", "Old", "c")]
+        let after = [e(0, "AXButton", "Send", "a"), e(1, "AXTextField", "Message", "b", "hi"), e(2, "AXButton", "Cancel", "d")]
+        let d = ScreenDiff.between(before, after)
+        let text = d.text()
+        check(d.changed.count == 1 && d.added.count == 1 && d.removed.count == 1 && text.contains("~ e1 TextField value 'h'→'hi'")
+              && text.contains("+ e2 Button 'Cancel'") && text.contains("- e2 Button 'Old'"), "screen diff by ref")
+        check(ScreenDiff.listingUpdate(from: before, to: after) != nil && ScreenDiff.listingUpdate(from: before, to: before) == ""
+              && ScreenDiff.listingUpdate(from: before, to: [e(0, "AXButton", "New", "z")] + after.map { e(Int($0.id.dropFirst())! + 1, $0.role, $0.label, $0.ref, $0.value) }) == nil,
+              "desktop diff only while e-ids hold")
+    }
+    // Web diffs: stable w-ids compared by key; another page gets the full listing.
+    MainActor.assumeIsolated {
+        typealias B = BrowserBridge
+        func el(_ i: Int, _ role: String, _ text: String, _ value: String? = nil) -> B.PageElement {
+            B.PageElement(index: i, role: role, text: text, rect: .zero, editable: role == "textbox", extra: "", key: "|\(role)|\(text)", value: value)
+        }
+        func page(_ url: String, _ els: [B.PageElement]) -> B.Page {
+            B.Page(connection: ObjectIdentifier(Agent.self), url: url, title: "Apply", viewport: CGSize(width: 1, height: 1), scrollY: 0,
+                   scrollMax: 0, headings: [], elements: els, estimatedArea: nil)
+        }
+        let before = page("https://x.com/apply?step=1", [el(1, "textbox", "Name", ""), el(2, "button", "Next"), el(3, "link", "Jobs")])
+        let after = page("https://x.com/apply?step=2", [el(1, "textbox", "Name", "Amrit"), el(2, "button", "Next"), el(5, "button", "Dismiss")])
+        let d = B.diff(previous: before, current: after) ?? "nil"
+        check(d.contains("~ w1") && d.contains("+ w5 button: Dismiss") && d.contains("- w3 link: Jobs") && !d.contains("w2"), "page diff by stable id")
+        check(B.diff(previous: before, current: page("https://x.com/other", after.elements)) == nil, "another page gets the full listing")
+    }
+    // Job profile: fields answer their questions; a saved earlier answer wins for its own question.
+    do {
+        var p = Profile.Data()
+        p.name = "Amrit Nigam"; p.expectedCTC = "6 LPA"; p.noticePeriod = "Immediate"; p.linkedin = "https://linkedin.com/in/amrit"
+        p.qa = [Profile.QA(question: "Why do you want to join us?", answer: "I like the product")]
+        check(Profile.answer(for: "Expected CTC (per annum)", in: p) == "6 LPA" && Profile.answer(for: "Notice period", in: p) == "Immediate"
+              && Profile.answer(for: "LinkedIn profile URL", in: p) == p.linkedin && Profile.answer(for: "First name", in: p) == "Amrit"
+              && Profile.answer(for: "Why do you want to join us?", in: p) == "I like the product"
+              && Profile.answer(for: "Years of experience with Kubernetes", in: p) == nil, "profile answers form questions")
+    }
+    MainActor.assumeIsolated {
+        check(Agent.profileAnswer(for: ["question": "Which session did you attend, and how was it? I'll enter your name as Amrit Nigam.",
+                                        "options": ["Keynote · Great", "Swift workshop · Great"]]) == nil,
+              "profile: a side remark about the name doesn't answer a choice question")
+    }
+    check(!Agent.acts("radio") && !Agent.acts("AXCheckBox") && !Agent.acts("option") && Agent.acts("button") && Agent.acts("link")
+          && Agent.acts("AXButton"), "risky-click confirmation only for controls that act")
+    check(Agent.saysUnfinished("Steps 1–6 partly done: instance launched. Still to do: attach role, SSH check, SNS, alarm")
+          && !Agent.saysUnfinished("Subscription created; it's pending until you click the confirm link in the AWS email.")
+          && !Agent.saysUnfinished("Added the CloudWatch alarm steps to the Arc doc."), "done with work left isn't done")
+    check(Agent.keepsFrontApp("open Spotify") && Agent.keepsFrontApp("show me my calendar") && Agent.keepsFrontApp("please search flights to Goa")
+          && !Agent.keepsFrontApp("type hello into the open TextEdit document") && !Agent.keepsFrontApp("reply to Anmol that I'm on my way"),
+          "front app: kept for open/show/search requests only")
+    check(!Agent.isConfirmation("What should I put for Notice period?") && Agent.isConfirmation("Should I submit the form?")
+          && !Agent.isConfirmation("Who should I put as the referrer's name? (I won't submit the form yet.)")
+          && Agent.isConfirmation("Ready to submit?"), "confirmation vs a question for a detail")
+    check(!Agent.asksForPersonalDetails("Which session did you attend, and how was it? (I'll use the name Amrit Nigam.)")
+          && Agent.asksForPersonalDetails("What's your full name?") && Agent.asksForPersonalDetails("What is your phone number?"),
+          "personal-detail questions: the detail right after “your”")
+    check(Agent.isFormSubmit("Submit application") && Agent.isFormSubmit("Send application") && !Agent.isFormSubmit("Easy Apply to this job"),
+          "form submit buttons")
     // Replay: recorded page snapshots + replies re-checked offline (tests/replay/*.json).
     MainActor.assumeIsolated {
         guard let dir = Replay.repoFixtures else { print("skip replay fixtures (no tests/replay here)"); return }

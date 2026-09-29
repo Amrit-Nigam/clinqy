@@ -186,6 +186,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agent.answer(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value)
         }
         for url in urls where url.scheme == "clinqy" && url.host == "cancel" { agent.cancel() }
+        // Same as the Undo button on the latest reversible step (voice, scripts, tests/run.sh).
+        for url in urls where url.scheme == "clinqy" && url.host == "undo" { Task { await StepUndo.shared.undoLast(agent: agent) } }
         for url in urls where url.scheme == "clinqy" && url.host == "add" {
             agent.addContext(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value ?? "")
         }
@@ -207,6 +209,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             let test = items.first { $0.name == "test" }?.value == "1"
             let dry = items.first { $0.name == "dry" }?.value == "1"
+            // Tests skip the review card unless they ask for it (tests/run.sh answers it through clinqy://answer).
+            agent.reviewInTests = items.first { $0.name == "review" }?.value == "1"
+            agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
             agent.submit(dry ? "dry run: " + task : task, test: test)
         }
     }

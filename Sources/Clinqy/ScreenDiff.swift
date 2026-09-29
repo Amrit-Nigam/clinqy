@@ -53,3 +53,20 @@ struct ScreenDiff {
         return lines.count > limit ? shown + "\n… and \(lines.count - limit) more changes" : shown
     }
 }
+
+extension ScreenDiff {
+    /// The changes as a stand-in for a fresh element list, or nil when the full list must go out instead: e-ids are
+    /// positional, so if any control that's still there now answers to another id (something appeared above it),
+    /// a diff would send the model's clicks to the wrong place. Also nil when most of the screen changed or the
+    /// changes wouldn't fit in `limit` lines. "" = nothing changed.
+    static func listingUpdate(from before: [UIElementInfo], to after: [UIElementInfo], limit: Int = 40) -> String? {
+        let key = { (e: UIElementInfo) in e.ref.isEmpty ? "\(e.role)|\(e.label)" : e.ref }
+        let ids = Dictionary(before.map { (key($0), $0.id) }, uniquingKeysWith: { first, _ in first })
+        guard !after.contains(where: { e in ids[key(e)].map { $0 != e.id } ?? false }) else { return nil }
+        let d = between(before, after)
+        let count = d.added.count + d.removed.count + d.changed.count
+        let total = max(before.count, after.count)
+        guard count <= limit, total < 6 || Double(count) <= Double(total) * 0.5 else { return nil }
+        return d.isEmpty ? "" : d.text(limit: limit)
+    }
+}

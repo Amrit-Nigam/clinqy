@@ -182,6 +182,16 @@ enum Screenshot {
             .appendingPathComponent("Clinqy/runs/\(runID)", isDirectory: true)
     }
 
+    /// Keeps the newest `keep` runs' click traces; older folders go (they're only for chasing a recent misclick).
+    static func pruneRuns(keep: Int = 20) {
+        let root = runFolder("x").deletingLastPathComponent()
+        let fm = FileManager.default
+        guard let dirs = try? fm.contentsOfDirectory(at: root, includingPropertiesForKeys: [.contentModificationDateKey]),
+              dirs.count > keep else { return }
+        let date = { (u: URL) in (try? u.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast }
+        for old in dirs.sorted(by: { date($0) > date($1) }).dropFirst(keep) { try? fm.removeItem(at: old) }
+    }
+
     /// Debug trace: a red crosshair and ring at `point` (global top-left screen coordinates) on the latest
     /// screenshot of `app`'s window, saved as runs/<runID>/step<N>.jpg. Reuses the image the model saw when
     /// it's this app's and covers the point; otherwise takes a fresh capture. Returns the file, if written.

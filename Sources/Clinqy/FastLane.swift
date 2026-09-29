@@ -40,9 +40,13 @@ final class FastLane {
     private var stintTurns = 0
     private var stintFailures = 0
     private var briefed = false
+    /// The task's context, sent to the helper ahead of its first stint (see `warm`).
+    private var briefing: Task<Void, Never>?
     /// The previous turn ("say: actions"), waiting for its results.
     private var lastTurn: String?
     private var lastSignature = ""
+    /// The screen the last reply was made for: the same step again is only a loop if the screen didn't change.
+    private var lastScreen = ""
     /// Recent steps from both models, with results (the helper's briefing).
     private var recent: [String] = []
     /// Helper steps the lead hasn't heard about yet.
@@ -90,9 +94,18 @@ final class FastLane {
     }
 
     func close() {
+        briefing?.cancel()
+        briefing = nil
         session?.close()
         session = nil
     }
+
+    /// A last-line reminder: without it either model often writes a fake <invoke> tool call first, costing seconds a turn.
+    private static let jsonOnly = "\n\nReply with the JSON object only — no tool-call or XML tags."
+
+    /// The lead answered the last turn and will answer the next one, so it has seen every screen in between (a
+    /// screen described as changes since the last one is only readable by the model that saw that one).
+    var leadHasContinuity: Bool { !tag.hasPrefix("fast") && (model == nil || plan == nil) }
 
     // MARK: - Routing
 
@@ -109,6 +122,9 @@ final class FastLane {
 
     private func helperReply(_ turnText: String, image: String?) async -> String? {
         guard let model, let plan else { return nil }
+        await briefing?.value
+        briefing = nil
+        if session?.isAlive != true { session = try? ClaudeSession(system: Self.system, model: model); briefed = false }
         var text = ""
         if !briefed {
             text += "The lead's context for this task:\n\(intro)\n\n"
@@ -119,7 +135,7 @@ final class FastLane {
             if !recent.isEmpty { text += "Recent steps:\n" + recent.suffix(4).map { "- \($0)" }.joined(separator: "\n") + "\n" }
             text += "\n"
         }
-        text += turnText
+        text += turnText + Self.jsonOnly
         let reply: String
         do {
             if session?.isAlive != true { session = try ClaudeSession(system: Self.system, model: model) }
@@ -138,11 +154,12 @@ final class FastLane {
             return nil
         }
         let signature = actions.map { "\($0)" }.joined()
-        if signature == lastSignature { end("the helper repeated itself"); return nil }
+        if signature == lastSignature, Self.screenPart(turnText) == lastScreen { end("the helper repeated itself"); return nil }
         let finishing = json["done"] as? Bool == true
         if actions.isEmpty { end(finishing ? "the helper thinks it's finished" : "the helper had nothing to do"); return nil }
 
         lastSignature = signature
+        lastScreen = Self.screenPart(turnText)
         stintTurns += 1
         lastTurn = "[helper] \(say): " + actions.map(Self.brief).joined(separator: ", ")
         // Only the lead finishes: run the helper's last actions, then let the lead check.
@@ -166,11 +183,11 @@ final class FastLane {
             unreported = []
             handback = nil
         }
-        // A last-line reminder: without it the model often writes a fake <invoke> tool call first, costing seconds a turn.
-        let reply = try await lead.send(text + "\n\nReply with the JSON object only — no tool-call or XML tags.", image: image)
+        let reply = try await lead.send(text + Self.jsonOnly, image: image)
         let json = Brain.json(from: reply)
         let actions = json?["actions"] as? [[String: Any]] ?? []
         lastSignature = actions.map { "\($0)" }.joined()
+        lastScreen = Self.screenPart(turnText)
         lastTurn = json.map { "\($0["say"] as? String ?? ""): " + actions.map(Self.brief).joined(separator: ", ") }
         // A routine plan starts a new stint, and so does a streak of pure navigation; anything else keeps the lead in charge.
         let say = json?["say"] as? String ?? ""
@@ -183,8 +200,14 @@ final class FastLane {
             start(Self.keepGoing(say: say, actions: actions), auto: true)
         } else {
             plan = nil
+            if Self.autoDelegates, routineStreak == autoAfter - 1 { warm() }
         }
         return reply
+    }
+
+    /// The screen part of a turn's text (from "Frontmost app:"), without the step results before it.
+    private static func screenPart(_ turnText: String) -> String {
+        turnText.range(of: "Frontmost app: ").map { String(turnText[$0.lowerBound...]) } ?? turnText
     }
 
     /// Books the previous turn's results and reads the element labels off a full screen.
@@ -199,7 +222,10 @@ final class FastLane {
             }
             lastTurn = nil
         }
-        if turnText.contains("\nFrontmost app: ") || turnText.hasPrefix("Frontmost app: ") { labels = Self.labels(in: turnText) }
+        if turnText.contains("\nFrontmost app: ") || turnText.hasPrefix("Frontmost app: ") {
+            // A screen sent as changes updates the labels already known; a full listing replaces them.
+            labels = Self.labels(in: turnText, updating: turnText.contains("changes since your last look") ? labels : [:])
+        }
     }
 
     private func start(_ routine: String, auto: Bool) {
@@ -208,8 +234,19 @@ final class FastLane {
         stintTurns = 0
         stintFailures = 0
         routineStreak = 0
-        // Start the helper's process now, while the lead's actions run.
-        if session?.isAlive != true, let model { session = try? ClaudeSession(system: Self.system, model: model) }
+        // Start the helper now, while the lead's actions run.
+        warm()
+    }
+
+    /// Starts the helper and hands it the task's context in the background, so its first real turn is a short
+    /// message: read cold, the briefing made that turn ~3 s slower than the rest.
+    private func warm() {
+        guard let model else { return }
+        if session?.isAlive != true { session = try? ClaudeSession(system: Self.system, model: model); briefed = false }
+        guard !briefed, briefing == nil, let s = session else { return }
+        briefed = true
+        let text = "The lead's context for this task:\n\(intro)\n\nNo steps for you yet; reply {\"say\":\"ready\",\"actions\":[]}."
+        briefing = Task { _ = try? await s.send(text) }
     }
 
     private func end(_ why: String) {
@@ -296,13 +333,19 @@ final class FastLane {
     }
 
     /// "w3" → "w3 button: Submit [...]" for every listed element.
-    nonisolated static func labels(in screen: String) -> [String: String] {
-        var map: [String: String] = [:]
-        for line in screen.split(separator: "\n") {
-            let s = line.trimmingCharacters(in: .whitespaces)
+    nonisolated static func labels(in screen: String, updating known: [String: String] = [:]) -> [String: String] {
+        var map = known
+        // Diff lines: "- w7 …" is gone, "+ w7 …" / "~ w7 …" is (now) there. Gone first: an id can go and come back.
+        let lines = screen.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
+        func id(_ s: Substring) -> String? {
             guard let first = s.first, first == "e" || first == "w", let space = s.firstIndex(of: " "),
-                  s[s.index(after: s.startIndex)..<space].allSatisfy(\.isNumber), space > s.index(after: s.startIndex) else { continue }
-            map[String(s[..<space])] = s
+                  space > s.index(after: s.startIndex), s[s.index(after: s.startIndex)..<space].allSatisfy(\.isNumber) else { return nil }
+            return String(s[..<space])
+        }
+        for line in lines where line.hasPrefix("- ") { if let id = id(line.dropFirst(2)) { map[id] = nil } }
+        for line in lines {
+            let s = line.hasPrefix("+ ") || line.hasPrefix("~ ") ? line.dropFirst(2) : Substring(line)
+            if let id = id(s) { map[id] = String(s) }
         }
         return map
     }

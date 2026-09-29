@@ -25,12 +25,13 @@ enum Safety {
         let text = label.lowercased()
         let asked = request.lowercased()
         for (pattern, verbs) in risky where text.range(of: pattern, options: .regularExpression) != nil {
-            // They asked for exactly this — and didn't say "don't …" / "without …" about it.
-            let wanted = verbs.contains { verb in
-                asked.contains(verb) && asked.range(of: #"\b(don'?t|do not|never|without|not|no)\s+(\w+\s+){0,2}"# + NSRegularExpression.escapedPattern(for: verb),
-                                                    options: .regularExpression) == nil
+            // They asked for this — and said "don't …" / "without …" about none of its words: "fill the Easy Apply form
+            // but don't submit" names apply, yet the Submit button still needs their OK.
+            let negated = verbs.contains { verb in
+                asked.range(of: #"\b(don['’]?t|do not|never|without|not|no)\s+(\w+\s+){0,2}"# + NSRegularExpression.escapedPattern(for: verb),
+                            options: .regularExpression) != nil
             }
-            if wanted { return nil }
+            if !negated, verbs.contains(where: asked.contains) { return nil }
             return String(label.prefix(80))
         }
         return nil
@@ -87,37 +88,6 @@ enum Safety {
 
     // MARK: - Sensitive apps
 
-    /// Apps that hold secrets or money, by bundle-id prefix (a vendor prefix covers its helpers too).
-    private static let sensitiveBundles = [
-        "com.1password", "com.agilebits", "com.bitwarden", "com.lastpass", "com.dashlane", "com.nordpass",
-        "org.keepassxc", "com.apple.keychainaccess", "com.apple.Passwords", "com.apple.SecurityAgent",
-        "com.apple.LocalAuthentication", "com.apple.loginwindow",
-        // Banking and payments.
-        "com.chase", "com.bankofamerica", "com.wellsfargo", "com.citi", "com.capitalone", "com.usaa",
-        "com.americanexpress", "com.schwab", "com.fidelity", "com.vanguard", "com.paypal", "com.venmo",
-        "com.revolut", "com.monzo", "com.wise", "com.hdfcbank", "com.icicibank", "com.sbi", "com.axisbank",
-        "com.kotak", "net.one97.paytm", "com.phonepe", "com.zerodha",
-    ].map { $0.lowercased() }
-
-    /// True for password managers, keychain/auth prompts and banking apps, unless ALLOW_SENSITIVE_APPS=1.
-    static func isSensitive(_ app: NSRunningApplication) -> Bool {
-        if ["1", "true", "yes", "on"].contains(Config.value("ALLOW_SENSITIVE_APPS")?.lowercased() ?? "") { return false }
-        return isSensitive(bundleID: app.bundleIdentifier, name: app.cleanName)
-    }
-
-    static func isSensitive(bundleID: String?, name: String?) -> Bool {
-        let id = (bundleID ?? "").lowercased()
-        if sensitiveBundles.contains(where: { id == $0 || id.hasPrefix($0 + ".") }) { return true }
-        let n = (name ?? "").lowercased()
-        return ["1password", "bitwarden", "lastpass", "dashlane", "keychain access", "keepassxc"].contains(where: n.contains)
-            || n.range(of: #"\bbank(ing)?\b"#, options: .regularExpression) != nil
-    }
-
-    /// Message for refusing to act inside a sensitive app, or nil.
-    static func sensitiveBlock(_ app: NSRunningApplication) -> String? {
-        guard isSensitive(app) else { return nil }
-        return "\(app.cleanName ?? "That app") holds passwords or money, so I don't click or type in it. Please do this step yourself."
-    }
 
     // MARK: - System chords
 

@@ -55,7 +55,8 @@ final class Hand {
         }
         if !keepFrontApp, let app = runFrontApp, !app.isTerminated,
            NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
-            app.activate()
+            // Plain activate() is ignored while Clinqy isn't frontmost; bringToFront opens it, which always works.
+            Task { await Launcher.bringToFront(app) }
         }
         runCursor = nil
         runFrontApp = nil
@@ -76,10 +77,9 @@ final class Hand {
     }
 
     /// Clicks an element: Accessibility press first, a real click if that did nothing.
-    /// Returns why it didn't click (sensitive app, something else now at that spot), or nil.
+    /// Returns why it didn't click (something else now at that spot), or nil.
     @discardableResult
     func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int) async -> String? {
-        if let why = Safety.sensitiveBlock(app) { return refuse(why) }
         await buddy.travel(to: el.center, framing: el.frame)
         try? await Task.sleep(for: .milliseconds(80))   // aim
         buddy.click()
@@ -104,7 +104,6 @@ final class Hand {
     /// popup that slid in isn't clicked by mistake. Returns why it didn't click (re-scan and retry), or nil.
     @discardableResult
     func click(at point: CGPoint, pid: pid_t? = nil, window: WindowSnapshot? = nil, mode: ClickMode = .real) async -> String? {
-        if let pid, let app = NSRunningApplication(processIdentifier: pid), let why = Safety.sensitiveBlock(app) { return refuse(why) }
         if let why = window?.staleness() { return refuse(why) }
         if let pid, let why = await hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
@@ -121,7 +120,6 @@ final class Hand {
                 return refuse("no window of the target app at that point for a background click")
             }
             if let why = SkyLight.click(at: point, pid: pid, window: id, frame: frame) { return refuse(why) }
-            InputGuard.noteSynthetic()
         }
         return nil
     }
@@ -129,7 +127,6 @@ final class Hand {
     /// Puts the caret in a text box: travel, click, focus. Returns why it didn't, or nil.
     @discardableResult
     func focus(_ el: UIElementInfo, in app: NSRunningApplication) async -> String? {
-        if let why = Safety.sensitiveBlock(app) { return refuse(why) }
         await buddy.travel(to: el.center, framing: el.frame)
         try? await Task.sleep(for: .milliseconds(90))
         buddy.click()
@@ -166,7 +163,6 @@ final class Hand {
     /// Down and up through the HID stream; the up is posted however the down went, so the button is never left held.
     nonisolated private static func postRealClick(at point: CGPoint) {
         let source = CGEventSource(stateID: .hidSystemState)
-        InputGuard.noteSynthetic()
         CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
             .post(tap: .cghidEventTap)
         CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)?
@@ -192,7 +188,6 @@ final class Hand {
             }
             e.postToPid(pid)
         }
-        InputGuard.noteSynthetic()
         post(.leftMouseDown)
         defer { post(.leftMouseUp) }
         usleep(15_000)
@@ -231,7 +226,12 @@ final class Hand {
               let hit else { return nil }
         var owner: pid_t = 0
         guard AXUIElementGetPid(hit, &owner) == .success, owner != getpid() else { return nil }
-        if owner != pid {
+        // Web content can answer from the browser's own helper process (Safari's WebContent, Chromium helpers).
+        let helper = NSRunningApplication(processIdentifier: owner).map { app in
+            let id = app.bundleIdentifier?.lowercased() ?? ""
+            return id.hasPrefix("com.apple.webkit") || id.contains(".helper") || id.contains("framework")
+        } ?? true
+        if owner != pid, !helper {
             let other = NSRunningApplication(processIdentifier: owner)?.cleanName ?? "another app"
             let target = NSRunningApplication(processIdentifier: pid)?.cleanName ?? "the target app"
             return "\(other) is on top at that spot, not \(target); look again before clicking"
@@ -295,7 +295,6 @@ final class Hand {
         refusal = nil
         if let why = Safety.blockedChord(keys, request: request) { _ = refuse(why); return false }
         buddy.click()
-        InputGuard.noteSynthetic()
         return AXEngine.press(combo: keys)
     }
 
@@ -304,7 +303,6 @@ final class Hand {
             await buddy.travel(to: CGPoint(x: frame.midX, y: frame.midY))
         }
         for _ in 0..<4 {
-            InputGuard.noteSynthetic()
             AXEngine.scroll(up ? 3 : -3, in: app)
             try? await Task.sleep(for: .milliseconds(70))
         }
@@ -318,10 +316,8 @@ final class Hand {
 
     /// Replaces the focused field's text, typed at a human rhythm, and confirms it landed.
     /// Falls back to pasting once; never leaves half a message behind for a Return to send.
-    /// Refuses (false, with `refusal` set) in sensitive apps and while a password field holds secure input.
     func type(_ text: String, in app: NSRunningApplication) async -> Bool {
         refusal = nil
-        if let why = Safety.sensitiveBlock(app) ?? Safety.secureInputBlock() { _ = refuse(why); return false }
         buddy.setTyping(true)
         defer { buddy.setTyping(false) }
         // Browser editors whose text Accessibility can't see (Google Docs shows only zero-width spaces): typing
@@ -394,7 +390,6 @@ final class Hand {
         let lines = text.components(separatedBy: "\n")
         for (i, line) in lines.enumerated() {
             if Task.isCancelled { return }
-            if let why = Safety.secureInputBlock() { _ = refuse(why); return }
             if i > 0 {
                 AXEngine.press(combo: "shift+return")
                 try? await Task.sleep(for: .milliseconds(60))
@@ -418,8 +413,6 @@ final class Hand {
         refusal = nil
         for ch in text {
             if Task.isCancelled { return }
-            if let why = Safety.secureInputBlock() { _ = refuse(why); return }
-            InputGuard.noteSynthetic()
             AXEngine.type(String(ch))
             var ms = base + Double.random(in: 0...(base * 0.9))
             if ch == " " { ms += base * 0.5 }

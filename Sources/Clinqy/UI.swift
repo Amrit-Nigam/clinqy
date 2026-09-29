@@ -20,6 +20,8 @@ final class CommandPanel: NSPanel {
         hasShadow = false
         isMovableByWindowBackground = true
         appearance = NSAppearance(named: .darkAqua)
+        // Kept out of screen captures: Clinqy's screenshots and the user's screen shares show the app, not us.
+        sharingType = .none
         var view = CommandView(agent: agent, voice: voice, onMic: onMic, onClose: { [weak self] in self?.orderOut(nil) })
         view.onWatch = onWatch
         view.onCircle = onCircle
@@ -54,6 +56,7 @@ final class IslandPanel: NSPanel {
         hasShadow = false
         ignoresMouseEvents = true
         appearance = NSAppearance(named: .darkAqua)
+        sharingType = .none
         contentView = NSHostingView(rootView: IslandView(agent: agent, voice: voice))
     }
 
@@ -138,6 +141,7 @@ enum UI {
         let previous = agent?.phase
         if agent?.isRunning == true { agent?.phase = .waiting }
         present()
+        Agent.writeLog("  review “\(title)”: waiting (\(items.count) fields)")
         let review = ReviewCenter.Review(title: title, items: items.map { (label: $0.0, value: $0.1) })
         let ok = await withTaskCancellationHandler {
             await ReviewCenter.shared.begin(review)
@@ -924,6 +928,7 @@ final class ResultPanel: NSPanel {
         isOpaque = false
         hasShadow = false
         appearance = NSAppearance(named: .darkAqua)
+        sharingType = .none
         contentView = NSHostingView(rootView: ResultView(agent: agent, onClose: { [weak self] in self?.hide() }))
     }
 
