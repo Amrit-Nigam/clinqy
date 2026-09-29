@@ -8,6 +8,17 @@ final class Hand {
     private let buddy: Buddy
     /// Extra time to stay put at the end (e.g. while pointing something out).
     var lingerBeforeHome: TimeInterval = 0
+    /// The run's request, so session-ending chords are pressed only when it asked for them.
+    var request = ""
+    /// Set when switching apps was the point of the task ("open Spotify"): the run's end then leaves it in front.
+    var keepFrontApp = false
+    /// Why Hand last refused to act (password field, sensitive app, blocked chord, stale target), for the step's message.
+    private(set) var refusal: String?
+
+    private var runCursor: CGPoint?
+    private var runFrontApp: NSRunningApplication?
+    /// Where Clinqy last left the real pointer without putting it back (scrolling moves it).
+    private var cursorLeftAt: CGPoint?
 
     init(buddy: Buddy) { self.buddy = buddy }
 
@@ -15,9 +26,60 @@ final class Hand {
         if ProcessInfo.processInfo.environment["CB_TRACE"] != nil { print("    · \(s)"); fflush(stdout) }
     }
 
+    private func refuse(_ why: String) -> String {
+        refusal = why
+        trace("refused: \(why)")
+        return why
+    }
+
+    // MARK: - Run
+
+    /// Notes the pointer and frontmost app so `endRun` can put things back the way the user had them.
+    func beginRun(request: String) {
+        self.request = request
+        keepFrontApp = false
+        refusal = nil
+        cursorLeftAt = nil
+        runCursor = Buddy.mouse()
+        let front = NSWorkspace.shared.frontmostApplication
+        runFrontApp = front?.processIdentifier == getpid() ? nil : front
+    }
+
+    /// Releases any button left down, puts the pointer back if Clinqy moved it and the user hasn't since, and
+    /// brings back the app the user was in (unless `keepFrontApp`). Safe to call on cancel and failure.
+    func endRun() {
+        Self.releaseButtons()
+        if let start = runCursor, let left = cursorLeftAt, Self.near(Buddy.mouse(), left, 2) {
+            CGWarpMouseCursorPosition(start)
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
+        if !keepFrontApp, let app = runFrontApp, !app.isTerminated,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+            // Plain activate() is ignored while Clinqy isn't frontmost; bringToFront opens it, which always works.
+            Task { await Launcher.bringToFront(app) }
+        }
+        runCursor = nil
+        runFrontApp = nil
+        cursorLeftAt = nil
+    }
+
     // MARK: - Pointer
 
-    func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int) async {
+    /// How a click at a point is delivered.
+    enum ClickMode: Sendable {
+        /// Moves the real pointer, clicks, and puts it back. The default: web pages and many apps trust only real events.
+        case real
+        /// Posted straight to the app (postToPid): the pointer never moves, and the window needn't be frontmost.
+        case pid
+        /// Private SkyLight path for Chromium/Electron windows in the background. Only with BACKGROUND_CLICKS=1;
+        /// never picked automatically.
+        case background
+    }
+
+    /// Clicks an element: Accessibility press first, a real click if that did nothing.
+    /// Returns why it didn't click (something else now at that spot), or nil.
+    @discardableResult
+    func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int) async -> String? {
         await buddy.travel(to: el.center, framing: el.frame)
         try? await Task.sleep(for: .milliseconds(80))   // aim
         buddy.click()
@@ -30,22 +92,49 @@ final class Hand {
                 if await AXEngine.fingerprintAsync(of: app) != fingerprint { pressed = true; break }
             }
         }
-        if !pressed { realClick(at: el.center) }
+        if !pressed {
+            if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: element) { return refuse(why) }
+            realClick(at: el.center)
+        }
+        return nil
     }
 
-    /// A real click at a screen point, with the buddy travelling there first.
-    func click(at point: CGPoint) async {
+    /// Clicks a screen point, with the buddy travelling there first. Given the target `pid` (and the `window` as
+    /// scanned), first checks the window is unchanged and the point still shows that app, so a moved window or a
+    /// popup that slid in isn't clicked by mistake. Returns why it didn't click (re-scan and retry), or nil.
+    @discardableResult
+    func click(at point: CGPoint, pid: pid_t? = nil, window: WindowSnapshot? = nil, mode: ClickMode = .real) async -> String? {
+        if let why = window?.staleness() { return refuse(why) }
+        if let pid, let why = await hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
         try? await Task.sleep(for: .milliseconds(80))
         buddy.click()
-        realClick(at: point)
+        switch mode {
+        case .real:
+            realClick(at: point)
+        case .pid:
+            guard let pid else { return refuse("a click sent to an app needs its pid") }
+            Self.postClick(at: point, pid: pid)
+        case .background:
+            guard let pid, let (id, frame) = Self.windowInfo(pid: pid, containing: point) else {
+                return refuse("no window of the target app at that point for a background click")
+            }
+            if let why = SkyLight.click(at: point, pid: pid, window: id, frame: frame) { return refuse(why) }
+        }
+        return nil
     }
 
-    /// Puts the caret in a text box: travel, click, focus.
-    func focus(_ el: UIElementInfo, in app: NSRunningApplication) async {
+    /// Puts the caret in a text box: travel, click, focus. Returns why it didn't, or nil.
+    @discardableResult
+    func focus(_ el: UIElementInfo, in app: NSRunningApplication) async -> String? {
         await buddy.travel(to: el.center, framing: el.frame)
         try? await Task.sleep(for: .milliseconds(90))
         buddy.click()
+        if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: el.element) {
+            // Something covers the field: focusing through Accessibility alone is still safe.
+            _ = AXEngine.focus(el.element)
+            return Self.isTextRole(AXEngine.focusedRole(of: app)) ? nil : refuse(why)
+        }
         realClick(at: el.center)
         _ = AXEngine.focus(el.element)
         try? await Task.sleep(for: .milliseconds(120))
@@ -54,6 +143,7 @@ final class Hand {
             realClick(at: el.center)
             try? await Task.sleep(for: .milliseconds(150))
         }
+        return nil
     }
 
     static func isTextRole(_ role: String?) -> Bool {
@@ -64,14 +154,146 @@ final class Hand {
     /// A real click, with the user's pointer put back afterwards.
     private func realClick(at point: CGPoint) {
         let saved = Buddy.mouse()
-        AXEngine.click(at: point)
+        Self.postRealClick(at: point)
         usleep(25_000)
         CGWarpMouseCursorPosition(saved)
         CGAssociateMouseAndMouseCursorPosition(1)
     }
 
+    /// Down and up through the HID stream; the up is posted however the down went, so the button is never left held.
+    nonisolated private static func postRealClick(at point: CGPoint) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
+            .post(tap: .cghidEventTap)
+        CGEvent(mouseEventSource: source, mouseType: .leftMouseDown, mouseCursorPosition: point, mouseButton: .left)?
+            .post(tap: .cghidEventTap)
+        defer {
+            CGEvent(mouseEventSource: source, mouseType: .leftMouseUp, mouseCursorPosition: point, mouseButton: .left)?
+                .post(tap: .cghidEventTap)
+        }
+        usleep(15_000)
+    }
+
+    /// A click posted to the app itself: the real pointer stays put. The window number fields let AppKit route it
+    /// to the right window even when it isn't frontmost.
+    nonisolated private static func postClick(at point: CGPoint, pid: pid_t) {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let window = windowInfo(pid: pid, containing: point)?.id
+        func post(_ type: CGEventType) {
+            guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: .left) else { return }
+            e.setIntegerValueField(.mouseEventClickState, value: 1)
+            if let window {
+                e.setIntegerValueField(.mouseEventWindowUnderMousePointer, value: Int64(window))
+                e.setIntegerValueField(.mouseEventWindowUnderMousePointerThatCanHandleThisEvent, value: Int64(window))
+            }
+            e.postToPid(pid)
+        }
+        post(.leftMouseDown)
+        defer { post(.leftMouseUp) }
+        usleep(15_000)
+    }
+
+    /// Lets go of any mouse button still down (a click interrupted by a crash, cancel or error).
+    nonisolated static func releaseButtons() {
+        let point = CGEvent(source: nil)?.location ?? .zero
+        for (button, type) in [(CGMouseButton.left, CGEventType.leftMouseUp), (.right, .rightMouseUp)]
+        where CGEventSource.buttonState(.combinedSessionState, button: button) {
+            CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState), mouseType: type,
+                    mouseCursorPosition: point, mouseButton: button)?.post(tap: .cghidEventTap)
+        }
+    }
+
+    // MARK: - Pre-click checks
+
+    /// What's under `point` must belong to `pid` (and to the element's window, when known), or the click would
+    /// land on something else: another app's popup, a window that moved. Runs off the main thread.
+    private func hitCheck(_ point: CGPoint, pid: pid_t, windowOf element: AXUIElement) async -> String? {
+        let window: AXUIElement? = Self.axAttr(element, kAXWindowAttribute)
+        return await hitCheck(point, pid: pid, window: window)
+    }
+
+    private func hitCheck(_ point: CGPoint, pid: pid_t, window: AXUIElement?) async -> String? {
+        struct Box: @unchecked Sendable { let window: AXUIElement? }
+        let box = Box(window: window)
+        return await Task.detached { Self.hitMismatch(at: point, pid: pid, window: box.window) }.value
+    }
+
+    /// Why the element at `point` isn't the target app's (or target window's), or nil. Inconclusive answers
+    /// (no element, Clinqy's own overlay) pass: this guards against clicking the wrong thing, not against clicking.
+    nonisolated static func hitMismatch(at point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
+              let hit else { return nil }
+        var owner: pid_t = 0
+        guard AXUIElementGetPid(hit, &owner) == .success, owner != getpid() else { return nil }
+        // Web content can answer from the browser's own helper process (Safari's WebContent, Chromium helpers).
+        let helper = NSRunningApplication(processIdentifier: owner).map { app in
+            let id = app.bundleIdentifier?.lowercased() ?? ""
+            return id.hasPrefix("com.apple.webkit") || id.contains(".helper") || id.contains("framework")
+        } ?? true
+        if owner != pid, !helper {
+            let other = NSRunningApplication(processIdentifier: owner)?.cleanName ?? "another app"
+            let target = NSRunningApplication(processIdentifier: pid)?.cleanName ?? "the target app"
+            return "\(other) is on top at that spot, not \(target); look again before clicking"
+        }
+        if let window, let hitWindow: AXUIElement = axAttr(hit, kAXWindowAttribute), !CFEqual(hitWindow, window) {
+            return "a different \(NSRunningApplication(processIdentifier: pid)?.cleanName ?? "app") window is at that spot now; look again"
+        }
+        return nil
+    }
+
+    /// A window as it was when scanned, to check it's still there and in the same place before clicking into it.
+    struct WindowSnapshot: @unchecked Sendable {
+        let element: AXUIElement
+        let frame: CGRect
+        let pid: pid_t
+
+        /// The app's focused (or first) window, as it is now.
+        static func capture(_ app: NSRunningApplication) -> WindowSnapshot? {
+            let root = AXUIElementCreateApplication(app.processIdentifier)
+            let window: AXUIElement? = axAttr(root, kAXFocusedWindowAttribute)
+                ?? (axAttr(root, kAXWindowsAttribute) as [AXUIElement]?)?.first
+            guard let window, let frame = AXEngine.liveFrame(of: window) else { return nil }
+            return WindowSnapshot(element: window, frame: frame, pid: app.processIdentifier)
+        }
+
+        /// Why the window no longer matches the scan (closed, or moved/resized by more than 2 pt), or nil.
+        func staleness() -> String? {
+            guard let now = AXEngine.liveFrame(of: element) else { return "the window was closed since the last look; look again" }
+            let moved = abs(now.minX - frame.minX) > 2 || abs(now.minY - frame.minY) > 2
+                || abs(now.width - frame.width) > 2 || abs(now.height - frame.height) > 2
+            return moved ? "the window moved or resized since the last look; look again" : nil
+        }
+    }
+
+    /// The on-screen normal-level window of `pid` containing `point`: its number and bounds.
+    nonisolated static func windowInfo(pid: pid_t, containing point: CGPoint) -> (id: CGWindowID, frame: CGRect)? {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in list where (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid
+            && info[kCGWindowLayer as String] as? Int == 0 {
+            guard let id = info[kCGWindowNumber as String] as? Int,
+                  let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds), frame.contains(point) else { continue }
+            return (CGWindowID(id), frame)
+        }
+        return nil
+    }
+
+    nonisolated private static func axAttr<T>(_ element: AXUIElement, _ name: String) -> T? {
+        var value: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, name as CFString, &value) == .success else { return nil }
+        return value as? T
+    }
+
+    nonisolated private static func near(_ a: CGPoint, _ b: CGPoint, _ tolerance: CGFloat) -> Bool {
+        abs(a.x - b.x) <= tolerance && abs(a.y - b.y) <= tolerance
+    }
+
+    /// Presses a combo. Refuses (false, with `refusal` set) a lock/log-out/force-quit chord the request didn't ask for.
     @discardableResult
     func press(_ keys: String) -> Bool {
+        refusal = nil
+        if let why = Safety.blockedChord(keys, request: request) { _ = refuse(why); return false }
         buddy.click()
         return AXEngine.press(combo: keys)
     }
@@ -84,14 +306,18 @@ final class Hand {
             AXEngine.scroll(up ? 3 : -3, in: app)
             try? await Task.sleep(for: .milliseconds(70))
         }
+        // Scrolling moves the real pointer to the window's middle; the run's end puts it back if the user doesn't.
+        cursorLeftAt = Buddy.mouse()
         try? await Task.sleep(for: .milliseconds(200))
     }
+
 
     // MARK: - Keyboard
 
     /// Replaces the focused field's text, typed at a human rhythm, and confirms it landed.
     /// Falls back to pasting once; never leaves half a message behind for a Return to send.
     func type(_ text: String, in app: NSRunningApplication) async -> Bool {
+        refusal = nil
         buddy.setTyping(true)
         defer { buddy.setTyping(false) }
         // Browser editors whose text Accessibility can't see (Google Docs shows only zero-width spaces): typing
@@ -135,7 +361,7 @@ final class Hand {
         AXEngine.targetPid = app.processIdentifier
         defer { AXEngine.targetPid = nil }
         await keystrokes(text)
-        if Task.isCancelled { return false }
+        if Task.isCancelled || refusal != nil { return false }
         if await landed(text, in: app) { return true }
 
         // Some apps only accept keys through the system stream: retry by pasting that way,
@@ -180,9 +406,11 @@ final class Hand {
         }
     }
 
-    /// Types at a human rhythm (keys go wherever AXEngine.targetPid points).
+    /// Types at a human rhythm (keys go wherever AXEngine.targetPid points). Stops, with `refusal` set, the moment
+    /// a password field takes secure input: focus can move mid-word.
     func keystrokes(_ text: String) async {
         let base = text.count > 80 ? 10.0 : text.count > 30 ? 20.0 : 32.0
+        refusal = nil
         for ch in text {
             if Task.isCancelled { return }
             AXEngine.type(String(ch))
@@ -231,6 +459,8 @@ final class Hand {
     }
 
     private func spotlight(_ query: String) async {
+        // Typing blind into a password prompt is worse than launching the app directly (the caller falls back).
+        guard Safety.secureInputBlock() == nil else { return }
         let screen = NSScreen.main?.frame ?? .zero
         let primaryHeight = NSScreen.screens.first?.frame.height ?? 0
         let spot = CGPoint(x: screen.midX - 180, y: primaryHeight - screen.maxY + screen.height * 0.3)
@@ -302,6 +532,11 @@ final class Hand {
             break
         }
         if address.hasSuffix("/") { address.removeLast() }
+        if Safety.secureInputBlock() != nil {
+            press("esc")
+            await Launcher.openURL(url)
+            return browser
+        }
         buddy.setTyping(true)
         // Deliver keys straight to the browser so they can't land in some other window.
         AXEngine.targetPid = browser.processIdentifier

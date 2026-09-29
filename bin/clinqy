@@ -9,7 +9,10 @@
 #   clinqy run [--dry] "<task>"      Do a task (not saved to history). --dry: point at each click/keystroke, don't do it.
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
-#   clinqy stats [days]              Success rate, turns, time and screenshots per run (default: last 7 days).
+#   clinqy stats [days] [--last]     Success rate, model vs action time per turn, top failure reasons (default: 7 days).
+#   clinqy mcp                       Serve Clinqy as an MCP server on stdio (claude mcp add clinqy -- clinqy mcp).
+#   clinqy watch <app> <text> [--gone] [--timeout s]   Wait for text to appear in (or vanish from) an app.
+#   clinqy replay <fixture.json|folder> [--bless]      Re-check recorded runs offline (tests/replay).
 #   clinqy page [read|url]           What's in the focused browser tab, via the extension (read-only):
 #                                    its elements (w-ids, fields, values, errors) and visible text; read = full text.
 #   clinqy extension reload          Reload the browser extension from disk.
@@ -118,21 +121,10 @@ PY
   extension)
     ensure_app
     open -g "clinqy://reload-extension?token=$TOKEN"; echo "Asked the browser(s) to reload the Clinqy extension." ;;
-  stats)
-    python3 - "${1:-7}" <<'PY'
-import json, os, sys, datetime as dt
-days = float(sys.argv[1]); path = os.path.expanduser("~/Library/Logs/Clinqy/runs.jsonl")
-if not os.path.exists(path): sys.exit("No runs recorded yet.")
-cut = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days)
-rows = [r for r in map(json.loads, open(path)) if dt.datetime.fromisoformat(r["date"].replace("Z", "+00:00")) >= cut]
-if not rows: sys.exit(f"No runs in the last {days:g} days.")
-done = [r for r in rows if not r.get("stopped")]
-ok = sum(r["ok"] for r in done); avg = lambda k, rs=rows: sum(r[k] for r in rs) / max(len(rs), 1)
-print(f"Last {days:g} days: {len(rows)} runs · {ok}/{len(done)} succeeded ({100*ok/max(len(done),1):.0f}%) · {len(rows)-len(done)} stopped by you")
-print(f"Per run: {avg('seconds'):.0f} s · {avg('turns'):.1f} turns ({avg('fast_turns'):.1f} by the fast helper) · {avg('screenshots'):.1f} screenshots · {avg('failed_steps'):.1f} failed steps")
-slow = sorted(rows, key=lambda r: -r["seconds"])[:5]
-print("Slowest:"); [print(f"  {r['seconds']:>6.0f} s  {r['turns']:>3} turns  {'✓' if r['ok'] else '✗'}  {r['request'][:70]}") for r in slow]
-PY
-    ;;
+  stats|mcp|watch|replay)
+    # Handled by the app binary itself (no running app needed): stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>.
+    APP=/Applications/Clinqy.app/Contents/MacOS/Clinqy
+    [[ -x $APP ]] || { echo "Clinqy isn't installed (run ./build.sh in the repo)"; exit 2; }
+    exec $APP "$cmd" "$@" ;;
   *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 esac

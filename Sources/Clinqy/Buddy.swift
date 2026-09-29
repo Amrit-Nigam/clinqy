@@ -419,6 +419,9 @@ private final class Stage {
         window.level = .screenSaver
         window.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         window.isReleasedWhenClosed = false
+        // Keep the companion out of Clinqy's own screenshots (and other capture), so the model never
+        // mistakes the ring/arrow/bubble for part of the app it's looking at.
+        window.sharingType = .none
         window.setFrame(frame, display: false)
 
         // AppKit owns the view's own layer (and resets its flip), so everything lives on a child

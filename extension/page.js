@@ -13,6 +13,90 @@ function visible(el) {
   return cs.visibility !== "hidden" && cs.display !== "none" && Number(cs.opacity) > 0.05;
 }
 
+// An element's shadow root, closed ones too (content scripts may open them; only custom elements carry one in practice).
+function shadowOf(n) {
+  if (n.shadowRoot) return n.shadowRoot;
+  if (!n.tagName || !n.tagName.includes("-")) return null;
+  try { return typeof chrome !== "undefined" && chrome.dom && chrome.dom.openOrClosedShadowRoot ? chrome.dom.openOrClosedShadowRoot(n) : null; } catch { return null; }
+}
+
+// Is `node` inside `box`, crossing shadow-root boundaries (contains() stops at them)?
+function within(box, node) {
+  for (let n = node, k = 0; n && k < 200; n = n.parentNode || n.host, k++) if (n === box) return true;
+  return false;
+}
+
+// The element that really has the caret: document.activeElement only names the shadow host.
+function deepActive() {
+  let a = document.activeElement;
+  for (let k = 0; a && k < 20; k++) { const s = shadowOf(a); if (!s || !s.activeElement) break; a = s.activeElement; }
+  return a;
+}
+
+// Would a real click at the element's centre land on it (not on a sticky footer, backdrop or popup over it)?
+function hitAt(el) {
+  const r = el.getBoundingClientRect();
+  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
+  if (r.width < 1 || r.height < 1 || cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) return false;
+  let top = document.elementFromPoint(cx, cy);
+  for (let k = 0; top && k < 10; k++) { const s = shadowOf(top); const inner = s && s.elementFromPoint(cx, cy); if (!inner || inner === top) break; top = inner; }
+  return !!top && (within(el, top) || within(top, el));
+}
+
+// The element's nearest scrolling ancestor (a modal's body, a side panel), or null when that's the page itself.
+// `memo` (a Map) lets a snapshot resolve each ancestor once.
+function scrollBoxOf(el, memo) {
+  const up = (n) => n.parentElement || (n.getRootNode && n.getRootNode().host) || null;
+  const chain = [];
+  let found = null;
+  for (let p = up(el); p && p !== document.body && p !== document.documentElement; p = up(p)) {
+    if (memo && memo.has(p)) { found = memo.get(p); break; }
+    chain.push(p);
+    if (p.scrollHeight > p.clientHeight + 4 && /^(auto|scroll|overlay)$/.test(getComputedStyle(p).overflowY)) { found = p; break; }
+  }
+  if (memo) chain.forEach((n) => memo.set(n, found));
+  return found;
+}
+
+// Brings an element into view, scrolling every box it sits in (instantly: a page's smooth scrolling would leave
+// the rect we read next stale). If a sticky header/footer inside a scrolling modal still covers it, centre it.
+function reveal(el) {
+  el.scrollIntoView({ block: "nearest", inline: "nearest", behavior: "instant" });
+  if (hitAt(el)) return;
+  const box = scrollBoxOf(el);
+  if (box) {
+    const br = box.getBoundingClientRect(), r = el.getBoundingClientRect();
+    box.scrollBy({ top: (r.top + r.height / 2) - (br.top + br.height / 2), behavior: "instant" });
+  } else el.scrollIntoView({ block: "center", inline: "nearest", behavior: "instant" });
+}
+
+// A modal's (or scrolling panel's) name, for "5 more fields below in “Apply to Acme”".
+function paneName(box) {
+  const d = box.closest("[role=dialog], [role=alertdialog], dialog, [aria-modal=true]");
+  const n = d || box;
+  const h = n.querySelector("h1, h2, h3, [role=heading]");
+  return { name: squash(n.getAttribute("aria-label") || labelledBy(n) || (h && h.innerText) || "").slice(0, 60), modal: !!d };
+}
+
+// Which code editor (if any) an element is part of: they re-indent and auto-close what's typed.
+function editorKind(el) {
+  const kinds = [[".monaco-editor", "monaco"], [".cm-editor", "codemirror"], [".CodeMirror", "codemirror"], [".ace_editor", "ace"]];
+  for (let n = el, k = 0; n && k < 10; n = (n.getRootNode && n.getRootNode().host) || null, k++) {
+    if (!n.closest) continue;
+    for (const [sel, kind] of kinds) { const box = n.closest(sel); if (box) return { kind, box }; }
+  }
+  return null;
+}
+
+// A code editor's text: its hidden input only holds a line or so, so read the rendered lines (the visible part;
+// editors only draw what's on screen).
+function editorText(ed) {
+  const sel = { monaco: ".view-line", codemirror: ".cm-line, pre.CodeMirror-line", ace: ".ace_line" }[ed.kind];
+  const lines = [...ed.box.querySelectorAll(sel)];
+  if (ed.kind === "monaco") lines.sort((a, b) => a.getBoundingClientRect().top - b.getBoundingClientRect().top);
+  return lines.map((l) => l.innerText.replace(/\u00a0/g, " ")).join("\n");
+}
+
 // Text of the elements an aria-labelledby points at (how Google Forms and many apps name their fields).
 function labelledBy(el) {
   const ids = (el.getAttribute && el.getAttribute("aria-labelledby") || "").split(/\s+/).filter(Boolean);
@@ -72,7 +156,7 @@ function candidates() {
   const walk = (root) => {
     root.querySelectorAll(SEL).forEach((el) => nodes.push(el));
     const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    for (let n = tw.nextNode(); n; n = tw.nextNode()) if (n.shadowRoot) walk(n.shadowRoot);
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) { const s = shadowOf(n); if (s) walk(s); }
   };
   walk(document);
   return nodes;
@@ -125,12 +209,41 @@ function visibleText(listed, budgetMs) {
   return out.join(" · ").slice(0, 1500);
 }
 
+// A key per listed element that stays the same while the page shifts around it (role, name, question; for
+// look-alikes also the link target or nearest label, then an ordinal), so background.js can keep its w-id.
+function keys(out, picked) {
+  const base = out.map((it) => [it.role, it.text, it.q || ""].join("|"));
+  const count = new Map();
+  base.forEach((b) => count.set(b, (count.get(b) || 0) + 1));
+  const ctx = (el, it) => {
+    if (it.href) { try { return new URL(it.href).pathname; } catch {} }
+    for (let p = el.parentElement, hops = 0; p && hops < 5; p = p.parentElement, hops++) {
+      const l = p.querySelector("label, legend, [role=heading], h1, h2, h3, h4, h5, h6");
+      const t = l && !within(l, el) && squash(l.innerText).slice(0, 40);
+      if (t && t !== it.text) return t;
+    }
+    return "";
+  };
+  const seen = new Map();
+  out.forEach((it, k) => {
+    let key = base[k];
+    if (count.get(key) > 1) key += "|" + ctx(picked[k], it);
+    const n = (seen.get(key) || 0) + 1;
+    seen.set(key, n);
+    it.key = n > 1 ? key + "#" + n : key;
+  });
+}
+
 function snapshot() {
   const started = performance.now();
   const vw = innerWidth, vh = innerHeight;
   const seen = new Set(), listed = new Set();
   const out = [], picked = [], sigs = [];
+  const act = deepActive();
   let above = 0, below = 0, skipped = 0, truncated = false;
+  const boxOf = new Map(), boxRects = new Map(), panes = new Map();
+  const countable = (el) => el.getClientRects().length && (/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName)
+    || /^(listbox|radio|checkbox|textbox|combobox|switch|button)$/.test(el.getAttribute("role") || ""));
   for (const el of candidates()) {
     if (seen.has(el)) continue;
     seen.add(el);
@@ -138,12 +251,24 @@ function snapshot() {
     try {
       const r = el.getBoundingClientRect();
       if (r.width < 3 || r.height < 3) continue;
+      // Scrolled out of its own box (LinkedIn's Easy Apply modal body): not visible even though it's inside the
+      // viewport. Counted per box, so the model knows that box — not the page — needs scrolling.
+      const box = scrollBoxOf(el, boxOf);
+      if (box) {
+        let br = boxRects.get(box);
+        if (!br) { br = box.getBoundingClientRect(); boxRects.set(box, br); }
+        if (br.bottom > 0 && br.top < vh && (r.bottom <= br.top + 2 || r.top >= br.bottom - 2)) {
+          if (countable(el)) {
+            const p = panes.get(box) || { above: 0, below: 0 };
+            if (r.bottom <= br.top + 2) p.above++; else p.below++;
+            panes.set(box, p);
+          }
+          continue;
+        }
+      }
       if (r.bottom < 0 || r.top > vh) {
         // Off screen: just count fields and buttons, so the model knows to scroll.
-        if (el.getClientRects().length && (/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName)
-            || /^(listbox|radio|checkbox|textbox|combobox|switch|button)$/.test(el.getAttribute("role") || ""))) {
-          if (r.bottom < 0) above++; else below++;
-        }
+        if (countable(el)) { if (r.bottom < 0) above++; else below++; }
         continue;
       }
       if (r.right < 0 || r.left > vw) continue;
@@ -154,7 +279,7 @@ function snapshot() {
       // Is it actually the thing on top at its centre (not covered by a modal)?
       const cx = Math.min(vw - 1, Math.max(0, r.left + r.width / 2)), cy = Math.min(vh - 1, Math.max(0, r.top + r.height / 2));
       const top = document.elementFromPoint(cx, cy);
-      const covered = top && !(el === top || el.contains(top) || top.contains(el));
+      const covered = top && !(within(el, top) || within(top, el));
       const { tag, role, text } = d;
       const item = { i: out.length, role, text, x: r.left, y: r.top, w: r.width, h: r.height };
       if (d.editable) {
@@ -186,7 +311,7 @@ function snapshot() {
       if (el.getAttribute("aria-checked") === "true" || el.checked) item.checked = true;
       else if (tickable) item.unchecked = true;
       if (el.getAttribute("aria-selected") === "true") item.selected = true;
-      if (document.activeElement === el) item.focused = true;
+      if (act && (act === el || (d.editable && act !== document.body && within(el, act)))) item.focused = true;
       out.push(item);
       picked.push(el);
       listed.add(el);
@@ -196,6 +321,12 @@ function snapshot() {
   }
   window.__clinqyList = picked;
   window.__clinqySigs = sigs;
+  try { keys(out, picked); } catch {}
+  const paneList = [];
+  for (const [box, p] of panes) {
+    try { paneList.push({ ...paneName(box), above: p.above, below: p.below }); } catch {}
+    above += p.above; below += p.below;
+  }
   let headings = [], messages = [], text = "", frames = [];
   try { headings = [...document.querySelectorAll("h1,h2,h3")].map((h) => squash(h.innerText)).filter(Boolean).slice(0, 12); } catch {}
   try { messages = pageMessages(); } catch {}
@@ -215,7 +346,7 @@ function snapshot() {
     screen: { x: screenX, y: screenY, ow: outerWidth, oh: outerHeight, zoom: devicePixelRatio },
     scroll: (() => { const el = scroller(); return el ? { y: el.scrollTop, max: el.scrollHeight - el.clientHeight }
                                                      : { y: scrollY, max: document.documentElement.scrollHeight - vh }; })(),
-    headings, elements: out, messages, text, frames, above, below, truncated, skipped,
+    headings, elements: out, messages, text, frames, above, below, panes: paneList, truncated, skipped,
     ms: Math.round(performance.now() - started),
   };
 }
@@ -247,18 +378,14 @@ function target(index) {
 // land on it — not on a popup's backdrop, which on LinkedIn/Indeed closes the popup instead.
 function locate(index) {
   const el = target(index);
-  el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  reveal(el);
   const r = el.getBoundingClientRect();
-  const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
-  const onScreen = r.width >= 1 && r.height >= 1 && cx >= 0 && cy >= 0 && cx < innerWidth && cy < innerHeight;
-  const top = onScreen ? document.elementFromPoint(cx, cy) : null;
-  const hit = !!top && (el === top || el.contains(top) || top.contains(el));
-  return { x: r.left, y: r.top, w: r.width, h: r.height, hit };
+  return { x: r.left, y: r.top, w: r.width, h: r.height, hit: hitAt(el) };
 }
 
 function click(index) {
   const el = target(index);
-  el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  reveal(el);
   const r = el.getBoundingClientRect();
   const opts = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
   el.dispatchEvent(new PointerEvent("pointerdown", { ...opts, pointerType: "mouse" }));
@@ -282,10 +409,11 @@ function editableOf(el) {
 
 function focus(index) {
   const el = editableOf(target(index));
-  el.scrollIntoView({ block: "nearest", inline: "nearest" });
+  reveal(el);
   el.focus({ preventScroll: true });
   if (el.select && !el.isContentEditable) el.select();
-  return { focused: document.activeElement === el || el.contains(document.activeElement) };
+  const a = deepActive();
+  return { focused: !!a && within(el, a) };
 }
 
 // Sets text the way frameworks (React etc.) notice, for when keystrokes don't land.
@@ -323,7 +451,7 @@ function findOption(text) {
   const hit = all.find((o) => t(o) === want) || all.find((o) => t(o).startsWith(want)) || all.find((o) => t(o).includes(want))
     || all.find((o) => t(o).length > 2 && want.includes(t(o)));
   if (!hit) return { found: false, options: all.map((o) => optionText(o) || squash(o.innerText)).filter(Boolean).slice(0, 30) };
-  hit.scrollIntoView({ block: "nearest", inline: "nearest" });
+  reveal(hit);
   const r = hit.getBoundingClientRect();
   return { found: true, text: optionText(hit) || squash(hit.innerText), x: r.left, y: r.top, w: r.width, h: r.height };
 }
@@ -453,8 +581,9 @@ function readText() {
   function isActive(i) {
     let el = null; try { el = target(i); } catch {}
     if (!el) return { active: false };
-    const inner = editableOf(el), a = document.activeElement;
-    return { active: !!a && (a === inner || inner.contains(a)) && document.hasFocus() };
+    // The caret may be deep inside it: a shadow root (web components), or a code editor's hidden textarea.
+    const inner = editableOf(el), a = deepActive();
+    return { active: !!a && a !== document.body && (within(inner, a) || within(el, a)) && document.hasFocus() };
   }
   function value(i) {
     let el = null; try { el = target(i); } catch {}
@@ -464,18 +593,27 @@ function readText() {
                                            : String(f.isContentEditable ? f.innerText : f.value || "").slice(0, 400) };
   }
   function activeValue() {
-    const el = document.activeElement;
+    const el = deepActive();
     // Editors like Google Docs keep the caret in an iframe: keys typed now land there, but its text can't be read.
+    // background.js then asks the frames themselves (focusedFrame).
     const where = { hasFocus: document.hasFocus(), url: location.href };
     if (el && (el.tagName === "IFRAME" || el.tagName === "FRAME")) return { ...where, editable: true, code: false, value: null, frame: true };
-    const editable = el && (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName));
-    // Code editors (Monaco on LeetCode, CodeMirror, Ace) re-indent what's typed.
-    const code = !!(el && el.closest && el.closest(".monaco-editor, .CodeMirror, .cm-editor, .ace_editor"));
-    return { ...where, editable: !!editable, code, value: editable ? String(el.isContentEditable ? el.innerText : el.value || "").slice(0, 400) : null };
+    // Code editors (Monaco on LeetCode, CodeMirror, Ace) re-indent what's typed; their caret sits in a hidden
+    // textarea or a contenteditable, and their text is in the rendered lines.
+    const ed = el && editorKind(el);
+    if (ed) return { ...where, editable: true, code: true, editorKind: ed.kind, value: editorText(ed).slice(0, 400) };
+    const role = el && el.getAttribute ? el.getAttribute("role") || "" : "";
+    const editable = el && (el.isContentEditable || /^(INPUT|TEXTAREA)$/.test(el.tagName) || /^(textbox|searchbox|combobox)$/.test(role)
+      || (document.designMode === "on" && el === document.body));   // old rich-text frames edit the whole document
+    const v = !editable ? null : el.isContentEditable || el === document.body ? el.innerText : el.value;
+    return { ...where, editable: !!editable, code: false, value: editable ? String(v || "").slice(0, 400) : null };
   }
   function fillActive(text) {
-    const el = document.activeElement;
+    const el = deepActive();
     if (!el) return { value: null };
+    // A code editor's hidden textarea isn't its text: setting it would corrupt the editor. Leave it be.
+    const ed = editorKind(el);
+    if (ed && !el.isContentEditable) return { value: editorText(ed).slice(0, 400), skipped: true };
     if (el.isContentEditable) { document.execCommand("selectAll", false); document.execCommand("insertText", false, text); }
     else if (/^(INPUT|TEXTAREA)$/.test(el.tagName)) {
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
@@ -496,10 +634,31 @@ function readText() {
     let el = null; try { el = target(i); } catch {}
     const a = (n) => el && el.getAttribute(n);
     return { sig: JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
-      el && el.value, location.href, document.body ? document.body.innerText.length : 0, document.activeElement === el]) };
+      el && el.value, location.href, textHash(), document.activeElement === el]) };
+  }
+  // Cheap hash of the visible text: its length alone misses same-length changes ("Step 2" → "Step 4"),
+  // and a click that did work would then be clicked again by the fallback.
+  function textHash() {
+    const t = document.body ? document.body.innerText : "";
+    let h = 0;
+    for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
+    return t.length + ":" + h;
   }
   // Apps like the AWS console scroll an inner panel, not the window: scroll whichever actually moves.
   function scroller() {
+    // An open modal (LinkedIn's Easy Apply) scrolls its own body; scrolling the page behind it does nothing useful.
+    try {
+      const dialogs = [...document.querySelectorAll("[role=dialog], [role=alertdialog], dialog[open], [aria-modal=true]")].filter(visible);
+      for (const d of dialogs.reverse()) {
+        let best = null, area = 0;
+        for (const el of [d, ...d.querySelectorAll("*")]) {
+          if (el.scrollHeight <= el.clientHeight + 4 || !/^(auto|scroll|overlay)$/.test(getComputedStyle(el).overflowY)) continue;
+          const r = el.getBoundingClientRect(), a = r.width * r.height;
+          if (a > area) { best = el; area = a; }
+        }
+        if (best) return best;
+      }
+    } catch {}
     const root = document.scrollingElement || document.documentElement;
     if (root.scrollHeight > innerHeight + 4) return null;
     let best = null, area = 0;

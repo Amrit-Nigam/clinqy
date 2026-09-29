@@ -122,8 +122,63 @@ if CommandLine.arguments.count >= 3, ["--click-label", "--type", "--key"].contai
     exit(0)
 }
 
+/// Subcommands work with or without dashes (`Clinqy mcp` or `Clinqy --mcp`), like the `clinqy` command's words.
+let command = CommandLine.arguments.count >= 2 && !CommandLine.arguments[1].hasPrefix("-psn")
+    ? String(CommandLine.arguments[1].drop { $0 == "-" }) : ""
+
+// `Clinqy mcp`: an MCP server on stdio for other agents (`claude mcp add clinqy -- …/Clinqy mcp`).
+if command == "mcp" { MCPServer.serve() }
+
+// `Clinqy stats [days] [--last]`: success rate, model vs action time per turn, top failure reasons.
+if command == "stats" {
+    let rest = CommandLine.arguments.dropFirst(2)
+    print(Stats.report(days: rest.compactMap(Double.init).first ?? 7, last: rest.contains("--last")))
+    exit(0)
+}
+
+// `Clinqy watch <app> <text> [--gone] [--timeout s]`: waits for text to appear (or go) via Accessibility notifications.
+if command == "watch" {
+    let rest = Array(CommandLine.arguments.dropFirst(2))
+    let words = rest.enumerated().filter { !$0.element.hasPrefix("--") && ($0.offset == 0 || rest[$0.offset - 1] != "--timeout") }.map(\.element)
+    guard words.count >= 2 else { print("usage: Clinqy watch <app name or bundle id> <text> [--gone] [--timeout seconds]"); exit(2) }
+    let name = words[0].lowercased()
+    guard let target = NSWorkspace.shared.runningApplications.first(where: { $0.bundleIdentifier?.lowercased() == name })
+            ?? NSWorkspace.shared.runningApplications.first(where: { $0.activationPolicy == .regular && ($0.localizedName ?? "").lowercased().contains(name) })
+    else { print("no running app matches \(words[0])"); exit(2) }
+    if !AXIsProcessTrusted() { print("note: this process has no Accessibility permission, so the app's text can't be read") }
+    let timeout = rest.firstIndex(of: "--timeout").flatMap { rest.indices.contains($0 + 1) ? Double(rest[$0 + 1]) : nil } ?? 30
+    let gone = rest.contains("--gone")
+    Task { @MainActor in
+        let t0 = Date()
+        let ok = await Watch.until(app: target, text: words[1], gone: gone, timeout: timeout)
+        print("\(ok ? "yes" : "timed out"): “\(words[1])” \(gone ? "gone from" : "in") \(target.localizedName ?? name) after \(Int(Date().timeIntervalSince(t0) * 1000)) ms")
+        exit(ok ? 0 : 1)
+    }
+    RunLoop.main.run()
+}
+
+// `Clinqy replay <fixture.json|folder> [--bless]`: re-checks recorded runs offline (see Replay.swift for the format).
+if command == "replay" {
+    let rest = CommandLine.arguments.dropFirst(2)
+    let bless = rest.contains("--bless")
+    let files = rest.filter { !$0.hasPrefix("--") }.flatMap(Replay.fixtures(at:))
+    guard !files.isEmpty else { print("usage: Clinqy replay <fixture.json|folder> [--bless]"); exit(2) }
+    let failed = MainActor.assumeIsolated {
+        var failed = 0
+        for url in files {
+            let r = Replay.run(url, bless: bless)
+            if bless { print("blessed \(url.lastPathComponent)"); continue }
+            print("\(r.failures.isEmpty ? "PASS" : "FAIL")  \(url.lastPathComponent)  (\(r.checks) checks)")
+            r.failures.forEach { print("   ✗ \($0)") }
+            if !r.failures.isEmpty { failed += 1 }
+        }
+        return failed
+    }
+    exit(failed == 0 ? 0 : 1)
+}
+
 // `Clinqy --selftest`: fast checks of logic that needs no UI (safety rules, reply parsing).
-if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
+if command == "selftest" {
     var failures = 0
     func check(_ ok: Bool, _ what: String) { print((ok ? "ok   " : "FAIL ") + what); if !ok { failures += 1 } }
     check(Safety.needsConfirmation(label: "Pay ₹500", request: "open the checkout page") != nil, "pay needs confirmation")
@@ -156,7 +211,10 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
             }
         }
         print("     memory: \(all) facts · maths sends \(math.facts.count) · food sends \(food.facts.count)")
-        check(all < 8 || math.facts.count < all / 2, "irrelevant facts are left out")
+        // Below Memory.sendAllBudget (16k characters) every fact goes along by design; filtering starts above it.
+        let small = Memory.facts.joined().count <= 16_000
+        check(small ? math.omitted == 0 : all < 8 || math.facts.count < all / 2,
+              small ? "small memory is sent whole" : "irrelevant facts are left out")
         check(!Memory.facts.contains { $0.contains("Swiggy") } || food.facts.contains { $0.contains("Swiggy") }, "food request brings in Swiggy facts")
     }
     // Workflows: a saved run turns typed text into a named parameter with the original as default.
@@ -217,6 +275,102 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--selftest" {
         }
         sem.wait()
         check(dict?.contains("class note") == true && dict?.contains("make") == true, "Notes dictionary summary (\(dict?.count ?? 0) chars)")
+    }
+    // Stats: model vs action time per turn comes from agent.log's "turn N · <ms> ms" lines and step times.
+    do {
+        let runs = Stats.parse("""
+        === fill the form
+        [  0.30s]   page: Form · 10 elements
+        [  2.30s] turn 0 · 2000 ms · {"say":"x"}
+        [  2.40s]   → Type “Amrit”
+        [  3.00s]     ✗ the text didn't land in w3
+        [  5.50s] turn 1 · 2000 ms · {"say":"y"}
+        [  5.60s]   → Click Next
+        [  6.60s] ✓ Filled it
+        """)
+        let t = runs.first?.turns ?? []
+        check(runs.count == 1 && t.count == 2 && t[0].actMs == 1200 && t[1].actMs == 1100 && runs[0].setupMs == 300
+              && runs[0].stepFailures.count == 1 && runs[0].ok == true, "stats: per-turn model vs action time")
+        check(Stats.reason("couldn't find “Next” (w12)") == Stats.reason("couldn't find “Submit” (w3)"), "stats: similar failures group")
+    }
+    // Safety: a "don't" about any of a control's words wins over another word the request used ("Easy Apply").
+    check(Safety.needsConfirmation(label: "Submit application", request: "fill the Easy Apply form but don't submit it") != nil
+          && Safety.needsConfirmation(label: "Submit application", request: "fill the easy apply form, don’t submit") != nil
+          && Safety.needsConfirmation(label: "Submit application", request: "apply to this job with my details") == nil, "negated verb blocks submit")
+    check(Safety.blockedChord("cmd+ctrl+q", request: "open spotify") != nil && Safety.blockedChord("ctrl+cmd+q", request: "lock my screen") == nil
+          && Safety.blockedChord("cmd+ctrl+q", request: "set a clock alarm") != nil && Safety.blockedChord("cmd+q", request: "quit notes") == nil,
+          "session-ending chords only when asked")
+    // Desktop diffs: what changed by stable ref, and none at all once positional ids have shifted.
+    do {
+        let el = AXUIElementCreateApplication(getpid())
+        func e(_ i: Int, _ role: String, _ label: String, _ ref: String, _ value: String? = nil) -> UIElementInfo {
+            UIElementInfo(id: "e\(i)", role: role, label: label, frame: .zero, element: el, ref: ref, value: value)
+        }
+        let before = [e(0, "AXButton", "Send", "a"), e(1, "AXTextField", "Message", "b", "h"), e(2, "AXButton", "Old", "c")]
+        let after = [e(0, "AXButton", "Send", "a"), e(1, "AXTextField", "Message", "b", "hi"), e(2, "AXButton", "Cancel", "d")]
+        let d = ScreenDiff.between(before, after)
+        let text = d.text()
+        check(d.changed.count == 1 && d.added.count == 1 && d.removed.count == 1 && text.contains("~ e1 TextField value 'h'→'hi'")
+              && text.contains("+ e2 Button 'Cancel'") && text.contains("- e2 Button 'Old'"), "screen diff by ref")
+        check(ScreenDiff.listingUpdate(from: before, to: after) != nil && ScreenDiff.listingUpdate(from: before, to: before) == ""
+              && ScreenDiff.listingUpdate(from: before, to: [e(0, "AXButton", "New", "z")] + after.map { e(Int($0.id.dropFirst())! + 1, $0.role, $0.label, $0.ref, $0.value) }) == nil,
+              "desktop diff only while e-ids hold")
+    }
+    // Web diffs: stable w-ids compared by key; another page gets the full listing.
+    MainActor.assumeIsolated {
+        typealias B = BrowserBridge
+        func el(_ i: Int, _ role: String, _ text: String, _ value: String? = nil) -> B.PageElement {
+            B.PageElement(index: i, role: role, text: text, rect: .zero, editable: role == "textbox", extra: "", key: "|\(role)|\(text)", value: value)
+        }
+        func page(_ url: String, _ els: [B.PageElement]) -> B.Page {
+            B.Page(connection: ObjectIdentifier(Agent.self), url: url, title: "Apply", viewport: CGSize(width: 1, height: 1), scrollY: 0,
+                   scrollMax: 0, headings: [], elements: els, estimatedArea: nil)
+        }
+        let before = page("https://x.com/apply?step=1", [el(1, "textbox", "Name", ""), el(2, "button", "Next"), el(3, "link", "Jobs")])
+        let after = page("https://x.com/apply?step=2", [el(1, "textbox", "Name", "Amrit"), el(2, "button", "Next"), el(5, "button", "Dismiss")])
+        let d = B.diff(previous: before, current: after) ?? "nil"
+        check(d.contains("~ w1") && d.contains("+ w5 button: Dismiss") && d.contains("- w3 link: Jobs") && !d.contains("w2"), "page diff by stable id")
+        check(B.diff(previous: before, current: page("https://x.com/other", after.elements)) == nil, "another page gets the full listing")
+    }
+    // Job profile: fields answer their questions; a saved earlier answer wins for its own question.
+    do {
+        var p = Profile.Data()
+        p.name = "Amrit Nigam"; p.expectedCTC = "6 LPA"; p.noticePeriod = "Immediate"; p.linkedin = "https://linkedin.com/in/amrit"
+        p.qa = [Profile.QA(question: "Why do you want to join us?", answer: "I like the product")]
+        check(Profile.answer(for: "Expected CTC (per annum)", in: p) == "6 LPA" && Profile.answer(for: "Notice period", in: p) == "Immediate"
+              && Profile.answer(for: "LinkedIn profile URL", in: p) == p.linkedin && Profile.answer(for: "First name", in: p) == "Amrit"
+              && Profile.answer(for: "Why do you want to join us?", in: p) == "I like the product"
+              && Profile.answer(for: "Years of experience with Kubernetes", in: p) == nil, "profile answers form questions")
+    }
+    MainActor.assumeIsolated {
+        check(Agent.profileAnswer(for: ["question": "Which session did you attend, and how was it? I'll enter your name as Amrit Nigam.",
+                                        "options": ["Keynote · Great", "Swift workshop · Great"]]) == nil,
+              "profile: a side remark about the name doesn't answer a choice question")
+    }
+    check(!Agent.acts("radio") && !Agent.acts("AXCheckBox") && !Agent.acts("option") && Agent.acts("button") && Agent.acts("link")
+          && Agent.acts("AXButton"), "risky-click confirmation only for controls that act")
+    check(Agent.saysUnfinished("Steps 1–6 partly done: instance launched. Still to do: attach role, SSH check, SNS, alarm")
+          && !Agent.saysUnfinished("Subscription created; it's pending until you click the confirm link in the AWS email.")
+          && !Agent.saysUnfinished("Added the CloudWatch alarm steps to the Arc doc."), "done with work left isn't done")
+    check(Agent.keepsFrontApp("open Spotify") && Agent.keepsFrontApp("show me my calendar") && Agent.keepsFrontApp("please search flights to Goa")
+          && !Agent.keepsFrontApp("type hello into the open TextEdit document") && !Agent.keepsFrontApp("reply to Anmol that I'm on my way"),
+          "front app: kept for open/show/search requests only")
+    check(!Agent.isConfirmation("What should I put for Notice period?") && Agent.isConfirmation("Should I submit the form?")
+          && !Agent.isConfirmation("Who should I put as the referrer's name? (I won't submit the form yet.)")
+          && Agent.isConfirmation("Ready to submit?"), "confirmation vs a question for a detail")
+    check(!Agent.asksForPersonalDetails("Which session did you attend, and how was it? (I'll use the name Amrit Nigam.)")
+          && Agent.asksForPersonalDetails("What's your full name?") && Agent.asksForPersonalDetails("What is your phone number?"),
+          "personal-detail questions: the detail right after “your”")
+    check(Agent.isFormSubmit("Submit application") && Agent.isFormSubmit("Send application") && !Agent.isFormSubmit("Easy Apply to this job"),
+          "form submit buttons")
+    // Replay: recorded page snapshots + replies re-checked offline (tests/replay/*.json).
+    MainActor.assumeIsolated {
+        guard let dir = Replay.repoFixtures else { print("skip replay fixtures (no tests/replay here)"); return }
+        for url in Replay.fixtures(at: dir) {
+            let r = Replay.run(url)
+            r.failures.forEach { print("     \($0)") }
+            check(r.checks > 0 && r.failures.isEmpty, "replay \(url.lastPathComponent) (\(r.checks) checks)")
+        }
     }
     print(failures == 0 ? "all passed" : "\(failures) failed")
     exit(failures == 0 ? 0 : 1)

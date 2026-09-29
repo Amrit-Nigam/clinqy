@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Clinqy",
-  "version": "1.5.1",
+  "version": "1.6.1",
   "description": "Lets the Clinqy Mac app see and act on web pages precisely.",
   "permissions": ["tabs", "scripting", "alarms", "storage"],
   "host_permissions": ["<all_urls>"],

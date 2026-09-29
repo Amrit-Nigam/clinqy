@@ -1,0 +1,555 @@
+{
+  "name" : "LinkedIn Easy Apply: open, fill contact info, a toast shifts ids, discard needs confirmation",
+  "request" : "apply to this Smytten internship with my details",
+  "turns" : [
+    {
+      "expect" : {
+        "actions" : [
+          "click w4"
+        ],
+        "confirm" : [
+
+        ],
+        "focused" : null
+      },
+      "ms" : 1380,
+      "page" : {
+        "elements" : [
+          {
+            "i" : 0,
+            "role" : "link",
+            "text" : "Home"
+          },
+          {
+            "i" : 1,
+            "role" : "link",
+            "text" : "Jobs"
+          },
+          {
+            "i" : 2,
+            "role" : "link",
+            "text" : "Messaging"
+          },
+          {
+            "editable" : true,
+            "i" : 3,
+            "placeholder" : "Search",
+            "role" : "combobox",
+            "text" : "Search"
+          },
+          {
+            "i" : 4,
+            "role" : "button",
+            "text" : "Easy Apply to this job"
+          },
+          {
+            "i" : 5,
+            "role" : "button",
+            "text" : "Save Software Development Engineer Intern – Backend at Smytten"
+          },
+          {
+            "i" : 6,
+            "role" : "link",
+            "text" : "Smytten"
+          },
+          {
+            "i" : 7,
+            "role" : "button",
+            "text" : "Show more"
+          }
+        ],
+        "title" : "Software Development Engineer Intern – Backend | Smytten | LinkedIn",
+        "url" : "https://www.linkedin.com/jobs/view/4012345678/"
+      },
+      "reply" : "{\"say\":\"Starting Easy Apply\",\"actions\":[{\"do\":\"click\",\"id\":\"w4\"}],\"done\":false}"
+    },
+    {
+      "expect" : {
+        "actions" : [
+          "type w12",
+          "click w14"
+        ],
+        "added" : [
+          "button “Dismiss”",
+          "textbox “First name”",
+          "textbox “Last name”",
+          "combobox “Phone country code”",
+          "textbox “Mobile phone number”",
+          "textbox “Email address”",
+          "button “Continue to next step”"
+        ],
+        "changed" : [
+
+        ],
+        "confirm" : [
+
+        ],
+        "drift" : [
+
+        ],
+        "focused" : 12,
+        "removed" : [
+
+        ]
+      },
+      "ms" : 2379,
+      "page" : {
+        "elements" : [
+          {
+            "covered" : true,
+            "i" : 0,
+            "role" : "link",
+            "text" : "Home"
+          },
+          {
+            "covered" : true,
+            "i" : 1,
+            "role" : "link",
+            "text" : "Jobs"
+          },
+          {
+            "covered" : true,
+            "i" : 2,
+            "role" : "link",
+            "text" : "Messaging"
+          },
+          {
+            "covered" : true,
+            "editable" : true,
+            "i" : 3,
+            "placeholder" : "Search",
+            "role" : "combobox",
+            "text" : "Search"
+          },
+          {
+            "covered" : true,
+            "i" : 4,
+            "role" : "button",
+            "text" : "Easy Apply to this job"
+          },
+          {
+            "covered" : true,
+            "i" : 5,
+            "role" : "button",
+            "text" : "Save Software Development Engineer Intern – Backend at Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 6,
+            "role" : "link",
+            "text" : "Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 7,
+            "role" : "button",
+            "text" : "Show more"
+          },
+          {
+            "i" : 8,
+            "role" : "button",
+            "text" : "Dismiss"
+          },
+          {
+            "editable" : true,
+            "i" : 9,
+            "required" : true,
+            "role" : "textbox",
+            "text" : "First name",
+            "value" : "Amrit"
+          },
+          {
+            "editable" : true,
+            "i" : 10,
+            "required" : true,
+            "role" : "textbox",
+            "text" : "Last name",
+            "value" : "Nigam"
+          },
+          {
+            "editable" : true,
+            "i" : 11,
+            "options" : "India (+91) | United States (+1)",
+            "role" : "combobox",
+            "text" : "Phone country code",
+            "value" : "India (+91)"
+          },
+          {
+            "editable" : true,
+            "focused" : true,
+            "i" : 12,
+            "required" : true,
+            "role" : "textbox",
+            "text" : "Mobile phone number"
+          },
+          {
+            "editable" : true,
+            "i" : 13,
+            "required" : true,
+            "role" : "textbox",
+            "text" : "Email address",
+            "value" : "amrit@example.com"
+          },
+          {
+            "i" : 14,
+            "role" : "button",
+            "text" : "Continue to next step"
+          }
+        ],
+        "title" : "Software Development Engineer Intern – Backend | Smytten | LinkedIn",
+        "url" : "https://www.linkedin.com/jobs/view/4012345678/"
+      },
+      "reply" : "Filling the phone number\n<invoke name=\"type\">\n<parameter name=\"id\">w12</parameter>\n<parameter name=\"text\">9000000000</parameter>\n</invoke>\n<invoke name=\"click\">\n<parameter name=\"id\">w14</parameter>\n</invoke>"
+    },
+    {
+      "expect" : {
+        "actions" : [
+          "choose w10",
+          "type w11",
+          "click w13"
+        ],
+        "added" : [
+          "button “Dismiss notification”",
+          "combobox “How many years of work experience do you have with Go?”",
+          "textbox “Expected CTC (per annum)”",
+          "button “Back to previous step”",
+          "button “Review your application”"
+        ],
+        "changed" : [
+
+        ],
+        "confirm" : [
+
+        ],
+        "drift" : [
+          "link “Home”: w0 → w1",
+          "link “Jobs”: w1 → w2",
+          "link “Messaging”: w2 → w3",
+          "combobox “Search”: w3 → w4",
+          "button “Easy Apply to this job”: w4 → w5",
+          "button “Save Software Development Engineer Intern – Backend at Smytten”: w5 → w6",
+          "link “Smytten”: w6 → w7",
+          "button “Show more”: w7 → w8",
+          "button “Dismiss”: w8 → w9"
+        ],
+        "focused" : 10,
+        "removed" : [
+          "textbox “First name”",
+          "textbox “Last name”",
+          "combobox “Phone country code”",
+          "textbox “Mobile phone number”",
+          "textbox “Email address”",
+          "button “Continue to next step”"
+        ]
+      },
+      "ms" : 1956,
+      "page" : {
+        "elements" : [
+          {
+            "i" : 0,
+            "role" : "button",
+            "text" : "Dismiss notification"
+          },
+          {
+            "covered" : true,
+            "i" : 1,
+            "role" : "link",
+            "text" : "Home"
+          },
+          {
+            "covered" : true,
+            "i" : 2,
+            "role" : "link",
+            "text" : "Jobs"
+          },
+          {
+            "covered" : true,
+            "i" : 3,
+            "role" : "link",
+            "text" : "Messaging"
+          },
+          {
+            "covered" : true,
+            "editable" : true,
+            "i" : 4,
+            "placeholder" : "Search",
+            "role" : "combobox",
+            "text" : "Search"
+          },
+          {
+            "covered" : true,
+            "i" : 5,
+            "role" : "button",
+            "text" : "Easy Apply to this job"
+          },
+          {
+            "covered" : true,
+            "i" : 6,
+            "role" : "button",
+            "text" : "Save Software Development Engineer Intern – Backend at Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 7,
+            "role" : "link",
+            "text" : "Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 8,
+            "role" : "button",
+            "text" : "Show more"
+          },
+          {
+            "i" : 9,
+            "role" : "button",
+            "text" : "Dismiss"
+          },
+          {
+            "editable" : true,
+            "focused" : true,
+            "i" : 10,
+            "options" : "Select an option | 0 years | 1 year | 2 years",
+            "q" : "How many years of work experience do you have with Go?",
+            "required" : true,
+            "role" : "combobox",
+            "text" : "Select an option",
+            "value" : "Select an option"
+          },
+          {
+            "editable" : true,
+            "i" : 11,
+            "q" : "Expected CTC (per annum)",
+            "required" : true,
+            "role" : "textbox",
+            "text" : ""
+          },
+          {
+            "i" : 12,
+            "role" : "button",
+            "text" : "Back to previous step"
+          },
+          {
+            "i" : 13,
+            "role" : "button",
+            "text" : "Review your application"
+          }
+        ],
+        "title" : "Software Development Engineer Intern – Backend | Smytten | LinkedIn",
+        "url" : "https://www.linkedin.com/jobs/view/4012345678/"
+      },
+      "reply" : "{\"say\":\"Filling experience\",\"actions\":[{\"do\":\"choose\",\"id\":\"w10\",\"option\":\"0 years\"},{\"do\":\"type\",\"id\":\"w11\",\"text\":\"360000\"},{\"do\":\"click\",\"id\":\"w13\"}],\"done\":false}"
+    },
+    {
+      "expect" : {
+        "actions" : [
+          "click w11",
+          "click w8"
+        ],
+        "added" : [
+          "button “Submit application”",
+          "checkbox “Follow Smytten to stay up to date with their page.”"
+        ],
+        "changed" : [
+
+        ],
+        "confirm" : [
+
+        ],
+        "drift" : [
+          "link “Home”: w1 → w0",
+          "link “Jobs”: w2 → w1",
+          "link “Messaging”: w3 → w2",
+          "combobox “Search”: w4 → w3",
+          "button “Easy Apply to this job”: w5 → w4",
+          "button “Save Software Development Engineer Intern – Backend at Smytten”: w6 → w5",
+          "link “Smytten”: w7 → w6",
+          "button “Show more”: w8 → w7",
+          "button “Dismiss”: w9 → w8",
+          "button “Back to previous step”: w12 → w9"
+        ],
+        "focused" : null,
+        "removed" : [
+          "button “Dismiss notification”",
+          "combobox “How many years of work experience do you have with Go?”",
+          "textbox “Expected CTC (per annum)”",
+          "button “Review your application”"
+        ]
+      },
+      "ms" : 2053,
+      "page" : {
+        "elements" : [
+          {
+            "covered" : true,
+            "i" : 0,
+            "role" : "link",
+            "text" : "Home"
+          },
+          {
+            "covered" : true,
+            "i" : 1,
+            "role" : "link",
+            "text" : "Jobs"
+          },
+          {
+            "covered" : true,
+            "i" : 2,
+            "role" : "link",
+            "text" : "Messaging"
+          },
+          {
+            "covered" : true,
+            "editable" : true,
+            "i" : 3,
+            "placeholder" : "Search",
+            "role" : "combobox",
+            "text" : "Search"
+          },
+          {
+            "covered" : true,
+            "i" : 4,
+            "role" : "button",
+            "text" : "Easy Apply to this job"
+          },
+          {
+            "covered" : true,
+            "i" : 5,
+            "role" : "button",
+            "text" : "Save Software Development Engineer Intern – Backend at Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 6,
+            "role" : "link",
+            "text" : "Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 7,
+            "role" : "button",
+            "text" : "Show more"
+          },
+          {
+            "i" : 8,
+            "role" : "button",
+            "text" : "Dismiss"
+          },
+          {
+            "i" : 9,
+            "role" : "button",
+            "text" : "Back to previous step"
+          },
+          {
+            "i" : 10,
+            "role" : "button",
+            "text" : "Submit application"
+          },
+          {
+            "checked" : true,
+            "i" : 11,
+            "role" : "checkbox",
+            "text" : "Follow Smytten to stay up to date with their page."
+          }
+        ],
+        "title" : "Software Development Engineer Intern – Backend | Smytten | LinkedIn",
+        "url" : "https://www.linkedin.com/jobs/view/4012345678/"
+      },
+      "reply" : "{\"say\":\"Unfollowing, then closing\",\"actions\":[{\"do\":\"click\",\"id\":\"w11\"},{\"do\":\"click\",\"id\":\"w8\"}],\"done\":false}"
+    },
+    {
+      "expect" : {
+        "actions" : [
+          "click w8"
+        ],
+        "added" : [
+          "button “Discard”",
+          "button “Save”"
+        ],
+        "changed" : [
+
+        ],
+        "confirm" : [
+          "w8"
+        ],
+        "drift" : [
+
+        ],
+        "focused" : null,
+        "removed" : [
+          "button “Dismiss”",
+          "button “Back to previous step”",
+          "button “Submit application”",
+          "checkbox “Follow Smytten to stay up to date with their page.”"
+        ]
+      },
+      "ms" : 1964,
+      "page" : {
+        "elements" : [
+          {
+            "covered" : true,
+            "i" : 0,
+            "role" : "link",
+            "text" : "Home"
+          },
+          {
+            "covered" : true,
+            "i" : 1,
+            "role" : "link",
+            "text" : "Jobs"
+          },
+          {
+            "covered" : true,
+            "i" : 2,
+            "role" : "link",
+            "text" : "Messaging"
+          },
+          {
+            "covered" : true,
+            "editable" : true,
+            "i" : 3,
+            "placeholder" : "Search",
+            "role" : "combobox",
+            "text" : "Search"
+          },
+          {
+            "covered" : true,
+            "i" : 4,
+            "role" : "button",
+            "text" : "Easy Apply to this job"
+          },
+          {
+            "covered" : true,
+            "i" : 5,
+            "role" : "button",
+            "text" : "Save Software Development Engineer Intern – Backend at Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 6,
+            "role" : "link",
+            "text" : "Smytten"
+          },
+          {
+            "covered" : true,
+            "i" : 7,
+            "role" : "button",
+            "text" : "Show more"
+          },
+          {
+            "i" : 8,
+            "role" : "button",
+            "text" : "Discard"
+          },
+          {
+            "i" : 9,
+            "role" : "button",
+            "text" : "Save"
+          }
+        ],
+        "title" : "Software Development Engineer Intern – Backend | Smytten | LinkedIn",
+        "url" : "https://www.linkedin.com/jobs/view/4012345678/"
+      },
+      "reply" : "{\"say\":\"Closing the dialog\",\"actions\":[{\"do\":\"click\",\"id\":\"w8\"}],\"done\":false}"
+    }
+  ]
+}

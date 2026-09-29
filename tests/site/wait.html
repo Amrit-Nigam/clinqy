@@ -1,0 +1,18 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>Report generator</title>
+<style>body { font: 16px system-ui; margin: 40px; } button { font-size: 16px; padding: 8px 16px; }</style></head>
+<body>
+<h1>Report generator</h1>
+<button id="go">Generate report</button>
+<p id="status"></p>
+<script>
+// The code only shows up 6 s after clicking, so the agent has to wait for it rather than guess.
+document.getElementById("go").onclick = () => {
+  document.getElementById("status").textContent = "Generating… this takes a few seconds.";
+  setTimeout(() => {
+    document.getElementById("status").textContent = "Report ready. Confirmation code: ZX-4417";
+    document.title = "Report ready";
+  }, 6000);
+};
+</script>
+</body></html>

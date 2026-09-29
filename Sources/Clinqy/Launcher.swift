@@ -38,7 +38,7 @@ enum Launcher {
         // `open` on a running app whose windows are closed brings a window back.
         _ = await Shell.run("/usr/bin/open", [url.path])
         for _ in 0..<40 {
-            if app.isActive, AXEngine.elements(of: app, limit: 5).count > 1 { break }
+            if app.isActive, AXEngine.elements(of: app, limit: 5, menuBar: true).count > 1 { break }
             app.activate()
             try? await Task.sleep(for: .milliseconds(100))
         }

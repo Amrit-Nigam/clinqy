@@ -18,6 +18,8 @@ final class History: ObservableObject {
         var trace: [WorkflowStep]? = nil
         /// The document the run read, for a follow-up task to use without reopening it.
         var readText: String? = nil
+        /// The first request of a chain of "continue"s: its instructions stay in force for every follow-up.
+        var task: String? = nil
     }
 
     @Published private(set) var entries: [Entry] = []

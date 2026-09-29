@@ -64,6 +64,12 @@ final class Agent: ObservableObject {
     var echo = false
     /// Test runs aren't saved to History and teach memory nothing.
     var isTest = false
+    /// The run's last real step opened an app or page, so that's what the user wants to see at the end.
+    private var openedLast = false
+    /// A test run that still shows the review card before a form submit (answered via `clinqy://answer`).
+    var reviewInTests = false
+    /// A test run that still saves form answers to the job profile (tests/run.sh restores the profile after).
+    var saveInTests = false
 
     private let buddy: Buddy
     private let hand: Hand
@@ -72,13 +78,20 @@ final class Agent: ObservableObject {
     fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
-    /// Step screenshots taken this run with snap, for paste_snaps.
-    private var snaps: [(caption: String, png: Data)] = []
+    /// Step screenshots taken with snap, for paste_snaps. Kept across "continue"s of the same task (a write-up
+    /// spans several runs); each is pasted once.
+    private var snaps: [(caption: String, png: Data, pasted: Bool)] = []
+    /// Runs this task continued on its own after running out of steps or stalling (see `finish`).
+    private var autoContinues = 0
     /// The browser tab this task opened (the only tab it may navigate in place).
     private var ownedTab: Int?
     /// The user already said yes to a confirmation in this run.
     private var userConfirmed = false
-
+    /// Names this run's folder of click traces; `clickCount` numbers them.
+    private var runID = UUID().uuidString
+    private var clickCount = 0
+    /// Where the run started, for the replay cache (a similar request from the same place gets these steps as a hint).
+    private var startPlace: (app: String?, url: String?, title: String?) = (nil, nil, nil)
     static func isNewTabPage(_ url: String) -> Bool {
         url.isEmpty || url.hasPrefix("chrome://newtab") || url.hasPrefix("arc://newtab") || url == "about:blank"
             || url.hasPrefix("chrome://new-tab-page") || url.hasPrefix("edge://newtab") || url.hasPrefix("brave://newtab")
@@ -117,10 +130,13 @@ final class Agent: ObservableObject {
         if qa != nil { return options.first }   // tests run unattended: take the first (go-ahead) option
         let previous = phase
         phase = .waiting
-        buddy.bubble("need your input", for: 4)
+        // Waiting on the user isn't a hang: say so in the log, and keep the buddy's bubble up until they answer.
+        log("  waiting for your answer: \(sensitive ? "(hidden)" : String(text.prefix(120)))")
+        buddy.bubble("need your input", for: 600)
         question = Question(text: text, options: options, sensitive: sensitive)
         onQuestion()
         let reply = await withCheckedContinuation { answerWaiter = $0 }
+        buddy.bubble(nil)
         if !Task.isCancelled { phase = previous == .waiting ? .acting : previous }
         return reply
     }
@@ -134,8 +150,76 @@ final class Agent: ObservableObject {
         return yes
     }
 
+    /// Before clicking a control on a web page: a form's final Submit shows the user every answer on the form and
+    /// waits for Submit or Edit (instead of the plain question, so they're asked once); other consequential clicks get
+    /// confirmRisky. nil = go ahead, else why not.
+    private func approve(_ label: String, role: String, page: BrowserBridge.Page?) async -> String? {
+        // Picking an option or ticking a box sends nothing, whatever its label says ("Send a notification to the
+        // following SNS topic" is a choice in a form); only a control that acts needs the user's OK.
+        guard Self.acts(role) else { return nil }
+        if !userConfirmed, let page, Self.isFormSubmit(label), let ok = await reviewBeforeSubmit(page) {
+            return ok ? nil : Self.editedReview
+        }
+        return await confirmRisky(label) ? nil
+            : "the user said not to click \(label.prefix(40).debugDescription); stop and tell them where things stand"
+    }
+
+    /// A final summary that itself lists work still to do ("Steps 1–6 partly done … Still to do: …"), unless what's
+    /// left needs the user (a login, a code, a confirmation link).
+    nonisolated static func saysUnfinished(_ say: String) -> Bool {
+        let unfinished = #"(?i)\b(still to do|still need to|remaining steps?|steps? (left|remaining)|left to do|not (yet )?(done|finished)|partly done|partially (done|complete)|next,? i('ll| will)|haven't (yet )?(done|finished|captured|added|started))\b"#
+        let needsUser = #"(?i)\b(you need to|you'll need to|you have to|waiting (for|on) you|your (password|otp|code|login|approval|confirmation)|log ?in|sign ?in|confirm(ation)? (link|email)|click the (confirm|link))\b"#
+        return say.range(of: unfinished, options: .regularExpression) != nil && say.range(of: needsUser, options: .regularExpression) == nil
+    }
+
+    /// Whether clicking an element of this role does something (a button, a link, a menu item), as opposed to
+    /// choosing or ticking (radio, checkbox, option, tab) or focusing (a text box), which never needs a confirmation.
+    nonisolated static func acts(_ role: String) -> Bool {
+        let r = role.lowercased().replacingOccurrences(of: "ax", with: "", options: .anchored)
+        return !["radio", "radiobutton", "checkbox", "switch", "option", "menuitemradio", "menuitemcheckbox", "tab",
+                 "textbox", "textfield", "textarea", "searchfield", "combobox", "listbox", "row", "cell", "heading",
+                 "statictext", "group", "radiogroup", "slider", "treeitem"].contains(r)
+    }
+
+    /// Why the step stopped when the user chose Edit on the review.
+    private static var editedReview: String {
+        "the user chose Edit on the review" + (UI.lastReviewNote.map { ": \"\($0)\". Make that change, then submit again" }
+            ?? " without saying what; ask them what to change")
+    }
+
+    /// A form's final button ("Submit", "Submit application", "Send application"), not one that opens a form ("Easy Apply").
+    nonisolated static func isFormSubmit(_ label: String) -> Bool {
+        label.range(of: #"(?i)\bsubmit\b|^\s*(send|finish|complete) (my |the |your )?(application|form)\b"#, options: .regularExpression) != nil
+    }
+
+    /// Shows every answer on the page's form (question → answer) and waits for Submit or Edit. nil = no form here
+    /// (or an unattended, dry or test run): the caller falls back to a plain confirmation.
+    private func reviewBeforeSubmit(_ page: BrowserBridge.Page) async -> Bool? {
+        guard qa == nil, !runDry, !isTest || reviewInTests,
+              let r = try? await BrowserBridge.shared.perform("review", on: page, timeout: 8),
+              let items = r["items"] as? [[String: Any]] else { return nil }
+        let pairs = items.compactMap { i -> (String, String)? in
+            guard let q = i["q"] as? String, !q.isEmpty else { return nil }
+            return (q, i["answer"] as? String ?? "")
+        }
+        guard pairs.count >= 2 else { return nil }
+        reviewedForm = true
+        let ok = await UI.reviewBeforeSubmit(items: pairs, title: String((r["title"] as? String ?? page.title).prefix(70)))
+        lastProgress = Date()
+        if ok { userConfirmed = true }
+        return ok
+    }
+
     /// The user's reply to the current question (nil = they declined / cancelled).
     func answer(_ text: String?) {
+        // A waiting review card takes the answer too (voice, `clinqy://answer`): "submit"/"yes" approves, anything
+        // else is an edit to make first.
+        if ReviewCenter.shared.pending != nil, answerWaiter == nil {
+            let t = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let approve = t.range(of: #"(?i)^(submit|yes|ok|okay|go ahead|approve|send)\b"#, options: .regularExpression) != nil
+            ReviewCenter.shared.decide(approve, note: approve ? nil : t)
+            return
+        }
         guard let waiter = answerWaiter else { return }
         answerWaiter = nil
         lastProgress = Date()   // time spent answering isn't "stuck"
@@ -151,7 +235,8 @@ final class Agent: ObservableObject {
         hand = Hand(buddy: buddy)
     }
 
-    func submit(_ raw: String, test: Bool = false) {
+    func submit(_ raw: String, test: Bool = false, auto: Bool = false) {
+        if !auto { autoContinues = 0 }
         var request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
         // "dry run: book a cab" rehearses just this request.
@@ -213,25 +298,35 @@ final class Agent: ObservableObject {
         narration = ""
         openedTab = false
         checkedMemoryForAsk = false
+        pushedOn = 0
+        profileOffered = []
         turnCount = 0; fastTurnCount = 0; lookCount = 0
         reviewedForm = false
         userAnswers = []
-        snaps = []
+        if continuation == nil { snaps = [] }
         addedNotes = []
         readText = nil
         ownedTab = nil
         userConfirmed = false
         secrets = []
+        runID = UUID().uuidString
+        clickCount = 0
+        startPlace = (nil, nil, nil)
+        openedLast = false
+        hand.beginRun(request: request)
+        if !isTest { Task.detached(priority: .background) { Screenshot.pruneRuns() } }
         self.request = request
         runResult = nil
         phase = .thinking
         buddy.clearMark()
         onStart()
         startWatchdog()
+        Replay.Recorder.shared.begin(request: request)
         Self.writeLog("=== \(dry ? "[dry run] " : "")\(request)\(selectedText.map { " [selection: \($0.count) chars]" } ?? "")\(selectedFiles.isEmpty ? "" : " [files: \(selectedFiles.map(\.lastPathComponent).joined(separator: ", "))]")\(annotation.map { " [circled: \(Int($0.rect.width))×\(Int($0.rect.height)) at \(Int($0.rect.minX)),\(Int($0.rect.minY))]" } ?? "")")
     }
 
     func cancel() {
+        UI.cancelReview()
         answer(nil)
         task?.cancel()
         session?.close()
@@ -274,13 +369,30 @@ final class Agent: ObservableObject {
         var wantsLook = false
         var failures = 0
         var lastSignature = ""
-        var repeats = 0
+        var repeats = 0, sameRuns = 0
+        // Loops already met with "change method" (a loop that comes back after that stops the run).
+        var escalated: Set<String> = []
         var askedForAnswer = false
         var lastScreen = ""
+        // What the model was last shown, so later turns can say only what changed (see screenText).
+        var shown: Observation?
+        var lastFullTurn = 0, lookedLastTurn = false
+        let maxTurns = 50
 
-        for turn in 0..<50 {   // long forms take 30+ turns
+        for turn in 0..<maxTurns {   // long forms take 30+ turns
             guard !Task.isCancelled else { return }
+            if turn == maxTurns - 10 {
+                message += "\n(\(turn) of \(maxTurns) steps used. If the current approach isn't getting closer, change it now; "
+                    + "if the task can't be finished, finish with done:true and say where things stand.)"
+            }
             let obs = await Observation.capture(app)
+            if turn == 0, continuation == nil, qa == nil {
+                startPlace = (obs.app?.cleanName, obs.page?.url, obs.page?.title)
+                if let hint = ReplayCache.shared.hint(request: request, app: obs.app?.cleanName, url: obs.page?.url, title: obs.page?.title) {
+                    message += hint
+                    log("replay hint offered")
+                }
+            }
             if let page = obs.page {
                 let fields = page.elements.filter(\.editable).map { "w\($0.index) \($0.extra)" }.joined(separator: " | ")
                 log("  page: \(page.title.prefix(50)) · \(page.elements.count) elements\(fields.isEmpty ? "" : " · fields: \(fields.prefix(300))")")
@@ -299,11 +411,25 @@ final class Agent: ObservableObject {
             var image: String?
             if wantsLook, let shotApp = obs.app {
                 image = await Screenshot.annotated(app: shotApp, elements: obs.elements, circled: circled)
+                if image == nil, let blank = Screenshot.lastBlank { message += "\n" + blank.hint }
             }
             wantsLook = false
             // An unchanged screen is one line, not the whole list again (less to read, faster replies).
-            let screen = obs.text == lastScreen && image == nil ? "Screen: unchanged since your last look." : obs.text
-            lastScreen = obs.text
+            let full = obs.text
+            let screenUnchanged = full == lastScreen
+            var screen = "Screen: unchanged since your last look."
+            if !screenUnchanged || image != nil {
+                // The whole list when the model may not have the last one in mind: the first turn, a screenshot (its
+                // boxes carry e-ids), the turn after one, a failed step, another app or window, the fast helper's
+                // turns, and every 6th turn; otherwise only what changed since.
+                let fresh = turn == 0 || image != nil || lookedLastTurn || failures > 0 || turn - lastFullTurn >= 6
+                    || !fast.leadHasContinuity
+                screen = fresh ? full : Self.screenText(obs, since: shown) ?? full
+                if screen == full { lastFullTurn = turn } else { log("  screen: changes only (\(screen.count) of \(full.count) chars)") }
+            }
+            lastScreen = full
+            shown = obs
+            lookedLastTurn = image != nil
             // Anything the user added mid-task comes first: it can change the plan.
             if !addedNotes.isEmpty {
                 message = "The user added while you were working (take it into account; it may change the plan):\n"
@@ -321,7 +447,9 @@ final class Agent: ObservableObject {
                 return finish(ok: false, error.localizedDescription)
             }
             if Task.isCancelled { return }
-            log("turn \(turn) · \(Int(Date().timeIntervalSince(t0) * 1000)) ms · \(fast.tag)\(reply.prefix(300))")
+            let ms = Int(Date().timeIntervalSince(t0) * 1000)
+            log("turn \(turn) · \(ms) ms · \(fast.tag)\(reply.prefix(300))")
+            Replay.Recorder.shared.turn(reply: reply, ms: ms)
             turnCount += 1
             if fast.tag.hasPrefix("fast") { fastTurnCount += 1 }
             if image != nil { lookCount += 1 }
@@ -331,23 +459,53 @@ final class Agent: ObservableObject {
                 continue
             }
             let say = (json["say"] as? String) ?? ""
-            let actions = (json["actions"] as? [[String: Any]]) ?? []
+            // A bare action ({"do":"ask",…}) instead of the wrapper is still a clear intent.
+            let actions = (json["actions"] as? [[String: Any]]) ?? (json["do"] is String ? [json] : [])
             let isDone = json["done"] as? Bool == true
+            // The model saw the last failure and chose to do nothing (usually to finish): that's its answer to it,
+            // so it no longer blocks finishing. Without this a failed step before a plain "done" loops to the step cap.
+            if actions.isEmpty { failures = 0 }
             if !say.isEmpty, !isDone { narration = say }
 
-            // Only the same actions three times in a row is a loop; turns with no actions (thinking, finishing) aren't.
+            // A loop is the same actions three times with nothing changing (scrolling on through a page isn't one);
+            // turns with no actions (thinking, finishing) never are. The first time, the actions aren't run again:
+            // the model is told to change method, with a screenshot. Only the same loop after that stops the run.
+            // The same step while the screen keeps changing is progress (Next through a wizard, pages of results):
+            // only a long run of it (12) counts, and the step cap bounds the rest.
             let signature = actions.map { "\($0)" }.joined()
-            repeats = !actions.isEmpty && signature == lastSignature ? repeats + 1 : 0
+            let same = !actions.isEmpty && signature == lastSignature
+            sameRuns = same ? sameRuns + 1 : 0
+            repeats = same && (screenUnchanged || failures > 0) ? repeats + 1 : 0
             lastSignature = signature
-            if repeats >= 2 { return finish(ok: false, "I kept trying the same thing, so I stopped") }
+            if !actions.isEmpty, escalated.contains(signature) && repeats >= 1 || ((repeats >= 2 || sameRuns >= 12) && escalated.count >= 2) {
+                return finish(ok: false, "I kept trying the same thing, so I stopped")
+            }
+            if repeats >= 2 || sameRuns >= 12 {
+                let why = repeats >= 2 ? "3× with nothing changing" : "\(sameRuns + 1)×"
+                escalated.insert(signature)
+                repeats = 0; sameRuns = 0
+                wantsLook = true
+                log("  loop: same actions \(why) — asking for another method")
+                steps.append(Step(text: "Same step repeated — trying another way", state: .info))
+                message = "Your last reply repeated the same actions again (\(actions.map(FastLane.brief).joined(separator: ", "))) "
+                    + "and they aren't getting anywhere, so they were NOT run again. That approach failed: don't send it again. "
+                    + "Use a different method, in this order: the keyboard (tab/shift+tab to reach the control, space or return to press it, "
+                    + "arrows in lists, esc to close a popup), then the other id for it (its e-id from Accessibility instead of the w-id, or "
+                    + "the reverse), then click by x/y on the screenshot attached now. If the goal can't be reached, finish with done:true and say what's blocking."
+                continue
+            }
 
             if !actions.isEmpty {
                 phase = .acting
                 buddy.mood = .acting
             }
             var results: [String] = []
+            // Part of the batch didn't run because the page changed under it (not a failure, but not finished either).
+            var cutShort = false
             var context = ActionContext(app: obs.app, elements: obs.elements, fingerprint: obs.fingerprint,
                                         page: obs.page, webArea: obs.webArea)
+            context.seen = obs.page
+            context.identity = obs.app.flatMap(AXEngine.identity(of:))
             for (i, action) in actions.enumerated() {
                 guard !Task.isCancelled else { return }
                 // The user added something mid-batch: the rest of this plan may be outdated, re-plan first.
@@ -357,23 +515,68 @@ final class Agent: ObservableObject {
                 }
                 lastTarget = nil
                 var action = action
+                let kind = (action["do"] as? String ?? "").lowercased()
                 // click/type/open_* already wait for the screen to settle; a wait stacked on top is mostly dead time.
-                if (action["do"] as? String) == "wait", i > 0,
+                if kind == "wait", i > 0,
                    ["click", "type", "open_url", "open_app", "key"].contains(actions[i - 1]["do"] as? String ?? ""),
                    (action["ms"] as? Int ?? 600) > 1000 {
                     action["ms"] = 1000
                 }
+                // The ids the model gave point into the page list it was shown; if the page was listed again since
+                // (a field appeared or went away), use the same element's id in the current list — never a neighbour's.
+                if Self.isWebRef(action["id"]), let seen = context.seen, let now = context.page {
+                    guard let n = Self.webIndex(action["id"]), let id = Self.rematch(n, from: seen, to: now) else {
+                        let was = Self.webIndex(action["id"]).flatMap { n in seen.elements.first { $0.index == n } }
+                        results.append("\(i + 1). (not done: the page changed after the steps above, and \(action["id"] ?? "?")"
+                                       + "\(was.map { " (\($0.role) \($0.text.prefix(40).debugDescription))" } ?? "") isn't there anymore; "
+                                       + "the rest of this batch was skipped — the fresh page is below)")
+                        cutShort = true
+                        break
+                    }
+                    if id != n {
+                        log("    w\(n) is now w\(id) (the page re-listed)")
+                        action["id"] = "w\(id)"
+                    }
+                }
+                // Trailing look after page actions: the page list the next turn brings is exact and fresh, so a
+                // screenshot adds time, not information. A look on its own is always honoured.
+                if kind == "look", i > 0, Self.pageListSuffices(context, after: actions[..<i]) {
+                    results.append("\(i + 1). look skipped — the fresh page list below shows the result (send look on its own "
+                                   + "if you need pixels: pictures, canvas, iframes, a native dialog)")
+                    continue
+                }
                 let result = await perform(action, context: &context)
                 if result.ok, !runDry { record(action) }
+                // Opening something was only a step if more work followed in it (see `keepsFrontApp`).
+                if result.ok, ["click", "type", "key", "choose", "upload", "scroll", "applescript", "fill"].contains((action["do"] as? String ?? "").lowercased()) {
+                    openedLast = false
+                }
                 if case .look = result.effect { wantsLook = true }
                 results.append("\(i + 1). \(result.summary)")
                 if !result.ok { failures += 1; break }
                 failures = 0
+                // A click or key that brought another app forward (a link opening the browser, a share sheet): the rest
+                // of the batch was planned for the old screen, so stop here; the next turn looks at the new app.
+                if ["click", "key", "type"].contains(kind), !runDry, i + 1 < actions.count, let current = context.app,
+                   let other = AXEngine.handoff(from: current), other.bundleIdentifier != Bundle.main.bundleIdentifier {
+                    log("    \(other.cleanName ?? "another app") came to the front")
+                    results.append("(\(other.cleanName ?? "another app") came to the front, so the rest of this batch was skipped — its screen is below)")
+                    context.app = other
+                    cutShort = true
+                    break
+                }
+                // Forms re-render as they're filled (LinkedIn adds and drops fields): before the next step by w-id, list
+                // the page again so it lands on the element the model meant, not whatever now sits at that index.
+                if ["type", "choose", "click", "upload"].contains(kind), context.page != nil, !runDry,
+                   actions[(i + 1)...].contains(where: { Self.isWebRef($0["id"]) }) {
+                    await relist(&context)
+                }
             }
             app = context.app
             // A final reply may carry last actions; finish once they ran (unless one failed).
-            if isDone, failures == 0, !addedNotes.isEmpty {
-                message = "Results:\n" + results.joined(separator: "\n") + "\n(You were about to finish, but the user added something.)"
+            if isDone, failures == 0, !addedNotes.isEmpty || cutShort {
+                message = "Results:\n" + results.joined(separator: "\n")
+                    + (cutShort ? "\n(You were about to finish, but not all of your last steps ran.)" : "\n(You were about to finish, but the user added something.)")
                 continue
             }
             // A question answered with a status label ("Your roll number") instead of the answer: ask once for the answer.
@@ -382,6 +585,15 @@ final class Agent: ObservableObject {
                 message = (results.isEmpty ? "" : "Results:\n" + results.joined(separator: "\n") + "\n")
                     + "Your final say (\"\(say)\") is a label, not the answer. The user asked a question: finish again with done:true "
                     + "and a say that contains the answer itself, as a full sentence (e.g. \"Your roll number is 1601…\")."
+                continue
+            }
+            if isDone, failures == 0, pushedOn < 2, Self.saysUnfinished(say) {
+                pushedOn += 1
+                log("  not done yet: “\(say.prefix(80))” — carrying on")
+                message = (results.isEmpty ? "" : "Results:\n" + results.joined(separator: "\n") + "\n")
+                    + "You were about to finish, but your own summary says work remains (\"\(say.prefix(200))\"). The user wants the "
+                    + "whole task done without having to say continue: do the remaining steps now. Finish only when everything is "
+                    + "done, or when something truly needs the user (say exactly what)."
                 continue
             }
             if isDone, failures == 0 {
@@ -396,6 +608,10 @@ final class Agent: ObservableObject {
     }
 
     private var checkedMemoryForAsk = false
+    /// Times this run was told to carry on after finishing with work left (see `saysUnfinished`).
+    private var pushedOn = 0
+    /// Questions the profile already answered this run (the next time the model asks one, it's asked for real).
+    private var profileOffered: Set<String> = []
     /// This run's numbers for runs.jsonl: model turns, turns the fast helper took, screenshots sent.
     private var turnCount = 0, fastTurnCount = 0, lookCount = 0
 
@@ -453,11 +669,49 @@ final class Agent: ObservableObject {
         return end(line, .init(ok: true, summary: "review shown to the user. \(note)\n\(summary)"))
     }
 
+    /// Requests whose point is what ends up on screen ("open Spotify", "show me my calendar", "search …"): the app
+    /// they end in stays in front instead of the user's previous one coming back.
+    nonisolated static func keepsFrontApp(_ request: String) -> Bool {
+        request.range(of: #"(?i)^\s*(please |can you |could you )?(open|launch|start|switch to|go to|take me to|show( me)?|play|search|find|look up|google|navigate|bring up|pull up)\b"#,
+                      options: .regularExpression) != nil
+    }
+
+    /// A request that may lead to an application form (where the job-application profile applies).
+    static func mayMeetForms(_ text: String) -> Bool {
+        text.range(of: #"(?i)\b(appl(y|ication)|job|internship|intern|form|fill|resume|cv|role|position|opening|hiring|linkedin|naukri|greenhouse|lever|workday)"#,
+                   options: .regularExpression) != nil
+    }
+
+    /// "Submit with your resume attached?", "Should I go ahead?": asks for a decision, not for details.
+    nonisolated static func isConfirmation(_ text: String) -> Bool {
+        // Only the question itself: "(I won't submit the form yet)" after it isn't what's being asked.
+        let question = text.firstIndex(of: "?").map { String(text[...$0]) } ?? text
+        // "What/Who should I put for …?" asks for a detail, not for a go-ahead.
+        if question.range(of: #"(?i)\b(what|which|who|whom|where|when|how much|how many)\b.*\bshould i (put|enter|use|write|fill|type|say|give|choose|select|answer|add|list|mention)\b"#,
+                          options: .regularExpression) != nil { return false }
+        return question.range(of: #"(?i)\b(submit|send it|should i|shall i|go ahead|ready to|confirm|okay to|ok to)\b"#, options: .regularExpression) != nil
+    }
+
+    /// The profile's answer to an ask that's a single form question it covers, as (question, answer).
+    static func profileAnswer(for action: [String: Any]) -> (String, String)? {
+        guard let q = action["question"] as? String, !isConfirmation(q), action["sensitive"] as? Bool != true,
+              q.filter({ $0 == "?" }).count <= 1 else { return nil }
+        // Only the question itself: a side remark after it ("…? I'll enter your name as …") isn't what's asked.
+        let asked = q.firstIndex(of: "?").map { String(q[...$0]) } ?? q
+        guard let a = Profile.answer(for: asked) else { return nil }
+        // A multiple-choice question takes the profile's answer only when it is one of the choices.
+        let options = (action["options"] as? [String] ?? []).map { $0.lowercased() }
+        if !options.isEmpty, !options.contains(where: { $0.contains(a.lowercased()) || a.lowercased().contains($0) }) { return nil }
+        return (q, a)
+    }
+
     /// A question for the user's own details (name, email, phone, college…), which memory may already hold.
-    static func asksForPersonalDetails(_ question: String) -> Bool {
+    nonisolated static func asksForPersonalDetails(_ question: String) -> Bool {
         // Confirmations ("Submit with your resume attached?") aren't requests for details.
-        if question.range(of: #"(?i)\b(submit|send it|should i|shall i|go ahead|ready to|confirm|okay to|ok to)\b"#, options: .regularExpression) != nil { return false }
-        return question.range(of: #"(?i)\b(your|you)\b.*\b(name|e-?mail|phone|mobile|number|college|university|cgpa|gpa|degree|graduat|linkedin|github|portfolio|address|city|gender|birth|dob|age|skills?|stack|experience|resume|cv)\b"#,
+        if isConfirmation(question) { return false }
+        // "your (full) name", "your phone number": the detail right after "your" — not any "you … name" in a sentence
+        // ("Which session did you attend? (I'll use the name …)" asks for a choice, not for a detail).
+        return question.range(of: #"(?i)\byour\s+(\w+\s+){0,2}?(name|e-?mail|phone|mobile|number|college|university|cgpa|gpa|degree|graduat\w*|linkedin|github|portfolio|address|city|gender|birth|dob|age|skills?|stack|experience|resume|cv)\b"#,
                        options: .regularExpression) != nil
     }
 
@@ -545,6 +799,9 @@ final class Agent: ObservableObject {
                 + "x \(Int(r.minX))–\(Int(r.maxX)), y \(Int(r.minY))–\(Int(r.maxY)) in screen points. It's the yellow loop on the first screenshot."
         }
         if let earlier = continuation {
+            if let task = earlier.task, task != earlier.request {
+                text += "\n\nThe task this is all part of (the user's own instructions, still in force until everything is done):\n\(task)"
+            }
             text += """
 
             This continues an earlier task (\(earlier.date.formatted(date: .abbreviated, time: .shortened))):
@@ -574,6 +831,11 @@ final class Agent: ObservableObject {
             + "- Full name: \(NSFullUserName())\n" + profile.map { "- \($0)" }.joined(separator: "\n")
         if !other.isEmpty { text += "\nOther things you remember about the user:\n" + other.map { "- \($0)" }.joined(separator: "\n") }
         if omitted > 0 { text += "\n(\(omitted) more remembered facts not shown — use recall if you need something about the user that isn't here.)" }
+        // The job-application profile, for requests that may meet a form (it's long, and nothing else needs it).
+        if Self.mayMeetForms(context) {
+            let jobProfile = Profile.promptBlock
+            if !jobProfile.isEmpty { text += "\n" + jobProfile }
+        }
         return text
     }
 
@@ -588,6 +850,10 @@ final class Agent: ObservableObject {
         var webArea: CGRect?
         /// Page fields typed into this turn (index → text), re-checked because browser autofill can change them later.
         var typedFields: [(Int, String)] = []
+        /// The page list the model's w-ids refer to (what it was shown this turn); `page` may be a newer listing.
+        var seen: BrowserBridge.Page?
+        /// The app's process as scanned: a pid alone can be reused by a relaunch.
+        var identity: AXEngine.ProcessIdentity?
     }
 
     struct ActionResult {
@@ -606,6 +872,7 @@ final class Agent: ObservableObject {
             let line = begin("Open \(name)")
             guard let app = await hand.openApp(named: name) else { return end(line, fail("Couldn't find an app called \(name)")) }
             context.app = app
+            openedLast = true
             await refresh(&context)
             return end(line, .init(ok: true, summary: "\(app.cleanName ?? name) is now frontmost"))
 
@@ -663,13 +930,17 @@ final class Agent: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(1200))
                 await refresh(&context)
             }
+            openedLast = true
+            registerNavigationUndo(line, label: "Leave \(url.host ?? raw)", closing: reuse ? nil : ownedTab, app: context.app)
             return end(line, .init(ok: true, summary: "opened \(url.absoluteString) in \(context.app?.cleanName ?? "the browser")"))
 
         case "click" where Self.isWebRef(action["id"]):
             guard let (el, rect) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
             let line = begin("Click \(el.text.prefix(32))")
-            guard await confirmRisky(el.text) else { return end(line, fail("the user said not to click \(el.text.prefix(40).debugDescription); stop and tell them where things stand")) }
+            let submits = Self.isFormSubmit(el.text) || Safety.needsConfirmation(label: el.text, request: request) != nil
+            if let why = await approve(el.text, role: el.role, page: context.page) { return end(line, fail(why)) }
             if let app = context.app { await Launcher.bringToFront(app) }
+            let urlBefore = el.role == "link" ? await BrowserBridge.shared.activeTab(in: context.app)?.url : nil
             // A real mouse click, like a person: many sites (Google Forms, React apps) ignore script clicks.
             // If nothing changed and it wasn't covered, fall back to clicking through the page.
             let page = context.page!
@@ -686,7 +957,14 @@ final class Agent: ObservableObject {
                 mouse = hit && web.contains(point)
             }
             var after = before
+            // Something of another app's over that spot (a notification, a popup): click through the page instead.
+            let pid = context.app?.processIdentifier ?? 0
+            if mouse, let why = await Task.detached(operation: { Hand.hitMismatch(at: point, pid: pid, window: nil) }).value {
+                log("    \(why) — clicking through the page")
+                mouse = false
+            }
             if mouse {
+                traceClick(point, in: context.app)
                 await hand.click(at: point)
                 after = await state()
                 for _ in 0..<3 where before != nil && before == after {
@@ -700,6 +978,17 @@ final class Agent: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(250))
             }
             buddy.clearHighlight()
+            if submits {
+                // Sent: undoing the typing that went into it would only confuse the page.
+                StepUndo.shared.clear()
+            } else if ["checkbox", "switch"].contains(el.role), line < steps.count {
+                let index = el.index
+                StepUndo.shared.register(step: steps[line].id, kind: .toggle, label: "Click “\(el.text.prefix(30))” back") {
+                    (try? await BrowserBridge.shared.perform("click", on: page, ["index": index])) != nil
+                }
+            } else if let urlBefore, let now = await BrowserBridge.shared.activeTab(in: context.app)?.url, now != urlBefore {
+                registerNavigationUndo(line, label: "Go back from \(URL(string: now)?.host ?? "that page")", closing: nil, app: context.app)
+            }
             return end(line, .init(ok: true, summary: "clicked \(el.role) \(el.text.prefix(60).debugDescription) on the page"))
 
         case "application":
@@ -776,7 +1065,7 @@ final class Agent: ObservableObject {
                 buddy.clearHighlight()
                 return end(line, .init(ok: true, summary: "\(want.debugDescription) was already chosen"))
             }
-            await hand.click(at: CGPoint(x: rect.midX, y: rect.midY))
+            if let why = await hand.click(at: CGPoint(x: rect.midX, y: rect.midY), pid: app.processIdentifier) { return end(line, fail(why)) }
             if el.editable {
                 // A search-as-you-type box: typing narrows the list to the option.
                 try? await Task.sleep(for: .milliseconds(150))
@@ -798,7 +1087,10 @@ final class Agent: ObservableObject {
                 return end(line, fail("no option like \(want.debugDescription)\(seen.isEmpty ? " appeared" : "; the options are: " + seen.joined(separator: " | "))"))
             }
             let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
-            await hand.click(at: CGPoint(x: web.minX + (x + w / 2) * sx, y: web.minY + (y + h / 2) * sy))
+            if let why = await hand.click(at: CGPoint(x: web.minX + (x + w / 2) * sx, y: web.minY + (y + h / 2) * sy), pid: app.processIdentifier) {
+                hand.press("esc")
+                return end(line, fail(why))
+            }
             try? await Task.sleep(for: .milliseconds(350))
             let now = await current()
             buddy.clearHighlight()
@@ -830,7 +1122,7 @@ final class Agent: ObservableObject {
             // Keep the browser's autocomplete list from opening over the field, then click into it for real
             // like a person (a real click also closes any popup still open from the previous field).
             _ = try? await BrowserBridge.shared.perform("prepare", on: page, ["index": el.index])
-            await hand.click(at: CGPoint(x: rect.midX, y: rect.midY))
+            if let why = await hand.click(at: CGPoint(x: rect.midX, y: rect.midY), pid: app.processIdentifier) { return end(line, fail(why)) }
             try? await Task.sleep(for: .milliseconds(150))
             // It must be *this* field that has the caret (not just any text box, e.g. the previous one);
             // keys anywhere else would trigger page shortcuts or land in the wrong field.
@@ -852,15 +1144,19 @@ final class Agent: ObservableObject {
             }
             // Type it like a person; if the page didn't take the keys, set it the way frameworks notice.
             // Start from an empty field (it may hold autofill or old text); keystrokes then type the rest.
-            if let old = (try? await BrowserBridge.shared.perform("value", on: page, ["index": el.index]))?["value"] as? String, !old.isEmpty {
+            let old = (try? await BrowserBridge.shared.perform("value", on: page, ["index": el.index]))?["value"] as? String ?? ""
+            if !old.isEmpty {
                 _ = try? await BrowserBridge.shared.perform("fill", on: page, ["index": el.index, "text": ""])
             }
-            let isCode = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["code"] as? Bool ?? false
+            let active = try? await BrowserBridge.shared.perform("activeValue", on: page)
+            let isCode = active?["code"] as? Bool ?? false
             buddy.setTyping(true)
             AXEngine.targetPid = app.processIdentifier
             await hand.enterText(text, codeEditor: isCode)
             AXEngine.targetPid = nil
             buddy.setTyping(false)
+            // A password field took secure input: never set it behind the user's back either.
+            if let why = hand.refusal { return end(line, fail(why)) }
             // Keys queue up in the browser; wait until the field shows them before moving on (or focus could
             // move to the next field while this one's last keys are still in flight).
             var value: String?
@@ -869,7 +1165,8 @@ final class Agent: ObservableObject {
                 if let v = value, AXEngine.similar(v, text) { break }
                 try? await Task.sleep(for: .milliseconds(100))
             }
-            if let value, !AXEngine.similar(value, text) || value.count > text.count + 3 {
+            // (A code editor's field isn't its text: setting it would corrupt the editor.)
+            if !isCode, let value, !AXEngine.similar(value, text) || value.count > text.count + 3 {
                 _ = try? await BrowserBridge.shared.perform("fill", on: page, ["index": el.index, "text": text])
             }
             // Browser autofill can rewrite fields filled a moment ago (e.g. focusing a password box refills the
@@ -888,7 +1185,14 @@ final class Agent: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
             }
             buddy.clearHighlight()
-            return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into \(el.role) \(el.text.prefix(40).debugDescription)\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
+            if action["submit"] as? Bool != true, line < steps.count {
+                let index = el.index
+                StepUndo.shared.register(step: steps[line].id, kind: .text, label: old.isEmpty ? "Clear “\(el.text.prefix(30))”" : "Put back the earlier text in “\(el.text.prefix(30))”") {
+                    (try? await BrowserBridge.shared.perform("fill", on: page, ["index": index, "text": old])) != nil
+                }
+            }
+            let editor = (active?["editorKind"] as? String).map { " (a \($0) code editor: it may re-indent)" } ?? ""
+            return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into \(el.role) \(el.text.prefix(40).debugDescription)\(editor)\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
 
         case "type" where action["id"] == nil && context.page != nil:
             guard let text = action["text"] as? String, let page = context.page, let app = context.app else { return fail("type needs text") }
@@ -896,23 +1200,10 @@ final class Agent: ObservableObject {
             await Launcher.bringToFront(app)
             let before = try? await BrowserBridge.shared.perform("activeValue", on: page)
             guard before?["editable"] as? Bool == true else {
-                // The caret is in something the page can't see: a native dialog over it (the upload picker's
-                // "Go to folder" box, a Save sheet) or a frame. Type there if the app says a text field has focus.
-                let role = AXEngine.focusedRole(of: app) ?? ""
-                guard ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"].contains(role) else {
-                    return end(line, fail("no text box on the page has focus; click one first (give its w-id)"))
-                }
-                AXEngine.targetPid = app.processIdentifier
-                let landed = await hand.type(text, in: app)
-                AXEngine.targetPid = nil
-                guard landed else { return end(line, fail("the text didn't land in the focused field")) }
-                if action["submit"] as? Bool == true {
-                    try? await Task.sleep(for: .milliseconds(120))
-                    hand.press("return")
-                    try? await Task.sleep(for: .milliseconds(500))
-                }
-                context.fingerprint = await AXEngine.fingerprintAsync(of: app)
-                return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into the focused field (outside the page)\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
+                let result = await typeOutsidePage(text, submit: action["submit"] as? Bool == true, app: app,
+                                                   pageFocused: before?["hasFocus"] as? Bool ?? false, context: &context)
+                buddy.clearHighlight()
+                return end(line, result)
             }
             if let existing = before?["value"] as? String, !existing.isEmpty {
                 AXEngine.targetPid = app.processIdentifier
@@ -920,17 +1211,24 @@ final class Agent: ObservableObject {
                 AXEngine.targetPid = nil
                 try? await Task.sleep(for: .milliseconds(60))
             }
-            let isCode = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["code"] as? Bool ?? false
+            let editor = before?["editorKind"] as? String
             buddy.setTyping(true)
             AXEngine.targetPid = app.processIdentifier
             // Document editors (Google Docs) take the caret into an iframe: paste the whole text at once there.
             if before?["frame"] as? Bool == true { AXEngine.paste(text) }
-            else { await hand.enterText(text, codeEditor: isCode) }
+            else { await hand.enterText(text, codeEditor: before?["code"] as? Bool ?? false) }
             AXEngine.targetPid = nil
             buddy.setTyping(false)
+            if let why = hand.refusal { return end(line, fail(why)) }
             if let value = (try? await BrowserBridge.shared.perform("activeValue", on: page))?["value"] as? String,
                !AXEngine.similar(value, text) || value.count > text.count + 3 {
-                _ = try? await BrowserBridge.shared.perform("fillActive", on: page, ["text": text])
+                let r = try? await BrowserBridge.shared.perform("fillActive", on: page, ["text": text])
+                // A code editor can't be set directly (it would corrupt it): what it shows is the result.
+                if r?["skipped"] as? Bool == true, let shows = r?["value"] as? String, !AXEngine.similar(shows, text) {
+                    buddy.clearHighlight()
+                    return end(line, fail("the \(editor ?? "code") editor shows \(shows.prefix(200).debugDescription), not the text typed "
+                                          + "(auto-indent or auto-closed brackets?). Fix what differs rather than typing it all again"))
+                }
             }
             if action["submit"] as? Bool == true {
                 try? await Task.sleep(for: .milliseconds(120))
@@ -938,7 +1236,8 @@ final class Agent: ObservableObject {
                 try? await Task.sleep(for: .milliseconds(500))
             }
             buddy.clearHighlight()
-            return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into the focused field\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
+            let into = editor.map { "the focused code editor (\($0))" } ?? "the focused field"
+            return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into \(into)\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
 
         case "point" where Self.isWebRef(action["id"]), "mark" where Self.isWebRef(action["id"]):
             guard let (el, rect) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
@@ -1008,8 +1307,10 @@ final class Agent: ObservableObject {
             guard let x = (action["x"] as? NSNumber)?.doubleValue, let y = (action["y"] as? NSNumber)?.doubleValue,
                   let p = Screenshot.screenPoint(x: x, y: y) else { return fail("click needs an id, or x/y on the last screenshot") }
             let line = begin("Click")
+            if let why = staleApp(context) { return end(line, fail(why)) }
             if let app = context.app { await Launcher.bringToFront(app) }
-            await hand.click(at: p)
+            traceClick(p, in: context.app)
+            if let why = await hand.click(at: p, pid: context.app?.processIdentifier) { return end(line, fail(why)) }
             try? await Task.sleep(for: .milliseconds(450))
             if let app = context.app { context.fingerprint = await AXEngine.fingerprintAsync(of: app) }
             return end(line, .init(ok: true, summary: "clicked at (\(Int(x)), \(Int(y))) on the screenshot"))
@@ -1018,12 +1319,22 @@ final class Agent: ObservableObject {
             guard let app = context.app else { return fail("no app") }
             guard let el = await resolve(action["id"], context: &context) else { return fail("element \(action["id"] ?? "?") isn't on screen anymore") }
             let line = begin("Click \(el.shortLabel)")
-            guard await confirmRisky(el.label) else { return end(line, fail("the user said not to click \(el.label.prefix(40).debugDescription); stop and tell them where things stand")) }
+            if let why = staleApp(context) { return end(line, fail(why)) }
+            if let why = await approve(el.label, role: el.role, page: nil) { return end(line, fail(why)) }
             await Launcher.bringToFront(app)
-            await hand.click(el, in: app, fingerprint: context.fingerprint)
+            traceClick(el.center, in: app)
+            if let why = await hand.click(el, in: app, fingerprint: context.fingerprint) { return end(line, fail(why)) }
             let didChange = await changed(app, from: context.fingerprint, ms: 600)
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
             buddy.clearHighlight()
+            if Self.isFormSubmit(el.label) || Safety.needsConfirmation(label: el.label, request: request) != nil {
+                StepUndo.shared.clear()   // sent: putting back what was typed into it would only confuse
+            } else if el.role == "AXCheckBox" || el.role == "AXSwitch", line < steps.count {
+                let element = el.element
+                StepUndo.shared.register(step: steps[line].id, kind: .toggle, label: "Click “\(el.shortLabel)” back") {
+                    await Task.detached { AXEngine.axPress(element) }.value
+                }
+            }
             return end(line, .init(ok: true, summary: "clicked \(el.describe)\(didChange ? "" : " (no visible change)")"))
 
         case "type":
@@ -1032,14 +1343,23 @@ final class Agent: ObservableObject {
             let submit = action["submit"] as? Bool ?? false
             let line = begin("Type “\(text.prefix(40))”")
             await Launcher.bringToFront(app)
+            if let why = staleApp(context) { return end(line, fail(why)) }
             var target = "the focused field"
             if action["id"] != nil {
                 guard let el = await resolve(action["id"], context: &context) else { return end(line, fail("element \(action["id"] ?? "?") isn't on screen anymore")) }
-                await hand.focus(el, in: app)
+                if let why = await hand.focus(el, in: app) { return end(line, fail(why)) }
                 target = el.describe
             }
+            // What the field held, to put back on undo (never for a password field).
+            let field = Self.focusedElement(of: app)
+            let old = field.flatMap { Safety.isSecureField($0) ? nil : Self.axValue($0) }
             guard await hand.type(text, in: app) else {
-                return end(line, fail("the text didn't land in \(target) (field shows \((AXEngine.focusedValue(of: app) ?? "nothing").prefix(60).debugDescription))"))
+                return end(line, fail(hand.refusal ?? "the text didn't land in \(target) (field shows \((AXEngine.focusedValueShown(of: app) ?? "nothing").prefix(60).debugDescription))"))
+            }
+            if !submit, let field, let old, line < steps.count {
+                StepUndo.shared.register(step: steps[line].id, kind: .text, label: old.isEmpty ? "Clear \(target)" : "Put back the earlier text in \(target)") {
+                    AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, old as CFString) == .success
+                }
             }
             if submit {
                 try? await Task.sleep(for: .milliseconds(120))
@@ -1054,7 +1374,7 @@ final class Agent: ObservableObject {
             guard let keys = action["keys"] as? String else { return fail("key needs keys") }
             let line = begin("Press \(keys)")
             if let app = context.app { await Launcher.bringToFront(app) }
-            guard hand.press(keys) else { return end(line, fail("unknown key \(keys)")) }
+            guard hand.press(keys) else { return end(line, fail(hand.refusal ?? "unknown key \(keys)")) }
             var didChange = false
             if let app = context.app {
                 didChange = await changed(app, from: context.fingerprint, ms: 450)
@@ -1079,8 +1399,11 @@ final class Agent: ObservableObject {
         case "shell":
             guard let cmd = action["cmd"] as? String else { return fail("shell needs cmd") }
             let line = begin("Look something up")
-            let r = await Shell.run("/bin/zsh", ["-lc", cmd], timeout: 20)
-            return end(line, .init(ok: r.status == 0, summary: "exit \(r.status)\(r.output.isEmpty ? "" : ": \(r.output.prefix(2000))")"))
+            // A glob that matches nothing stays as typed (so `ls a/*.pem b/*.pem` still lists what exists) instead of
+            // zsh aborting the whole line with "no matches found".
+            let r = await Shell.run("/bin/zsh", ["-lc", "setopt no_nomatch 2>/dev/null\n" + cmd], timeout: 20)
+            let hint = r.status == 0 ? "" : Self.shellHint(r.output)
+            return end(line, .init(ok: r.status == 0, summary: "exit \(r.status)\(r.output.isEmpty ? "" : ": \(r.output.prefix(2000))")\(hint)"))
 
         case "pdf":
             // iLovePDF-style jobs, done in the background with PDFKit; no app opens.
@@ -1158,14 +1481,22 @@ final class Agent: ObservableObject {
             hand.lingerBeforeHome = 3.5
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
 
-        case "ask" where !reviewedForm && context.page != nil
+        case "ask" where !reviewedForm && !userConfirmed && context.page != nil
                 && (action["question"] as? String ?? "").range(of: #"(?i)\b(submit|apply|send (the |this |my )?(form|application))\b"#, options: .regularExpression) != nil:
-            // Before "ready to submit?", show the user every answer on the form (and catch empty required ones).
+            // "Ready to submit?" is answered by the review: every answer on the form, with Submit or Edit.
             reviewedForm = true   // once per run, whatever happens
-            let r = await reviewForm(context.page!)
-            guard r.ok else { return await perform(action, context: &context) }   // no form found: just ask
-            return .init(ok: false, summary: "NOT ASKED YET — the form review is on screen for the user:\n\(r.summary)\n"
-                         + "If a required answer is missing or wrong, fix it first; otherwise ask your question again.")
+            let line = begin("Review before submitting")
+            guard let ok = await reviewBeforeSubmit(context.page!) else { return await perform(action, context: &context) }   // no form: just ask
+            return end(line, ok ? .init(ok: true, summary: "the user checked every answer on the form and approved submitting: submit now, without asking again")
+                                : fail(Self.editedReview))
+
+        case "ask" where qa == nil && !profileOffered.contains(action["question"] as? String ?? "") && Self.profileAnswer(for: action) != nil:
+            // Standard application answers (CTC, notice period, links…) and earlier form answers are in the profile.
+            // Once per question: if it doesn't fit, asking again goes through.
+            let (q, a) = Self.profileAnswer(for: action)!
+            profileOffered.insert(q)
+            log("  profile answers “\(q.prefix(60))”")
+            return .init(ok: false, summary: "NOT ASKED — the job-application profile already answers this: \(q) → \(a). Use it.")
 
         case "ask" where !checkedMemoryForAsk && Self.asksForPersonalDetails(action["question"] as? String ?? ""):
             // Before bothering the user for their own details, look in memory once; they may already be there.
@@ -1204,6 +1535,12 @@ final class Agent: ObservableObject {
             }
             if sensitive { secrets.append(reply) } else { log("  user answered: \(reply.prefix(200))") }
             if !options.isEmpty, Safety.isYes(reply) { userConfirmed = true }
+            // An answer to an application form's question is kept for the next application that asks it (never a code).
+            if !sensitive, !isTest || saveInTests, qa == nil, context.page != nil, Self.mayMeetForms(request), !Self.isConfirmation(text),
+               text.range(of: #"(?i)\b(otp|code|password|passcode|pin|cvv)\b"#, options: .regularExpression) == nil,
+               reply.count < 300, !Safety.isYes(reply) {
+                Profile.remember(question: text, answer: reply)
+            }
             phase = .acting
             buddy.mood = .acting
             if let app = context.app { await Launcher.bringToFront(app) }
@@ -1234,6 +1571,10 @@ final class Agent: ObservableObject {
         case "look":
             return .init(ok: true, summary: "screenshot attached next turn", effect: .look)
 
+        case "wait" where action["for"] is String:
+            return await waitFor(action["for"] as! String, gone: action["gone"] as? Bool == true,
+                                 seconds: min(30, max(1, (action["timeout"] as? NSNumber)?.doubleValue ?? 10)), context: &context)
+
         case "wait":
             let ms = min(5000, (action["ms"] as? Int) ?? 600)
             try? await Task.sleep(for: .milliseconds(ms))
@@ -1247,7 +1588,8 @@ final class Agent: ObservableObject {
             let line = begin("Screenshot: \(caption.prefix(40))")
             try? await Task.sleep(for: .milliseconds(300))   // let the last step finish drawing
             guard let png = await Screenshot.windowPNG(app: app) else { return end(line, fail("couldn't capture the window (Screen Recording permission?)")) }
-            snaps.append((caption, png))
+            snaps.append((caption, png, false))
+            if snaps.count > 60 { snaps.removeFirst(snaps.count - 60) }
             let board = NSPasteboard.general
             board.clearContents()
             board.setData(png, forType: .png)
@@ -1256,15 +1598,20 @@ final class Agent: ObservableObject {
         case "paste_snaps":
             // Into the document that has the caret: each caption, then its screenshot, in order.
             guard let app = context.app else { return fail("no app") }
-            guard !snaps.isEmpty else { return fail("no screenshots taken yet; use snap first") }
-            let line = begin("Paste \(snaps.count) screenshots")
+            let todo = snaps.indices.filter { !snaps[$0].pasted }
+            guard !todo.isEmpty else {
+                return fail(snaps.isEmpty ? "no screenshots taken yet; use snap first" : "all \(snaps.count) screenshots are already pasted; snap new steps first")
+            }
+            let line = begin("Paste \(todo.count) screenshots")
             await Launcher.bringToFront(app)
             let board = NSPasteboard.general
             let saved = board.string(forType: .string)
             AXEngine.targetPid = app.processIdentifier
             defer { AXEngine.targetPid = nil }
-            for (i, snap) in snaps.enumerated() {
+            for i in todo {
                 guard !Task.isCancelled else { break }
+                let snap = snaps[i]
+                snaps[i].pasted = true
                 board.clearContents()
                 board.setString("Step \(i + 1): \(snap.caption)", forType: .string)
                 AXEngine.press(0x09, flags: .maskCommand)
@@ -1281,7 +1628,7 @@ final class Agent: ObservableObject {
             board.clearContents()
             if let saved { board.setString(saved, forType: .string) }
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
-            return end(line, .init(ok: true, summary: "pasted \(snaps.count) captioned screenshots where the caret was"))
+            return end(line, .init(ok: true, summary: "pasted \(todo.count) captioned screenshots where the caret was (steps \(todo.first! + 1)–\(todo.last! + 1))"))
 
         case "remember":
             guard let fact = action["fact"] as? String else { return fail("remember needs fact") }
@@ -1351,9 +1698,100 @@ final class Agent: ObservableObject {
         case "files":
             return await files(action)
 
+        case "tab":
+            return await tab(action, context: &context)
+
+        case "menu":
+            guard let path = action["path"] as? String, let app = context.app else { return fail("menu needs path (\"File > Export…\") and an app in front") }
+            let line = begin("Menu: \(path.prefix(40))")
+            if let why = staleApp(context) { return end(line, fail(why)) }
+            await Launcher.bringToFront(app)
+            let r = await Task.detached { AXEngine.pressMenu(path, in: app) }.value
+            try? await Task.sleep(for: .milliseconds(300))
+            await refresh(&context)
+            return end(line, r.ok ? .init(ok: true, summary: r.note) : fail(r.note))
+
+        case "window":
+            guard let app = context.app else { return fail("no app") }
+            let op = (action["op"] as? String ?? "").lowercased()
+            let num = { (k: String) in (action[k] as? NSNumber)?.doubleValue }
+            let what: AXEngine.WindowAction
+            switch op {
+            case "move":
+                guard let x = num("x"), let y = num("y") else { return fail("window move needs x and y (screen points)") }
+                what = .move(CGPoint(x: x, y: y))
+            case "resize":
+                guard let w = num("w") ?? num("width"), let h = num("h") ?? num("height") else { return fail("window resize needs w and h") }
+                what = .resize(CGSize(width: w, height: h))
+            case "minimize": what = .minimize
+            case "restore": what = .restore
+            case "fullscreen": what = .fullscreen(action["on"] as? Bool ?? true)
+            case "close": what = .close
+            case "raise": what = .raise
+            default: return fail("window op: move, resize, minimize, restore, fullscreen, close or raise")
+            }
+            let line = begin("Window: \(op)")
+            if let why = staleApp(context) { return end(line, fail(why)) }
+            let title = action["title"] as? String
+            let r = await Task.detached { AXEngine.window(what, in: app, titled: title) }.value
+            await refresh(&context)
+            return end(line, r.ok ? .init(ok: true, summary: r.note) : fail(r.note))
+
+        case "schedule":
+            guard let task = action["request"] as? String, !task.isEmpty, let when = action["when"] as? String else {
+                return fail("schedule needs request and when")
+            }
+            let line = begin("Schedule: \(task.prefix(40))")
+            guard let summary = Scheduler.add(request: task, phrase: when) else {
+                return end(line, fail("couldn't read \(when.debugDescription) as a time; say it like \"at 9am\", \"tomorrow 8:30\", "
+                                      + "\"in 20 minutes\", \"every weekday at 9\" or \"every hour\""))
+            }
+            return end(line, .init(ok: true, summary: summary + " (Clinqy runs it then, if the Mac is awake)"))
+
+        case "remember_answer":
+            guard let q = action["question"] as? String, let a = action["answer"] as? String, !q.isEmpty, !a.isEmpty else {
+                return fail("remember_answer needs question and answer")
+            }
+            if !isTest || saveInTests { Profile.remember(question: q, answer: a) }
+            steps.append(Step(text: "Saved answer: \(q.prefix(40))", state: .info))
+            return .init(ok: true, summary: "saved for future forms")
+
         default:
             return fail("unknown action \(kind.debugDescription)")
         }
+    }
+
+    /// Why acting on the app the model saw would be wrong now: it quit, or its pid belongs to a new process.
+    private func staleApp(_ context: ActionContext) -> String? {
+        guard let id = context.identity, !AXEngine.isSameProcess(id) else { return nil }
+        return "\(context.app?.cleanName ?? "the app") quit or restarted since the last look; look again"
+    }
+
+    /// Marks where a click is about to land on the latest screenshot (runs/<run>/step<N>.jpg), for chasing misclicks.
+    private func traceClick(_ point: CGPoint, in app: NSRunningApplication?) {
+        guard !isTest, !runDry, let app else { return }
+        clickCount += 1
+        let (n, id) = (clickCount, runID)
+        Task { await Screenshot.saveClickTrace(app: app, point: point, step: n, runID: id) }
+    }
+
+    /// Undo for a step that navigated: close the tab it opened, else go back in the tab.
+    private func registerNavigationUndo(_ line: Int, label: String, closing tab: Int?, app: NSRunningApplication?) {
+        guard !runDry, line < steps.count else { return }
+        StepUndo.shared.register(step: steps[line].id, kind: .navigation, label: label) {
+            let bridge = BrowserBridge.shared
+            if let tab { return (try? await bridge.closeTab(tab, in: app)) != nil }
+            guard let current = await bridge.activeTab(in: app) else { return false }
+            return await bridge.tabCommand("goBack", on: current, ["tabId": current.id]) != nil
+        }
+    }
+
+    /// The app's focused element (to read, or later restore, a native field's text).
+    private static func focusedElement(of app: NSRunningApplication) -> AXUIElement? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedUIElementAttribute as CFString, &ref) == .success,
+              let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        return (ref as! AXUIElement)
     }
 
     /// Finder jobs without Finder: Spotlight search, listing, renaming/moving (undoable), sorting a folder, trash.
@@ -1439,6 +1877,151 @@ final class Agent: ObservableObject {
         }
     }
 
+    /// Browser tabs: list them, bring one to the front, close one Clinqy opened, or read one without switching to it.
+    private func tab(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
+        let op = (action["op"] as? String ?? "list").lowercased()
+        let id = (action["id"] as? NSNumber)?.intValue ?? (action["id"] as? String).flatMap { Int($0.filter(\.isNumber)) }
+        let bridge = BrowserBridge.shared
+        guard bridge.isConnected else { return fail("the browser extension isn't connected") }
+        let app = context.app.flatMap { Launcher.isBrowser($0) ? $0 : nil }
+        if op != "list", id == nil { return fail("tab \(op) needs id (from tab list)") }
+        do {
+            switch op {
+            case "list":
+                let tabs = try await bridge.tabs(in: app)
+                return .init(ok: true, summary: tabs.isEmpty ? "no tabs" : "tabs in the front window:\n" + BrowserBridge.describe(tabs))
+            case "switch":
+                let line = begin("Switch tab")
+                try await bridge.switchTab(id!, in: app)
+                try? await Task.sleep(for: .milliseconds(400))
+                await refresh(&context)
+                return end(line, .init(ok: true, summary: "tab \(id!) is in front: \(context.page?.title.prefix(80) ?? "")"))
+            case "close":
+                let line = begin("Close tab")
+                try await bridge.closeTab(id!, in: app)
+                try? await Task.sleep(for: .milliseconds(300))
+                await refresh(&context)
+                return end(line, .init(ok: true, summary: "closed tab \(id!)"))
+            case "look", "read":
+                let line = begin("Read another tab")
+                guard let page = await bridge.snapshot(tab: id!, in: app) else { return end(line, fail("couldn't read tab \(id!)")) }
+                return end(line, .init(ok: true, summary: "tab \(id!) (read only — switch to it to act on it): \(page.title)\nURL: \(page.url)\n"
+                                       + Observation.pageList(page) + (page.text.isEmpty ? "" : "\nText on screen: \(page.text.prefix(4000))")))
+            default:
+                return fail("tab op: list, switch, close or look")
+            }
+        } catch {
+            return fail(error.localizedDescription)
+        }
+    }
+
+    /// Waits until `text` shows (or, with gone, stops showing) in the page's text, the window's elements or title,
+    /// polling cheaply; text recognition on the screen is the last resort, every few polls. "Gone" must hold on two
+    /// checks at least half a second apart: pages re-render, and a spinner that blinks out for a frame isn't done.
+    private func waitFor(_ text: String, gone: Bool, seconds: Double, context: inout ActionContext) async -> ActionResult {
+        let want = text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !want.isEmpty, let app = context.app else { return fail("wait needs for:\"<text>\" and an app in front") }
+        let line = begin(gone ? "Wait for “\(text.prefix(30))” to go" : "Wait for “\(text.prefix(30))”")
+        let started = Date()
+        if context.page == nil {
+            return end(line, await watchFor(text, gone: gone, seconds: seconds, app: app, context: &context))
+        }
+        // A long wait is progress, not a stuck step (a slow final text recognition included).
+        let beat = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.lastProgress = Date()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        defer { beat.cancel() }
+        var goneSince: Date?
+        while true {
+            guard !Task.isCancelled else { return end(line, fail("cancelled")) }
+            // The page's own text is enough while polling; text recognition on a whole browser window takes
+            // seconds, so it's only the last word (at the timeout, or to confirm a "gone").
+            let useOCR = Date().timeIntervalSince(started) >= seconds
+            let seen = await Self.shows(want, app: app, page: context.page, ocr: useOCR)
+            if gone {
+                if seen { goneSince = nil }
+                else if let since = goneSince, Date().timeIntervalSince(since) >= 0.5 {
+                    // Settled: one last look with text recognition, which also sees pictures of text.
+                    if !(await Self.shows(want, app: app, page: context.page, ocr: true)) { break }
+                    goneSince = nil
+                } else if goneSince == nil { goneSince = Date() }
+            } else if seen { break }
+            if Date().timeIntervalSince(started) >= seconds, goneSince == nil {   // (a pending "gone" gets its re-check)
+                await refresh(&context)
+                return end(line, fail("after \(Int(seconds)) s \(text.debugDescription) \(gone ? "still shows" : "hasn't appeared"); look at what's there instead"))
+            }
+            try? await Task.sleep(for: .milliseconds(250))
+        }
+        await refresh(&context)
+        let took = String(format: "%.1f", Date().timeIntervalSince(started))
+        return end(line, .init(ok: true, summary: "\(text.debugDescription) \(gone ? "is gone" : "shows") (after \(took) s)"))
+    }
+
+    /// waitFor outside a web page: the app's own Accessibility notifications wake the check (Watch), so nothing is
+    /// re-read on a timer. A "gone" must still hold half a second later; text recognition is the last word either way.
+    private func watchFor(_ text: String, gone: Bool, seconds: Double, app: NSRunningApplication,
+                          context: inout ActionContext) async -> ActionResult {
+        let started = Date()
+        // Watch can sit quietly for the whole timeout: that's waiting, not a stuck step.
+        let beat = Task { [weak self] in
+            while !Task.isCancelled {
+                self?.lastProgress = Date()
+                try? await Task.sleep(for: .seconds(2))
+            }
+        }
+        defer { beat.cancel() }
+        var met = false
+        while !Task.isCancelled {
+            let left = seconds - Date().timeIntervalSince(started)
+            guard left > 0 else { break }
+            guard await Watch.until(app: app, text: text, gone: gone, timeout: left) else { break }
+            if !gone { met = true; break }
+            try? await Task.sleep(for: .milliseconds(500))
+            if !Watch.contains(pid: app.processIdentifier, text.lowercased()) { met = true; break }
+        }
+        if Task.isCancelled { return fail("cancelled") }
+        // Pictures of text (and apps that don't publish their text) only show to text recognition.
+        let onScreen = { (await Reader.ocr(app))?.lowercased().contains(text.lowercased()) ?? false }
+        if !met, !gone { met = await onScreen() } else if met, gone, await onScreen() { met = false }
+        await refresh(&context)
+        guard met else {
+            return fail("after \(Int(seconds)) s \(text.debugDescription) \(gone ? "still shows" : "hasn't appeared"); look at what's there instead")
+        }
+        return .init(ok: true, summary: "\(text.debugDescription) \(gone ? "is gone" : "shows") (after \(String(format: "%.1f", Date().timeIntervalSince(started))) s)")
+    }
+
+    /// Whether the text shows in the page (title, listed elements, text) or the app's window, or — with ocr — on screen.
+    private static func shows(_ want: String, app: NSRunningApplication, page: BrowserBridge.Page?, ocr: Bool) async -> Bool {
+        if let page, let r = try? await BrowserBridge.shared.perform("read", on: page),
+           ((r["title"] as? String ?? "") + "\n" + (r["text"] as? String ?? "")).lowercased().contains(want) { return true }
+        let scan = await AXEngine.scan(app)
+        if scan.window.lowercased().contains(want) || scan.focused.lowercased().contains(want)
+            || scan.elements.contains(where: { $0.label.lowercased().contains(want) }) { return true }
+        return ocr ? (await Reader.ocr(app))?.lowercased().contains(want) ?? false : false
+    }
+
+    /// What a failed shell step's error means and what to do instead (the raw zsh/cp messages led to retries).
+    static func shellHint(_ output: String) -> String {
+        if output.contains("/Library/Containers/") || output.contains("/Library/Group Containers/"),
+           output.contains("Operation not permitted") || output.contains("Permission denied") {
+            return "\n→ That file is inside another app's sandbox (~/Library/Containers), which can't be read or copied by path. "
+                + "Open it in its app and read with no path (in Preview, read copies all its text), or have the app save/export a copy "
+                + "to ~/Downloads and use that."
+        }
+        if output.contains("no matches found") || (output.contains("No such file or directory") && output.contains("*")) {
+            return "\n→ The pattern matched no files. Check the folder exists and what's in it (ls -la \"<folder>\"), or search with "
+                + "files find (name words + kind) instead of guessing a folder."
+        }
+        if output.contains("No such file or directory") {
+            return "\n→ Check the path: quote paths with spaces (\"~/Downloads/resume stuff/a.pdf\" won't expand ~ inside quotes — "
+                + "use \"$HOME/Downloads/resume stuff/a.pdf\"), and ls the folder or use files find to get the exact name."
+        }
+        return ""
+    }
+
     /// Dry run: instead of acting, mark the target and say what would happen. nil = this action is safe to really do
     /// (opening, scrolling, reading, asking, anything that only looks).
     private func rehearse(_ kind: String, _ action: [String: Any], context: inout ActionContext) async -> ActionResult? {
@@ -1446,7 +2029,8 @@ final class Agent: ObservableObject {
                                      "point", "mark", "review", "assert", "extract"]
         let readOps: [String: Set<String>] = ["event": ["list", "find", "search", "free", "busy"], "calendar": ["list", "find", "search", "free", "busy"],
                                               "reminder": ["list"], "files": ["find", "search", "list", "reveal", "show"],
-                                              "application": ["find", "check", "list", "show"], "pdf": ["info"], "media": ["info"]]
+                                              "application": ["find", "check", "list", "show"], "pdf": ["info"], "media": ["info"],
+                                              "tab": ["list", "look", "read"]]
         let op = (action["op"] as? String ?? "").lowercased()
         if lookOnly.contains(kind) || readOps[kind]?.contains(op) == true { return nil }
         if kind == "files", op == "organize" || op == "sort" || op == "tidy", action["apply"] as? Bool != true { return nil }   // only plans
@@ -1507,31 +2091,204 @@ final class Agent: ObservableObject {
         let scan = await AXEngine.scan(app)
         context.elements = scan.elements
         context.fingerprint = scan.fingerprint
+        context.identity = AXEngine.identity(of: app)
         // Keep the web page current too, so page actions in the same turn see what's actually there.
         if Launcher.isBrowser(app), BrowserBridge.shared.isConnected, let page = await BrowserBridge.shared.snapshot(for: app) {
-            context.page = page
+            adopt(page, into: &context)
             context.webArea = await Task.detached { AXEngine.webAreaFrame(of: app) }.value ?? page.estimatedArea
         } else {
             context.page = nil
         }
     }
 
+    /// Lists the page again mid-turn (cheaper than a full refresh: no Accessibility scan).
+    private func relist(_ context: inout ActionContext) async {
+        guard let app = context.app, let old = context.page, let page = await BrowserBridge.shared.snapshot(for: app) else { return }
+        if Self.signatures(old) != Self.signatures(page) {
+            log("    page re-listed: \(old.elements.count) → \(page.elements.count) elements")
+        }
+        adopt(page, into: &context)
+    }
+
+    /// A new listing replaces the extension's index list, so the fields typed this turn move to their new indices.
+    private func adopt(_ page: BrowserBridge.Page, into context: inout ActionContext) {
+        if let old = context.page {
+            context.typedFields = context.typedFields.compactMap { index, text in Self.rematch(index, from: old, to: page).map { ($0, text) } }
+        }
+        context.page = page
+    }
+
+    static func webIndex(_ ref: Any?) -> Int? {
+        guard let ref = ref as? String, isWebRef(ref) else { return nil }
+        return Int(ref.dropFirst())
+    }
+
+    /// What identifies a page element across listings: the extension's key (role, name, question, frame — the same
+    /// thing its stable ids follow), else role, name and question. Never its value.
+    static func signature(_ el: BrowserBridge.PageElement) -> String {
+        if !el.key.isEmpty { return el.key }
+        var q = ""
+        if el.extra.hasPrefix("in “"), let close = el.extra.range(of: "”") { q = String(el.extra[..<close.upperBound]) }
+        return "\(el.role)|\(el.text)|\(q)"
+    }
+
+    static func signatures(_ page: BrowserBridge.Page) -> [String] { page.elements.map(signature) }
+
+    /// The index in `now` of the element listed as `index` in `seen`: the same index if it's still the same element
+    /// (the usual case: the extension keeps ids stable), else the nearest one with the same identity (nil = it's gone;
+    /// the batch then stops before the step instead of the extension failing it as "isn't on the page now").
+    static func rematch(_ index: Int, from seen: BrowserBridge.Page, to now: BrowserBridge.Page) -> Int? {
+        guard let old = seen.elements.first(where: { $0.index == index }) else { return nil }
+        let want = signature(old)
+        if let same = now.elements.first(where: { $0.index == index }), signature(same) == want { return index }
+        let far = { (e: BrowserBridge.PageElement) in hypot(e.rect.midX - old.rect.midX, e.rect.midY - old.rect.midY) }
+        return now.elements.filter { signature($0) == want }.min { far($0) < far($1) }?.index
+    }
+
+    /// Whether the page list alone shows what the model needs after these actions (a trailing look adds nothing):
+    /// the browser is still in front with a readable page, and every step so far stayed inside the page.
+    private static func pageListSuffices(_ context: ActionContext, after prior: ArraySlice<[String: Any]>) -> Bool {
+        guard let page = context.page, page.problem == nil, page.elements.count >= 6,
+              NSWorkspace.shared.frontmostApplication?.processIdentifier == context.app?.processIdentifier else { return false }
+        let inPage: Set<String> = ["scroll", "wait", "review", "read", "extract", "recall", "remember", "show", "application"]
+        return prior.allSatisfy { isWebRef($0["id"]) || inPage.contains(($0["do"] as? String ?? "").lowercased()) }
+    }
+
+    /// The screen as changes since `before` (what the model was shown last turn), or nil when it has to be listed in
+    /// full: another app or window, another page or tab, ids that moved, or too much changed to read as a diff.
+    static func screenText(_ obs: Observation, since before: Observation?) -> String? {
+        // In a browser the window title is the page's, so the page diff alone decides (it refuses another tab or address).
+        guard let before, let app = obs.app, before.app?.processIdentifier == app.processIdentifier,
+              before.window == obs.window || (obs.page != nil && before.page != nil),
+              before.dialog?.title == obs.dialog?.title else { return nil }
+        if let page = obs.page {
+            guard let prev = before.page, let diff = BrowserBridge.diff(previous: prev, current: page) else { return nil }
+            return obs.render(pageDiff: diff)
+        }
+        guard before.page == nil, let diff = ScreenDiff.listingUpdate(from: before.elements, to: obs.elements) else { return nil }
+        return obs.render(elementsDiff: diff)
+    }
+
     /// Looks an element up by id; if the screen changed since it was listed, finds the same role+label again.
     private func resolve(_ ref: Any?, context: inout ActionContext) async -> UIElementInfo? {
         guard let app = context.app, let ref = ref as? String,
-              let n = Int(ref.trimmingCharacters(in: CharacterSet(charactersIn: "eE"))), n < context.elements.count else { return nil }
-        let wanted = context.elements[n]
+              let wanted = AXEngine.lookup(ref, in: context.elements) else { return nil }
         lastTarget = .init(kind: "ax", role: wanted.role, label: wanted.label)
         if await AXEngine.fingerprintAsync(of: app) == context.fingerprint { return wanted }
         // The screen moved on. The same element is usually still alive (maybe shifted); else find its twin.
         if let frame = AXEngine.liveFrame(of: wanted.element), frame.width > 2, frame.height > 2 {
-            return UIElementInfo(id: wanted.id, role: wanted.role, label: wanted.label, frame: frame, element: wanted.element)
+            return UIElementInfo(id: wanted.id, role: wanted.role, label: wanted.label, frame: frame, element: wanted.element,
+                                 ref: wanted.ref, value: wanted.value, inDialog: wanted.inDialog)
         }
         await refresh(&context)
+        if let twin = AXEngine.twin(of: wanted, in: context.elements) { return twin }
         let near = { (e: UIElementInfo) in hypot(e.frame.midX - wanted.frame.midX, e.frame.midY - wanted.frame.midY) }
         return context.elements.first { $0.role == wanted.role && $0.label == wanted.label }
             ?? context.elements.first { $0.label == wanted.label }
             ?? context.elements.filter { $0.role == wanted.role && near($0) < 40 }.min { near($0) < near($1) }
+    }
+
+    /// `type` with no id while no page text box has the caret: the keys belong to something the page can't see.
+    /// A native text field (a sheet, the address bar, the file picker's "Go to folder" box, which lives in a helper
+    /// process) takes them through the system and is checked through Accessibility; a focused page control that
+    /// isn't a text box (a listbox, a date part, an editor surface) or a dialog in front takes plain keystrokes, as a
+    /// person's typing would. With nothing focused at all it fails, rather than set off the page's key shortcuts.
+    private func typeOutsidePage(_ text: String, submit: Bool, app: NSRunningApplication, pageFocused: Bool,
+                                 context: inout ActionContext) async -> ActionResult {
+        let textRoles: Set<String> = ["AXTextField", "AXTextArea", "AXComboBox", "AXSearchField"]
+        // A sheet opened by the step before (cmd+shift+g) takes a moment to take focus.
+        var focus = Self.systemFocus()
+        for _ in 0..<8 where !(focus.map { textRoles.contains($0.role) } ?? false) {
+            try? await Task.sleep(for: .milliseconds(80))
+            focus = Self.systemFocus()
+        }
+        let pressed = submit ? " and pressed Return" : ""
+        let send = { [hand] (pid: pid_t?) async in
+            AXEngine.targetPid = pid
+            if text.count > 80 { AXEngine.paste(text) } else { await hand.enterText(text) }
+            if submit {
+                try? await Task.sleep(for: .milliseconds(120))
+                AXEngine.pressReturn()
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            AXEngine.targetPid = nil
+        }
+        defer { buddy.setTyping(false) }
+        if let f = focus, textRoles.contains(f.role) {
+            // Keys for a helper process's panel go through the system stream; the browser's own fields get them directly.
+            let own = f.pid == app.processIdentifier
+            buddy.setTyping(true)
+            if !(Self.axValue(f.element) ?? "").isEmpty {
+                AXEngine.targetPid = own ? app.processIdentifier : nil
+                AXEngine.selectAll()
+                AXEngine.targetPid = nil
+                try? await Task.sleep(for: .milliseconds(60))
+            }
+            await send(own ? app.processIdentifier : nil)
+            // Keys that went astray: set the field's value directly (native fields accept that).
+            if !submit, let now = Self.axValue(f.element), !AXEngine.similar(now, text) {
+                AXUIElementSetAttributeValue(f.element, kAXValueAttribute as CFString, text as CFString)
+            }
+            context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+            return .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into the focused \(f.role.dropFirst(2)) "
+                         + "(\(own ? "outside the page" : "a system dialog"))\(pressed)")
+        }
+        // A page control that isn't a text box has focus: type-ahead keys are what it takes.
+        if pageFocused, let page = await BrowserBridge.shared.snapshot(for: app),
+           let el = page.elements.first(where: { $0.extra.range(of: #"(^| )focused( |$)"#, options: .regularExpression) != nil }) {
+            adopt(page, into: &context)
+            buddy.setTyping(true)
+            await send(app.processIdentifier)
+            return .init(ok: true, summary: "sent the keys \(text.prefix(60).debugDescription) to the focused \(el.role) \(el.text.prefix(40).debugDescription) "
+                         + "(not a text box, so the result isn't checked)\(pressed)")
+        }
+        // The page lost focus to a dialog or sheet with no text field focused (a file picker's list): typing is what a
+        // person would do there ("/" or "~" opens its Go-to-folder box; letters jump to a file).
+        if !pageFocused, Self.dialogInFront(app) || (focus.map { $0.pid != app.processIdentifier } ?? false) {
+            buddy.setTyping(true)
+            await send(nil)
+            context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+            return .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into the dialog in front (no text field in it had focus; "
+                         + "check it took)\(pressed)")
+        }
+        return fail("nothing here can take the text: no text box on the page or in a dialog has focus. Type with the field's id, "
+                    + "or click the field first (look if it isn't listed)")
+    }
+
+    /// The element with keyboard focus anywhere on the Mac (it can belong to a helper process, like the file picker,
+    /// which neither the page nor the browser's own tree shows). Never Clinqy's own windows.
+    private static func systemFocus() -> (element: AXUIElement, role: String, pid: pid_t)? {
+        let system = AXUIElementCreateSystemWide()
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(system, kAXFocusedUIElementAttribute as CFString, &ref) == .success,
+              let ref, CFGetTypeID(ref) == AXUIElementGetTypeID() else { return nil }
+        let element = ref as! AXUIElement
+        var pid: pid_t = 0
+        AXUIElementGetPid(element, &pid)
+        guard pid != ProcessInfo.processInfo.processIdentifier else { return nil }
+        var role: CFTypeRef?
+        AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
+        return (element, role as? String ?? "", pid)
+    }
+
+    private static func axValue(_ element: AXUIElement) -> String? {
+        var ref: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(element, kAXValueAttribute as CFString, &ref) == .success else { return nil }
+        return ref as? String
+    }
+
+    /// Whether the app's front window is a dialog, or has a sheet over it (Open/Save panels, alerts).
+    private static func dialogInFront(_ app: NSRunningApplication) -> Bool {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        func get(_ el: AXUIElement, _ name: String) -> CFTypeRef? {
+            var ref: CFTypeRef?
+            return AXUIElementCopyAttributeValue(el, name as CFString, &ref) == .success ? ref : nil
+        }
+        guard let w = get(root, kAXFocusedWindowAttribute), CFGetTypeID(w) == AXUIElementGetTypeID() else { return false }
+        let window = w as! AXUIElement
+        if ["AXDialog", "AXSystemDialog", "AXFloatingWindow"].contains(get(window, kAXSubroleAttribute) as? String ?? "") { return true }
+        let children = get(window, kAXChildrenAttribute) as? [AXUIElement] ?? []
+        return children.contains { get($0, kAXRoleAttribute) as? String == "AXSheet" }
     }
 
     private func changed(_ app: NSRunningApplication, from fingerprint: Int, ms: Int) async -> Bool {
@@ -1580,12 +2337,37 @@ final class Agent: ObservableObject {
             result = runResult
             onResult()
         }
+        hand.keepFrontApp = openedLast || Self.keepsFrontApp(request)
+        hand.endRun()
+        Replay.Recorder.shared.end(ok: ok)
         if !isTest { recordStats(ok: ok, answer: text) }
+        if !isTest {
+            // A run that worked becomes a hint for similar requests from the same place; one that was offered a hint
+            // and failed counts against it.
+            if ok, !runDry, !trace.isEmpty, !request.hasPrefix("Workflow:"), !request.hasPrefix("Correction for") {
+                ReplayCache.shared.record(request: request, trace: trace, app: startPlace.app ?? targetApp?.cleanName,
+                                          url: startPlace.url, title: startPlace.title, redact: secrets)
+            } else {
+                ReplayCache.shared.outcome(ok: ok)
+            }
+        }
         if !isTest { History.shared.add(.init(date: started, request: runDry ? "Dry run: \(request)" : request, answer: text, ok: ok,
                                  steps: steps.map(\.text), app: targetApp?.cleanName, result: runResult,
-                                 trace: trace.isEmpty ? nil : trace, readText: readText.map { String($0.prefix(8_000)) })) }
+                                 trace: trace.isEmpty ? nil : trace, readText: readText.map { String($0.prefix(8_000)) },
+                                 task: continuation.map { $0.task ?? $0.request })) }
         session = nil
         onFinish(text, ok)
+        // Out of steps or stalled on one step isn't the end of the task: carry on by itself (a few times), with the
+        // history as context, instead of waiting for the user to type "continue". Only Stop really stops.
+        if !ok, !isTest, !runDry, qa == nil, autoContinues < 3,
+           text.hasPrefix("Ran out of steps") || text.hasPrefix("I got stuck on") {
+            autoContinues += 1
+            log("auto-continue \(autoContinues)/3 after: \(text.prefix(60))")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, !self.isRunning else { return }
+                self.submit("continue", auto: true)
+            }
+        }
     }
 
     /// Last time the run made progress; a watchdog stops runs stuck on one step.
@@ -1648,16 +2430,67 @@ struct Observation {
     let app: NSRunningApplication?
     let elements: [UIElementInfo]
     let fingerprint: Int
-    let text: String
     var page: BrowserBridge.Page? = nil
     var webArea: CGRect? = nil
+    var window = ""
+    var focused = ""
+    var dialog: (kind: String, title: String)? = nil
+
+    /// Everything, as listed on a turn that shows the whole screen.
+    @MainActor var text: String { render() }
+
+    /// The screen for the model. `elementsDiff` / `pageDiff` stand in for the element or page list when the model
+    /// still has the previous one in context (changes since then, ids unchanged).
+    @MainActor
+    func render(elementsDiff: String? = nil, pageDiff: String? = nil) -> String {
+        guard let app else { return "No app is frontmost." }
+        // With the page covered by the extension, list only the browser's own controls from Accessibility.
+        let controls = elements.filter { e in webArea.map { !$0.contains(CGPoint(x: e.frame.midX, y: e.frame.midY)) } ?? true }
+        let list = AXEngine.listing(controls, budget: 8000)
+        var text = """
+        Frontmost app: \(app.cleanName ?? "?")\(Launcher.isBrowser(app) ? " (browser)" : "")\(Scripting.isScriptable(app) && !Launcher.isBrowser(app) ? " (scriptable)" : "")
+        Window: \(window.isEmpty ? "(none)" : window)
+        """
+        if let dialog { text += "\nDialog: a \(dialog.kind) is open\(dialog.title.isEmpty ? "" : ": “\(dialog.title)”") — its controls are listed first" }
+        text += "\nFocused: \(focused)\n"
+        if let elementsDiff {
+            text += "Element changes since your last look (e-ids unchanged; + new, - gone, ~ changed):\n\(elementsDiff.isEmpty ? "(none)" : elementsDiff)"
+        } else {
+            text += "\(page != nil ? "Browser controls" : "Elements"):\n\(list.isEmpty ? "(none readable — ask to look)" : list)"
+        }
+        if let page {
+            text += "\n\nWeb page (via extension; use w-ids for anything on the page): \(page.title)\nURL: \(page.url)\n"
+                + "Scroll: \(Int(page.scrollY)) of \(Int(page.scrollMax))"
+            if let pageDiff {
+                text += "\nPage changes since your last look (w-ids unchanged; + new, - gone, ~ changed):\n\(pageDiff.isEmpty ? "(none)" : pageDiff)"
+            } else {
+                text += (page.headings.isEmpty ? "" : "\nHeadings: " + page.headings.joined(separator: " | "))
+                    + "\n" + Self.pageList(page)
+                if !page.messages.isEmpty { text += "\nMessages on the page: " + page.messages.map { "“\($0)”" }.joined(separator: " · ") }
+            }
+            if page.above + page.below > 0 { text += "\nNot shown (scroll to reach): \(page.above) fields/buttons above, \(page.below) below." }
+            if let panes = BrowserBridge.paneSummary(page) { text += "\nScrolled out of view \(panes)." }
+            if !page.text.isEmpty { text += "\nText on screen: \(page.text)" }
+            if page.ready == "loading" { text += "\n(The page is still loading.)" }
+            if let problem = page.problem { text += "\n(Couldn't read the page: \(problem). Use look and click by position, or read.)" }
+        } else if Launcher.isBrowser(app) {
+            text += "\n(Browser extension not connected: page content comes from Accessibility only.)"
+        }
+        return text
+    }
+
+    /// A page's element list, as the model reads it.
+    static func pageList(_ page: BrowserBridge.Page) -> String {
+        let items = page.elements.map { "w\($0.index) \($0.role): \($0.text)\($0.extra.isEmpty ? "" : " [\($0.extra)]")" }
+        return "Page elements (visible part):\n" + (items.isEmpty ? "(none)" : items.joined(separator: "\n"))
+    }
 
     /// Reads the frontmost app's UI off the main thread, so the buddy never stutters while we look.
     @MainActor
     static func capture(_ preferred: NSRunningApplication?) async -> Observation {
         let front = NSWorkspace.shared.frontmostApplication
         let app = (front?.bundleIdentifier == Bundle.main.bundleIdentifier ? nil : front) ?? preferred
-        guard let app else { return Observation(app: nil, elements: [], fingerprint: 0, text: "No app is frontmost.") }
+        guard let app else { return Observation(app: nil, elements: [], fingerprint: 0) }
         let scan = await AXEngine.scan(app)
 
         // In a browser with the extension: the real page, element by element.
@@ -1673,41 +2506,8 @@ struct Observation {
             if page != nil { webArea = await Task.detached { AXEngine.webAreaFrame(of: app) }.value ?? page?.estimatedArea }
             if webArea == nil { page = nil }
         }
-        // With the page covered by the extension, list only the browser's own controls from Accessibility.
-        let list = scan.elements.enumerated()
-            .filter { item in
-                guard let web = webArea else { return true }
-                return !web.contains(CGPoint(x: item.element.frame.midX, y: item.element.frame.midY))
-            }
-            .map { "e\($0.offset) \($0.element.role.dropFirst(2)): \($0.element.label)" }
-            .joined(separator: "\n")
-        var text = """
-        Frontmost app: \(app.cleanName ?? "?")\(Launcher.isBrowser(app) ? " (browser)" : "")\(Scripting.isScriptable(app) && !Launcher.isBrowser(app) ? " (scriptable)" : "")
-        Window: \(scan.window.isEmpty ? "(none)" : scan.window)
-        Focused: \(scan.focused)
-        \(page != nil ? "Browser controls" : "Elements"):
-        \(list.isEmpty ? "(none readable — ask to look)" : list)
-        """
-        if let page {
-            let items = page.elements.map { "w\($0.index) \($0.role): \($0.text)\($0.extra.isEmpty ? "" : " [\($0.extra)]")" }
-            text += """
-
-            Web page (via extension; use w-ids for anything on the page): \(page.title)
-            URL: \(page.url)
-            Scroll: \(Int(page.scrollY)) of \(Int(page.scrollMax))\(page.headings.isEmpty ? "" : "\nHeadings: " + page.headings.joined(separator: " | "))
-            Page elements (visible part):
-            \(items.isEmpty ? "(none)" : items.joined(separator: "\n"))
-            """
-            if !page.messages.isEmpty { text += "\nMessages on the page: " + page.messages.map { "“\($0)”" }.joined(separator: " · ") }
-            if page.above + page.below > 0 { text += "\nNot shown (scroll to reach): \(page.above) fields/buttons above, \(page.below) below." }
-            if !page.text.isEmpty { text += "\nText on screen: \(page.text)" }
-            if page.ready == "loading" { text += "\n(The page is still loading.)" }
-            if let problem = page.problem { text += "\n(Couldn't read the page: \(problem). Use look and click by position, or read.)" }
-        } else if Launcher.isBrowser(app) {
-            text += "\n(Browser extension not connected: page content comes from Accessibility only.)"
-        }
-        return Observation(app: app, elements: scan.elements, fingerprint: scan.fingerprint, text: text,
-                           page: page, webArea: webArea)
+        return Observation(app: app, elements: scan.elements, fingerprint: scan.fingerprint, page: page, webArea: webArea,
+                           window: scan.window, focused: scan.focused, dialog: scan.dialog)
     }
 }
 
@@ -1717,6 +2517,7 @@ extension AXEngine {
         let fingerprint: Int
         let window: String
         let focused: String
+        var dialog: (kind: String, title: String)?
     }
 
     static func scan(_ app: NSRunningApplication) async -> Scan {
@@ -1724,7 +2525,7 @@ extension AXEngine {
             enableManualAccessibility(app)
             let focus = focusSummary(of: app)
             return Scan(elements: elements(of: app, limit: 150), fingerprint: fingerprint(of: app),
-                        window: focus.window, focused: focus.focused)
+                        window: focus.window, focused: focus.focused, dialog: dialog(of: app))
         }.value
     }
 

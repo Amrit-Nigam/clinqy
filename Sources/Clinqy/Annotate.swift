@@ -28,6 +28,8 @@ final class AnnotationOverlay {
             window.isOpaque = false
             window.hasShadow = false
             window.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+            // The dimming layer mustn't end up in the screenshot that shows the model what was circled.
+            window.sharingType = .none
             window.contentView = DrawView(onDone: { [weak self] in self?.end($0) })
             window.setFrame(screen.frame, display: true)
             window.orderFrontRegardless()

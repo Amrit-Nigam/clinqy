@@ -20,6 +20,8 @@ final class CommandPanel: NSPanel {
         hasShadow = false
         isMovableByWindowBackground = true
         appearance = NSAppearance(named: .darkAqua)
+        // Kept out of screen captures: Clinqy's screenshots and the user's screen shares show the app, not us.
+        sharingType = .none
         var view = CommandView(agent: agent, voice: voice, onMic: onMic, onClose: { [weak self] in self?.orderOut(nil) })
         view.onWatch = onWatch
         view.onCircle = onCircle
@@ -54,6 +56,7 @@ final class IslandPanel: NSPanel {
         hasShadow = false
         ignoresMouseEvents = true
         appearance = NSAppearance(named: .darkAqua)
+        sharingType = .none
         contentView = NSHostingView(rootView: IslandView(agent: agent, voice: voice))
     }
 
@@ -85,6 +88,80 @@ final class IslandPanel: NSPanel {
 }
 
 private final class Hover: ObservableObject { @Published var on = false }
+
+// MARK: - Review before submit
+
+/// A form's answers shown in the command bar before a consequential submit (apply, send), waiting for
+/// Submit or Edit.
+@MainActor
+final class ReviewCenter: ObservableObject {
+    static let shared = ReviewCenter()
+
+    struct Review: Identifiable {
+        let id = UUID()
+        let title: String
+        let items: [(label: String, value: String)]
+    }
+
+    @Published private(set) var pending: Review?
+    private var waiter: CheckedContinuation<Bool, Never>?
+
+    fileprivate func begin(_ review: Review) async -> Bool {
+        decide(false)   // only one at a time: an older review counts as not approved
+        pending = review
+        return await withCheckedContinuation { waiter = $0 }
+    }
+
+    func decide(_ submit: Bool, note: String? = nil) {
+        UI.lastReviewNote = submit ? nil : note.flatMap { $0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? nil : $0 }
+        pending = nil
+        let w = waiter
+        waiter = nil
+        w?.resume(returning: submit)
+    }
+}
+
+/// UI entry points the agent calls. The app delegate wires the hooks.
+@MainActor
+enum UI {
+    /// Brings the command bar up (set by the app delegate).
+    static var present: () -> Void = {}
+    /// Puts it away again after the user decided (set by the app delegate).
+    static var dismiss: () -> Void = {}
+    /// The agent whose run the review pauses (set by the app delegate), so the watchdog doesn't count the wait.
+    static weak var agent: Agent?
+    /// What the user typed instead of approving the last review ("change the notice period to 30 days"), if anything.
+    static var lastReviewNote: String?
+
+    /// Shows every answer on the form (label → value) with Submit / Edit, and waits. true = submit it;
+    /// false = Edit / typed a change (see `lastReviewNote`) / the run was stopped.
+    static func reviewBeforeSubmit(items: [(String, String)], title: String) async -> Bool {
+        guard !Task.isCancelled else { return false }
+        let agent = agent
+        let previous = agent?.phase
+        if agent?.isRunning == true { agent?.phase = .waiting }
+        present()
+        Agent.writeLog("  review “\(title)”: waiting (\(items.count) fields)")
+        let review = ReviewCenter.Review(title: title, items: items.map { (label: $0.0, value: $0.1) })
+        let ok = await withTaskCancellationHandler {
+            await ReviewCenter.shared.begin(review)
+        } onCancel: {
+            Task { @MainActor in if ReviewCenter.shared.pending?.id == review.id { ReviewCenter.shared.decide(false) } }
+        }
+        if let agent, agent.phase == .waiting, agent.question == nil { agent.phase = previous == .waiting ? .acting : previous ?? .acting }
+        dismiss()
+        Agent.writeLog("  review “\(title)”: \(ok ? "submit" : "edit")\(lastReviewNote.map { " — \($0)" } ?? "")")
+        return ok
+    }
+
+    /// Resolves a waiting review as not approved (the run stopped).
+    static func cancelReview() {
+        if ReviewCenter.shared.pending != nil { ReviewCenter.shared.decide(false) }
+    }
+}
+
+/// Which failed run's "fix it" chip the user dismissed.
+private final class FixState: ObservableObject { @Published var dismissed: UUID? }
 
 // MARK: - Design tokens
 
@@ -171,6 +248,10 @@ struct CommandView: View {
     var onCircle: () -> Void = {}
     @StateObject private var historyTab = Hover()
     @ObservedObject private var whisper = Whisper.shared
+    @ObservedObject private var review = ReviewCenter.shared
+    @ObservedObject private var undo = StepUndo.shared
+    @ObservedObject private var history = History.shared
+    @StateObject private var fix = FixState()
     let onMic: () -> Void
     let onClose: () -> Void
     @FocusState private var focused: Bool
@@ -184,9 +265,55 @@ struct CommandView: View {
 
     private var mood: Buddy.Mood { voice.isListening ? .listening : agent.phase.mood }
 
+    /// The run that just failed or was stopped, which the next thing typed corrects ("no, click the other one").
+    private var fixable: History.Entry? {
+        guard !agent.isRunning, agent.question == nil, review.pending == nil, agent.phase == .failed,
+              let last = history.entries.first, !last.ok, last.id != fix.dismissed,
+              Date().timeIntervalSince(last.date) < 30 * 60, !last.request.hasPrefix("Dry run:") else { return nil }
+        return last
+    }
+
+    /// Continues the failed run with its history plus the user's correction.
+    private func submitFix(_ entry: History.Entry, _ text: String) {
+        let correction = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !correction.isEmpty else { return }
+        fix.dismissed = entry.id
+        agent.continuation = entry
+        agent.submit("Correction for “\(entry.request.prefix(120))”: \(correction)")
+    }
+
+    private func submitInput() {
+        if review.pending != nil { review.decide(false, note: agent.input); agent.input = "" }
+        else if agent.question != nil { agent.answer(agent.input) }
+        else if agent.isRunning { agent.addContext(agent.input); onClose() }
+        else if let entry = fixable { submitFix(entry, agent.input) }
+        else { agent.submit(agent.input) }
+    }
+
+    private var placeholder: String {
+        if review.pending != nil { return "Type a change, or click Submit" }
+        if agent.question != nil { return "Your answer" }
+        if agent.isRunning { return "Add to this task or change the plan…" }
+        if fixable != nil { return "What should I do differently? e.g. “no, click the other one”" }
+        return agent.dryRun ? "What should I show you? (dry run)" : "What should I do?"
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             VStack(spacing: 0) {
+                if let r = review.pending {
+                    ReviewCard(review: r, onSubmit: { review.decide(true) },
+                               onEdit: { review.decide(false, note: agent.input); agent.input = "" })
+                        .padding(.horizontal, 18)
+                        .padding(.top, 16)
+                        .transition(.opacity.combined(with: .move(edge: .top)))
+                }
+                if let entry = fixable {
+                    ContextChip(icon: "wrench.and.screwdriver", text: "Didn't finish: \(entry.request) — tell me what to do differently") { fix.dismissed = entry.id }
+                        .padding(.horizontal, 18)
+                        .padding(.top, 12)
+                        .transition(.opacity)
+                }
                 if let q = agent.question {
                     QuestionCard(question: q) { agent.answer($0) }
                         .padding(.horizontal, 18)
@@ -273,21 +400,19 @@ struct CommandView: View {
                         .focused($focused)
                         .onSubmit { agent.answer(agent.input) }
                 } else {
-                    TextField("", text: $agent.input, prompt: Text(agent.question != nil ? "Your answer" : agent.isRunning ? "Add to this task or change the plan…" : agent.dryRun ? "What should I show you? (dry run)" : "What should I do?").foregroundStyle(DS.tertiary))
+                    TextField("", text: $agent.input, prompt: Text(placeholder).foregroundStyle(DS.tertiary))
                         .textFieldStyle(.plain)
                         .font(.system(size: 20, weight: .regular))
                         .foregroundStyle(DS.text)
                         .focused($focused)
-                        .onSubmit {
-                            if agent.question != nil { agent.answer(agent.input) }
-                            else if agent.isRunning { agent.addContext(agent.input); onClose() }
-                            else { agent.submit(agent.input) }
-                        }
+                        .onSubmit(submitInput)
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if agent.question != nil {
+            if review.pending != nil {
+                IconButton(symbol: "stop.fill", tint: .white) { agent.cancel() }
+            } else if agent.question != nil {
                 IconButton(symbol: voice.isListening ? "waveform" : "mic.fill",
                            tint: voice.isListening ? DS.color(.listening) : DS.secondary, action: onMic)
                     .symbolEffect(.variableColor.iterative, isActive: voice.isListening)
@@ -368,7 +493,18 @@ struct CommandView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.bottom, 2)
                 }
-                ForEach(agent.steps.suffix(7)) { step in StepRow(step: step) }
+                let visible = agent.steps.suffix(7)
+                if let last = undo.last, !visible.contains(where: { $0.id == last.id }),
+                   let step = agent.steps.last(where: { $0.id == last.id }) {
+                    StepRow(step: step, undoLabel: last.label, undoBusy: undo.busy) { Task { await undo.undoLast(agent: agent) } }
+                }
+                ForEach(visible) { step in
+                    if let last = undo.last, last.id == step.id {
+                        StepRow(step: step, undoLabel: last.label, undoBusy: undo.busy) { Task { await undo.undoLast(agent: agent) } }
+                    } else {
+                        StepRow(step: step)
+                    }
+                }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
@@ -455,6 +591,69 @@ private struct QuestionCard: View {
             }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+/// Every answer on the form, label → value, before a consequential submit.
+private struct ReviewCard: View {
+    let review: ReviewCenter.Review
+    let onSubmit: () -> Void
+    let onEdit: () -> Void
+
+    private var emptyCount: Int { review.items.filter { $0.value.trimmingCharacters(in: .whitespaces).isEmpty }.count }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 8) {
+                Image(systemName: "checkmark.shield.fill")
+                    .font(.system(size: 13, weight: .semibold))
+                    .foregroundStyle(Color(nsColor: Palette.accent))
+                Text(review.title)
+                    .font(.system(size: 15, weight: .medium))
+                    .foregroundStyle(DS.text)
+                    .lineLimit(2)
+                Spacer(minLength: 6)
+                Text(emptyCount > 0 ? "\(review.items.count) fields · \(emptyCount) empty" : "\(review.items.count) fields")
+                    .font(.system(size: 11)).foregroundStyle(emptyCount > 0 ? DS.color(.failure) : DS.tertiary)
+            }
+            ScrollView {
+                VStack(alignment: .leading, spacing: 5) {
+                    ForEach(Array(review.items.enumerated()), id: \.offset) { _, item in
+                        ReviewRow(label: item.label, value: item.value.trimmingCharacters(in: .whitespacesAndNewlines))
+                    }
+                }
+                .padding(.horizontal, 10).padding(.vertical, 8)
+            }
+            .frame(maxHeight: 170)
+            .background(RoundedRectangle(cornerRadius: 10, style: .continuous).fill(Color.white.opacity(0.05)))
+            HStack(spacing: 6) {
+                ChoiceButton(text: "Submit", action: onSubmit)
+                ChoiceButton(text: "Edit", action: onEdit)
+                Text("or type a change and press return").font(.system(size: 11)).foregroundStyle(DS.tertiary)
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+    }
+}
+
+private struct ReviewRow: View {
+    let label: String
+    let value: String
+
+    var body: some View {
+        HStack(alignment: .firstTextBaseline, spacing: 10) {
+            Text(label)
+                .font(.system(size: 12))
+                .foregroundStyle(DS.secondary)
+                .lineLimit(2)
+                .frame(width: 190, alignment: .leading)
+            Text(value.isEmpty ? "(empty)" : value)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(value.isEmpty ? DS.color(.failure) : DS.text)
+                .lineLimit(3)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
     }
 }
 
@@ -598,6 +797,10 @@ private struct SuggestionRow: View {
 
 private struct StepRow: View {
     let step: Agent.Step
+    /// Set on the latest step that can be reversed: shows an Undo button.
+    var undoLabel: String? = nil
+    var undoBusy = false
+    var onUndo: (() -> Void)? = nil
 
     var body: some View {
         HStack(spacing: 10) {
@@ -615,6 +818,21 @@ private struct StepRow: View {
                 .font(.system(size: 13))
                 .foregroundStyle(step.state == .running ? DS.text : DS.secondary)
                 .lineLimit(1)
+            if let onUndo, let undoLabel {
+                Spacer(minLength: 6)
+                Button(action: onUndo) {
+                    HStack(spacing: 4) {
+                        Image(systemName: "arrow.uturn.backward").font(.system(size: 9, weight: .bold))
+                        Text(undoBusy ? "Undoing…" : "Undo").font(.system(size: 11, weight: .medium))
+                    }
+                    .foregroundStyle(DS.text)
+                    .padding(.horizontal, 8).padding(.vertical, 3)
+                    .background(Capsule().fill(Color.white.opacity(0.1)))
+                }
+                .buttonStyle(.plain)
+                .disabled(undoBusy)
+                .help(undoLabel)
+            }
         }
         .transition(.opacity.combined(with: .offset(y: 6)))
     }
@@ -660,12 +878,14 @@ private struct Waveform: View {
 struct IslandView: View {
     @ObservedObject var agent: Agent
     @ObservedObject var voice: Voice
+    @ObservedObject private var review = ReviewCenter.shared
 
     private var text: String {
         if voice.isListening { return voice.transcript.isEmpty ? (voice.isFollowUp ? "Anything else? I'm listening…" : "Listening…") : voice.transcript }
         if Recorder.shared.isRecording { return "Watching you… do the task, then ⌃⌥ or ⏹ to stop" }
         if voice.isTranscribing { return "Transcribing…" }
         if let q = agent.question { return "Needs your input: \(q.text)" }
+        if let r = review.pending { return "Check before I submit: \(r.title)" }
         return agent.narration.isEmpty ? "Thinking…" : agent.narration
     }
 
@@ -708,6 +928,7 @@ final class ResultPanel: NSPanel {
         isOpaque = false
         hasShadow = false
         appearance = NSAppearance(named: .darkAqua)
+        sharingType = .none
         contentView = NSHostingView(rootView: ResultView(agent: agent, onClose: { [weak self] in self?.hide() }))
     }
 

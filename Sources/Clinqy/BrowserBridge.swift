@@ -17,7 +17,15 @@ final class BrowserBridge {
         let rect: CGRect
         let editable: Bool
         let extra: String
+        /// What the element is on its page (role, name, question, frame…); its index stays the same while this does.
+        var key = ""
+        /// Current value/choice (fields, dropdowns), and state flags (checked, covered, disabled…), for diffs.
+        var value: String?
+        var flags: Set<String> = []
     }
+
+    /// A scrolling box (usually a modal's body) with fields/buttons scrolled out of it.
+    struct Pane { let name: String; let modal: Bool; let above: Int; let below: Int }
 
     struct Page {
         let connection: ObjectIdentifier
@@ -40,6 +48,12 @@ final class BrowserBridge {
         var problem: String?
         /// Viewport's on-screen rect estimated from window geometry (fallback when Accessibility can't say).
         let estimatedArea: CGRect?
+        /// Scrolling boxes (modals) with more fields out of view; their counts are included in above/below.
+        var panes: [Pane] = []
+        /// The browser tab this was read from; `pinned` = read by id (snapshot(tab:)), so commands go to that tab
+        /// even while it's in the background.
+        var tabId: Int?
+        var pinned = false
     }
 
     private var listener: NWListener?
@@ -140,7 +154,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.5.1"
+    static let extensionVersion = "1.6.1"
     private var reloadAsked: Set<String> = []
 
     private func checkVersion(_ version: String, on conn: NWConnection) {
@@ -254,7 +268,112 @@ final class BrowserBridge {
         guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
         var body = args
         body["cmd"] = cmd
+        if page.pinned, body["tabId"] == nil, let id = page.tabId { body["tabId"] = id }
         return try await request(conn, body, timeout: timeout)
+    }
+
+    // MARK: - Tabs
+
+    struct BrowserTab { let id: Int; let title: String; let url: String; let active: Bool; let opened: Bool }
+
+    /// The browser in front (its connection), as for snapshots: the one reporting a focused window, else the only one.
+    private func frontConnection(for app: NSRunningApplication?) async -> (ObjectIdentifier, NWConnection)? {
+        let pool = candidates(for: app)
+        for (key, conn) in pool {
+            if let r = try? await request(conn, ["cmd": "tabInfo"], timeout: 1.5), r["focused"] as? Bool == true { return (key, conn) }
+        }
+        return pool.count == 1 ? pool.first : nil
+    }
+
+    /// Tabs of the front browser window, in strip order. `opened` = Clinqy opened it (only those can be closed).
+    func tabs(in app: NSRunningApplication? = nil) async throws -> [BrowserTab] {
+        guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
+        let r = try await request(conn, ["cmd": "tabs"], timeout: 3)
+        return (r["tabs"] as? [[String: Any]] ?? []).compactMap { t in
+            guard let id = t["id"] as? Int else { return nil }
+            return BrowserTab(id: id, title: t["title"] as? String ?? "", url: t["url"] as? String ?? "",
+                              active: t["active"] as? Bool == true, opened: t["opened"] as? Bool == true)
+        }
+    }
+
+    /// Brings tab `id` to the front of its window.
+    func switchTab(_ id: Int, in app: NSRunningApplication? = nil) async throws {
+        guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
+        _ = try await request(conn, ["cmd": "switchTab", "tabId": id], timeout: 3)
+    }
+
+    /// Closes tab `id` — only a tab Clinqy opened (the extension refuses others, with a reason).
+    func closeTab(_ id: Int, in app: NSRunningApplication? = nil) async throws {
+        guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
+        _ = try await request(conn, ["cmd": "closeTab", "tabId": id], timeout: 3)
+    }
+
+    /// Reads tab `id` without bringing it to the front. The page is pinned: perform() on it acts on that tab.
+    func snapshot(tab id: Int, in app: NSRunningApplication? = nil) async -> Page? {
+        guard let (key, conn) = await frontConnection(for: app),
+              let r = try? await request(conn, ["cmd": "snapshot", "tabId": id], timeout: 5) else { return nil }
+        var page = parse(r, connection: key)
+        page.pinned = true
+        return page
+    }
+
+    /// The tab list as the model sees it: "tab 123 (active): Title — url", "(opened by you)" where it's ours.
+    static func describe(_ tabs: [BrowserTab]) -> String {
+        tabs.map { "tab \($0.id)\($0.active ? " (active)" : "")\($0.opened ? " (opened by you)" : ""): \($0.title.prefix(80)) — \($0.url.prefix(120))" }
+            .joined(separator: "\n")
+    }
+
+    // MARK: - Snapshot diffs
+
+    /// Compact changes from `previous` to `current`, one per line: "+ w12 button: Next [..]" (new), "- w7 link: Jobs"
+    /// (gone), "~ w3 value \"\" → \"360000\"", "~ w5 now covered", plus new/cleared messages and heading changes.
+    /// "" = nothing changed. nil = the page changed too much for a diff to help (another address or tab, a page
+    /// that couldn't be read, or more than half its elements changed): send the full listing instead.
+    static func diff(previous: Page, current: Page) -> String? {
+        guard previous.connection == current.connection, previous.tabId == current.tabId,
+              previous.problem == nil, current.problem == nil,
+              samePage(previous.url, current.url) else { return nil }
+        let old = Dictionary(previous.elements.map { ($0.index, $0) }, uniquingKeysWith: { a, _ in a })
+        let new = Dictionary(current.elements.map { ($0.index, $0) }, uniquingKeysWith: { a, _ in a })
+        func line(_ e: PageElement) -> String { "w\(e.index) \(e.role): \(e.text)\(e.extra.isEmpty ? "" : " [\(e.extra.prefix(160))]")" }
+        var added: [String] = [], removed: [String] = [], changed: [String] = []
+        for e in current.elements {
+            guard let was = old[e.index], was.key == e.key else { added.append("+ " + line(e)); continue }
+            var what: [String] = []
+            if was.value != e.value { what.append("value \((was.value ?? "").debugDescription) → \((e.value ?? "").debugDescription)") }
+            for flag in ["checked", "selected", "covered", "disabled", "invalid", "focused"] where was.flags.contains(flag) != e.flags.contains(flag) {
+                what.append(e.flags.contains(flag) ? "now \(flag)" : "no longer \(flag)")
+            }
+            if !what.isEmpty { changed.append("~ w\(e.index) \(e.role) \(e.text.prefix(40).debugDescription): " + what.joined(separator: ", ")) }
+        }
+        for e in previous.elements where new[e.index]?.key != e.key { removed.append("- w\(e.index) \(e.role): \(e.text.prefix(60))") }
+        // Mostly different: a new step or screen — the full listing reads better than a wall of +/- lines.
+        let total = max(previous.elements.count, current.elements.count)
+        if total >= 6, Double(added.count + removed.count + changed.count) > Double(total) * 0.5 { return nil }
+        var out = removed + added + changed
+        if previous.headings != current.headings, !current.headings.isEmpty { out.append("headings now: " + current.headings.joined(separator: " | ")) }
+        for m in current.messages where !previous.messages.contains(m) { out.append("! message: “\(m)”") }
+        for m in previous.messages where !current.messages.contains(m) { out.append("message gone: “\(m)”") }
+        if previous.above != current.above || previous.below != current.below {
+            out.append("not shown now: \(current.above) fields/buttons above, \(current.below) below")
+        }
+        return out.joined(separator: "\n")
+    }
+
+    /// Where the out-of-view fields are when they're inside a scrolling box (a modal's body), e.g.
+    /// "in the “Apply to Acme” dialog: 4 fields/buttons below (scroll moves the dialog)". nil when there are none.
+    static func paneSummary(_ page: Page) -> String? {
+        let parts = page.panes.filter { $0.above + $0.below > 0 }.map { p -> String in
+            let name = p.name.isEmpty ? (p.modal ? "the dialog" : "a scrolling panel") : "the “\(p.name)” \(p.modal ? "dialog" : "panel")"
+            return "in \(name): \(p.above) above, \(p.below) below\(p.modal ? " (scroll moves the dialog)" : "")"
+        }
+        return parts.isEmpty ? nil : parts.joined(separator: "; ")
+    }
+
+    /// Same document: origin and path (a changed query or #hash on a single-page app is still the same page).
+    private static func samePage(_ a: String, _ b: String) -> Bool {
+        guard let x = URLComponents(string: a), let y = URLComponents(string: b) else { return a == b }
+        return x.scheme == y.scheme && x.host == y.host && x.port == y.port && x.path == y.path
     }
 
     /// The viewport sits at the bottom of the window, flush with its sides: window origin + the difference
@@ -268,6 +387,7 @@ final class BrowserBridge {
     }
 
     private func parse(_ r: [String: Any], connection: ObjectIdentifier) -> Page {
+        Replay.Recorder.shared.page(r)
         let vp = r["viewport"] as? [String: Any]
         let scroll = r["scroll"] as? [String: Any]
         let els = (r["elements"] as? [[String: Any]] ?? []).map { e -> PageElement in
@@ -279,11 +399,17 @@ final class BrowserBridge {
             if let v = e["value"] as? String { extra.append("value=\(v.debugDescription)") }
             if let p = e["placeholder"] as? String, (e["text"] as? String) != p { extra.append("placeholder=\(p.debugDescription)") }
             if let o = e["options"] as? String { extra.append("options: \(o)") }
-            for flag in ["required", "invalid", "focused", "checked", "unchecked", "selected", "disabled", "covered"] where e[flag] as? Bool == true { extra.append(flag) }
+            let flags = ["required", "invalid", "focused", "checked", "unchecked", "selected", "disabled", "covered"].filter { e[$0] as? Bool == true }
+            extra += flags
             if let href = e["href"] as? String { extra.append("→ \(href)") }
             return PageElement(index: (e["i"] as? Int) ?? 0, role: e["role"] as? String ?? "?", text: e["text"] as? String ?? "",
                                rect: CGRect(x: d("x"), y: d("y"), width: d("w"), height: d("h")),
-                               editable: e["editable"] as? Bool == true, extra: extra.joined(separator: " "))
+                               editable: e["editable"] as? Bool == true, extra: extra.joined(separator: " "),
+                               key: [e["frame"] as? String ?? "", e["key"] as? String ?? "\(e["role"] ?? "")|\(e["text"] ?? "")"].joined(separator: "|"),
+                               value: e["value"] as? String, flags: Set(flags))
+        }
+        let panes = (r["panes"] as? [[String: Any]] ?? []).map {
+            Pane(name: $0["name"] as? String ?? "", modal: $0["modal"] as? Bool == true, above: $0["above"] as? Int ?? 0, below: $0["below"] as? Int ?? 0)
         }
         return Page(connection: connection, url: r["url"] as? String ?? "", title: r["title"] as? String ?? "",
                     viewport: CGSize(width: (vp?["w"] as? NSNumber)?.doubleValue ?? 1, height: (vp?["h"] as? NSNumber)?.doubleValue ?? 1),
@@ -291,6 +417,6 @@ final class BrowserBridge {
                     headings: r["headings"] as? [String] ?? [], elements: els,
                     messages: r["messages"] as? [String] ?? [], text: r["text"] as? String ?? "",
                     above: r["above"] as? Int ?? 0, below: r["below"] as? Int ?? 0, ready: r["ready"] as? String ?? "complete",
-                    problem: r["error"] as? String, estimatedArea: Self.estimate(r))
+                    problem: r["error"] as? String, estimatedArea: Self.estimate(r), panes: panes, tabId: r["tabId"] as? Int)
     }
 }
