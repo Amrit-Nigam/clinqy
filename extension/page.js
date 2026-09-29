@@ -634,7 +634,15 @@ function readText() {
     let el = null; try { el = target(i); } catch {}
     const a = (n) => el && el.getAttribute(n);
     return { sig: JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
-      el && el.value, location.href, document.body ? document.body.innerText.length : 0, document.activeElement === el]) };
+      el && el.value, location.href, textHash(), document.activeElement === el]) };
+  }
+  // Cheap hash of the visible text: its length alone misses same-length changes ("Step 2" → "Step 4"),
+  // and a click that did work would then be clicked again by the fallback.
+  function textHash() {
+    const t = document.body ? document.body.innerText : "";
+    let h = 0;
+    for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
+    return t.length + ":" + h;
   }
   // Apps like the AWS console scroll an inner panel, not the window: scroll whichever actually moves.
   function scroller() {
