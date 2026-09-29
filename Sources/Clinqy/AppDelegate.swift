@@ -4,7 +4,7 @@ import Carbon
 import ServiceManagement
 
 @MainActor
-final class AppDelegate: NSObject, NSApplicationDelegate {
+final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var buddy: Buddy!
     private var agent: Agent!
@@ -32,6 +32,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
         agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
+        // Review before submit: the form's answers come up in the bar; it goes away once the user decides.
+        UI.agent = agent
+        UI.present = { [weak self] in self?.panel.showCentered(); self?.island.show() }
+        UI.dismiss = { [weak self] in self?.panel.orderOut(nil) }
         enableOpenAtLogin()
         _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
         installEditMenu()
@@ -45,14 +49,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         agent.onStart = { [weak self] in
             guard let self else { return }
             self.setStatusIcon(running: true)
+            StepUndo.shared.clear()
             // Keystrokes must reach the target app, and clicks must not land on our windows.
             self.panel.orderOut(nil)
             self.island.show()
         }
-        agent.onFinish = { [weak self] _, ok in
+        agent.onFinish = { [weak self] answer, ok in
             guard let self else { return }
+            UI.cancelReview()
             self.setStatusIcon(running: false)
             self.island.show(for: 4.5)
+            // Stopped by the user: bring the bar back so they can say what to do differently ("no, the other one").
+            if !ok, answer == "Stopped", !self.agent.isTest, !self.voiceRun {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+                    guard let self, !self.agent.isRunning, !self.panel.isVisible, !Recorder.shared.isRecording else { return }
+                    self.panel.showCentered()
+                }
+            }
             let spoken = self.voiceRun
             self.voiceRun = false
             if spoken, ok, !self.agent.isTest { self.listenForFollowUp() }
@@ -100,6 +113,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
+        menu.addItem(withTitle: "Job Profile…", action: #selector(openProfile), keyEquivalent: "")
+        menu.addItem(withTitle: "Stats…", action: #selector(showStats), keyEquivalent: "")
+        let schedules = NSMenuItem(title: "Schedules", action: nil, keyEquivalent: "")
+        let schedulesMenu = NSMenu()
+        schedulesMenu.delegate = self   // rebuilt each time it opens
+        schedules.submenu = schedulesMenu
+        menu.addItem(schedules)
         menu.addItem(withTitle: "Tidy Memory", action: #selector(tidyMemory), keyEquivalent: "")
         menu.addItem(.separator())
         let dry = menu.addItem(withTitle: "Dry Run (show, don't act)", action: #selector(toggleDryRun(_:)), keyEquivalent: "")
@@ -327,13 +347,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                     model: q["model"].flatMap { $0.isEmpty ? nil : $0 }, report: out)
     }
 
-    /// Runs workflows scheduled for this minute (checked every 30 s; once a day each).
+    /// Runs workflows scheduled for this minute (checked every 30 s; once a day each), and scheduled requests
+    /// (Scheduler) once they're due.
     private var scheduler: Timer?
 
     private func startScheduler() {
         scheduler = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, !self.agent.isRunning else { return }
+                guard let self, !self.agent.isRunning, self.agent.question == nil, !Recorder.shared.isRecording else { return }
+                if let item = Scheduler.takeDue() {
+                    Agent.writeLog("scheduled request: \(item.request) (\(item.rule.label))")
+                    // Whatever is in front when it fires; nothing selected or copied rides along.
+                    let front = NSWorkspace.shared.frontmostApplication
+                    if let front, front.bundleIdentifier != Bundle.main.bundleIdentifier { self.agent.targetApp = front }
+                    self.agent.selectedText = nil
+                    self.agent.selectedFiles = []
+                    self.agent.copied = nil
+                    self.agent.annotation = nil
+                    self.agent.continuation = nil
+                    self.agent.submit(item.request)
+                    return
+                }
                 let now = Date()
                 let hm = now.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
                 for var wf in Workflows.shared.all where wf.schedule == hm {
@@ -444,7 +478,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func dismissOnOutsideClick() {
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
             MainActor.assumeIsolated {
-                guard let self, self.panel.isVisible, self.agent.question == nil, !self.voice.isListening else { return }
+                guard let self, self.panel.isVisible, self.agent.question == nil, ReviewCenter.shared.pending == nil,
+                      !self.voice.isListening else { return }
                 self.panel.orderOut(nil)
             }
         }
@@ -502,6 +537,82 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     @objc func showApplications() { agent.showApplications() }
+
+    @objc func openProfile() { Profile.open() }
+
+    @objc func showStats() {
+        agent.result = Stats.card
+        agent.onResult()
+    }
+
+    // MARK: - Schedules menu
+
+    func menuNeedsUpdate(_ menu: NSMenu) {
+        menu.removeAllItems()
+        let items = Scheduler.all
+        if items.isEmpty {
+            let none = menu.addItem(withTitle: "Nothing scheduled", action: nil, keyEquivalent: "")
+            none.isEnabled = false
+        }
+        for item in items {
+            let title = "\(item.request.prefix(50))\(item.request.count > 50 ? "…" : "")  ·  \(Scheduler.describe(item))"
+            let row = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+            let sub = NSMenu()
+            let run = sub.addItem(withTitle: "Run Now", action: #selector(runScheduleNow(_:)), keyEquivalent: "")
+            run.representedObject = item.request
+            run.target = self
+            let remove = sub.addItem(withTitle: "Remove", action: #selector(removeSchedule(_:)), keyEquivalent: "")
+            remove.representedObject = item.id
+            remove.target = self
+            row.submenu = sub
+            menu.addItem(row)
+        }
+        menu.addItem(.separator())
+        let add = menu.addItem(withTitle: "New Schedule…", action: #selector(newSchedule), keyEquivalent: "")
+        add.target = self
+    }
+
+    @objc func removeSchedule(_ item: NSMenuItem) {
+        guard let id = item.representedObject as? UUID else { return }
+        Scheduler.remove(id)
+    }
+
+    @objc func runScheduleNow(_ item: NSMenuItem) {
+        guard let request = item.representedObject as? String, !agent.isRunning else { return }
+        agent.continuation = nil
+        agent.submit(request)
+    }
+
+    /// Asks for a request and when to run it ("every weekday at 9", "tomorrow 8:30", "in 20 minutes").
+    @objc func newSchedule() {
+        let alert = NSAlert()
+        alert.messageText = "Schedule a task"
+        alert.informativeText = "When: “at 9am”, “tomorrow 8:30”, “in 20 minutes”, “every weekday at 9”, “daily 18:00”, “every hour”."
+        let request = NSTextField(frame: NSRect(x: 0, y: 30, width: 320, height: 24))
+        request.placeholderString = "What should I do? e.g. check placement mail"
+        let when = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        when.placeholderString = "When? e.g. every weekday at 9"
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
+        box.addSubview(request)
+        box.addSubview(when)
+        alert.accessoryView = box
+        alert.window.initialFirstResponder = request
+        alert.addButton(withTitle: "Schedule")
+        alert.addButton(withTitle: "Cancel")
+        NSApp.activate(ignoringOtherApps: true)
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let text = request.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty else { return }
+        let done = NSAlert()
+        if let line = Scheduler.add(request: text, phrase: when.stringValue) {
+            done.messageText = "Scheduled"
+            done.informativeText = line
+        } else {
+            done.messageText = "I couldn't read “\(when.stringValue)” as a time"
+            done.informativeText = "Try “at 9am”, “tomorrow 8:30”, “in 20 minutes” or “every weekday at 9”."
+        }
+        done.runModal()
+    }
 
     @objc func toggleDryRun(_ item: NSMenuItem) {
         agent.dryRun.toggle()
