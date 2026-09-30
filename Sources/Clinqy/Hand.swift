@@ -105,7 +105,7 @@ final class Hand {
     @discardableResult
     func click(at point: CGPoint, pid: pid_t? = nil, window: WindowSnapshot? = nil, mode: ClickMode = .real) async -> String? {
         if let why = window?.staleness() { return refuse(why) }
-        if let pid, let why = await hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
+        if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
         try? await Task.sleep(for: .milliseconds(80))
         buddy.click()
@@ -206,21 +206,21 @@ final class Hand {
     // MARK: - Pre-click checks
 
     /// What's under `point` must belong to `pid` (and to the element's window, when known), or the click would
-    /// land on something else: another app's popup, a window that moved. Runs off the main thread.
+    /// land on something else: another app's popup, a window that moved.
     private func hitCheck(_ point: CGPoint, pid: pid_t, windowOf element: AXUIElement) async -> String? {
         let window: AXUIElement? = Self.axAttr(element, kAXWindowAttribute)
-        return await hitCheck(point, pid: pid, window: window)
+        return hitCheck(point, pid: pid, window: window)
     }
 
-    private func hitCheck(_ point: CGPoint, pid: pid_t, window: AXUIElement?) async -> String? {
-        struct Box: @unchecked Sendable { let window: AXUIElement? }
-        let box = Box(window: window)
-        return await Task.detached { Self.hitMismatch(at: point, pid: pid, window: box.window) }.value
+    private func hitCheck(_ point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
+        Self.hitMismatch(at: point, pid: pid, window: window)
     }
 
     /// Why the element at `point` isn't the target app's (or target window's), or nil. Inconclusive answers
     /// (no element, Clinqy's own overlay) pass: this guards against clicking the wrong thing, not against clicking.
-    nonisolated static func hitMismatch(at point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
+    /// Main thread only: a hit test that lands on one of Clinqy's own windows is answered in this process on the calling
+    /// thread, and off the main thread AppKit throws inside SwiftUI's update and leaves its lock held, freezing the app.
+    static func hitMismatch(at point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
         var hit: AXUIElement?
         guard AXUIElementCopyElementAtPosition(AXUIElementCreateSystemWide(), Float(point.x), Float(point.y), &hit) == .success,
               let hit else { return nil }

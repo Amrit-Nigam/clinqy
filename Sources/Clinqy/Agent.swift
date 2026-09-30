@@ -959,7 +959,7 @@ final class Agent: ObservableObject {
             var after = before
             // Something of another app's over that spot (a notification, a popup): click through the page instead.
             let pid = context.app?.processIdentifier ?? 0
-            if mouse, let why = await Task.detached(operation: { Hand.hitMismatch(at: point, pid: pid, window: nil) }).value {
+            if mouse, let why = Hand.hitMismatch(at: point, pid: pid, window: nil) {
                 log("    \(why) — clicking through the page")
                 mouse = false
             }
