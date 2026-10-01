@@ -54,9 +54,7 @@ final class History: ObservableObject {
         save()
     }
 
-    private func save() {
-        if let data = try? JSONEncoder.iso.encode(entries) { try? data.write(to: url, options: .atomic) }
-    }
+    private func save() { Persist.write(entries, to: url, encoder: .iso) }
 }
 
 /// Something a task produced for the user to look at: options, a plan, prices, a summary.

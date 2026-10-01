@@ -96,7 +96,11 @@ enum AgentPrompt {
                                                            gone and stays gone (a spinner, "Uploading…", a dialog). Use it instead of wait+look loops
     {"do":"recall","query":"delivery address"}           search everything you remember about the user (only the relevant part is shown up front)
     {"do":"remember","fact":"mom = WhatsApp chat 'Mom ❤️'"} save a lasting fact about the user right away (who's who, preferences, usual apps/places); use "Things you remember" before asking
+    {"do":"remember","fact":"date fields are dd/mm/yyyy; click the dd part and type digits","scope":"site:docs.google.com"}   know-how for one site
+                                                           or app ("app:Find My") that cost you steps: it's shown to you whenever you're there again
     {"do":"remember_answer","question":"Why this company?","answer":"…"}   save the user's answer to a form question for future applications
+    {"do":"autofill"}                                      on a form: fills every visible field, dropdown and radio group the user's job profile
+                                                           answers, in one step (never submits); the result lists what's left for you
     {"do":"schedule","request":"check my placement mail","when":"every weekday at 9"}   run a request later or on repeat
                                                            ("at 9am", "tomorrow 8:30", "in 20 minutes", "daily at 18:00", "every hour")
     {"do":"dictionary"}                                    the frontmost app's AppleScript vocabulary (only for apps marked "(scriptable)")
@@ -223,8 +227,9 @@ enum AgentPrompt {
     - Job/internship applications: first application find (by company/role/link) — if it's there, say when and how it went \
       instead of applying again, unless they insist. The "Job-application profile" has their standard answers (CTC, notice \
       period, experience, links, resume, relocation, work authorization) and answers to earlier form questions: use them \
-      as-is, never ask for them. A question it doesn't cover: ask once (the answer is saved), or remember_answer what \
-      they told you. Upload resumes with upload, not the file picker. After filling or sending, application record (status \
+      as-is, never ask for them. On each page of a form, send autofill first (with anything else you're sure of in the same \
+      batch): it fills what the profile covers in one step, and its result lists the rest. A question it doesn't cover: \
+      ask once (the answer is saved), or remember_answer what they told you. Upload resumes with upload, not the file picker. After filling or sending, application record (status \
       filled, submitted or emailed). Don't remember applications as facts; the tracker holds them.
     - Later or on repeat ("every weekday at 9 check placement mail", "in 20 minutes check if the build passed"): schedule it instead of \
       waiting. A request starting "Correction for “…”:" continues that earlier failed run: apply the correction to what's \

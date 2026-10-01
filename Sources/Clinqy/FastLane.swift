@@ -80,8 +80,10 @@ final class FastLane {
     }
 
     /// Gets this turn's reply: from the helper when the lead planned routine steps and nothing speaks against it,
-    /// otherwise (or when the helper hands back) from the lead, told first what the helper did.
-    func reply(to turnText: String, message: String, image: String?, failures: Int, lead: ClaudeSession) async throws -> String {
+    /// otherwise (or when the helper hands back) from the lead, told first what the helper did. `partial` sees the lead's
+    /// reply as it's written (the helper's isn't streamed: its actions are vetted only once it's complete).
+    func reply(to turnText: String, message: String, image: String?, failures: Int, lead: ClaudeSession,
+               partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         absorb(message: message, turnText: turnText, failures: failures)
         tag = ""
         if let why = blocker(turnText: turnText, failures: failures) {
@@ -90,7 +92,7 @@ final class FastLane {
             tag = "fast · "
             return reply
         }
-        return try await leadReply(turnText, image: image, lead: lead)
+        return try await leadReply(turnText, image: image, lead: lead, partial: partial)
     }
 
     func close() {
@@ -172,7 +174,8 @@ final class FastLane {
         return reply
     }
 
-    private func leadReply(_ turnText: String, image: String?, lead: ClaudeSession) async throws -> String {
+    private func leadReply(_ turnText: String, image: String?, lead: ClaudeSession,
+                           partial: (@Sendable (String) -> Void)?) async throws -> String {
         var text = turnText
         if !unreported.isEmpty || handback != nil {
             text = "While you waited, a faster helper did routine steps for you:\n"
@@ -183,7 +186,7 @@ final class FastLane {
             unreported = []
             handback = nil
         }
-        let reply = try await lead.send(text + Self.jsonOnly, image: image)
+        let reply = try await lead.send(text + Self.jsonOnly, image: image, partial: partial)
         let json = Brain.json(from: reply)
         let actions = json?["actions"] as? [[String: Any]] ?? []
         lastSignature = actions.map { "\($0)" }.joined()
@@ -284,7 +287,7 @@ final class FastLane {
 
     /// Words on a control that commit, leave or open something the lead should decide on.
     nonisolated static let riskyLabel = #"(?i)\b(submit|send|pay|payment|buy|purchase|order|checkout|check out|book|reserve|confirm|delete|remove|trash|erase|discard|post|publish|tweet|share|apply|sign ?up|register|sign ?in|log ?in|log ?out|sign ?out|transfer|withdraw|donate|reply|forward|unsubscribe|cancel|deactivate|save|upload|attach|browse|add file|allow|approve|accept|agree|install|download|close|quit|finish|done)\b"#
-    nonisolated private static let safeKinds: Set<String> = ["click", "type", "choose", "key", "scroll", "wait", "look", "read", "recall"]
+    nonisolated private static let safeKinds: Set<String> = ["click", "type", "choose", "key", "scroll", "wait", "look", "read", "recall", "autofill"]
     nonisolated private static let safeKeys: Set<String> = ["tab", "shift+tab", "up", "down", "left", "right", "esc", "escape",
                                                 "pageup", "pagedown", "page_up", "page_down", "home", "end"]
 

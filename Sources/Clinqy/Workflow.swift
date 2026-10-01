@@ -122,9 +122,7 @@ final class Workflows: ObservableObject {
         all.first { $0.name.lowercased() == name.lowercased() } ?? all.first { $0.name.lowercased().contains(name.lowercased()) }
     }
 
-    private func save() {
-        if let data = try? JSONEncoder.iso8601.encode(all) { try? data.write(to: url, options: .atomic) }
-    }
+    private func save() { Persist.write(all, to: url, encoder: .iso8601) }
 }
 
 /// What a run that worked did, kept so a similar request later starts from the known path instead of exploring.
@@ -190,6 +188,7 @@ final class ReplayCache {
         all.sort { $0.last > $1.last }
         if all.count > 150 { all.removeLast(all.count - 150) }
         offered = nil
+        Embedder.shared.warm([request])
         save()
     }
 
@@ -198,9 +197,16 @@ final class ReplayCache {
         let want = Self.words(request)
         guard !want.isEmpty else { return nil }
         let place = Self.place(url: url, app: app), shape = Self.titleShape(title)
+        let wantVector = Embedder.shared.vector(request)
         let scored = all.compactMap { r -> (CachedRoute, Double)? in
             let have = Set(r.words)
-            var score = Double(want.intersection(have).count) / Double(want.union(have).count)
+            let shared = want.intersection(have).count
+            var score = Double(shared) / Double(want.union(have).count)
+            // The same ask in other words ("fill this job application" / "apply for this job"): sentence vectors add
+            // a little when they're very close, and only on top of at least one shared word.
+            if shared > 0, let a = wantVector, let b = Embedder.shared.cached(r.request) {
+                score += max(0, Double(Embedder.cosine(a, b)) - 0.7)
+            }
             if r.site != nil {
                 // It opened its own page: the words decide (naming the site counts as agreeing).
                 if let site = r.site?.split(separator: ".").first, want.contains(String(site)) { score += 0.2 }
@@ -250,9 +256,7 @@ final class ReplayCache {
 
     func remove(_ r: CachedRoute) { all.removeAll { $0.id == r.id }; save() }
 
-    private func save() {
-        if let data = try? JSONEncoder.iso8601.encode(all) { try? data.write(to: url, options: .atomic) }
-    }
+    private func save() { Persist.write(all, to: url, encoder: .iso8601) }
 
     // MARK: Keys
 
@@ -289,6 +293,20 @@ final class ReplayCache {
         guard step.action == "click", let label = step.target?.label else { return false }
         return label.range(of: FastLane.riskyLabel, options: .regularExpression) != nil
     }
+}
+
+/// Writes app data off the main thread: encoded where it's called (a consistent snapshot), written on one serial
+/// queue in order. history.json alone is ~300 KB, and runs used to pay for writing it before the next could start.
+enum Persist {
+    private static let queue = DispatchQueue(label: "clinqy.persist", qos: .utility)
+
+    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder) {
+        guard let data = try? encoder.encode(value) else { return }
+        queue.async { try? data.write(to: url, options: .atomic) }
+    }
+
+    /// Waits for pending writes (before the app quits).
+    static func flush() { queue.sync {} }
 }
 
 extension JSONDecoder {

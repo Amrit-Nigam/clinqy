@@ -177,6 +177,31 @@ if command == "replay" {
     exit(failed == 0 ? 0 : 1)
 }
 
+// `Clinqy memory ["request"] [--app Name] [--site host]`: how memory is organised (profile, notes per site/app), and
+// with a request, exactly which facts it would be sent and why. Read-only.
+if command == "memory" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    func option(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
+    let query = args.enumerated().filter { i, a in !a.hasPrefix("--") && (i == 0 || !args[i - 1].hasPrefix("--")) }.map(\.1).joined(separator: " ")
+    Embedder.shared.warmNow(Memory.facts)
+    let entries = Memory.entries
+    let profile = entries.filter { Memory.isProfile($0.text) }
+    let scoped = Dictionary(grouping: entries.filter { $0.scope != nil }, by: { $0.scope!.tag })
+    print("\(entries.count) facts · \(profile.count) profile (always sent) · \(scoped.values.map(\.count).reduce(0, +)) notes for \(scoped.count) sites/apps")
+    if query.isEmpty {
+        for (tag, facts) in scoped.sorted(by: { $0.value.count > $1.value.count }) {
+            print("\n\(tag)\(facts.allSatisfy(\.tagged) ? "" : " (some inferred)")")
+            facts.forEach { print("  - \($0.text.prefix(110))") }
+        }
+    } else {
+        let t0 = Date()
+        let (facts, omitted) = Memory.relevant(to: query, app: option("--app"), host: option("--site"))
+        print("\n“\(query)” → \(facts.count) facts, \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
+        for f in facts { print("  \(Memory.isProfile(f) ? "P" : " ") \(f.prefix(120))") }
+    }
+    exit(0)
+}
+
 // `Clinqy --selftest`: fast checks of logic that needs no UI (safety rules, reply parsing).
 if command == "selftest" {
     var failures = 0
@@ -202,6 +227,14 @@ if command == "selftest" {
     }, "tool-call number parameters")
     // Memory relevance: a maths question gets only core facts; food brings in the Swiggy facts.
     MainActor.assumeIsolated {
+        let t0 = Date()
+        Embedder.shared.warmNow(Memory.facts)   // the app does this in the background at launch
+        let warmMs = Int(Date().timeIntervalSince(t0) * 1000)
+        let t1 = Date()
+        _ = Memory.relevant(to: "fill this internship application form")
+        let rankMs = Int(Date().timeIntervalSince(t1) * 1000)
+        print("     memory: vectors ready in \(warmMs) ms · one ranking \(rankMs) ms")
+        check(rankMs < 400, "ranking memory is fast once vectors are cached")
         let all = Memory.facts.count
         let math = Memory.relevant(to: "what's 15% of 2400")
         let food = Memory.relevant(to: "order me something to eat")
@@ -216,6 +249,34 @@ if command == "selftest" {
         check(small ? math.omitted == 0 : all < 8 || math.facts.count < all / 2,
               small ? "small memory is sent whole" : "irrelevant facts are left out")
         check(!Memory.facts.contains { $0.contains("Swiggy") } || food.facts.contains { $0.contains("Swiggy") }, "food request brings in Swiggy facts")
+    }
+    // Memory scopes: tags parse, how-to lines infer their site, facts about the user stay unscoped.
+    MainActor.assumeIsolated {
+        let parsed = Memory.parse("""
+        - [site:www.Docs.Google.com] date fields are dd/mm/yyyy; click the dd part
+        - [app:Find My] open it with open_app name 'FindMy'
+        - Wellfound job filters are managed at wellfound.com/jobs/filters
+        - Personal email is someone@example.com
+        - Likes lofi music
+        """)
+        check(parsed.count == 5 && parsed[0].scope == Memory.Scope(kind: "site", name: "docs.google.com") && parsed[0].tagged
+              && parsed[0].text.hasPrefix("date fields") && parsed[0].line.hasPrefix("[site:docs.google.com] "), "scope tag parses and round-trips")
+        check(parsed[1].scope?.matches(app: "Find My", host: nil) == true && parsed[1].scope?.matches(app: "FindMy", host: nil) == true
+              && parsed[1].scope?.mentioned(in: "open find my and check where mom is") == true, "app scope matches its app and mentions")
+        check(parsed[2].scope == Memory.Scope(kind: "site", name: "wellfound.com") && !parsed[2].tagged
+              && parsed[2].scope?.matches(app: nil, host: "https://wellfound.com/jobs") == true
+              && parsed[2].scope?.mentioned(in: "apply on wellfound") == true, "how-to line infers its site")
+        check(parsed[3].scope == nil && parsed[4].scope == nil, "facts about the user stay unscoped (emails aren't sites)")
+        check(parsed[0].scope?.matches(app: nil, host: "mail.google.com") == false, "a site scope doesn't leak to sibling subdomains")
+        check(Memory.stem("ordering") == "order" && Memory.stem("orders") == "order" && Memory.stem("applies") == "apply"
+              && Memory.stem("classes") == "class" && Memory.stem("bus") == "bus", "stemmer")
+        let index = Memory.Index(["Orders food through Swiggy", "CGPA 8.96 at KJSCE", "Listens to lofi music on YouTube"])
+        let hits = index.scores(Memory.expand("order me something to eat"), among: [0, 1, 2])
+        check(hits.keys.sorted() == [0], "BM25 finds the ordering fact and nothing else")
+        check(Memory.details("call +91 93267 70790 or mail a@b.co about 'Waje+'", quoted: true).count == 3, "details: phone, email, quoted name")
+        check(Set(Agent.closest(to: "Application submitted", in: "Home\nYour application was sent · Thanks!\nApplication received"))
+              == ["Your application was sent", "Application received"],
+              "a missed wait shows the closest text on the page")
     }
     // Workflows: a saved run turns typed text into a named parameter with the original as default.
     MainActor.assumeIsolated {
@@ -331,6 +392,43 @@ if command == "selftest" {
         let d = B.diff(previous: before, current: after) ?? "nil"
         check(d.contains("~ w1") && d.contains("+ w5 button: Dismiss") && d.contains("- w3 link: Jobs") && !d.contains("w2"), "page diff by stable id")
         check(B.diff(previous: before, current: page("https://x.com/other", after.elements)) == nil, "another page gets the full listing")
+    }
+    // Autofill: one plan for every visible field the profile answers; the rest is listed for the model.
+    MainActor.assumeIsolated {
+        typealias B = BrowserBridge
+        func f(_ i: Int, _ role: String, _ text: String, q: String? = nil, value: String? = nil, options: [String] = [],
+               flags: Set<String> = [], dropdown: Bool = false) -> B.PageElement {
+            B.PageElement(index: i, role: role, text: text, rect: .zero, editable: !["radio", "button", "file"].contains(role), extra: "",
+                          key: "|\(role)|\(text)", value: value, flags: flags, question: q, options: options, dropdown: dropdown)
+        }
+        let form = B.Page(connection: ObjectIdentifier(Agent.self), url: "https://jobs.lever.co/acme/apply", title: "Apply", viewport: CGSize(width: 1, height: 1),
+                          scrollY: 0, scrollMax: 0, headings: [], elements: [
+            f(1, "text", "Full name *"), f(2, "email", "Email", value: "already@there.com"), f(3, "select", "Notice period", value: "Select…",
+            options: ["Select…", "Immediately", "15 days", "30 days"]), f(4, "radio", "Yes", q: "Willing to relocate?"),
+            f(5, "radio", "No", q: "Willing to relocate?"), f(6, "textarea", "Why Acme?", flags: ["required"]),
+            f(7, "file", "Resume"), f(8, "button", "Submit application"), f(9, "select", "Experience", value: "", options: ["0-6 months", "18 months"]),
+        ], estimatedArea: nil)
+        let answers = ["full name": "Amrit Nigam", "email": "a@b.co", "notice period": "Immediate", "willing to relocate?": "Yes (Bangalore)",
+                       "experience": "8 months"]
+        let plan = FormFill.plan(form) { answers[$0.lowercased()] }
+        let did = plan.steps.map { "\($0.action["do"]!) \($0.action["id"]!) \($0.answer)" }
+        check(did == ["type w1 Amrit Nigam", "choose w3 Immediately", "click w4 Yes"], "autofill plans typing, a dropdown and a radio (\(did))")
+        check(plan.open.contains("Why Acme? (required)") && plan.open.contains { $0.hasPrefix("Experience") } && plan.uploads == 1,
+              "autofill leaves unanswered and unmatched questions to the model")
+        check(FormFill.bestOption("8 months", in: ["18 months", "6-12 months"]) == nil && FormFill.bestOption("No", in: ["Yes", "No, I don't"]) == "No, I don't"
+              && FormFill.bestOption("Immediate", in: ["Immediately", "1 month"]) == "Immediately", "autofill option matching is whole-word")
+    }
+    // Streaming: the first action is read out of a half-written reply once it's complete, and only then.
+    MainActor.assumeIsolated {
+        let full = #"```json\n{"say":"Filling","actions":[{"do":"type","id":"w3","text":"a {brace} and \"quote\""},{"do":"click","id":"w9"}],"done":false}"#
+        let cut = full.firstIndex(of: "}").map { full[...$0] }.map(String.init) ?? ""   // ends inside the first action's text
+        check(Brain.firstAction(inPartial: #"{"say":"Fill"#) == nil && Brain.firstAction(inPartial: cut) == nil,
+              "streaming: nothing until the first action is complete")
+        let first = Brain.firstAction(inPartial: String(full.prefix(full.range(of: "{\"do\":\"click")!.lowerBound.utf16Offset(in: full))))
+        check(first?["do"] as? String == "type" && first?["text"] as? String == "a {brace} and \"quote\"", "streaming: first action parsed past braces and quotes in strings")
+        check(Agent.startsEarly(["do": "click", "id": "w1"]) && !Agent.startsEarly(["do": "ask", "question": "?"]) && !Agent.startsEarly(["do": "email"]),
+              "streaming: only on-screen steps start early")
+        check(Agent.canonical(["b": 1, "a": "x"]) == Agent.canonical(["a": "x", "b": 1]), "streaming: actions compare by content")
     }
     // Job profile: fields answer their questions; a saved earlier answer wins for its own question.
     do {

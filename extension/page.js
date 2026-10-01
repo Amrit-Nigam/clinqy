@@ -679,5 +679,36 @@ function readText() {
   }
   function selection() { return String(window.getSelection() || "").slice(0, 8000); }
 
-  window.__clinqy = { snapshot, locate, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection };
+  // Resolves as soon as `want` shows in the page's text or title — or, with gone, has stayed gone for half a second —
+  // woken by the page's own changes (a MutationObserver) rather than polled; { met: false } at the timeout.
+  function waitText(want, gone, ms) {
+    const w = norm(want);
+    const has = () => norm(document.title + " " + (document.body ? document.body.innerText : "")).includes(w);
+    return new Promise((resolve) => {
+      let done = false, queued = false, goneTimer = null, obs = null, timer = null;
+      const finish = (met) => {
+        if (done) return;
+        done = true;
+        if (obs) obs.disconnect();
+        clearTimeout(timer); clearTimeout(goneTimer);
+        resolve({ met });
+      };
+      const check = () => {
+        queued = false;
+        if (done) return;
+        const seen = has();
+        if (!gone) { if (seen) finish(true); return; }
+        if (seen) { clearTimeout(goneTimer); goneTimer = null; }
+        else if (!goneTimer) goneTimer = setTimeout(() => { goneTimer = null; if (!has()) finish(true); }, 500);
+      };
+      // Bursts of changes are read once (innerText lays the page out): at most every 80 ms.
+      obs = new MutationObserver(() => { if (!queued) { queued = true; setTimeout(check, 80); } });
+      obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true,
+                                              attributeFilter: ["hidden", "style", "class", "aria-hidden", "open"] });
+      timer = setTimeout(() => finish(false), Math.max(100, ms));
+      check();
+    });
+  }
+
+  window.__clinqy = { snapshot, locate, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();
