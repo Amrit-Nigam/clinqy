@@ -39,11 +39,12 @@ async function activeTab() {
 // ---- running page.js functions in frames ----
 
 // Runs window.__clinqy[name](...args) in a frame; errors come back as values, so one frame never sinks the rest.
-const runner = (n, a) => {
+// Async so a page function may return a promise (waitText); executeScript waits for it.
+const runner = async (n, a) => {
   try {
     const f = window.__clinqy && window.__clinqy[n];
     if (!f) return { __error: "no page function " + n };
-    return { __ok: f(...a) };
+    return { __ok: await f(...a) };
   } catch (e) { return { __error: String(e && e.message || e) }; }
 };
 
@@ -296,6 +297,7 @@ async function handle(msg) {
       return { ...r, x: r.x + o.x, y: r.y + o.y };
     }
     case "fill": return await indexed("fill", [msg.text]);
+    case "waitText": return await call(tab.id, 0, "waitText", [msg.text, !!msg.gone, Number(msg.ms) || 10000]);
     case "upload": {
       if (msg.index >= 0) return await indexed("upload", [msg.name, msg.type, msg.data]);
       try { return await call(tab.id, 0, "upload", [-1, msg.name, msg.type, msg.data]); }

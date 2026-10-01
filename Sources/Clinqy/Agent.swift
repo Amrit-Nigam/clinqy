@@ -300,6 +300,7 @@ final class Agent: ObservableObject {
         narration = ""
         openedTab = false
         checkedMemoryForAsk = false
+        lastFirst = ""
         shownFacts = []; visitedHosts = []; visitedApps = []
         pushedOn = 0
         profileOffered = []
@@ -469,8 +470,35 @@ final class Agent: ObservableObject {
             phase = .thinking
             buddy.mood = .thinking
             let t0 = Date()
+            var context = ActionContext(app: obs.app, elements: obs.elements, fingerprint: obs.fingerprint,
+                                        page: obs.page, webArea: obs.webArea)
+            context.seen = obs.page
+            context.identity = obs.app.flatMap(AXEngine.identity(of:))
+            // The reply streams in: its first action starts as soon as it's written, while the model writes the rest
+            // (a batch's first step no longer waits for the whole reply). EARLY_START=off turns it off.
+            let (partials, sink) = AsyncStream<String>.makeStream(bufferingPolicy: .bufferingNewest(1))
+            let sent = message, failed = failures, shot = image
+            let stream: @Sendable (String) -> Void = { text in _ = sink.yield(text) }
+            let partial = Self.earlyStartOn ? stream : nil
+            let replying = Task { @MainActor () throws -> String in
+                defer { sink.finish() }
+                return try await fast.reply(to: turnText, message: sent, image: shot, failures: failed, lead: session, partial: partial)
+            }
+            var early: (action: [String: Any], result: ActionResult, target: WorkflowStep.Target?)?
+            for await text in partials {
+                guard let first = Brain.firstAction(inPartial: text) else { continue }
+                if Self.startsEarly(first), Self.canonical(first) != lastFirst, addedNotes.isEmpty, !Task.isCancelled {
+                    phase = .acting
+                    buddy.mood = .acting
+                    log("  early start: \(FastLane.brief(first)) (while the model writes the rest)")
+                    lastTarget = nil
+                    let result = await perform(first, context: &context)
+                    early = (first, result, lastTarget)
+                }
+                break
+            }
             let reply: String
-            do { reply = try await fast.reply(to: turnText, message: message, image: image, failures: failures, lead: session) } catch {
+            do { reply = try await withTaskCancellationHandler { try await replying.value } onCancel: { replying.cancel() } } catch {
                 if Task.isCancelled { return }
                 return finish(ok: false, error.localizedDescription)
             }
@@ -484,6 +512,7 @@ final class Agent: ObservableObject {
 
             guard let json = Brain.json(from: reply) else {
                 message = "Your last reply wasn't a JSON object. Reply with JSON only."
+                    + (early.map { "\n(Its first step already ran: \(FastLane.brief($0.action)) → \($0.result.summary))" } ?? "")
                 continue
             }
             let say = (json["say"] as? String) ?? ""
@@ -520,6 +549,7 @@ final class Agent: ObservableObject {
                     + "Use a different method, in this order: the keyboard (tab/shift+tab to reach the control, space or return to press it, "
                     + "arrows in lists, esc to close a popup), then the other id for it (its e-id from Accessibility instead of the w-id, or "
                     + "the reverse), then click by x/y on the screenshot attached now. If the goal can't be reached, finish with done:true and say what's blocking."
+                    + (early.map { " (Only its first step had already started: \(FastLane.brief($0.action)) → \($0.result.summary))" } ?? "")
                 continue
             }
 
@@ -530,10 +560,14 @@ final class Agent: ObservableObject {
             var results: [String] = []
             // Part of the batch didn't run because the page changed under it (not a failure, but not finished either).
             var cutShort = false
-            var context = ActionContext(app: obs.app, elements: obs.elements, fingerprint: obs.fingerprint,
-                                        page: obs.page, webArea: obs.webArea)
-            context.seen = obs.page
-            context.identity = obs.app.flatMap(AXEngine.identity(of:))
+            // The action started early is this batch's first step; if the final reply doesn't start with it after all,
+            // the model still hears that it ran.
+            let earlyIsFirst = early.map { e in actions.first.map { Self.canonical($0) == Self.canonical(e.action) } ?? false } ?? false
+            if let e = early, !earlyIsFirst {
+                results.append("(already done while you were writing: \(FastLane.brief(e.action)) → \(e.result.summary))")
+                if !e.result.ok { failures += 1 }
+            }
+            lastFirst = actions.first.map(Self.canonical) ?? ""
             for (i, action) in actions.enumerated() {
                 guard !Task.isCancelled else { return }
                 // The user added something mid-batch: the rest of this plan may be outdated, re-plan first.
@@ -573,10 +607,16 @@ final class Agent: ObservableObject {
                                    + "if you need pixels: pictures, canvas, iframes, a native dialog)")
                     continue
                 }
-                let result = await perform(action, context: &context)
+                let result: ActionResult
+                if i == 0, earlyIsFirst, let e = early {
+                    result = e.result
+                    lastTarget = e.target   // so the step is recorded with the element it acted on
+                } else {
+                    result = await perform(action, context: &context)
+                }
                 if result.ok, !runDry { record(action) }
                 // Opening something was only a step if more work followed in it (see `keepsFrontApp`).
-                if result.ok, ["click", "type", "key", "choose", "upload", "scroll", "applescript", "fill"].contains((action["do"] as? String ?? "").lowercased()) {
+                if result.ok, ["click", "type", "key", "choose", "upload", "scroll", "applescript", "fill", "autofill"].contains((action["do"] as? String ?? "").lowercased()) {
                     openedLast = false
                 }
                 if case .look = result.effect { wantsLook = true }
@@ -595,7 +635,7 @@ final class Agent: ObservableObject {
                 }
                 // Forms re-render as they're filled (LinkedIn adds and drops fields): before the next step by w-id, list
                 // the page again so it lands on the element the model meant, not whatever now sits at that index.
-                if ["type", "choose", "click", "upload"].contains(kind), context.page != nil, !runDry,
+                if ["type", "choose", "click", "upload", "autofill"].contains(kind), context.page != nil, !runDry,
                    actions[(i + 1)...].contains(where: { Self.isWebRef($0["id"]) }) {
                     await relist(&context)
                 }
@@ -641,6 +681,24 @@ final class Agent: ObservableObject {
     }
 
     private var checkedMemoryForAsk = false
+    /// The last turn's first action (canonical JSON): the same one again isn't started early, since a repeat may be
+    /// a loop the turn's checks stop.
+    private var lastFirst = ""
+
+    /// Streamed replies start their first action before the model has finished writing (EARLY_START=off stops it).
+    static var earlyStartOn: Bool { !["off", "0", "no", "false"].contains((Config.value("EARLY_START") ?? "on").lowercased()) }
+
+    /// Steps worth starting while the model is still writing: ones that act on the screen, not questions, waits,
+    /// looks or anything sent outside the screen (email, shell, scripts, schedules).
+    nonisolated static func startsEarly(_ action: [String: Any]) -> Bool {
+        ["click", "type", "choose", "scroll", "key", "open_url", "open_app", "autofill", "upload", "read", "review"]
+            .contains((action["do"] as? String ?? "").lowercased())
+    }
+
+    nonisolated static func canonical(_ action: [String: Any]) -> String {
+        (try? JSONSerialization.data(withJSONObject: action, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "\(action)"
+    }
+
     /// Memory facts this run was shown (up front, as notes for a site or app, or recalled): the ones the run then used
     /// rank higher next time.
     private var shownFacts: Set<String> = []
@@ -705,6 +763,45 @@ final class Agent: ObservableObject {
         onResult()
         let summary = items.map { "- \($0["q"] as? String ?? "?"): \(($0["answer"] as? String).flatMap { $0.isEmpty ? nil : $0 } ?? "(empty)")" }.joined(separator: "\n")
         return end(line, .init(ok: true, summary: "review shown to the user. \(note)\n\(summary)"))
+    }
+
+    /// Fills every visible field, dropdown and radio group the job profile answers, in this one action (each still a
+    /// real, checked type / choose / click), and tells the model what's left. Never submits anything.
+    private func autofill(context: inout ActionContext) async -> ActionResult {
+        guard let page = context.page else { return fail("autofill needs a web page") }
+        let profile = Profile.current
+        let plan = FormFill.plan(page) { Profile.answer(for: $0, in: profile) }
+        log("  autofill: \(plan.steps.count) to fill, \(plan.open.count) open")
+        var filled: [String] = [], failed: [String] = []
+        for step in plan.steps {
+            guard !Task.isCancelled, addedNotes.isEmpty else { break }
+            var action = step.action
+            // Forms re-render as they're filled: aim at the same field in the latest listing.
+            if let n = Self.webIndex(action["id"]), let now = context.page {
+                guard let id = Self.rematch(n, from: page, to: now) else { failed.append("\(step.question) (the field went away)"); continue }
+                action["id"] = "w\(id)"
+            }
+            lastTarget = nil
+            let r = await perform(action, context: &context)
+            if r.ok {
+                filled.append("\(step.question) → \(step.answer.prefix(60))")
+                if !runDry { record(action) }
+            } else {
+                failed.append("\(step.question): \(r.summary.replacingOccurrences(of: "FAILED: ", with: "").prefix(120))")
+            }
+            if context.page != nil, !runDry { await relist(&context) }
+        }
+        var summary = filled.isEmpty ? "nothing on screen that the profile answers" : "filled \(filled.count) from the profile:\n"
+            + filled.map { "- \($0)" }.joined(separator: "\n")
+        if !failed.isEmpty { summary += "\ncouldn't fill (do these yourself):\n" + failed.map { "- \($0)" }.joined(separator: "\n") }
+        if !plan.open.isEmpty {
+            summary += "\nnot in the profile (fill from memory/resume, or ask the user once; remember_answer what they say):\n"
+                + plan.open.map { "- \($0)" }.joined(separator: "\n")
+        }
+        if plan.uploads > 0 { summary += "\n\(plan.uploads) upload field\(plan.uploads == 1 ? "" : "s") here: upload the resume yourself." }
+        if let now = context.page, now.below > 0 { summary += "\n\(now.below) more fields/buttons below: scroll, then autofill again." }
+        // A partial fill is still progress; only "nothing done and something broke" is a failure.
+        return filled.isEmpty && !failed.isEmpty ? fail(summary) : .init(ok: true, summary: summary)
     }
 
     /// Requests whose point is what ends up on screen ("open Spotify", "show me my calendar", "search …"): the app
@@ -1121,6 +1218,9 @@ final class Agent: ObservableObject {
 
         case "review" where context.page != nil:
             return await reviewForm(context.page!)
+
+        case "autofill" where context.page != nil:
+            return await autofill(context: &context)
 
         case "choose" where Self.isWebRef(action["id"]):
             // A dropdown in one step: open it with a real click (type to filter if it's a search box), find the
@@ -2030,6 +2130,17 @@ final class Agent: ObservableObject {
             }
         }
         defer { beat.cancel() }
+        // The page itself wakes us the moment the text shows (or goes): no ¼-second polling. Text in embedded frames,
+        // the window's own controls and pictures of text aren't seen there, so a miss still gets the checks below
+        // (quickly: the time is spent). An extension without waitText just falls through to them.
+        if let page = context.page,
+           let r = try? await BrowserBridge.shared.perform("waitText", on: page, ["text": text, "gone": gone, "ms": Int(seconds * 1000)],
+                                                           timeout: seconds + 3),
+           r["met"] as? Bool == true {
+            await refresh(&context)
+            let took = String(format: "%.1f", Date().timeIntervalSince(started))
+            return end(line, .init(ok: true, summary: "\(text.debugDescription) \(gone ? "is gone" : "shows") (after \(took) s)"))
+        }
         var goneSince: Date?
         while true {
             guard !Task.isCancelled else { return end(line, fail("cancelled")) }
@@ -2266,7 +2377,7 @@ final class Agent: ObservableObject {
     private static func pageListSuffices(_ context: ActionContext, after prior: ArraySlice<[String: Any]>) -> Bool {
         guard let page = context.page, page.problem == nil, page.elements.count >= 6,
               NSWorkspace.shared.frontmostApplication?.processIdentifier == context.app?.processIdentifier else { return false }
-        let inPage: Set<String> = ["scroll", "wait", "review", "read", "extract", "recall", "remember", "show", "application"]
+        let inPage: Set<String> = ["scroll", "wait", "review", "read", "extract", "recall", "remember", "show", "application", "autofill"]
         return prior.allSatisfy { isWebRef($0["id"]) || inPage.contains(($0["do"] as? String ?? "").lowercased()) }
     }
 

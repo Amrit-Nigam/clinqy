@@ -393,6 +393,43 @@ if command == "selftest" {
         check(d.contains("~ w1") && d.contains("+ w5 button: Dismiss") && d.contains("- w3 link: Jobs") && !d.contains("w2"), "page diff by stable id")
         check(B.diff(previous: before, current: page("https://x.com/other", after.elements)) == nil, "another page gets the full listing")
     }
+    // Autofill: one plan for every visible field the profile answers; the rest is listed for the model.
+    MainActor.assumeIsolated {
+        typealias B = BrowserBridge
+        func f(_ i: Int, _ role: String, _ text: String, q: String? = nil, value: String? = nil, options: [String] = [],
+               flags: Set<String> = [], dropdown: Bool = false) -> B.PageElement {
+            B.PageElement(index: i, role: role, text: text, rect: .zero, editable: !["radio", "button", "file"].contains(role), extra: "",
+                          key: "|\(role)|\(text)", value: value, flags: flags, question: q, options: options, dropdown: dropdown)
+        }
+        let form = B.Page(connection: ObjectIdentifier(Agent.self), url: "https://jobs.lever.co/acme/apply", title: "Apply", viewport: CGSize(width: 1, height: 1),
+                          scrollY: 0, scrollMax: 0, headings: [], elements: [
+            f(1, "text", "Full name *"), f(2, "email", "Email", value: "already@there.com"), f(3, "select", "Notice period", value: "Select…",
+            options: ["Select…", "Immediately", "15 days", "30 days"]), f(4, "radio", "Yes", q: "Willing to relocate?"),
+            f(5, "radio", "No", q: "Willing to relocate?"), f(6, "textarea", "Why Acme?", flags: ["required"]),
+            f(7, "file", "Resume"), f(8, "button", "Submit application"), f(9, "select", "Experience", value: "", options: ["0-6 months", "18 months"]),
+        ], estimatedArea: nil)
+        let answers = ["full name": "Amrit Nigam", "email": "a@b.co", "notice period": "Immediate", "willing to relocate?": "Yes (Bangalore)",
+                       "experience": "8 months"]
+        let plan = FormFill.plan(form) { answers[$0.lowercased()] }
+        let did = plan.steps.map { "\($0.action["do"]!) \($0.action["id"]!) \($0.answer)" }
+        check(did == ["type w1 Amrit Nigam", "choose w3 Immediately", "click w4 Yes"], "autofill plans typing, a dropdown and a radio (\(did))")
+        check(plan.open.contains("Why Acme? (required)") && plan.open.contains { $0.hasPrefix("Experience") } && plan.uploads == 1,
+              "autofill leaves unanswered and unmatched questions to the model")
+        check(FormFill.bestOption("8 months", in: ["18 months", "6-12 months"]) == nil && FormFill.bestOption("No", in: ["Yes", "No, I don't"]) == "No, I don't"
+              && FormFill.bestOption("Immediate", in: ["Immediately", "1 month"]) == "Immediately", "autofill option matching is whole-word")
+    }
+    // Streaming: the first action is read out of a half-written reply once it's complete, and only then.
+    MainActor.assumeIsolated {
+        let full = #"```json\n{"say":"Filling","actions":[{"do":"type","id":"w3","text":"a {brace} and \"quote\""},{"do":"click","id":"w9"}],"done":false}"#
+        let cut = full.firstIndex(of: "}").map { full[...$0] }.map(String.init) ?? ""   // ends inside the first action's text
+        check(Brain.firstAction(inPartial: #"{"say":"Fill"#) == nil && Brain.firstAction(inPartial: cut) == nil,
+              "streaming: nothing until the first action is complete")
+        let first = Brain.firstAction(inPartial: String(full.prefix(full.range(of: "{\"do\":\"click")!.lowerBound.utf16Offset(in: full))))
+        check(first?["do"] as? String == "type" && first?["text"] as? String == "a {brace} and \"quote\"", "streaming: first action parsed past braces and quotes in strings")
+        check(Agent.startsEarly(["do": "click", "id": "w1"]) && !Agent.startsEarly(["do": "ask", "question": "?"]) && !Agent.startsEarly(["do": "email"]),
+              "streaming: only on-screen steps start early")
+        check(Agent.canonical(["b": 1, "a": "x"]) == Agent.canonical(["a": "x", "b": 1]), "streaming: actions compare by content")
+    }
     // Job profile: fields answer their questions; a saved earlier answer wins for its own question.
     do {
         var p = Profile.Data()

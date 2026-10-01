@@ -22,6 +22,11 @@ final class BrowserBridge {
         /// Current value/choice (fields, dropdowns), and state flags (checked, covered, disabled…), for diffs.
         var value: String?
         var flags: Set<String> = []
+        /// The question a field or choice answers (its group's label), its placeholder, and a dropdown's choices.
+        var question: String?
+        var placeholder: String?
+        var options: [String] = []
+        var dropdown = false
     }
 
     /// A scrolling box (usually a modal's body) with fields/buttons scrolled out of it.
@@ -154,7 +159,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.6.1"
+    static let extensionVersion = "1.7.0"
     private var reloadAsked: Set<String> = []
 
     private func checkVersion(_ version: String, on conn: NWConnection) {
@@ -406,7 +411,10 @@ final class BrowserBridge {
                                rect: CGRect(x: d("x"), y: d("y"), width: d("w"), height: d("h")),
                                editable: e["editable"] as? Bool == true, extra: extra.joined(separator: " "),
                                key: [e["frame"] as? String ?? "", e["key"] as? String ?? "\(e["role"] ?? "")|\(e["text"] ?? "")"].joined(separator: "|"),
-                               value: e["value"] as? String, flags: Set(flags))
+                               value: e["value"] as? String, flags: Set(flags), question: e["q"] as? String,
+                               placeholder: e["placeholder"] as? String,
+                               options: (e["options"] as? String).map { $0.components(separatedBy: " | ") } ?? [],
+                               dropdown: e["dropdown"] as? Bool == true)
         }
         let panes = (r["panes"] as? [[String: Any]] ?? []).map {
             Pane(name: $0["name"] as? String ?? "", modal: $0["modal"] as? Bool == true, above: $0["above"] as? Int ?? 0, below: $0["below"] as? Int ?? 0)

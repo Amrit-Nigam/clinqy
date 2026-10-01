@@ -30,6 +30,9 @@ final class ClaudeSession: @unchecked Sendable {
     private let lock = NSLock()
     private var buffer = Data()
     private var pending: CheckedContinuation<String, Error>?
+    /// The current turn's reply so far, and who wants to see it grow (see `send`).
+    private var partialText = ""
+    private var partialHandler: (@Sendable (String) -> Void)?
     private var dead = false
 
     init(system: String, model: String) throws {
@@ -39,6 +42,8 @@ final class ClaudeSession: @unchecked Sendable {
             "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
             "--model", model, "--effort", Config.value("CLAUDE_EFFORT") ?? "low", "--tools", "", "--system-prompt", system,
             "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
+            // The reply as it's written, so the first action can start before the model has finished the rest.
+            "--include-partial-messages",
         ]
         var env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
@@ -61,8 +66,9 @@ final class ClaudeSession: @unchecked Sendable {
 
     var isAlive: Bool { lock.withLock { !dead } && process.isRunning }
 
-    /// Sends one user turn (text plus an optional JPEG) and returns the reply text.
-    func send(_ text: String, image: String? = nil) async throws -> String {
+    /// Sends one user turn (text plus an optional JPEG) and returns the reply text. `partial` sees the reply text so
+    /// far each time it grows (on a background thread).
+    func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         var content: [[String: Any]] = []
         if let image {
             content.append(["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": image]])
@@ -78,6 +84,8 @@ final class ClaudeSession: @unchecked Sendable {
             if dead { lock.unlock(); continuation.resume(throwing: BrainError.died); return }
             if pending != nil { lock.unlock(); continuation.resume(throwing: BrainError.busy); return }
             pending = continuation
+            partialText = ""
+            partialHandler = partial
             lock.unlock()
             input.fileHandleForWriting.write(line)
         }
@@ -93,19 +101,30 @@ final class ClaudeSession: @unchecked Sendable {
         lock.lock()
         buffer.append(chunk)
         var results: [Result<String, Error>] = []
+        var grown: String?
         while let newline = buffer.firstIndex(of: 0x0A) {
             let line = buffer[buffer.startIndex..<newline]
             buffer.removeSubrange(buffer.startIndex...newline)
-            guard let event = try? JSONSerialization.jsonObject(with: line) as? [String: Any],
-                  event["type"] as? String == "result" else { continue }
+            guard let event = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            if event["type"] as? String == "stream_event" {
+                if let e = event["event"] as? [String: Any], let delta = e["delta"] as? [String: Any],
+                   delta["type"] as? String == "text_delta", let piece = delta["text"] as? String, pending != nil {
+                    partialText += piece
+                    grown = partialText
+                }
+                continue
+            }
+            guard event["type"] as? String == "result" else { continue }
             let text = event["result"] as? String ?? ""
             results.append(event["is_error"] as? Bool == true ? .failure(BrainError.failed(text)) : .success(text))
         }
         var toResume: [(CheckedContinuation<String, Error>, Result<String, Error>)] = []
         for result in results {
-            if let p = pending { toResume.append((p, result)); pending = nil }
+            if let p = pending { toResume.append((p, result)); pending = nil; partialHandler = nil }
         }
+        let handler = results.isEmpty ? partialHandler : nil
         lock.unlock()
+        if let grown, let handler { handler(grown) }
         for (continuation, result) in toResume { continuation.resume(with: result) }
     }
 
@@ -114,6 +133,7 @@ final class ClaudeSession: @unchecked Sendable {
         dead = true
         let p = pending
         pending = nil
+        partialHandler = nil
         lock.unlock()
         p?.resume(throwing: error)
     }
@@ -151,6 +171,36 @@ enum Brain {
         // Sometimes the model writes tool-call tags instead (`<invoke name="scroll"><parameter name="dir">up</parameter>…`):
         // read every one, with its parameters, as an action.
         return invokes(in: reply)
+    }
+
+    /// The first action of a reply that's still being written, once that action is complete ("actions":[{…} closed).
+    /// nil until then, or when the reply isn't the usual {"say","actions"} object.
+    static func firstAction(inPartial text: String) -> [String: Any]? {
+        guard let open = text.range(of: #""actions"\s*:\s*\["#, options: .regularExpression) else { return nil }
+        var i = open.upperBound
+        while i < text.endIndex, text[i].isWhitespace { i = text.index(after: i) }
+        guard i < text.endIndex, text[i] == "{" else { return nil }
+        let start = i
+        var depth = 0, inString = false, escaped = false
+        while i < text.endIndex {
+            let c = text[i]
+            if inString {
+                if escaped { escaped = false } else if c == "\\" { escaped = true } else if c == "\"" { inString = false }
+            } else if c == "\"" {
+                inString = true
+            } else if c == "{" {
+                depth += 1
+            } else if c == "}" {
+                depth -= 1
+                if depth == 0 {
+                    let object = String(text[start...i])
+                    guard let action = try? JSONSerialization.jsonObject(with: Data(object.utf8)) as? [String: Any], action["do"] is String else { return nil }
+                    return action
+                }
+            }
+            i = text.index(after: i)
+        }
+        return nil
     }
 
     static func invokes(in reply: String) -> [String: Any]? {
