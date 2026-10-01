@@ -13,6 +13,8 @@
 #   clinqy mcp                       Serve Clinqy as an MCP server on stdio (claude mcp add clinqy -- clinqy mcp).
 #   clinqy watch <app> <text> [--gone] [--timeout s]   Wait for text to appear in (or vanish from) an app.
 #   clinqy replay <fixture.json|folder> [--bless]      Re-check recorded runs offline (tests/replay).
+#   clinqy memory ["request"] [--app Name] [--site host]   How memory is organised (profile, notes per site/app);
+#                                    with a request: exactly which facts it would be sent.
 #   clinqy page [read|url]           What's in the focused browser tab, via the extension (read-only):
 #                                    its elements (w-ids, fields, values, errors) and visible text; read = full text.
 #   clinqy extension reload          Reload the browser extension from disk.
@@ -121,8 +123,8 @@ PY
   extension)
     ensure_app
     open -g "clinqy://reload-extension?token=$TOKEN"; echo "Asked the browser(s) to reload the Clinqy extension." ;;
-  stats|mcp|watch|replay)
-    # Handled by the app binary itself (no running app needed): stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>.
+  stats|mcp|watch|replay|memory)
+    # Handled by the app binary itself (no running app needed): stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>, memory.
     APP=/Applications/Clinqy.app/Contents/MacOS/Clinqy
     [[ -x $APP ]] || { echo "Clinqy isn't installed (run ./build.sh in the repo)"; exit 2; }
     exec $APP "$cmd" "$@" ;;

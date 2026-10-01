@@ -96,6 +96,8 @@ enum AgentPrompt {
                                                            gone and stays gone (a spinner, "Uploading…", a dialog). Use it instead of wait+look loops
     {"do":"recall","query":"delivery address"}           search everything you remember about the user (only the relevant part is shown up front)
     {"do":"remember","fact":"mom = WhatsApp chat 'Mom ❤️'"} save a lasting fact about the user right away (who's who, preferences, usual apps/places); use "Things you remember" before asking
+    {"do":"remember","fact":"date fields are dd/mm/yyyy; click the dd part and type digits","scope":"site:docs.google.com"}   know-how for one site
+                                                           or app ("app:Find My") that cost you steps: it's shown to you whenever you're there again
     {"do":"remember_answer","question":"Why this company?","answer":"…"}   save the user's answer to a form question for future applications
     {"do":"schedule","request":"check my placement mail","when":"every weekday at 9"}   run a request later or on repeat
                                                            ("at 9am", "tomorrow 8:30", "in 20 minutes", "daily at 18:00", "every hour")

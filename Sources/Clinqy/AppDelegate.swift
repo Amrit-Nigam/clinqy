@@ -22,6 +22,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     /// The mic is open for a follow-up after a finished task ("now email that to Rahul").
     private var followUpOpen = false
 
+    func applicationWillTerminate(_ notification: Notification) {
+        Persist.flush()
+    }
+
     func applicationDidFinishLaunching(_ notification: Notification) {
         buddy = Buddy()
         agent = Agent(buddy: buddy)
@@ -41,6 +45,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installEditMenu()
         dismissOnOutsideClick()
         Brain.prewarm()
+        // Vectors for memory and saved runs, in the background, so no request waits on embedding them.
+        Embedder.shared.warm(Memory.facts + ReplayCache.shared.all.map(\.request))
         Whisper.shared.prepare()
         BrowserBridge.shared.start()
         Clipboard.start()

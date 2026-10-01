@@ -6,8 +6,9 @@ import Foundation
 @MainActor
 enum MemoryTidy {
     private static let lastCountKey = "memoryTidyLastCount"
-    /// Tidy after this many facts were added since the last time.
-    private static let every = 15
+    /// Tidy after this many facts were added since the last time (learning already merges and updates as it goes,
+    /// so this is a rare sweep).
+    private static let every = 40
 
     static func runIfDue() async {
         let count = Memory.facts.count
@@ -19,7 +20,7 @@ enum MemoryTidy {
     /// Returns a short report (nil when there was nothing to do or it was unsafe).
     @discardableResult
     static func run() async -> String? {
-        let facts = Memory.facts
+        let facts = Memory.lines
         guard facts.count >= 10 else { return nil }
         let system = """
         You tidy a list of facts an assistant remembers about its user. Reply with JSON only (no prose, no tool calls):
@@ -28,7 +29,8 @@ enum MemoryTidy {
         (drop the older one as superseded). Merge facts that say the same thing into one line that keeps every detail \
         (names, numbers, emails, links, dates, app/chat names). Drop facts that are clearly one-off or no longer true \
         (an expired listing, a finished one-time task) as stale. Keep everything else exactly as written. \
-        Never invent or change details. Keep each fact one short line.
+        Never invent or change details. Keep each fact one short line. A fact may start with a scope tag like \
+        [site:docs.google.com] or [app:Find My] (know-how for that place): keep the tag at the start, and merge only facts with the same tag.
         """
         do {
             let session = try ClaudeSession(system: system, model: Brain.model)
@@ -51,22 +53,12 @@ enum MemoryTidy {
         }
     }
 
-    /// Emails, links and numbers (4+ digits) in a fact: the details that must never silently disappear.
-    private static func details(_ text: String) -> Set<String> {
-        let pattern = #"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}|(?:https?://)?(?:[a-z0-9-]+\.)+[a-z]{2,}/[^\s,;)]+|\+?\d[\d ]{3,}\d"#
-        guard let re = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
-        let ns = text as NSString
-        return Set(re.matches(in: text, range: NSRange(location: 0, length: ns.length)).map {
-            ns.substring(with: $0.range).lowercased().replacingOccurrences(of: " ", with: "")
-        })
-    }
-
     static func safe(before: [String], after: [String], removed: [(String, String)]) -> Bool {
         guard after.count >= Int(Double(before.count) * 0.6) else { return false }
         let kept = after.joined(separator: "\n").lowercased().replacingOccurrences(of: " ", with: "")
         let replaced = Set(removed.filter { $0.1.contains("supersed") || $0.1.contains("stale") }.map(\.0))
         for fact in before where !replaced.contains(fact) {
-            for d in details(fact) where !kept.contains(d) { return false }
+            for d in Memory.details(fact) where !kept.contains(d) { return false }
         }
         return true
     }

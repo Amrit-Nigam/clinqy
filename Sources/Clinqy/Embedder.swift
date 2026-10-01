@@ -1,0 +1,128 @@
+import CryptoKit
+import Foundation
+import NaturalLanguage
+
+/// On-device sentence vectors (NaturalLanguage), cached by text. One embedding costs ~9 ms, so memory facts and
+/// saved runs are embedded once, in the background, and kept in Caches across launches; a request then costs a
+/// single embedding (its own) instead of one per fact.
+final class Embedder: @unchecked Sendable {
+    static let shared = Embedder()
+
+    private let model = NLEmbedding.sentenceEmbedding(for: .english)
+    private let words = NLEmbedding.wordEmbedding(for: .english)
+    /// Guards `cache`, `touched`, `neighbors` and `dirty`.
+    private let lock = NSLock()
+    /// Serialises use of the NaturalLanguage models.
+    private let modelLock = NSLock()
+    private var cache: [String: [Float]] = [:]
+    /// Keys used this launch: the cache is trimmed to these when it grows too big.
+    private var touched: Set<String> = []
+    private var neighbors: [String: [String]] = [:]
+    private var dirty = false
+    private let queue = DispatchQueue(label: "clinqy.embedder", qos: .utility)
+
+    private let url: URL = {
+        let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir.appendingPathComponent("vectors.plist")
+    }()
+
+    private init() {
+        guard let data = try? Data(contentsOf: url),
+              let saved = try? PropertyListSerialization.propertyList(from: data, format: nil) as? [String: Data] else { return }
+        for (key, blob) in saved {
+            cache[key] = blob.withUnsafeBytes { Array($0.bindMemory(to: Float.self)) }
+        }
+    }
+
+    var available: Bool { model != nil }
+
+    static func key(_ text: String) -> String {
+        let digest = SHA256.hash(data: Data(normalize(text).utf8))
+        return digest.prefix(12).map { String(format: "%02x", $0) }.joined()
+    }
+
+    private static func normalize(_ text: String) -> String {
+        text.lowercased().trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// The vector if it's already cached; never computes (safe to call in a loop over many texts).
+    func cached(_ text: String) -> [Float]? {
+        let k = Self.key(text)
+        lock.lock(); defer { lock.unlock() }
+        if let v = cache[k] { touched.insert(k); return v }
+        return nil
+    }
+
+    /// The vector, computed now if needed (for the one text a request is about).
+    func vector(_ text: String) -> [Float]? {
+        if let v = cached(text) { return v }
+        guard let model else { return nil }
+        modelLock.lock()
+        let raw = model.vector(for: Self.normalize(text))
+        modelLock.unlock()
+        guard let raw else { return nil }
+        let v = raw.map(Float.init)
+        let k = Self.key(text)
+        lock.lock()
+        cache[k] = v
+        touched.insert(k)
+        dirty = true
+        lock.unlock()
+        return v
+    }
+
+    /// Embeds these texts in the background (skipping cached ones), then saves the cache.
+    func warm(_ texts: [String]) {
+        guard model != nil else { return }
+        let missing = texts.filter { cached($0) == nil }
+        guard !missing.isEmpty else { return }
+        queue.async { [self] in
+            for text in missing { _ = vector(text) }
+            save()
+        }
+    }
+
+    /// Embeds these texts now, on the caller's thread (tests, and code already off the main thread).
+    func warmNow(_ texts: [String]) {
+        for text in texts where cached(text) == nil { _ = vector(text) }
+        queue.sync { save() }
+    }
+
+    /// Close words for a query word ("eat" → meal, snack, hungry), from the on-device word vectors.
+    /// Replaces a hand-written synonym list, so it works for anyone's vocabulary.
+    func related(_ word: String, max: Int = 5, within distance: Double = 0.95) -> [String] {
+        lock.lock()
+        if let hit = neighbors[word] { lock.unlock(); return hit }
+        lock.unlock()
+        guard let words else { return [] }
+        modelLock.lock()
+        let found = words.neighbors(for: word, maximumCount: max).filter { $0.1 < distance }.map(\.0)
+        modelLock.unlock()
+        lock.lock()
+        neighbors[word] = found
+        lock.unlock()
+        return found
+    }
+
+    static func cosine(_ a: [Float], _ b: [Float]) -> Float {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var dot: Float = 0, x: Float = 0, y: Float = 0
+        for i in a.indices { dot += a[i] * b[i]; x += a[i] * a[i]; y += b[i] * b[i] }
+        return dot / ((x * y).squareRoot() + 1e-9)
+    }
+
+    private func save() {
+        lock.lock()
+        guard dirty else { lock.unlock(); return }
+        dirty = false
+        // Don't grow without bound: past 4000 vectors, keep only the ones used this launch.
+        if cache.count > 4000 { cache = cache.filter { touched.contains($0.key) } }
+        let snapshot = cache
+        lock.unlock()
+        let blobs = snapshot.mapValues { v in v.withUnsafeBufferPointer { Data(buffer: $0) } }
+        if let data = try? PropertyListSerialization.data(fromPropertyList: blobs, format: .binary, options: 0) {
+            try? data.write(to: url, options: .atomic)
+        }
+    }
+}

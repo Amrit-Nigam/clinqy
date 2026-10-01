@@ -279,11 +279,13 @@ final class Agent: ObservableObject {
     /// The saved workflow to replay for this request, when that's safe to do without the model: nothing selected,
     /// copied, circled or continued that the model would need to see, and not a question or a request about "this".
     private func workflowFirst(_ request: String) -> Router.Match? {
-        guard !["off", "0", "no", "false"].contains((Config.value("WORKFLOW_FIRST") ?? "on").lowercased()),
-              selectedText == nil, selectedFiles.isEmpty, annotation == nil, continuation == nil,
+        guard Self.workflowFirstOn, selectedText == nil, selectedFiles.isEmpty, annotation == nil, continuation == nil,
               !Self.isQuestion(request), !Router.refersToContext(request), !Safety.micInUse else { return nil }
         return Router.match(request, in: Workflows.shared.all)
     }
+
+    /// Saved workflows and runs that worked are replayed with no model when they fit exactly (WORKFLOW_FIRST=off stops it).
+    static var workflowFirstOn: Bool { !["off", "0", "no", "false"].contains((Config.value("WORKFLOW_FIRST") ?? "on").lowercased()) }
 
     /// Resets per-run state; shared by requests, workflow replays and QA runs.
     fileprivate func prepare(_ request: String, test: Bool, dry: Bool = false) {
@@ -298,6 +300,7 @@ final class Agent: ObservableObject {
         narration = ""
         openedTab = false
         checkedMemoryForAsk = false
+        shownFacts = []; visitedHosts = []; visitedApps = []
         pushedOn = 0
         profileOffered = []
         turnCount = 0; fastTurnCount = 0; lookCount = 0
@@ -385,13 +388,38 @@ final class Agent: ObservableObject {
                 message += "\n(\(turn) of \(maxTurns) steps used. If the current approach isn't getting closer, change it now; "
                     + "if the task can't be finished, finish with done:true and say where things stand.)"
             }
+            let observeStart = Date()
             let obs = await Observation.capture(app)
+            let observeMs = Int(Date().timeIntervalSince(observeStart) * 1000)
+            if observeMs > 400 { log("  observe: \(observeMs) ms") }
             if turn == 0, continuation == nil, qa == nil {
                 startPlace = (obs.app?.cleanName, obs.page?.url, obs.page?.title)
+                // This exact request worked from here before, more than once, with nothing risky in it: replay its
+                // steps with no model at all (the model only steps in if a step no longer fits the screen).
+                if !isTest, !runDry, selectedText == nil, selectedFiles.isEmpty, annotation == nil, Self.workflowFirstOn,
+                   let replay = ReplayCache.shared.replayable(request: request, app: obs.app?.cleanName, url: obs.page?.url, title: obs.page?.title) {
+                    log("replay-first: this exact request worked here before — replaying \(replay.steps.count) steps, no model")
+                    steps.append(Step(text: "Done exactly this before — replaying it, no model needed", state: .info))
+                    session.close()
+                    fast.close()
+                    await replayOrHeal(replay, params: [:])
+                    return
+                }
                 if let hint = ReplayCache.shared.hint(request: request, app: obs.app?.cleanName, url: obs.page?.url, title: obs.page?.title) {
                     message += hint
                     log("replay hint offered")
                 }
+            }
+            // Know-how saved for the site or app the task is in now, the first time it gets there.
+            let host = obs.page.map { Memory.bareHost($0.url) }.flatMap { $0.isEmpty ? nil : $0 }
+            if let host { visitedHosts.insert(host) }
+            if let name = obs.app?.cleanName { visitedApps.insert(name) }
+            let notes = Memory.scoped(app: obs.app?.cleanName, host: host).filter { !shownFacts.contains($0) }
+            if !notes.isEmpty {
+                shownFacts.formUnion(notes)
+                message += "\nNotes you saved for \(host ?? obs.app?.cleanName ?? "this app") (how to work it; follow them here):\n"
+                    + notes.map { "- \($0)" }.joined(separator: "\n")
+                log("  memory: \(notes.count) note\(notes.count == 1 ? "" : "s") for \(host ?? obs.app?.cleanName ?? "?")")
             }
             if let page = obs.page {
                 let fields = page.elements.filter(\.editable).map { "w\($0.index) \($0.extra)" }.joined(separator: " | ")
@@ -598,6 +626,11 @@ final class Agent: ObservableObject {
             }
             if isDone, failures == 0 {
                 finish(ok: true, say.isEmpty ? "Done" : say)
+                if !runDry, !isTest {
+                    // Credit the remembered facts this run put to work, so they rank higher next time.
+                    let output = (steps.map(\.text) + trace.compactMap(\.text) + [say]).joined(separator: "\n")
+                    Memory.noteUsed(Memory.used(among: shownFacts, output: output, apps: visitedApps, hosts: visitedHosts))
+                }
                 if !runDry { await learn(from: session) }
                 return
             }
@@ -608,6 +641,11 @@ final class Agent: ObservableObject {
     }
 
     private var checkedMemoryForAsk = false
+    /// Memory facts this run was shown (up front, as notes for a site or app, or recalled): the ones the run then used
+    /// rank higher next time.
+    private var shownFacts: Set<String> = []
+    /// Sites and apps this run worked in (for crediting scoped notes, and telling learning where it was).
+    private var visitedHosts: Set<String> = [], visitedApps: Set<String> = []
     /// Times this run was told to carry on after finishing with work left (see `saysUnfinished`).
     private var pushedOn = 0
     /// Questions the profile already answered this run (the next time the model asks one, it's asked for real).
@@ -732,26 +770,66 @@ final class Agent: ObservableObject {
     }
 
     /// After a task, keep anything lasting it revealed about the user (people, preferences, usual apps and
-    /// places), so next time is faster. Runs in the background once the user already has their answer.
+    /// places) and know-how for the sites and apps it worked in, so next time is faster. The model sees only the
+    /// facts closest to this task (not the whole memory) and answers with edits — add, update, remove — so memory
+    /// stays one clean line per thing instead of piling up near-duplicates. Runs in the background once the user
+    /// already has their answer.
     private func learn(from session: ClaudeSession) async {
         guard !Task.isCancelled, !isTest else { return }
-        let known = Memory.facts
+        let about = ([request] + steps.suffix(25).map(\.text) + [answer]).joined(separator: "\n")
+        let near = Memory.relevant(to: about, app: targetApp?.cleanName, limit: 30).facts
+        let places = (visitedHosts.sorted() + visitedApps.sorted()).joined(separator: ", ")
         let prompt = """
-        The task is finished. List lasting facts about the user that this task revealed and that would help future \
-        tasks: people and where to reach them (which app/chat), preferences (seats, airlines, food, tone), usual apps, \
-        home/work city, frequent places, accounts or usernames. Not passwords, card numbers, OTPs, one-off details, \
-        not job applications (the application tracker holds those), \
-        or facts about the screen. Skip anything already known:
-        \(known.isEmpty ? "(nothing yet)" : known.map { "- \($0)" }.joined(separator: "\n"))
-        Reply with JSON only: {"facts":["short fact", ...]} — an empty list if nothing new.
+        The task is finished. Update what you remember from what this task revealed. Worth keeping: lasting facts \
+        about the user — people and where to reach them (which app/chat), preferences (seats, airlines, food, tone), \
+        usual apps, home/work city, frequent places, accounts or usernames — and know-how for a site or app that \
+        cost you steps here and would save them next time (where something lives, a trick that worked, the name an \
+        app must be opened with). Never passwords, card numbers, OTPs, one-off details, job applications (the \
+        application tracker holds those) or what merely happened to be on screen.
+        Places this task worked in: \(places.isEmpty ? "(none)" : places)
+        Related things you already remember (numbered):
+        \(near.isEmpty ? "(nothing yet)" : near.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
+        Reply with JSON only: {"ops":[…]}, each op one of
+          {"add":"<short fact>","scope":"site:<host>" | "app:<App name>" | null}   something new; scope only for know-how that matters just there
+          {"update":<n>,"to":"<fact n, corrected or with the new detail>"}         fact n changed or gained a detail
+          {"remove":<n>,"why":"<what this task showed>"}                            fact n is no longer true
+        {"ops":[]} if nothing is new.
         """
-        guard let reply = try? await session.send(prompt), let json = Brain.json(from: reply),
-              let facts = json["facts"] as? [String] else { return }
-        let lower = Set(known.map { $0.lowercased() })
-        for fact in facts.map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-        where !fact.isEmpty && fact.count < 200 && !lower.contains(fact.lowercased()) {
-            Memory.add(fact)
-            log("🧠 remembered: \(fact)")
+        guard let reply = try? await session.send(prompt), let json = Brain.json(from: reply) else { return }
+        var ops = json["ops"] as? [[String: Any]] ?? []
+        if let legacy = json["facts"] as? [String] { ops += legacy.map { ["add": $0] } }
+        let line = { (v: Any?) -> String? in
+            guard let t = (v as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty, t.count < 240 else { return nil }
+            return t
+        }
+        let fact = { (v: Any?) -> String? in
+            guard let n = (v as? NSNumber)?.intValue ?? Int(v as? String ?? ""), n >= 1, n <= near.count else { return nil }
+            return near[n - 1]
+        }
+        var removed = 0
+        for op in ops {
+            if let new = line(op["add"]) {
+                if let known = Memory.nearDuplicate(of: new) {
+                    log("🧠 already known: \(known.prefix(80))")
+                    continue
+                }
+                Memory.add(new, scope: Memory.Scope(op["scope"] as? String))
+                log("🧠 remembered: \(new)\((op["scope"] as? String).map { " [\($0)]" } ?? "")")
+            } else if let old = fact(op["update"]), let new = line(op["to"]), new != old {
+                // A rewrite keeps every email, link and number unless it's clearly the same fact with a new value.
+                let sameSubject = Set(Memory.words(old).map(Memory.stem)).intersection(Memory.words(new).map(Memory.stem)).count >= 2
+                guard MemoryTidy.safe(before: [old], after: [new], removed: []) || sameSubject && !Memory.details(new).isEmpty else {
+                    log("🧠 update skipped (it would drop details): \(old.prefix(60))")
+                    continue
+                }
+                if Memory.update(old, to: new) { log("🧠 updated: \(old) → \(new)") }
+            } else if let old = fact(op["remove"]), removed < 2, !Memory.isProfile(old) {
+                // The old line stays in the log, so a wrong removal can be put back.
+                if Memory.remove(old) {
+                    removed += 1
+                    log("🧠 forgot (\((op["why"] as? String ?? "superseded").prefix(60))): \(old)")
+                }
+            }
         }
         await MemoryTidy.runIfDue()
     }
@@ -825,7 +903,8 @@ final class Agent: ObservableObject {
         }
         // Only the memory that matters for this request (plus core facts); the rest is one recall away.
         let context = [request, targetApp?.cleanName ?? "", selectedText ?? "", continuation?.request ?? ""].joined(separator: " ")
-        let (facts, omitted) = Memory.relevant(to: context)
+        let (facts, omitted) = Memory.relevant(to: context, app: targetApp?.cleanName)
+        shownFacts.formUnion(facts)
         let profile = facts.filter(Memory.isProfile), other = facts.filter { !Memory.isProfile($0) }
         text += "\nThe user's profile (their own details: fill forms with these and never ask for them; the latest line wins if two disagree):\n"
             + "- Full name: \(NSFullUserName())\n" + profile.map { "- \($0)" }.joined(separator: "\n")
@@ -1558,6 +1637,7 @@ final class Agent: ObservableObject {
             let query = (action["query"] as? String) ?? ""
             let line = begin("Recall \(query.prefix(40))")
             let hits = Memory.search(query)
+            shownFacts.formUnion(hits.prefix(5))
             return end(line, .init(ok: true, summary: hits.isEmpty ? "nothing remembered about that"
                                    : "remembered:\n" + hits.map { "- \($0)" }.joined(separator: "\n")))
 
@@ -1577,9 +1657,25 @@ final class Agent: ObservableObject {
 
         case "wait":
             let ms = min(5000, (action["ms"] as? Int) ?? 600)
-            try? await Task.sleep(for: .milliseconds(ms))
-            if let app = context.app { context.fingerprint = await AXEngine.fingerprintAsync(of: app) }
-            return .init(ok: true, summary: "waited \(ms) ms")
+            guard let app = context.app, ms >= 1500 else {
+                try? await Task.sleep(for: .milliseconds(ms))
+                if let app = context.app { context.fingerprint = await AXEngine.fingerprintAsync(of: app) }
+                return .init(ok: true, summary: "waited \(ms) ms")
+            }
+            // Most long waits are "let it load": they end once it has — the screen changed and then held still for
+            // 0.8 s. A screen that never changes gets the full wait (then it's for something outside, like an email).
+            let started = Date()
+            var last = await AXEngine.fingerprintAsync(of: app)
+            var changed = false, stillSince = Date()
+            while Date().timeIntervalSince(started) * 1000 < Double(ms), !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(250))
+                let now = await AXEngine.fingerprintAsync(of: app)
+                if now != last { changed = true; stillSince = Date(); last = now }
+                else if changed, Date().timeIntervalSince(stillSince) >= 0.8 { break }
+            }
+            context.fingerprint = last
+            let waited = Int(Date().timeIntervalSince(started) * 1000)
+            return .init(ok: true, summary: waited < ms - 200 ? "waited \(waited) ms (the screen settled)" : "waited \(ms) ms")
 
         case "snap":
             // A step screenshot for a write-up: copied like ⌃⌘⇧4 (clipboard only, no file) and kept for paste_snaps.
@@ -1632,7 +1728,7 @@ final class Agent: ObservableObject {
 
         case "remember":
             guard let fact = action["fact"] as? String else { return fail("remember needs fact") }
-            Memory.add(fact)
+            Memory.add(fact, scope: Memory.Scope(action["scope"] as? String))
             steps.append(Step(text: "Remembered: \(fact)", state: .info))
             return .init(ok: true, summary: "saved")
 
@@ -1951,13 +2047,33 @@ final class Agent: ObservableObject {
             } else if seen { break }
             if Date().timeIntervalSince(started) >= seconds, goneSince == nil {   // (a pending "gone" gets its re-check)
                 await refresh(&context)
-                return end(line, fail("after \(Int(seconds)) s \(text.debugDescription) \(gone ? "still shows" : "hasn't appeared"); look at what's there instead"))
+                // Most misses are the wording ("Application sent" for "Application submitted"): show what's closest.
+                var near = ""
+                if !gone, let page = context.page, let r = try? await BrowserBridge.shared.perform("read", on: page) {
+                    let close = Self.closest(to: text, in: (r["title"] as? String ?? "") + "\n" + (r["text"] as? String ?? ""))
+                    if !close.isEmpty { near = "; closest on the page: " + close.map { "“\($0)”" }.joined(separator: ", ") }
+                }
+                return end(line, fail("after \(Int(seconds)) s \(text.debugDescription) \(gone ? "still shows" : "hasn't appeared")\(near); look at what's there instead"))
             }
             try? await Task.sleep(for: .milliseconds(250))
         }
         await refresh(&context)
         let took = String(format: "%.1f", Date().timeIntervalSince(started))
         return end(line, .init(ok: true, summary: "\(text.debugDescription) \(gone ? "is gone" : "shows") (after \(took) s)"))
+    }
+
+    /// Up to three lines of `text` sharing the most words with `want` (at least a third of them), for a wait that missed.
+    nonisolated static func closest(to want: String, in text: String) -> [String] {
+        let words = { (s: String) in Set(s.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init).filter { $0.count >= 3 }) }
+        let target = words(want)
+        guard !target.isEmpty else { return [] }
+        let lines = text.split(whereSeparator: { $0 == "\n" || $0 == "·" || $0 == "|" })
+            .map { $0.trimmingCharacters(in: .whitespaces) }.filter { $0.count >= 3 && $0.count <= 160 }
+        var seen = Set<String>()
+        return lines.compactMap { line -> (String, Double)? in
+            let share = Double(words(line).intersection(target).count) / Double(target.count)
+            return share >= 0.34 ? (line, share) : nil
+        }.sorted { $0.1 > $1.1 }.map(\.0).filter { seen.insert($0.lowercased()).inserted }.prefix(3).map { String($0.prefix(80)) }
     }
 
     /// waitFor outside a web page: the app's own Accessibility notifications wake the check (Watch), so nothing is
@@ -2491,21 +2607,25 @@ struct Observation {
         let front = NSWorkspace.shared.frontmostApplication
         let app = (front?.bundleIdentifier == Bundle.main.bundleIdentifier ? nil : front) ?? preferred
         guard let app else { return Observation(app: nil, elements: [], fingerprint: 0) }
-        let scan = await AXEngine.scan(app)
+        // The Accessibility scan, the page listing and the page's frame don't depend on each other: all at once
+        // (in a browser that's the slowest two overlapping instead of adding up).
+        async let scanning = AXEngine.scan(app)
 
         // In a browser with the extension: the real page, element by element.
         var page: BrowserBridge.Page?
         var webArea: CGRect?
         if Launcher.isBrowser(app), BrowserBridge.shared.isConnected {
+            async let area = Task.detached(priority: .userInitiated) { AXEngine.webAreaFrame(of: app) }.value
             page = await BrowserBridge.shared.snapshot(for: app)
             // Still arriving (or nothing listed yet on a page that isn't blocked): give it a moment, once.
             if let p = page, p.ready == "loading" || (p.elements.isEmpty && p.problem == nil) {
                 try? await Task.sleep(for: .milliseconds(700))
                 page = await BrowserBridge.shared.snapshot(for: app) ?? page
             }
-            if page != nil { webArea = await Task.detached { AXEngine.webAreaFrame(of: app) }.value ?? page?.estimatedArea }
+            if page != nil { webArea = await area ?? page?.estimatedArea }
             if webArea == nil { page = nil }
         }
+        let scan = await scanning
         return Observation(app: app, elements: scan.elements, fingerprint: scan.fingerprint, page: page, webArea: webArea,
                            window: scan.window, focused: scan.focused, dialog: scan.dialog)
     }
