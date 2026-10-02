@@ -667,7 +667,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         alert.informativeText = lines.joined(separator: "\n") + """
 
 
-        Claude CLI: \(ClaudeSession.claudePath ?? "❌ not found")
+        Model: \(Provider.current.label)
         Calendars & Reminders: \(Events.hasAccess ? "✅" : "asked the first time you schedule something")
 
         After enabling something in System Settings, click Check Again. \

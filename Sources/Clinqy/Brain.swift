@@ -8,7 +8,7 @@ final class ClaudeSession: @unchecked Sendable {
 
         var errorDescription: String? {
             switch self {
-            case .notInstalled: return "Claude CLI not found. Install Claude Code, or set CLAUDE_PATH in ~/.config/clinqy/env"
+            case .notInstalled: return "Claude CLI not found. Install Claude Code (or set CLAUDE_PATH), or add an API key to ~/.config/clinqy/env"
             case .failed(let message):
                 return message.contains("Not logged in") ? "Claude CLI isn't logged in. Run `claude` in a terminal once and log in." : message
             case .died: return "The Claude process stopped unexpectedly"
@@ -34,8 +34,15 @@ final class ClaudeSession: @unchecked Sendable {
     private var partialText = ""
     private var partialHandler: (@Sendable (String) -> Void)?
     private var dead = false
+    /// Set when PROVIDER is an HTTP API (see Providers.swift): turns go there instead of to a `claude` process.
+    private var api: APIChat?
 
     init(system: String, model: String) throws {
+        let provider = Provider.current
+        if provider != .claudeCLI {
+            api = try APIChat(provider: provider, system: system, model: model)
+            return
+        }
         guard let path = Self.claudePath else { throw BrainError.notInstalled }
         process.executableURL = URL(fileURLWithPath: path)
         process.arguments = [
@@ -64,11 +71,16 @@ final class ClaudeSession: @unchecked Sendable {
         try process.run()
     }
 
-    var isAlive: Bool { lock.withLock { !dead } && process.isRunning }
+    var isAlive: Bool {
+        if let api { return api.isAlive }
+        return lock.withLock { !dead } && process.isRunning
+    }
 
     /// Sends one user turn (text plus an optional JPEG) and returns the reply text. `partial` sees the reply text so
-    /// far each time it grows (on a background thread).
+    /// far each time it grows (on a background thread). The HTTP and one-shot CLI providers don't stream, so it isn't
+    /// called for them.
     func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
+        if let api { return try await api.send(text, image: image) }
         var content: [[String: Any]] = []
         if let image {
             content.append(["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": image]])
@@ -92,6 +104,7 @@ final class ClaudeSession: @unchecked Sendable {
     }
 
     func close() {
+        if let api { api.close(); return }
         output.fileHandleForReading.readabilityHandler = nil
         if process.isRunning { process.terminate() }
         fail(BrainError.died)
