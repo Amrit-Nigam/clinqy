@@ -1,0 +1,104 @@
+<!doctype html>
+<html><head><meta charset="utf-8"><title>clicks:country=|file=|badge=0|saved=0</title>
+<style>
+body { font: 16px system-ui; margin: 40px; max-width: 560px; }
+section { margin: 28px 0; }
+[role=combobox] { border: 1px solid #888; padding: 8px; width: 260px; cursor: pointer; border-radius: 4px; }
+[role=listbox] { display: none; list-style: none; margin: 2px 0 0; padding: 0; width: 276px; max-height: 140px; overflow-y: auto; border: 1px solid #888; }
+[role=listbox].open { display: block; }
+[role=option] { padding: 6px 8px; cursor: pointer; }
+[role=option][aria-selected=true], [role=option].active { background: #def; }
+.wrap { position: relative; display: inline-block; }
+.badge { position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); background: crimson; color: white;
+         font-size: 12px; padding: 2px 10px; border-radius: 9px; }
+button { font-size: 16px; padding: 10px 26px; }
+</style></head>
+<body>
+<h1>Click checks</h1>
+
+<!-- 1. A custom dropdown whose list loads 8 more countries each time it's scrolled to the bottom. -->
+<section>
+  <div id="country-label">Country</div>
+  <div id="country" role="combobox" tabindex="0" aria-labelledby="country-label" aria-controls="countries" aria-expanded="false">Choose a country</div>
+  <ul id="countries" role="listbox"></ul>
+</section>
+
+<!-- 2. An upload button with no file field until it's clicked (the field is never put in the page). -->
+<section>
+  <button id="attach" type="button">Attach resume</button> <span id="attached"></span>
+</section>
+
+<!-- 3. A button whose middle is covered by a badge that swallows clicks; only real clicks count. -->
+<section>
+  <span class="wrap"><button id="read" type="button">Mark as read</button><span class="badge" id="badge">3 new</span></span>
+</section>
+
+<!-- 4. A button the page re-renders (a new element, a new count) every 700 ms. -->
+<section id="draft-box"></section>
+
+<script>
+const state = { country: "", file: "", badge: 0, saved: 0 };
+const show = () => { document.title = `clicks:country=${state.country}|file=${state.file}|badge=${state.badge}|saved=${state.saved}`; };
+
+// 1. Lazy dropdown
+const all = ["Afghanistan", "Albania", "Algeria", "Argentina", "Australia", "Austria", "Bangladesh", "Belgium", "Brazil", "Canada",
+  "Chile", "China", "Colombia", "Denmark", "Egypt", "Finland", "France", "Germany", "Greece", "Hungary", "Iceland", "India",
+  "Indonesia", "Ireland", "Israel", "Italy", "Japan", "Kenya", "Malaysia", "Mexico", "Nepal", "Netherlands", "New Zealand",
+  "Nigeria", "Norway", "Pakistan", "Peru", "Poland", "Portugal", "Singapore", "South Africa", "Spain", "Sri Lanka", "Sweden",
+  "Switzerland", "Thailand", "Turkey", "Ukraine", "United Arab Emirates", "United Kingdom", "United States", "Vietnam"];
+const box = document.getElementById("country"), list = document.getElementById("countries");
+let loaded = 0, active = -1;
+const more = () => {
+  for (const name of all.slice(loaded, loaded + 8)) {
+    const li = document.createElement("li");
+    li.setAttribute("role", "option"); li.id = "opt-" + loaded; li.textContent = name;
+    li.onclick = () => pick(li);
+    list.appendChild(li); loaded++;
+  }
+};
+const pick = (li) => {
+  list.querySelectorAll("[role=option]").forEach((o) => o.setAttribute("aria-selected", String(o === li)));
+  box.textContent = li.textContent; state.country = li.textContent; show();
+  list.classList.remove("open"); box.setAttribute("aria-expanded", "false"); box.removeAttribute("aria-activedescendant");
+};
+more();
+list.addEventListener("scroll", () => { if (list.scrollTop + list.clientHeight >= list.scrollHeight - 4 && loaded < all.length) more(); });
+box.onclick = () => { const open = !list.classList.contains("open"); list.classList.toggle("open", open); box.setAttribute("aria-expanded", String(open)); };
+box.onkeydown = (e) => {
+  const opts = [...list.querySelectorAll("[role=option]")];
+  if (e.key === "ArrowDown") {
+    e.preventDefault();
+    list.classList.add("open"); box.setAttribute("aria-expanded", "true");
+    active = Math.min(active + 1, opts.length - 1);
+    if (active === opts.length - 1 && loaded < all.length) more();
+    const o = list.querySelectorAll("[role=option]")[active];
+    opts.forEach((x) => x.classList.remove("active")); o.classList.add("active"); o.scrollIntoView({ block: "nearest" });
+    box.setAttribute("aria-activedescendant", o.id);
+  } else if (e.key === "Enter" && active >= 0) { e.preventDefault(); pick(list.querySelectorAll("[role=option]")[active]); }
+};
+
+// 2. Upload through a file field made on the spot
+document.getElementById("attach").onclick = () => {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.onchange = () => { state.file = input.files[0] ? input.files[0].name : ""; document.getElementById("attached").textContent = state.file; show(); };
+  input.click();
+};
+
+// 3. Covered button: the badge eats clicks; script clicks don't count
+document.getElementById("badge").addEventListener("click", (e) => e.stopPropagation());
+document.getElementById("read").addEventListener("click", (e) => { if (e.isTrusted) { state.badge++; show(); } });
+
+// 4. Re-rendered button
+let n = 1;
+const render = () => {
+  const b = document.createElement("button");
+  b.type = "button"; b.textContent = `Save draft (${n++})`;
+  b.onclick = () => { state.saved++; show(); };
+  document.getElementById("draft-box").replaceChildren(b);
+};
+render();
+setInterval(render, 700);
+show();
+</script>
+</body></html>

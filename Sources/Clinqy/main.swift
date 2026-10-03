@@ -353,6 +353,18 @@ if command == "selftest" {
         check(runs.count == 1 && t.count == 2 && t[0].actMs == 1200 && t[1].actMs == 1100 && runs[0].setupMs == 300
               && runs[0].stepFailures.count == 1 && runs[0].ok == true, "stats: per-turn model vs action time")
         check(Stats.reason("couldn't find “Next” (w12)") == Stats.reason("couldn't find “Submit” (w3)"), "stats: similar failures group")
+        // Click lines: how often the first way worked, what rescued the rest, and where clicks struggle.
+        let clicks = Stats.parse("""
+        === tick things
+        [  1.00s] \(Clicks.line(kind: "web", place: "forms.gle", method: "mouse", worked: true, tries: 1))
+        [  2.00s] \(Clicks.line(kind: "web", place: "forms.gle", method: "script", worked: true, tries: 2))
+        [  3.00s] \(Clicks.line(kind: "web", place: "forms.gle", method: "key", worked: false, tries: 3))
+        [  4.00s] \(Clicks.line(kind: "ax", place: "Microsoft Teams", method: "axpress", worked: true, tries: 1))
+        [  5.00s] ✓ done
+        """).flatMap(\.clicks)
+        let report = Stats.clickReport(clicks).joined(separator: "\n")
+        check(clicks.count == 4 && report.contains("Clicks: 4 · worked first try 50% · needed another way 25% · no visible change 25%")
+              && report.contains("forms.gle 2/3") && report.contains("script 1"), "stats: click report")
     }
     // Safety: a "don't" about any of a control's words wins over another word the request used ("Easy Apply").
     check(Safety.needsConfirmation(label: "Submit application", request: "fill the Easy Apply form but don't submit it") != nil

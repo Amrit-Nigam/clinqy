@@ -98,6 +98,13 @@ Connect to: cursor
 
 - **One agent loop.** A long-lived Claude session reads the screen, picks actions, acts, checks the result and repeats until the task is done. Each step takes about 1–2 s.
 - **Works like a person.** It opens apps from the Dock (or Spotlight), opens websites by typing into the address bar, types at a human rhythm with real key codes, and clicks for real. Your pointer is put back where it was.
+- **Clicks that check themselves.**
+  - **Checks every click.** After each click it looks for an effect. If nothing changed, it tries the next way: a real mouse click, then a click through the page, then focus plus a key (for checkboxes, tabs and options). It remembers which way works on each site.
+  - **Aims carefully.** It waits until the target stops moving, and clicks a spot that isn't covered (a badge over a button's middle).
+  - **Re-finds elements.** If the page re-rendered the element, it re-reads the page and finds the same element again, even when a count in its name changed.
+  - **Dropdowns.** It searches the list the dropdown opened and scrolls lists that load as you go. Matching is loose ("USA" = "United States", "Sr." = "Senior", "Bangalore" = "Bengaluru"). If the list can't be clicked, it uses the arrow keys.
+  - **Uploads.** A file goes into the page's upload field directly, through the site's own upload button (even one that makes its field on the spot), or through the Mac file picker as a last resort.
+  - **Apps with few listed elements.** In WhatsApp and other apps that expose little to Accessibility, it clicks text it finds on screen with text recognition.
 - **Companion cursor.** A glowing blue arrow rides beside your pointer. It flies in arcs to its targets, frames what it's about to use, ripples on click, and floats away when you're idle. It can **mark** things on screen for you with a hand-drawn circle and arrow ("where is…").
 - **Sees the whole Mac.**
   - Native apps through the Accessibility tree (Electron apps too).
@@ -231,7 +238,7 @@ Expect: the page title shows name=Amrit Nigam
 
 From the terminal: `clinqy workflow <name> "Input=value"`. A step that breaks is healed by the model, and the workflow is saved with the fix.
 
-**How runs are going.** `Clinqy stats [days]` gives the success rate (overall and per app), the slowest runs, a per-turn breakdown of model time vs action time (from `agent.log`), and the most common failure reasons and failed steps. `Clinqy stats --last` shows the latest run turn by turn.
+**How runs are going.** `Clinqy stats [days]` gives the success rate (overall and per app), the slowest runs, a per-turn breakdown of model time vs action time (from `agent.log`), and the most common failure reasons and failed steps. `Clinqy stats --last` shows the latest run turn by turn. A **Clicks** section shows how often the first click worked, which fallbacks rescued the rest, and the sites and apps where clicks struggle most. What it learns about each site is kept in `~/Library/Application Support/Clinqy/click-hints.json`.
 
 ## MCP server (Claude Code, Codex, Cursor…)
 
@@ -353,6 +360,7 @@ tests/run.sh [filter]                 # end-to-end in Chrome against local pages
 - a Pay button, both declined and confirmed
 - reading a PDF
 - Watch & learn followed by running the learned skill
+- clicks that need more than a centre click (`clicks.html`): a dropdown that loads its options as it scrolls, an upload button that makes its file field on the spot, a button half-covered by a badge, and a button the page keeps re-rendering
 
 Test runs aren't saved to History or memory.
 
@@ -389,7 +397,8 @@ Sources/Clinqy/
   Applications.swift                 job-application tracker
   MCPServer.swift    `Clinqy mcp`: stdio MCP server relaying to the running app
   Watch.swift        wait for text to appear/vanish via AXObserver notifications (polling fallback)
-  Stats.swift        `Clinqy stats`: runs.jsonl + per-turn timings from agent.log
+  Stats.swift        `Clinqy stats`: runs.jsonl + per-turn timings and click outcomes from agent.log
+  Clicks.swift       click log lines and per-site memory of which way of clicking works
   Replay.swift       offline replay of recorded page snapshots + replies (tests/replay)
 bin/clinqy        the command-line entry point (qa · run · workflow · workflows)
 tests/qa/            example plain-English QA tests (compiled scripts in tests/qa/.clinqy/)

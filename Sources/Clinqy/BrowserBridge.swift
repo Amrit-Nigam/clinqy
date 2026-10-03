@@ -159,12 +159,14 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.7.0"
-    private var reloadAsked: Set<String> = []
+    static let extensionVersion = "1.8.6"
+    /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
+    /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
+    private var reloadAsked: [String: Int] = [:]
 
     private func checkVersion(_ version: String, on conn: NWConnection) {
-        guard version != Self.extensionVersion, !reloadAsked.contains(version) else { return }
-        reloadAsked.insert(version)
+        guard version != Self.extensionVersion, reloadAsked[version, default: 0] < 3 else { return }
+        reloadAsked[version, default: 0] += 1
         Agent.writeLog("browser extension v\(version) connected, app expects v\(Self.extensionVersion): reloading it")
         Task { _ = try? await request(conn, ["cmd": "reload"], timeout: 5) }
     }

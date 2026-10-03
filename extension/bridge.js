@@ -1,6 +1,9 @@
 // Connects to the Clinqy app on this Mac and runs its requests against the active tab — including the pages
 // embedded in it (Greenhouse/Lever job forms, payment boxes), whose elements are listed with the rest.
 const URL_ = "ws://127.0.0.1:47823";
+// This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
+// a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
+const SCRIPT_VERSION = "1.8.6";
 let socket = null;
 let retry = 1000;
 
@@ -9,7 +12,7 @@ function connect() {
   try { socket = new WebSocket(URL_); } catch { return; }
   socket.onopen = () => {
     retry = 1000;
-    send({ type: "hello", agent: navigator.userAgent, version: chrome.runtime.getManifest().version });
+    send({ type: "hello", agent: navigator.userAgent, version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version });
   };
   socket.onmessage = async (event) => {
     let msg;
@@ -46,6 +49,40 @@ const runner = async (n, a) => {
     if (!f) return { __error: "no page function " + n };
     return { __ok: await f(...a) };
   } catch (e) { return { __error: String(e && e.message || e) }; }
+};
+
+// Runs in the page's own world (scripts there create and click file inputs, which the extension's world can't
+// intercept): clicks the element page.js marked, catching the file input it asks for, and gives it the file.
+const pickerUpload = async (name, type, b64) => {
+  const el = document.querySelector("[data-clinqy-up]");
+  if (!el) return { ok: false, why: "the upload button is gone" };
+  el.removeAttribute("data-clinqy-up");
+  const proto = HTMLInputElement.prototype;
+  const click = proto.click, picker = proto.showPicker;
+  let caught = null;
+  proto.click = function (...a) { if (this.type === "file") { caught = this; return; } return click.apply(this, a); };
+  if (picker) proto.showPicker = function (...a) { if (this.type === "file") { caught = this; return; } return picker.apply(this, a); };
+  // A label or real click reaching a file input opens the picker by default: catch that too.
+  const onClick = (e) => { const t = e.composedPath ? e.composedPath()[0] : e.target; if (t && t.tagName === "INPUT" && t.type === "file") { caught = t; e.preventDefault(); } };
+  document.addEventListener("click", onClick, true);
+  try {
+    el.click();
+    for (let k = 0; k < 30 && !caught; k++) await new Promise((r) => setTimeout(r, 50));
+  } finally {
+    proto.click = click;
+    if (picker) proto.showPicker = picker;
+    document.removeEventListener("click", onClick, true);
+  }
+  if (!caught) return { ok: false, why: "clicking it didn't ask for a file" };
+  const bin = atob(b64), bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const dt = new DataTransfer();
+  if (caught.multiple) for (const f of caught.files || []) dt.items.add(f);
+  dt.items.add(new File([bytes], name, { type: type || "application/octet-stream", lastModified: Date.now() }));
+  caught.files = dt.files;
+  caught.dispatchEvent(new Event("input", { bubbles: true }));
+  caught.dispatchEvent(new Event("change", { bubbles: true }));
+  return { ok: caught.files.length > 0, files: [...caught.files].map((f) => f.name) };
 };
 
 async function inject(target) {
@@ -234,7 +271,7 @@ async function handle(msg) {
   // A command may name its tab (a snapshot of a background tab, acting on a tab the app pinned); else the one in front.
   const tab = msg.tabId != null && msg.cmd !== "goBack" ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
-  if (msg.cmd === "version") return { version: chrome.runtime.getManifest().version };
+  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
   if (msg.cmd === "selection") {
     const win = await chrome.windows.get(tab.windowId);
     if (!/^(https?|file):/.test(tab.url || "")) return { focused: !!win.focused, text: "" };
@@ -287,14 +324,28 @@ async function handle(msg) {
       }
     }
     case "click": case "focus": case "value": case "isActive": case "prepare": case "state": case "chosen":
+    case "alive": case "focusFor":
       return await indexed(msg.cmd);
+    case "activeOption": return await indexed("activeOption", [msg.want || ""]);
     case "locate": {
       // In top-page coordinates, so a frame's element (LinkedIn's Easy Apply form) is placed right too.
       const { frameId, local } = await route(tab.id, msg.index);
       const r = await call(tab.id, frameId, "locate", [local]);
       const o = ((await mapFor(tab.id)).offsets || {})[frameId];
       if (!o) return { ...r, hit: frameId === 0 && r.hit };
-      return { ...r, x: r.x + o.x, y: r.y + o.y };
+      return { ...r, x: r.x + o.x, y: r.y + o.y, px: r.px + o.x, py: r.py + o.y };
+    }
+    case "uploadVia": {
+      // The site's own upload button: click it in the page's world with file inputs' click()/showPicker() caught,
+      // so the file goes into the input it asks for (often one it creates on the spot) and no Mac picker opens.
+      const { frameId, local } = await route(tab.id, msg.index);
+      await call(tab.id, frameId, "markUpload", [local]);
+      let res;
+      try {
+        [res] = await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [frameId] }, world: "MAIN",
+                                                       func: pickerUpload, args: [msg.name, msg.type, msg.data] });
+      } catch (e) { throw new Error("the page can't be scripted: " + String(e && e.message || e)); }
+      return (res && res.result) || { ok: false, why: "the page didn't answer" };
     }
     case "fill": return await indexed("fill", [msg.text]);
     case "waitText": return await call(tab.id, 0, "waitText", [msg.text, !!msg.gone, Number(msg.ms) || 10000]);
@@ -310,14 +361,19 @@ async function handle(msg) {
       }
     }
     case "findOption": {
-      // The open list may be in the page or in an embedded form; report its box in top-page coordinates.
+      // The open list may be in the page or in an embedded form; report its box in top-page coordinates. The
+      // dropdown's own frame is asked with its local index (so its own list is searched first).
       const offsets = (await mapFor(tab.id)).offsets || {};
+      let owner = null;
+      if (msg.index != null && msg.index >= 0) { try { owner = await route(tab.id, msg.index); } catch {} }
       let fallback = null;
-      for (const { frameId, result } of (await callAll(tab.id, "findOption", [msg.text])).sort((a, b) => a.frameId - b.frameId)) {
+      const answers = owner ? [{ frameId: owner.frameId, result: await call(tab.id, owner.frameId, "findOption", [msg.text, owner.local]).catch(() => ({ found: false, options: [] })) }] : [];
+      if (!answers.length || !answers[0].result.found) answers.push(...(await callAll(tab.id, "findOption", [msg.text])).sort((a, b) => a.frameId - b.frameId));
+      for (const { frameId, result } of answers) {
         if (frameId !== 0 && !offsets[frameId]) continue;   // a frame we can't place on screen
         if (result.found) {
-          const o = offsets[frameId];
-          return { ...result, x: result.x + o.x, y: result.y + o.y };
+          const o = offsets[frameId] || { x: 0, y: 0 };
+          return { ...result, x: result.x + o.x, y: result.y + o.y, px: result.px + o.x, py: result.py + o.y };
         }
         if (!fallback || (result.options || []).length > (fallback.options || []).length) fallback = result;
       }

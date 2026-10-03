@@ -17,7 +17,9 @@ enum AgentPrompt {
     {"do":"open_app","name":"WhatsApp"}                   open an app the way a person does (clicks its Dock icon, or Spotlight)
     {"do":"open_url","url":"https://google.com"}           go to a website: opens a new tab in the browser and types the address
     {"do":"click","id":"e12"}                              click an element
-    {"do":"click","x":640,"y":210}                         click a spot on the last screenshot (pixels) — only when there's no id for it
+    {"do":"click","text":"Archive"}                        click text shown on the window (found by text recognition) when it has no id —
+                                                           steadier than x/y in apps that list few elements (WhatsApp, Electron apps); "nth":2 for the 2nd match
+    {"do":"click","x":640,"y":210}                         click a spot on the last screenshot (pixels) — only when there's no id or text for it
     {"do":"type","id":"e7","text":"...","submit":true}     click into e7 and type (replaces its text); submit presses Return. Omit id to type where the caret is —
                                                            that also reaches native dialogs over the browser (the file picker's cmd+shift+g "Go to folder" box)
                                                            and focused controls that aren't text boxes (an open listbox, a date part)
@@ -57,7 +59,8 @@ enum AgentPrompt {
                                                            trim (start/end: seconds or "1:30") · compress (level:"light"/"recommended"/"extreme") · to_mp4 ·
                                                            to_audio (→ .m4a) · info (length, size, resolution). Optional out:"<path>"; saves next to the original.
     {"do":"upload","id":"w12","file":"~/Downloads/resume stuff/Amrit_Resume_C.pdf"}   put a file into a web page's upload field
-                                                           directly — no Mac file picker. id = the upload/Attach button or field (omit when the page has one).
+                                                           directly — no Mac file picker. id = the upload/Attach button or field (omit when the page has one); with
+                                                           the button's id it also works through the site's own button and the Mac file picker it opens.
                                                            If it fails (Google Forms uploads go through Google Drive), use the site's own button.
     {"do":"review"}                                        read every question on the page's form with its current answer and show the user a checklist
                                                            (empty required ones flagged): a check that a long form is complete before its Submit.

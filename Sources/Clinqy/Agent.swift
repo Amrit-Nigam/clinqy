@@ -1071,7 +1071,8 @@ final class Agent: ObservableObject {
             // Never take over one of the user's tabs: reuse only a tab this task opened itself, or an empty
             // new-tab page; anything else gets a fresh tab.
             let bridge = BrowserBridge.shared
-            let before = context.app.map(Launcher.isBrowser) == true ? await bridge.activeTab() : nil
+            // Ask this browser, not whichever one has the extension too (Arc and Chrome both connected).
+            let before = context.app.map(Launcher.isBrowser) == true ? await bridge.activeTab(in: context.app) : nil
             let emptyTab = before.map { Self.isNewTabPage($0.url) } ?? false
             // Each site gets its own tab ("open github and wikipedia" = two tabs); staying on the same site in our
             // own tab (youtube.com → a YouTube search) reuses it.
@@ -1080,7 +1081,7 @@ final class Agent: ObservableObject {
             let reuse = before != nil && (emptyTab || (before?.id == ownedTab && sameSite))
             let browser = await hand.openURL(url, current: context.app, newTab: !reuse)
             openedTab = true
-            if let before, let after = await bridge.activeTab() {
+            if let before, let after = await bridge.activeTab(in: browser ?? context.app) {
                 log("    tab: \(reuse ? "reused" : "new") · before #\(before.id) \(before.url.prefix(50)) · now #\(after.id)")
                 if !reuse, after.id == before.id, !Self.isNewTabPage(before.url) {
                     log("    tab: the user's tab was changed — restoring it and opening a separate tab")
@@ -1111,48 +1112,75 @@ final class Agent: ObservableObject {
             return end(line, .init(ok: true, summary: "opened \(url.absoluteString) in \(context.app?.cleanName ?? "the browser")"))
 
         case "click" where Self.isWebRef(action["id"]):
-            guard let (el, rect) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
+            guard let (el, rect) = await liveWebTarget(action["id"], &context) else { return fail(goneMessage(action["id"])) }
             let line = begin("Click \(el.text.prefix(32))")
             let submits = Self.isFormSubmit(el.text) || Safety.needsConfirmation(label: el.text, request: request) != nil
             if let why = await approve(el.text, role: el.role, page: context.page) { return end(line, fail(why)) }
             if let app = context.app { await Launcher.bringToFront(app) }
             let urlBefore = el.role == "link" ? await BrowserBridge.shared.activeTab(in: context.app)?.url : nil
-            // A real mouse click, like a person: many sites (Google Forms, React apps) ignore script clicks.
-            // If nothing changed and it wasn't covered, fall back to clicking through the page.
+            // A real mouse click, like a person: many sites (Google Forms, React apps) ignore script clicks. Each way of
+            // clicking is checked for an effect before the next is tried: mouse, then a click through the page, then
+            // (for toggles, tabs and options, whose state shows whether it took) focus + a key. A site where the mouse
+            // keeps doing nothing gets the page click first.
             let page = context.page!
+            let host = Clicks.host(page.url)
             let state = { (try? await BrowserBridge.shared.perform("state", on: page, ["index": el.index]))?["sig"] as? String }
             let before = await state()
-            // Where it is now: the listed position goes stale when a popup re-lays out, and a mouse click that
-            // misses lands on the backdrop (LinkedIn's Easy Apply then closes and asks to save the application).
+            // Did it do anything? Unknown (the state couldn't be read) counts as yes, as a person wouldn't click twice.
+            let tookEffect = { () async -> Bool in
+                guard let before else { return true }
+                for k in 0..<4 {
+                    if await state() != before { return true }
+                    if k < 3 { try? await Task.sleep(for: .milliseconds(120)) }
+                }
+                return false
+            }
+            // Where it is now, once it has stopped moving, and a spot on it that isn't covered: the listed position goes
+            // stale when a popup re-lays out, and a mouse click that misses lands on the backdrop (LinkedIn's Easy Apply
+            // then closes and asks to save the application).
             var point = CGPoint(x: rect.midX, y: rect.midY), mouse = true
             if let spot = try? await BrowserBridge.shared.perform("locate", on: page, ["index": el.index]),
                let web = context.webArea, let hit = spot["hit"] as? Bool {
-                func d(_ k: String) -> Double { (spot[k] as? NSNumber)?.doubleValue ?? 0 }
+                func d(_ k: String) -> Double? { (spot[k] as? NSNumber)?.doubleValue }
                 let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
-                point = CGPoint(x: web.minX + (d("x") + d("w") / 2) * sx, y: web.minY + (d("y") + d("h") / 2) * sy)
+                let px = d("px") ?? ((d("x") ?? 0) + (d("w") ?? 0) / 2), py = d("py") ?? ((d("y") ?? 0) + (d("h") ?? 0) / 2)
+                point = CGPoint(x: web.minX + px * sx, y: web.minY + py * sy)
                 mouse = hit && web.contains(point)
             }
-            var after = before
             // Something of another app's over that spot (a notification, a popup): click through the page instead.
             let pid = context.app?.processIdentifier ?? 0
             if mouse, let why = Hand.hitMismatch(at: point, pid: pid, window: nil) {
                 log("    \(why) — clicking through the page")
                 mouse = false
             }
-            if mouse {
-                traceClick(point, in: context.app)
-                await hand.click(at: point)
-                after = await state()
-                for _ in 0..<3 where before != nil && before == after {
-                    try? await Task.sleep(for: .milliseconds(120))
-                    after = await state()
+            var order = mouse ? ["mouse", "script"] : ["script"]
+            if mouse, Clicks.prefersScript(host) { order = ["script", "mouse"] }
+            var method = "", worked = false, tries = 0, mouseTried = false, mouseWorked = false, scriptWorked = false
+            for way in order {
+                tries += 1
+                method = way
+                if way == "mouse" {
+                    mouseTried = true
+                    traceClick(point, in: context.app)
+                    await hand.click(at: point)
+                } else {
+                    do { _ = try await BrowserBridge.shared.perform("click", on: page, ["index": el.index]) }
+                    catch { return end(line, fail(error.localizedDescription)) }
                 }
+                worked = await tookEffect()
+                if way == "mouse" { mouseWorked = worked } else { scriptWorked = worked }
+                if worked { break }
             }
-            if !mouse || (before != nil && before == after) {
-                do { _ = try await BrowserBridge.shared.perform("click", on: page, ["index": el.index]) }
-                catch { return end(line, fail(error.localizedDescription)) }
-                try? await Task.sleep(for: .milliseconds(250))
+            let keyable: Set<String> = ["checkbox", "radio", "switch", "tab", "option", "menuitemcheckbox", "menuitemradio", "treeitem"]
+            if !worked, !submits, keyable.contains(el.role),
+               (try? await BrowserBridge.shared.perform("focusFor", on: page, ["index": el.index]))?["focused"] as? Bool == true {
+                tries += 1
+                method = "key"
+                hand.press(["checkbox", "switch", "menuitemcheckbox", "radio"].contains(el.role) ? "space" : "return")
+                worked = await tookEffect()
             }
+            Clicks.note(host, mouseTried: mouseTried, mouseWorked: mouseWorked, scriptWorked: scriptWorked)
+            log(Clicks.line(kind: "web", place: host, method: method, worked: worked, tries: tries))
             buddy.clearHighlight()
             if submits {
                 // Sent: undoing the typing that went into it would only confuse the page.
@@ -1165,7 +1193,8 @@ final class Agent: ObservableObject {
             } else if let urlBefore, let now = await BrowserBridge.shared.activeTab(in: context.app)?.url, now != urlBefore {
                 registerNavigationUndo(line, label: "Go back from \(URL(string: now)?.host ?? "that page")", closing: nil, app: context.app)
             }
-            return end(line, .init(ok: true, summary: "clicked \(el.role) \(el.text.prefix(60).debugDescription) on the page"))
+            return end(line, .init(ok: true, summary: "clicked \(el.role) \(el.text.prefix(60).debugDescription) on the page"
+                                   + (worked ? "" : " (nothing on the page visibly changed, even after trying other ways to click it)")))
 
         case "application":
             // The application tracker: find before applying, record after filling/sending.
@@ -1194,27 +1223,44 @@ final class Agent: ObservableObject {
 
         case "upload" where context.page != nil:
             // Straight into the page's upload field (no Mac file picker): the extension builds the file from its bytes.
+            // A site with its own upload button (no field until it's clicked) gets the file through that button's
+            // request for one; failing that, the Mac file picker it opens is driven like a person would.
             guard let path = (action["file"] ?? action["path"]) as? String else { return fail("upload needs file") }
             let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
             guard let data = try? Data(contentsOf: url) else { return fail("can't read \(url.path)") }
             guard data.count < 15_000_000 else { return fail("\(url.lastPathComponent) is too big to upload this way (\(data.count / 1_000_000) MB)") }
-            let page = context.page!
-            var index = -1
+            var target: (BrowserBridge.PageElement, CGRect)?
             if Self.isWebRef(action["id"]) {
-                guard let (el, _) = webTarget(action["id"], context) else { return fail("page element \(action["id"] ?? "?") not found; look again") }
-                index = el.index
+                guard let found = await liveWebTarget(action["id"], &context) else { return fail(goneMessage(action["id"])) }
+                target = found
             }
+            let page = context.page!
+            let index = target?.0.index ?? -1
             let line = begin("Upload \(url.lastPathComponent)")
             let type = UTType(filenameExtension: url.pathExtension)?.preferredMIMEType ?? "application/octet-stream"
+            let args: [String: Any] = ["index": index, "name": url.lastPathComponent, "type": type, "data": data.base64EncodedString()]
+            var why = ""
             do {
-                let r = try await BrowserBridge.shared.perform("upload", on: page, ["index": index, "name": url.lastPathComponent, "type": type,
-                                                                                    "data": data.base64EncodedString()], timeout: 20)
+                let r = try await BrowserBridge.shared.perform("upload", on: page, args, timeout: 20)
                 guard r["ok"] as? Bool == true else { return end(line, fail("the page didn't take the file")) }
                 try? await Task.sleep(for: .milliseconds(800))   // sites upload/parse it (Greenhouse fills fields from a resume)
                 return end(line, .init(ok: true, summary: "attached \(url.lastPathComponent) to the upload field (now holds: \((r["files"] as? [String] ?? []).joined(separator: ", ")))"))
             } catch {
-                return end(line, fail("\(error.localizedDescription) — if the site uses its own picker (Google Forms uses Google Drive), click its upload button instead"))
+                why = error.localizedDescription
             }
+            guard let (el, rect) = target else {
+                return end(line, fail("\(why) — give the id of the site's upload button (upload goes through it), or click it if it opens its own picker (Google Forms uses Google Drive)"))
+            }
+            if let r = try? await BrowserBridge.shared.perform("uploadVia", on: page, args, timeout: 20), r["ok"] as? Bool == true {
+                try? await Task.sleep(for: .milliseconds(800))
+                log("    upload: through the page's own button")
+                return end(line, .init(ok: true, summary: "attached \(url.lastPathComponent) through \(el.text.prefix(40).debugDescription) (now holds: \((r["files"] as? [String] ?? []).joined(separator: ", ")))"))
+            }
+            if let app = context.app, let done = await uploadThroughPicker(url, at: CGPoint(x: rect.midX, y: rect.midY), app: app) {
+                return end(line, done)
+            }
+            return end(line, fail("\(why). Clicking \(el.text.prefix(40).debugDescription) didn't ask for a file or open the Mac file picker — "
+                                  + "if it opened the site's own menu or picker (Google Drive, Dropbox…), choose its \"from this device\" option there"))
 
         case "review" where context.page != nil:
             return await reviewForm(context.page!)
@@ -1227,8 +1273,8 @@ final class Agent: ObservableObject {
             // option by its text, click it, then check the field shows it. Works for native selects, Google Forms
             // listboxes and React-style comboboxes (Greenhouse, Lever…).
             guard let want = (action["option"] ?? action["text"]) as? String, !want.isEmpty else { return fail("choose needs option") }
-            guard let (el, rect) = webTarget(action["id"], context), let page = context.page, let app = context.app,
-                  let web = context.webArea else { return fail("page element \(action["id"] ?? "?") not found; look again") }
+            guard let (el, rect) = await liveWebTarget(action["id"], &context), let page = context.page, let app = context.app,
+                  let web = context.webArea else { return fail(goneMessage(action["id"])) }
             let line = begin("Choose “\(want.prefix(40))”")
             await Launcher.bringToFront(app)
             await buddy.travel(to: CGPoint(x: rect.midX, y: rect.midY), framing: rect)
@@ -1253,27 +1299,39 @@ final class Agent: ObservableObject {
                 AXEngine.targetPid = nil
             }
             var option: [String: Any]?
+            var lastError: Error?
             for _ in 0..<10 {
                 try? await Task.sleep(for: .milliseconds(200))
-                option = try? await BrowserBridge.shared.perform("findOption", on: page, ["text": want])
+                do { option = try await BrowserBridge.shared.perform("findOption", on: page, ["text": want, "index": el.index], timeout: 6) }
+                catch { lastError = error }
                 if option?["found"] as? Bool == true { break }
             }
-            guard let option, option["found"] as? Bool == true,
-                  let x = (option["x"] as? NSNumber)?.doubleValue, let y = (option["y"] as? NSNumber)?.doubleValue,
-                  let w = (option["w"] as? NSNumber)?.doubleValue, let h = (option["h"] as? NSNumber)?.doubleValue else {
+            if option?["found"] as? Bool != true, let lastError { log("    findOption: \(lastError.localizedDescription)") }
+            let picked: String
+            if let option, option["found"] as? Bool == true,
+               let x = (option["x"] as? NSNumber)?.doubleValue, let y = (option["y"] as? NSNumber)?.doubleValue,
+               let w = (option["w"] as? NSNumber)?.doubleValue, let h = (option["h"] as? NSNumber)?.doubleValue {
+                let px = (option["px"] as? NSNumber)?.doubleValue ?? x + w / 2, py = (option["py"] as? NSNumber)?.doubleValue ?? y + h / 2
+                let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
+                if let why = await hand.click(at: CGPoint(x: web.minX + px * sx, y: web.minY + py * sy), pid: app.processIdentifier) {
+                    hand.press("esc")
+                    return end(line, fail(why))
+                }
+                picked = option["text"] as? String ?? want
+                log(Clicks.line(kind: "option", place: Clicks.host(page.url), method: "mouse", worked: true, tries: 1))
+            } else if let viaKeys = await chooseWithKeys(want, el: el, page: page) {
+                // No list the page shows as options (or not the one wanted): the arrow keys walk the dropdown's choices.
+                picked = viaKeys
+                log(Clicks.line(kind: "option", place: Clicks.host(page.url), method: "key", worked: true, tries: 2))
+            } else {
                 hand.press("esc")
+                log(Clicks.line(kind: "option", place: Clicks.host(page.url), method: "none", worked: false, tries: 2))
                 let seen = (option?["options"] as? [String]) ?? []
                 return end(line, fail("no option like \(want.debugDescription)\(seen.isEmpty ? " appeared" : "; the options are: " + seen.joined(separator: " | "))"))
-            }
-            let sx = web.width / page.viewport.width, sy = web.height / page.viewport.height
-            if let why = await hand.click(at: CGPoint(x: web.minX + (x + w / 2) * sx, y: web.minY + (y + h / 2) * sy), pid: app.processIdentifier) {
-                hand.press("esc")
-                return end(line, fail(why))
             }
             try? await Task.sleep(for: .milliseconds(350))
             let now = await current()
             buddy.clearHighlight()
-            let picked = option["text"] as? String ?? want
             if !now.isEmpty, !AXEngine.similar(now, picked), !now.lowercased().contains(picked.lowercased()) {
                 return end(line, fail("clicked \(picked.debugDescription) but the field shows \(now.debugDescription)"))
             }
@@ -1281,8 +1339,8 @@ final class Agent: ObservableObject {
 
         case "type" where Self.isWebRef(action["id"]):
             guard let text = action["text"] as? String else { return fail("type needs text") }
-            guard let (el, rect) = webTarget(action["id"], context), let page = context.page, let app = context.app
-            else { return fail("page element \(action["id"] ?? "?") not found; look again") }
+            guard let (el, rect) = await liveWebTarget(action["id"], &context), let page = context.page, let app = context.app
+            else { return fail(goneMessage(action["id"])) }
             let line = begin("Type “\(text.prefix(40))”")
             await Launcher.bringToFront(app)
             await buddy.travel(to: CGPoint(x: rect.midX, y: rect.midY), framing: rect)
@@ -1481,6 +1539,46 @@ final class Agent: ObservableObject {
             if !source.hasPrefix("the screen") { readText = "\(source):\n\(text)" }
             return end(line, .init(ok: true, summary: "text from \(source):\n\(text)"))
 
+        case "click" where action["id"] == nil && action["x"] == nil && action["text"] is String:
+            // By the text it shows, found on the window with text recognition: for apps whose buttons and rows the
+            // Accessibility tree doesn't show (WhatsApp, Electron and Catalyst apps, canvases), steadier than x/y guesses.
+            guard let app = context.app, let want = (action["text"] as? String)?.trimmingCharacters(in: .whitespaces), !want.isEmpty else {
+                return fail("click needs an id, a text or x/y")
+            }
+            let line = begin("Click “\(want.prefix(32))”")
+            if let why = staleApp(context) { return end(line, fail(why)) }
+            if let why = await approve(want, role: "button", page: context.page) { return end(line, fail(why)) }
+            await Launcher.bringToFront(app)
+            guard let boxes = await Reader.textBoxes(app, want: want) else { return end(line, fail("can't read the window (Screen Recording permission?)")) }
+            let key = { (t: String) in t.lowercased().folding(options: .diacriticInsensitive, locale: nil).trimmingCharacters(in: .whitespacesAndNewlines.union(.punctuationCharacters)) }
+            let w = key(want)
+            // Exactly that text first, then a line that holds it as words; top to bottom, left to right.
+            var hits = boxes.filter { key($0.text) == w }
+            if hits.isEmpty {
+                hits = boxes.filter { (" " + key($0.text) + " ").contains(" " + w + " ") }
+            }
+            hits.sort { abs($0.rect.minY - $1.rect.minY) > 6 ? $0.rect.minY < $1.rect.minY : $0.rect.minX < $1.rect.minX }
+            // The same spot found twice (the part and its whole line): keep one.
+            var spots: [(text: String, rect: CGRect)] = []
+            for h in hits where !spots.contains(where: { $0.rect.intersects(h.rect) }) { spots.append(h) }
+            let nth = max(1, (action["nth"] as? NSNumber)?.intValue ?? 1)
+            guard spots.count >= nth else {
+                let near = boxes.map(\.text).filter { AXEngine.similar($0, want) }.prefix(5)
+                return end(line, fail("no text \(want.debugDescription) on the window\(near.isEmpty ? "" : "; similar: " + near.map(\.debugDescription).joined(separator: ", "))"))
+            }
+            let spot = spots[nth - 1]
+            let point = CGPoint(x: spot.rect.midX, y: spot.rect.midY)
+            await buddy.travel(to: point, framing: spot.rect)
+            traceClick(point, in: app)
+            let fingerprint = await AXEngine.fingerprintAsync(of: app)
+            if let why = await hand.click(at: point, pid: app.processIdentifier) { return end(line, fail(why)) }
+            let didChange = await changed(app, from: fingerprint, ms: 600)
+            context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+            buddy.clearHighlight()
+            log(Clicks.line(kind: "text", place: app.cleanName ?? "", method: "real", worked: didChange, tries: 1))
+            let more = spots.count > nth ? " (\(spots.count) places show it; this was #\(nth) from the top — add \"nth\" for another)" : ""
+            return end(line, .init(ok: true, summary: "clicked the text \(spot.text.debugDescription)\(more)\(didChange ? "" : " (no visible change)")"))
+
         case "click" where action["id"] == nil:
             // By position on the last screenshot, for things with no element (canvas, custom-drawn UI, text links).
             guard let x = (action["x"] as? NSNumber)?.doubleValue, let y = (action["y"] as? NSNumber)?.doubleValue,
@@ -1505,6 +1603,7 @@ final class Agent: ObservableObject {
             if let why = await hand.click(el, in: app, fingerprint: context.fingerprint) { return end(line, fail(why)) }
             let didChange = await changed(app, from: context.fingerprint, ms: 600)
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
+            log(Clicks.line(kind: "ax", place: app.cleanName ?? "", method: hand.lastMethod, worked: didChange, tries: hand.lastMethod == "real" ? 2 : 1))
             buddy.clearHighlight()
             if Self.isFormSubmit(el.label) || Safety.needsConfirmation(label: el.label, request: request) != nil {
                 StepUndo.shared.clear()   // sent: putting back what was typed into it would only confuse
@@ -2286,6 +2385,8 @@ final class Agent: ObservableObject {
         } else if kind == "click", let x = (action["x"] as? NSNumber)?.doubleValue, let y = (action["y"] as? NSNumber)?.doubleValue,
                   let p = Screenshot.screenPoint(x: x, y: y) {
             rect = CGRect(x: p.x - 18, y: p.y - 18, width: 36, height: 36)
+        } else if kind == "click", let shown = action["text"] as? String {
+            name = shown
         }
         let target = name.map { " · \($0.prefix(30))" } ?? ""
         let line = begin("Would \(what)\(target)")
@@ -2311,6 +2412,84 @@ final class Agent: ObservableObject {
                           width: el.rect.width * sx, height: el.rect.height * sy)
         lastTarget = .init(kind: "web", role: el.role, label: el.text)
         return (el, rect.intersection(web).isNull ? rect : rect.intersection(web))
+    }
+
+    /// `webTarget`, checked against the live page first: when the page re-rendered the element past what the extension
+    /// can re-find, the page is listed again and the same element used (by identity, else the same role with a
+    /// similar name, nearest to where it was). nil = it's really gone.
+    private func liveWebTarget(_ ref: Any?, _ context: inout ActionContext) async -> (BrowserBridge.PageElement, CGRect)? {
+        guard let (el, rect) = webTarget(ref, context), let page = context.page else { return nil }
+        // Couldn't ask (an older extension, a busy page): carry on as before.
+        guard (try? await BrowserBridge.shared.perform("alive", on: page, ["index": el.index]))?["ok"] as? Bool == false else { return (el, rect) }
+        await relist(&context)
+        guard let now = context.page else { return nil }
+        let far = { (e: BrowserBridge.PageElement) in hypot(e.rect.midX - el.rect.midX, e.rect.midY - el.rect.midY) }
+        let index = Self.rematch(el.index, from: page, to: now)
+            ?? now.elements.filter { $0.role == el.role && AXEngine.similar($0.text, el.text) }.min { far($0) < far($1) }?.index
+        guard let index, let found = webTarget("w\(index)", context) else {
+            log("    w\(el.index) (\(el.role) \(el.text.prefix(40).debugDescription)) is gone and nothing like it is listed now")
+            return nil
+        }
+        log("    w\(el.index) was re-rendered: acting on w\(index) (\(found.0.role) \(found.0.text.prefix(40).debugDescription))")
+        return found
+    }
+
+    /// Picks a dropdown's option with the keyboard, as a person would when the list can't be clicked: focus it, then
+    /// arrow down through the choices until the highlighted one matches, and press Return. The choice's text, or nil
+    /// (the dropdown doesn't follow the arrow keys, or the end of the list came first).
+    private func chooseWithKeys(_ want: String, el: BrowserBridge.PageElement, page: BrowserBridge.Page) async -> String? {
+        guard (try? await BrowserBridge.shared.perform("focusFor", on: page, ["index": el.index]))?["focused"] as? Bool == true else { return nil }
+        var last = "", repeats = 0
+        for k in 0..<60 {
+            hand.press("down")
+            try? await Task.sleep(for: .milliseconds(70))
+            guard let r = try? await BrowserBridge.shared.perform("activeOption", on: page, ["index": el.index, "want": want]) else { return nil }
+            let text = r["text"] as? String ?? ""
+            if text.isEmpty { if k >= 2 { return nil }; continue }   // nothing highlights: not a keyboard list
+            if ((r["score"] as? NSNumber)?.doubleValue ?? 0) >= 0.5 {
+                hand.press("return")
+                return text
+            }
+            repeats = text == last ? repeats + 1 : 0
+            if repeats >= 2 { return nil }   // the bottom of the list
+            last = text
+        }
+        return nil
+    }
+
+    /// The last way to upload: click the site's button for real, and when the Mac's Open panel comes up, go to the
+    /// file with cmd+shift+g like a person would. nil = no panel opened.
+    private func uploadThroughPicker(_ file: URL, at point: CGPoint, app: NSRunningApplication) async -> ActionResult? {
+        guard await hand.click(at: point, pid: app.processIdentifier) == nil else { return nil }
+        let panelUp = { Self.dialogInFront(app) || (Self.systemFocus().map { $0.pid != app.processIdentifier } ?? false) }
+        var up = false
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(150))
+            if panelUp() { up = true; break }
+        }
+        guard up else { return nil }
+        log("    upload: through the Mac file picker")
+        try? await Task.sleep(for: .milliseconds(300))
+        hand.press("cmd+shift+g")
+        try? await Task.sleep(for: .milliseconds(600))
+        AXEngine.paste(file.path)
+        try? await Task.sleep(for: .milliseconds(300))
+        hand.press("return")   // go to the file
+        try? await Task.sleep(for: .milliseconds(900))
+        hand.press("return")   // open it
+        for _ in 0..<15 {
+            try? await Task.sleep(for: .milliseconds(200))
+            if !panelUp() {
+                try? await Task.sleep(for: .milliseconds(600))
+                return .init(ok: true, summary: "chose \(file.lastPathComponent) in the Mac file picker the site opened (check the page shows it)")
+            }
+        }
+        return .init(ok: false, summary: "FAILED: the Mac file picker is still open after going to \(file.path); look at it (the file may be greyed out "
+                     + "because the site doesn't accept that type)")
+    }
+
+    private func goneMessage(_ ref: Any?) -> String {
+        "page element \(ref ?? "?") isn't on the page any more and nothing like it is listed now (the page changed); look again"
     }
 
     private func refresh(_ context: inout ActionContext) async {

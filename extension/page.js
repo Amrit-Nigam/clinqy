@@ -33,14 +33,93 @@ function deepActive() {
   return a;
 }
 
+// The element on top at a viewport point, looking inside shadow roots.
+function topAt(x, y) {
+  let top = document.elementFromPoint(x, y);
+  for (let k = 0; top && k < 10; k++) { const s = shadowOf(top); const inner = s && s.elementFromPoint(x, y); if (!inner || inner === top) break; top = inner; }
+  return top;
+}
+
 // Would a real click at the element's centre land on it (not on a sticky footer, backdrop or popup over it)?
 function hitAt(el) {
   const r = el.getBoundingClientRect();
   const cx = r.left + r.width / 2, cy = r.top + r.height / 2;
   if (r.width < 1 || r.height < 1 || cx < 0 || cy < 0 || cx >= innerWidth || cy >= innerHeight) return false;
-  let top = document.elementFromPoint(cx, cy);
-  for (let k = 0; top && k < 10; k++) { const s = shadowOf(top); const inner = s && s.elementFromPoint(cx, cy); if (!inner || inner === top) break; top = inner; }
+  const top = topAt(cx, cy);
   return !!top && (within(el, top) || within(top, el));
+}
+
+// A viewport point where a real click lands on the element: the centre, else the first of a few spots around it
+// that isn't covered (a badge over a button's middle, a half-hidden row). null = covered everywhere.
+function hitPoint(el) {
+  const r = el.getBoundingClientRect();
+  if (r.width < 1 || r.height < 1) return null;
+  const spots = [[0.5, 0.5], [0.3, 0.5], [0.7, 0.5], [0.5, 0.3], [0.5, 0.7], [0.15, 0.5], [0.85, 0.5], [0.25, 0.25], [0.75, 0.75]];
+  for (const [fx, fy] of spots) {
+    const x = r.left + r.width * fx, y = r.top + r.height * fy;
+    if (x < 0 || y < 0 || x >= innerWidth || y >= innerHeight) continue;
+    const top = topAt(x, y);
+    if (top && (within(el, top) || within(top, el))) return { x, y };
+  }
+  return null;
+}
+
+// Waits (briefly) until the element stops moving: a click aimed while a popup slides in or a list re-lays out
+// lands beside it. Timers, not animation frames, which a background tab never runs.
+async function settle(el, ms = 400) {
+  const at = () => { const r = el.getBoundingClientRect(); return [r.left, r.top, r.width, r.height].map(Math.round).join(","); };
+  let prev = at();
+  for (const end = performance.now() + ms; performance.now() < end && el.isConnected;) {
+    await new Promise((res) => setTimeout(res, 40));
+    const now = at();
+    if (now === prev) return true;
+    prev = now;
+  }
+  return false;
+}
+
+// Loose text matching for choosing options: case, accents, punctuation and common short forms don't matter.
+const ALIASES = [
+  ["united states", "united states of america", "usa", "us", "u s", "u s a", "america"],
+  ["united kingdom", "uk", "u k", "great britain", "britain", "england"],
+  ["united arab emirates", "uae"], ["india", "bharat"], ["bengaluru", "bangalore"], ["mumbai", "bombay"], ["chennai", "madras"],
+  ["kolkata", "calcutta"], ["gurugram", "gurgaon"], ["new delhi", "delhi"], ["netherlands", "holland", "the netherlands"],
+  ["south korea", "korea republic of", "republic of korea", "korea"], ["russia", "russian federation"],
+  ["senior", "sr"], ["junior", "jr"], ["mister", "mr"], ["doctor", "dr"],
+  ["yes", "y", "true"], ["no", "n", "false"],
+  ["prefer not to say", "prefer not to answer", "decline to answer", "decline to self identify", "i don t wish to answer",
+   "i do not wish to answer", "do not wish to disclose", "rather not say", "not specified"],
+  ["male", "man"], ["female", "woman"], ["non binary", "nonbinary"],
+];
+const plain = (s) => norm(s).normalize("NFD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9+]+/g, " ").trim();
+const aliasOf = (() => {
+  const m = new Map();
+  ALIASES.forEach((group) => group.forEach((w) => m.set(w, group[0])));
+  return (s) => m.get(s) || s;
+})();
+// How well an option's text matches what's wanted, 0 (no) to 1 (exact). Numbers must agree ("1-2 years" never
+// picks "10+ years").
+function matchScore(want, have) {
+  const w = plain(want), h = plain(have);
+  if (!w || !h) return 0;
+  if (w === h || aliasOf(w) === aliasOf(h)) return 1;
+  const nums = (s) => s.match(/\d+/g) || [];
+  const wn = nums(w), hn = nums(h);
+  if (wn.length && !wn.every((n) => hn.includes(n))) return 0;
+  // Whole words only: "Male" isn't in "Female", "No" doesn't start "Not specified".
+  if (h.startsWith(w + " ")) return 0.9;
+  if ((" " + h + " ").includes(" " + w + " ")) return 0.8;
+  if (h.length > 2 && (" " + w + " ").includes(" " + h + " ")) return 0.7;
+  if (w.length >= 4 && h.startsWith(w)) return 0.75;   // typed the start of it ("Indi" → "India")
+  const wt = new Set(w.split(" ").map(aliasOf)), ht = new Set(h.split(" ").map(aliasOf));
+  let both = 0;
+  wt.forEach((t) => { if (ht.has(t)) both++; });
+  return both ? 0.6 * both / Math.max(wt.size, ht.size) : 0;
+}
+function bestMatch(want, items, textOf) {
+  let best = null, score = 0;
+  for (const it of items) { const sc = matchScore(want, textOf(it)); if (sc > score) { best = it; score = sc; } if (sc === 1) break; }
+  return score >= 0.5 ? best : null;
 }
 
 // The element's nearest scrolling ancestor (a modal's body, a side panel), or null when that's the page itself.
@@ -279,7 +358,8 @@ function snapshot() {
       // Is it actually the thing on top at its centre (not covered by a modal)?
       const cx = Math.min(vw - 1, Math.max(0, r.left + r.width / 2)), cy = Math.min(vh - 1, Math.max(0, r.top + r.height / 2));
       const top = document.elementFromPoint(cx, cy);
-      const covered = top && !(within(el, top) || within(top, el));
+      // Covered only if no spot on it can be clicked (a badge over a button's middle leaves its sides free).
+      const covered = top && !(within(el, top) || within(top, el)) && !hitPoint(el);
       const { tag, role, text } = d;
       const item = { i: out.length, role, text, x: r.left, y: r.top, w: r.width, h: r.height };
       if (d.editable) {
@@ -297,8 +377,13 @@ function snapshot() {
         item.dropdown = true;
         const opts = optionTexts(el);
         if (opts.length) item.options = opts.slice(0, 25).join(" | ");
-        const chosen = el.querySelector("[role=option][aria-selected=true]");
-        item.value = (chosen ? optionText(chosen) : "") || "(nothing chosen)";
+        // The chosen option may sit in the list it controls (aria-controls), not inside it.
+        const owned = el.getAttribute("aria-controls") || el.getAttribute("aria-owns");
+        const lists = [el, ...(owned ? owned.split(/\s+/).map((id) => document.getElementById(id)).filter(Boolean) : [])];
+        const chosen = lists.map((l) => l.querySelector("[role=option][aria-selected=true]")).find(Boolean);
+        let shown = el.tagName !== "INPUT" && el.getAttribute("role") === "combobox" ? squash(el.innerText) : "";
+        if (/^(-+|(please )?(choose|select|pick)\b.*)$/i.test(shown)) shown = "";   // a placeholder, not a choice
+        item.value = (chosen ? optionText(chosen) : "") || (shown && shown !== text ? shown.slice(0, 80) : "") || "(nothing chosen)";
       }
       if (d.q) item.q = d.q;
       if (el.required || el.getAttribute("aria-required") === "true" || /\*\s*$/.test(d.q || text)) item.required = true;
@@ -358,29 +443,59 @@ function target(index) {
   if (el && el.isConnected) return el;
   const sig = (window.__clinqySigs || [])[index];
   if (sig) {
-    let best = null, dist = Infinity;
+    // Closest match first: same role, name and question; then same role and name (the question's wording changed);
+    // then the name with its counts ignored ("Messages (3)" → "Messages (4)"). Nearest to where it was wins.
+    const loose = (t) => norm(t).replace(/\d+/g, "#");
+    const tiers = [
+      (d) => d.text === sig.text && (d.q || "") === (sig.q || ""),
+      (d) => d.text === sig.text,
+      (d) => loose(d.text) === loose(sig.text) && (d.q || "") === (sig.q || ""),
+    ];
+    const best = [null, null, null], dist = [Infinity, Infinity, Infinity];
     for (const c of candidates()) {
       try {
         const d = describe(c);
-        if (!d || d.role !== sig.role || d.text !== sig.text || (d.q || "") !== (sig.q || "")) continue;
+        if (!d || d.role !== sig.role) continue;
+        const t = tiers.findIndex((f) => f(d));
+        if (t < 0) continue;
         const r = c.getBoundingClientRect();
         if (r.width < 1 || r.height < 1) continue;
         const k = Math.hypot(r.left + r.width / 2 - sig.x, r.top + r.height / 2 - sig.y);
-        if (k < dist) { best = c; dist = k; }
+        if (k < dist[t]) { best[t] = c; dist[t] = k; }
       } catch {}
     }
-    if (best) { window.__clinqyList[index] = best; return best; }
+    const found = best.find(Boolean);
+    if (found) { window.__clinqyList[index] = found; return found; }
   }
   throw new Error("element w" + index + " is gone (the page changed); take a new look");
 }
 
 // Where the element is right now (brought into view first), and whether a real mouse click at its centre would
 // land on it — not on a popup's backdrop, which on LinkedIn/Indeed closes the popup instead.
-function locate(index) {
+// `px`/`py` is the point to click: the centre, or another uncovered spot on it. Waits for it to stop moving first.
+async function locate(index) {
+  let el = target(index);
+  reveal(el);
+  const still = await settle(el);
+  // Re-rendered while it settled: aim at the new one.
+  if (!el.isConnected) { el = target(index); reveal(el); }
+  const r = el.getBoundingClientRect();
+  const p = hitPoint(el);
+  return { x: r.left, y: r.top, w: r.width, h: r.height, hit: !!p, px: p ? p.x : r.left + r.width / 2, py: p ? p.y : r.top + r.height / 2, still };
+}
+
+// Whether a listed element can still be found (re-found if the page re-rendered it).
+function alive(index) {
+  try { target(index); return { ok: true }; } catch { return { ok: false }; }
+}
+
+// Focuses an element so a key press acts on it (the last fallback when clicks don't take).
+function focusFor(index) {
   const el = target(index);
   reveal(el);
-  const r = el.getBoundingClientRect();
-  return { x: r.left, y: r.top, w: r.width, h: r.height, hit: hitAt(el) };
+  if (el.focus) el.focus({ preventScroll: true });
+  const a = deepActive();
+  return { focused: !!a && (within(el, a) || within(a, el)) };
 }
 
 function click(index) {
@@ -424,7 +539,7 @@ function fill(index, text) {
     // Dropdowns: pick the option whose text (or value) matches.
     const want = String(text).trim().toLowerCase();
     const opt = [...el.options].find((o) => o.text.trim().toLowerCase() === want || o.value.toLowerCase() === want)
-      || [...el.options].find((o) => o.text.trim().toLowerCase().includes(want));
+      || bestMatch(text, [...el.options], (o) => o.text);
     if (!opt) throw new Error("no option like " + JSON.stringify(text) + "; options: " + [...el.options].map((o) => o.text.trim()).join(", "));
     el.value = opt.value;
     el.dispatchEvent(new Event("input", { bubbles: true }));
@@ -443,17 +558,62 @@ function fill(index, text) {
   return { value: (el.isContentEditable ? el.innerText : el.value).slice(0, 200) };
 }
 
-// A visible option (of an open dropdown or menu) matching `text`, scrolled into view, with its viewport rect.
-function findOption(text) {
-  const want = norm(text);
-  const all = [...document.querySelectorAll("[role=option], [role=menuitem], [role=menuitemradio], [role=menuitemcheckbox], [role=treeitem]")].filter(visible);
-  const t = (o) => norm(optionText(o)) || norm(o.innerText);
-  const hit = all.find((o) => t(o) === want) || all.find((o) => t(o).startsWith(want)) || all.find((o) => t(o).includes(want))
-    || all.find((o) => t(o).length > 2 && want.includes(t(o)));
-  if (!hit) return { found: false, options: all.map((o) => optionText(o) || squash(o.innerText)).filter(Boolean).slice(0, 30) };
+const OPTION_SEL = "[role=option], [role=menuitem], [role=menuitemradio], [role=menuitemcheckbox], [role=treeitem]";
+
+// The list a dropdown opened: the one it names (aria-controls / aria-owns / its active option's list), else null.
+function ownedList(el) {
+  if (!el) return null;
+  const ids = [el.getAttribute("aria-controls"), el.getAttribute("aria-owns")].filter(Boolean).join(" ").split(/\s+/).filter(Boolean);
+  for (const id of ids) { const n = document.getElementById(id); if (n && n.getClientRects().length) return n; }
+  const ad = el.getAttribute("aria-activedescendant");
+  const a = ad && document.getElementById(ad);
+  return a ? a.closest("[role=listbox], [role=menu], [role=tree]") : null;
+}
+
+// An option (of an open dropdown or menu) matching `text`, scrolled into view, with its viewport rect. Looks in the
+// list the dropdown `index` opened first (options scrolled out of its box count), then in any open list on the page;
+// matching is loose (case, accents, "USA" = "United States"). A long list that loads options as it scrolls is
+// scrolled through to find it.
+async function findOption(text, index) {
+  let owner = null;
+  if (index != null && index >= 0) { try { owner = target(index); } catch {} }
+  const list = ownedList(owner);
+  const textOf = (o) => optionText(o) || squash(o.innerText);
+  const shownIn = (o) => { const cs = getComputedStyle(o); return cs.display !== "none" && cs.visibility !== "hidden" && o.getClientRects().length; };
+  const pool = () => {
+    const inList = list ? [...list.querySelectorAll(OPTION_SEL)].filter(shownIn) : [];
+    return inList.length ? inList : [...document.querySelectorAll(OPTION_SEL)].filter(visible);
+  };
+  let all = pool();
+  let hit = bestMatch(text, all, textOf);
+  // Not there yet: scroll the list (the owned one, else the box the visible options sit in) a page at a time.
+  const box = !hit && (list && list.scrollHeight > list.clientHeight + 4 ? list : all.length ? scrollBoxOf(all[0]) : null);
+  const seen = new Set(all.map(textOf));
+  for (let k = 0; box && !hit && k < 25 && box.scrollTop + box.clientHeight < box.scrollHeight - 2; k++) {
+    box.scrollBy({ top: Math.max(40, box.clientHeight - 30), behavior: "instant" });
+    await new Promise((res) => setTimeout(res, 70));
+    all = pool();
+    all.forEach((o) => seen.add(textOf(o)));
+    hit = bestMatch(text, all, textOf);
+  }
+  if (!hit) return { found: false, options: [...seen].filter(Boolean).slice(0, 40) };
   reveal(hit);
+  await settle(hit, 250);
   const r = hit.getBoundingClientRect();
-  return { found: true, text: optionText(hit) || squash(hit.innerText), x: r.left, y: r.top, w: r.width, h: r.height };
+  const p = hitPoint(hit);
+  return { found: true, text: textOf(hit), x: r.left, y: r.top, w: r.width, h: r.height,
+           px: p ? p.x : r.left + r.width / 2, py: p ? p.y : r.top + r.height / 2 };
+}
+
+// The option a dropdown has highlighted now (moved with the arrow keys): its active descendant, or a focused option.
+function activeOption(index, want) {
+  let el = null; try { el = target(index); } catch {}
+  const ad = el && el.getAttribute("aria-activedescendant");
+  let o = ad ? document.getElementById(ad) : null;
+  if (!o) { const a = deepActive(); if (a && a.matches && a.matches(OPTION_SEL)) o = a; }
+  if (!o) { const list = ownedList(el); o = list && list.querySelector("[role=option][aria-selected=true], [role=option].focused, [role=option][data-focused=true]"); }
+  const text = o ? optionText(o) || squash(o.innerText) : "";
+  return { text, score: want && text ? matchScore(want, text) : 0 };
 }
 
 // The file input an element stands for: itself, one inside it, or the nearest one in the page (upload buttons
@@ -473,6 +633,16 @@ function fileInputFor(index) {
     if (near) return near;
   }
   return all[0];
+}
+
+// Marks the element an upload goes through, for background.js's picker capture (which runs in the page's own
+// world, where its scripts create and click their file inputs).
+function markUpload(index) {
+  document.querySelectorAll("[data-clinqy-up]").forEach((n) => n.removeAttribute("data-clinqy-up"));
+  const el = target(index);
+  reveal(el);
+  el.setAttribute("data-clinqy-up", "1");
+  return { ok: true };
 }
 
 // Puts a file into an upload field without the Mac file picker (bytes come from the app, base64).
@@ -710,5 +880,5 @@ function readText() {
     });
   }
 
-  window.__clinqy = { snapshot, locate, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+  window.__clinqy = { snapshot, locate, alive, focusFor, activeOption, markUpload, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();

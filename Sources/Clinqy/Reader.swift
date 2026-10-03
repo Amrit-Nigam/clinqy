@@ -44,7 +44,42 @@ enum Reader {
         }.value
     }
 
+    /// Each piece of text on the app's window with where it is on screen (global top-left points, like element
+    /// frames), for clicking things the Accessibility tree doesn't show (WhatsApp's chats, canvases, custom UI).
+    /// `want`, when given, is boxed on its own where a line holds more (the "Archive" in "Archive chat").
+    static func textBoxes(_ app: NSRunningApplication, want: String? = nil) async -> [(text: String, rect: CGRect)]? {
+        guard let (image, frame) = await windowCapture(app) else { return nil }
+        return await Task.detached(priority: .userInitiated) { () -> [(text: String, rect: CGRect)] in
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = false   // labels and names, not prose
+            try? VNImageRequestHandler(cgImage: image).perform([request])
+            // Vision's boxes are 0…1 with the origin at the bottom left.
+            let place = { (b: CGRect) in
+                CGRect(x: frame.minX + b.minX * frame.width, y: frame.minY + (1 - b.maxY) * frame.height,
+                       width: b.width * frame.width, height: b.height * frame.height)
+            }
+            var out: [(text: String, rect: CGRect)] = []
+            for case let candidate? in (request.results ?? []).map({ $0.topCandidates(1).first }) {
+                let line = candidate.string
+                if let want, !want.isEmpty, let range = line.range(of: want, options: [.caseInsensitive, .diacriticInsensitive]),
+                   range != line.startIndex..<line.endIndex, let part = try? candidate.boundingBox(for: range) {
+                    out.append((String(line[range]), place(part.boundingBox)))
+                }
+                if let whole = try? candidate.boundingBox(for: line.startIndex..<line.endIndex) {
+                    out.append((line, place(whole.boundingBox)))
+                }
+            }
+            return out
+        }.value
+    }
+
     private static func windowImage(_ app: NSRunningApplication) async -> CGImage? {
+        await windowCapture(app)?.image
+    }
+
+    /// The app's main window as an image, with its frame on screen.
+    private static func windowCapture(_ app: NSRunningApplication) async -> (image: CGImage, frame: CGRect)? {
         guard CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
               let window = content.windows
@@ -57,8 +92,9 @@ enum Reader {
         config.width = Int(window.frame.width * scale)
         config.height = Int(window.frame.height * scale)
         config.showsCursor = false
-        return try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
-                                                           configuration: config)
+        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
+                                                                      configuration: config) else { return nil }
+        return (image, window.frame)
     }
 
     private static func isPDF(_ url: URL) -> Bool {

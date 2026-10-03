@@ -9,6 +9,8 @@ enum Stats {
         var turns: [Turn] = []
         var steps: [(at: Double, text: String)] = []
         var stepFailures: [String] = []
+        /// "click: …" lines (see Clicks.line): kind, place, method, ok/nochange, tries.
+        var clicks: [String] = []
         var end: Double?
         var ok: Bool?
         var answer = ""
@@ -44,6 +46,8 @@ enum Stats {
                 run.steps.append((at, String(text.dropFirst(4))))
             } else if text.hasPrefix("    ✗ ") {
                 run.stepFailures.append(String(text.dropFirst(6)))
+            } else if text.hasPrefix("    click: ") {
+                run.clicks.append(String(text.dropFirst(11)))
             }
             runs.append(run)
         }
@@ -161,6 +165,40 @@ enum Stats {
         if !stepFails.isEmpty {
             out.append("Top failed steps:")
             for (why, n) in top(stepFails, 5) { out.append("  \(n)×  \(why)") }
+        }
+        out += clickReport(runs.flatMap(\.clicks))
+        return out
+    }
+
+    /// How clicks went: how often the first way worked, which ways ended up working, and where clicks do nothing.
+    static func clickReport(_ lines: [String]) -> [String] {
+        struct Click { let kind, place, method: String; let ok: Bool; let tries: Int }
+        let clicks = lines.compactMap { line -> Click? in
+            let p = line.split(separator: " ").map(String.init)
+            guard p.count >= 5, let tries = Int(p[4]) else { return nil }
+            return Click(kind: p[0], place: p[1] == "-" ? "" : p[1].replacingOccurrences(of: "_", with: " "), method: p[2], ok: p[3] == "ok", tries: tries)
+        }
+        guard !clicks.isEmpty else { return [] }
+        let pc = { (n: Int) in "\(100 * n / clicks.count)%" }
+        let first = clicks.filter { $0.ok && $0.tries == 1 }.count
+        let rescued = clicks.filter { $0.ok && $0.tries > 1 }.count
+        let none = clicks.filter { !$0.ok }.count
+        var out = ["", "Clicks: \(clicks.count) · worked first try \(pc(first)) · needed another way \(pc(rescued)) · no visible change \(pc(none))"]
+        let kinds = Dictionary(grouping: clicks, by: \.kind).sorted { $0.value.count > $1.value.count }
+        out.append("  by kind: " + kinds.map { k, cs in "\(k) \(cs.filter(\.ok).count)/\(cs.count)" }.joined(separator: " · "))
+        let methods = Dictionary(grouping: clicks.filter(\.ok), by: \.method).sorted { $0.value.count > $1.value.count }
+        if !methods.isEmpty { out.append("  what worked: " + methods.map { "\($0.key) \($0.value.count)" }.joined(separator: " · ")) }
+        // Where clicks most often needed another way or did nothing (at least 3 clicks there).
+        struct Place { let name: String; let total: Int; let bad: Int; var share: Double { Double(bad) / Double(total) } }
+        let grouped: [String: [Click]] = Dictionary(grouping: clicks.filter { !$0.place.isEmpty }, by: \.place)
+        var places: [Place] = []
+        for (name, cs) in grouped {
+            let bad = cs.filter { !$0.ok || $0.tries > 1 }.count
+            if cs.count >= 3, bad > 0 { places.append(Place(name: name, total: cs.count, bad: bad)) }
+        }
+        places.sort { $0.share > $1.share }
+        if !places.isEmpty {
+            out.append("  hardest places: " + places.prefix(5).map { "\($0.name) \($0.bad)/\($0.total)" }.joined(separator: " · "))
         }
         return out
     }

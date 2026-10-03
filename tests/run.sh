@@ -30,7 +30,11 @@ front_chrome() {
   done
   return 1
 }
-chrome "make new window" >/dev/null
+# Open the test window straight on a local page: Chrome's New Tab page (AI Mode, Gemini) can hang with "Page
+# Unresponsive" before the first test gets to navigate away from it.
+sleep 0.5
+if [[ $BROWSER == Arc ]]; then chrome "make new window" >/dev/null
+else open -na "$BROWSER" --args --new-window "$BASE/help.html"; sleep 1.5; fi
 front_chrome || { echo "Couldn't bring $BROWSER to the front"; exit 1; }
 sleep 1
 touch $LOG
@@ -100,6 +104,13 @@ fi
 [[ -f /tmp/clinqy-profile-backup.json ]] && cp /tmp/clinqy-profile-backup.json "$PROFILE"
 case_ tabs         tabs.html   "open the Help page from here in a new tab, tell me its heading, then close that tab" "answer:7731"
 case_ code-editor  monaco.html "replace the code in this editor with a Python solution to Two Sum using a dictionary" "title:indented=true|oneLine=false"
+# Clicks that need more than a click at the centre: a dropdown that loads its options as it scrolls (and names the
+# country differently), an upload button that makes its file field on the spot, a button with a badge over its middle
+# that only takes real clicks, and a button the page keeps re-rendering.
+case_ lazy-dropdown  clicks.html "choose USA as the country" "title:country=United States"
+case_ dynamic-upload clicks.html "attach the file $PWD/site/resume.pdf with the Attach resume button" "title:file=resume.pdf"
+case_ covered-button clicks.html "click Mark as read once" "title:badge=1"
+case_ rerendered     clicks.html "click the Save draft button once" "title:saved=1"
 
 # Undo: after a run types into a field, clinqy://undo puts back what was there before.
 undo_case() {

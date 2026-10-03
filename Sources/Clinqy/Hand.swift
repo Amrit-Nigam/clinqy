@@ -76,10 +76,14 @@ final class Hand {
         case background
     }
 
+    /// How the last element click went through: "axpress" or "real" (for the click log).
+    private(set) var lastMethod = ""
+
     /// Clicks an element: Accessibility press first, a real click if that did nothing.
     /// Returns why it didn't click (something else now at that spot), or nil.
     @discardableResult
     func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int) async -> String? {
+        lastMethod = "axpress"
         await buddy.travel(to: el.center, framing: el.frame)
         try? await Task.sleep(for: .milliseconds(80))   // aim
         buddy.click()
@@ -94,6 +98,7 @@ final class Hand {
         }
         if !pressed {
             if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: element) { return refuse(why) }
+            lastMethod = "real"
             realClick(at: el.center)
         }
         return nil
