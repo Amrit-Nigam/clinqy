@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import AppKit
 
 // Clinqy was called CursorBoy: carry its memory, history, skills, workflows, models and settings over once.
