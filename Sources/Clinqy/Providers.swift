@@ -102,7 +102,7 @@ enum Provider: String, CaseIterable {
 }
 
 /// One conversation over a provider's HTTP API (or a one-shot `codex exec` / `gemini -p` per turn), standing in for
-/// the `claude` process: it keeps the whole exchange so each turn has the same context the CLI session would.
+/// the `agy` process: it keeps the whole exchange so each turn has the same context the CLI session would.
 final class APIChat: @unchecked Sendable {
     private struct Turn { var user: Bool; var text: String; var image: String? }
 
@@ -121,16 +121,17 @@ final class APIChat: @unchecked Sendable {
     init(provider: Provider, system: String, model: String) throws {
         let key = provider.key
         if provider.isCLI, provider.cliPath == nil {
-            throw ClaudeSession.BrainError.failed("\(provider.rawValue): not found. Install it, or set \(provider == .codexCLI ? "CODEX_PATH" : "GEMINI_PATH") in ~/.config/clinqy/env")
+            let pathEnv = provider == .codexCLI ? "CODEX_PATH" : provider == .agyCLI ? "AGY_PATH" : provider == .claudeCLI ? "CLAUDE_PATH" : "GEMINI_PATH"
+            throw AgySession.BrainError.failed("\(provider.rawValue): not found. Install it, or set \(pathEnv) in ~/.config/clinqy/env")
         }
         if key == nil, !provider.isCLI, provider != .ollama, provider != .compatible {
-            throw ClaudeSession.BrainError.failed("No API key for \(provider.rawValue). Add it to ~/.config/clinqy/env (see the README).")
+            throw AgySession.BrainError.failed("No API key for \(provider.rawValue). Add it to ~/.config/clinqy/env (see the README).")
         }
         self.provider = provider
         self.key = key
         self.system = system
         self.model = provider.model(model)
-        effort = (Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
+        effort = (Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
     }
 
     var isAlive: Bool { lock.withLock { !closed } }

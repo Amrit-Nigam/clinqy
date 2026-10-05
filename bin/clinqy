@@ -1,5 +1,5 @@
 #!/bin/zsh
-# clinqy — drive the Clinqy app from a terminal or any coding agent (Claude Code, Codex, Cursor, …).
+# clinqy — drive the Clinqy app from a terminal or any coding agent (Antigravity CLI, Claude Code, Codex, Cursor, …).
 #
 #   clinqy qa <test.md | folder | "inline test"> ... [--relearn] [--model sonnet|opus|haiku] [--json]
 #       Run UI tests. The first run uses the model and compiles a deterministic script (saved in
@@ -10,7 +10,7 @@
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
 #   clinqy stats [days] [--last]     Success rate, model vs action time per turn, top failure reasons (default: 7 days).
-#   clinqy mcp                       Serve Clinqy as an MCP server on stdio (claude mcp add clinqy -- clinqy mcp).
+#   clinqy mcp                       Serve Clinqy as an MCP server on stdio (agy mcp add clinqy -- clinqy mcp).
 #   clinqy watch <app> <text> [--gone] [--timeout s]   Wait for text to appear in (or vanish from) an app.
 #   clinqy replay <fixture.json|folder> [--bless]      Re-check recorded runs offline (tests/replay).
 #   clinqy memory ["request"] [--app Name] [--site host]   How memory is organised (profile, notes per site/app);

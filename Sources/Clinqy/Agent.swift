@@ -1,7 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 
-/// Runs a request as a conversation with one Claude session: observe the screen → Claude picks actions →
+/// Runs a request as a conversation with one Agy session: observe the screen → Agy picks actions →
 /// the buddy carries them out the way a person would (travel, point, click, type) → report → repeat.
 @MainActor
 final class Agent: ObservableObject {
@@ -74,7 +74,7 @@ final class Agent: ObservableObject {
     private let buddy: Buddy
     private let hand: Hand
     fileprivate var task: Task<Void, Never>?
-    private var session: ClaudeSession?
+    private var session: AgySession?
     fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
@@ -105,7 +105,7 @@ final class Agent: ObservableObject {
     var lastTarget: WorkflowStep.Target?
     /// QA mode: the run is a UI test; checks are collected instead of asking the user anything.
     var qa: QAContext?
-    /// Use a different Claude model for this run (e.g. from `clinqy qa --model`).
+    /// Use a different model for this run (e.g. from `clinqy qa --model`).
     var modelOverride: String?
 
     /// Things the user added while the task was running; folded into the next step.
@@ -360,7 +360,7 @@ final class Agent: ObservableObject {
             phase = .thinking
         }
 
-        let session: ClaudeSession
+        let session: AgySession
         do { session = try Brain.session(model: modelOverride) } catch { return finish(ok: false, error.localizedDescription) }
         self.session = session
         defer { session.close() }
@@ -871,7 +871,7 @@ final class Agent: ObservableObject {
     /// facts closest to this task (not the whole memory) and answers with edits — add, update, remove — so memory
     /// stays one clean line per thing instead of piling up near-duplicates. Runs in the background once the user
     /// already has their answer.
-    private func learn(from session: ClaudeSession) async {
+    private func learn(from session: AgySession) async {
         guard !Task.isCancelled, !isTest else { return }
         let about = ([request] + steps.suffix(25).map(\.text) + [answer]).joined(separator: "\n")
         let near = Memory.relevant(to: about, app: targetApp?.cleanName, limit: 30).facts

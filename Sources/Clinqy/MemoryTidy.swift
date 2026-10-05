@@ -1,6 +1,6 @@
 import Foundation
 
-/// Now and then, has Claude tidy memory: merge duplicates, keep the newest of facts that disagree, drop stale ones.
+/// Now and then, has the model tidy memory: merge duplicates, keep the newest of facts that disagree, drop stale ones.
 /// Guarded so it can't lose real information: every email, link and long number must survive (unless it was
 /// replaced by a newer one), it can't shrink memory by more than 40%, and the old file is backed up first.
 @MainActor
@@ -33,7 +33,7 @@ enum MemoryTidy {
         [site:docs.google.com] or [app:Find My] (know-how for that place): keep the tag at the start, and merge only facts with the same tag.
         """
         do {
-            let session = try ClaudeSession(system: system, model: Brain.model)
+            let session = try AgySession(system: system, model: Brain.model)
             defer { session.close() }
             let reply = try await session.send(facts.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
             guard let json = Brain.json(from: reply), let kept = json["facts"] as? [String] else { return nil }

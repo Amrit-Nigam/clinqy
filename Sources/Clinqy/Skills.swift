@@ -36,7 +36,7 @@ final class Skills: ObservableObject {
         save()
     }
 
-    /// Turns a recording into a skill with Claude (a one-off session).
+    /// Turns a recording into a skill with the agent (a one-off session).
     func learn(from recording: [String]) async {
         guard recording.count >= 2 else { lastError = "That was too short to learn from"; return }
         isLearning = true
@@ -51,7 +51,7 @@ final class Skills: ObservableObject {
         Drop accidental or redundant actions (stray clicks, corrections). Keep app names and exact button/field labels.
         """
         do {
-            let session = try ClaudeSession(system: system, model: Brain.model)
+            let session = try AgySession(system: system, model: Brain.model)
             defer { session.close() }
             let reply = try await session.send("Recording:\n" + recording.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "\n"))
             guard let json = Brain.json(from: reply), let name = json["name"] as? String,
