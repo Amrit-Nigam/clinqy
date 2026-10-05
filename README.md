@@ -12,28 +12,27 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 
 ## Setup guide
 
-The quickest way to set up Clinqy is to let your AI coding agent do it (Antigravity CLI / agy, Cursor, Claude Code, Codex, Gemini CLI, Windsurf…).
+The quickest way to set up Clinqy is to let your AI coding agent do it (Claude Code, Cursor, Codex, Antigravity CLI / agy, Windsurf…).
 
 **1. Fill in the two lines at the top of the prompt**, in plain words:
 
 | If you want to use… | Write after `Model:` |
 |---|---|
-| Antigravity CLI (agy, your Google/Gemini login, the default) | `agy cli` |
-| Claude Code (your Claude login) | `claude cli` |
+| Claude Code (your Claude login, the default) | `claude cli` |
+| Antigravity CLI / agy (your Google login) | `agy cli` |
 | Codex CLI (your ChatGPT login) | `codex cli` |
-| Gemini CLI (your Google login) | `gemini cli` |
 | An Anthropic / OpenAI / Gemini / OpenRouter key | `anthropic api key`, `openai api key`, `gemini api key` or `openrouter api key` |
 | A local model with Ollama | `ollama qwen3-vl` (any vision model) |
 | Groq, LM Studio, Together… | `openai-compatible https://api.groq.com/openai/v1 <model>` |
 | Not sure | leave it blank, and the agent shows you what's installed and asks |
 
-`Connect to:` lists the coding agents that should be able to use Clinqy: `agy`, `cursor`, `claude code`, `codex`, `gemini cli`, or `none`.
+`Connect to:` lists the coding agents that should be able to use Clinqy: `claude code`, `cursor`, `codex`, `agy cli`, or `none`.
 
 **2. Paste the prompt into your agent:**
 
 ````text
-Model: agy cli
-Connect to: agy, cursor
+Model: claude cli
+Connect to: claude code, cursor
 
 Set up Clinqy (https://github.com/Amrit-Nigam/clinqy) on this Mac for me, using the two lines above. Run the
 commands yourself. Only stop when you need my answer or a click that only I can do.
@@ -46,9 +45,9 @@ commands yourself. Only stop when you need my answer or a click that only I can 
      `mkdir -p ~/.config/clinqy && cp -n env.example ~/.config/clinqy/env && chmod 600 ~/.config/clinqy/env`
      (if the file already exists, edit it, don't replace it).
    - In it, uncomment the block for my choice in section 1 of env.example. Every option there is listed with
-     its KEY=value lines. Leave the rest commented. For a model name, also set AGY_MODEL / CLAUDE_MODEL (or LOCAL_MODEL for
+     its KEY=value lines. Leave the rest commented. For a model name, also set CLAUDE_MODEL / AGY_MODEL (or LOCAL_MODEL for
      ollama / openai-compatible).
-   - agy/claude/codex/gemini cli: check the CLI is installed and logged in. If not, install it with the command in
+   - claude/codex/agy cli: check the CLI is installed and logged in. If not, install it with the command in
      env.example and have me log in.
    - API key: don't ask me to paste the key into this chat. Open ~/.config/clinqy/env for me
      (`open -e ~/.config/clinqy/env`), tell me which line to paste the key into, and wait until I've saved it.
@@ -63,11 +62,10 @@ commands yourself. Only stop when you need my answer or a click that only I can 
    mode, click Load unpacked and choose the repo's `extension/` folder. Give me that folder's full path.
 7. Add Clinqy as an MCP server (command `/Applications/Clinqy.app/Contents/MacOS/Clinqy`, argument `mcp`) to
    each agent on my "Connect to:" line. Keep their other servers:
-   - agy: `agy mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp`
    - claude code: `claude mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp`
+   - agy cli: `agy mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp`
    - cursor: ~/.cursor/mcp.json → "mcpServers": {"clinqy": {"command": "/Applications/Clinqy.app/Contents/MacOS/Clinqy", "args": ["mcp"]}}
    - codex: ~/.codex/config.toml → [mcp_servers.clinqy] command = "/Applications/Clinqy.app/Contents/MacOS/Clinqy", args = ["mcp"]
-   - gemini cli: ~/.gemini/settings.json → the same "mcpServers" entry as cursor
 8. Test it: run `clinqy run --dry "open example.com"` and show me the planned steps. Then have me press ⌃⌥
    (Control + Option) and ask "where's the brightness setting?". If something fails, read
    ~/Library/Logs/Clinqy/agent.log and fix it. End with a short summary of what's set up.
@@ -84,8 +82,8 @@ Model: openai api key
 Connect to: claude code
 ```
 ```text
-Model: gemini api key, gemini-3.6-flash
-Connect to: none
+Model: agy cli
+Connect to: agy cli, cursor
 ```
 ```text
 Model: ollama qwen3-vl
@@ -98,7 +96,7 @@ Connect to: cursor
 
 ## Features
 
-- **One agent loop.** A long-lived Antigravity (`agy`) session reads the screen, picks actions, acts, checks the result and repeats until the task is done. Each step takes about 1–2 s.
+- **One agent loop.** A long-lived Claude session (or Antigravity session with `--agy`) reads the screen, picks actions, acts, checks the result and repeats until the task is done. Each step takes about 1–2 s.
 - **Works like a person.** It opens apps from the Dock (or Spotlight), opens websites by typing into the address bar, types at a human rhythm with real key codes, and clicks for real. Your pointer is put back where it was.
 - **Clicks that check themselves.**
   - **Checks every click.** After each click it looks for an effect. If nothing changed, it tries the next way: a real mouse click, then a click through the page, then focus plus a key (for checkboxes, tabs and options). It remembers which way works on each site.
@@ -139,7 +137,7 @@ Connect to: cursor
 - macOS 14+ on Apple silicon (tested on an M4)
 - Swift 5.9+ (Xcode Command Line Tools are enough)
 - A model to drive it, one of:
-  - [Antigravity CLI (`agy`)](https://antigravity.google/docs/cli/overview), [Claude Code](https://claude.com/claude-code), [Codex CLI](https://github.com/openai/codex) or [Gemini CLI](https://github.com/google-gemini/gemini-cli), installed and logged in (your existing login is used), or
+  - [Claude Code](https://claude.com/claude-code), [Codex CLI](https://github.com/openai/codex) or [Antigravity CLI (`agy`)](https://antigravity.google/docs/cli/overview), installed and logged in (your existing login is used), or
   - an API key for Anthropic, OpenAI, Gemini or OpenRouter, or
   - a local model through Ollama or any OpenAI-compatible server.
 
@@ -242,18 +240,18 @@ From the terminal: `clinqy workflow <name> "Input=value"`. A step that breaks is
 
 **How runs are going.** `Clinqy stats [days]` gives the success rate (overall and per app), the slowest runs, a per-turn breakdown of model time vs action time (from `agent.log`), and the most common failure reasons and failed steps. `Clinqy stats --last` shows the latest run turn by turn. A **Clicks** section shows how often the first click worked, which fallbacks rescued the rest, and the sites and apps where clicks struggle most. What it learns about each site is kept in `~/Library/Application Support/Clinqy/click-hints.json`.
 
-## MCP server (Antigravity CLI, Claude Code, Codex, Cursor…)
+## MCP server (Claude Code, Antigravity CLI, Codex, Cursor…)
 
-`Clinqy mcp` runs Clinqy as a stdio [MCP](https://modelcontextprotocol.io) server with no extra dependencies. Register it in Antigravity CLI (`agy`) with:
-
-```bash
-agy mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp
-```
-
-Or in Claude Code with:
+`Clinqy mcp` runs Clinqy as a stdio [MCP](https://modelcontextprotocol.io) server with no extra dependencies. Register it in Claude Code with:
 
 ```bash
 claude mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp
+```
+
+Or in Antigravity CLI (`agy`) with:
+
+```bash
+agy mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp
 ```
 
 | Tool | Read-only | What it does |
@@ -266,14 +264,13 @@ The server hands tasks to the running app with `clinqy://` links, the same way t
 
 ## Choosing the model
 
-By default Clinqy runs on the Antigravity CLI (`agy`) with your Google login. To use something else, set `PROVIDER` (and a key where needed) in `~/.config/clinqy/env`. [`env.example`](env.example) has every option ready to uncomment:
+By default Clinqy runs on the Claude Code CLI with your Claude login. To switch to Antigravity CLI (`agy`) with your Google login, pass `--agy` on the command line or set `PROVIDER=agy-cli` (or `USE_AGY=1`) in `~/.config/clinqy/env`. [`env.example`](env.example) has every option ready to uncomment:
 
 | Option | Lines in `~/.config/clinqy/env` |
 |---|---|
-| Antigravity CLI (`agy`, default) | nothing, or `PROVIDER=agy-cli` |
-| Claude Code CLI | `PROVIDER=claude-cli` |
+| Claude Code CLI (default) | nothing, or `PROVIDER=claude-cli` |
+| Antigravity CLI (`agy`) | `PROVIDER=agy-cli` or `USE_AGY=1` (or `--agy` flag) |
 | Codex CLI | `PROVIDER=codex-cli` |
-| Gemini CLI | `PROVIDER=gemini-cli` |
 | Anthropic API | `PROVIDER=anthropic` and `ANTHROPIC_API_KEY=sk-ant-…` |
 | OpenAI API | `PROVIDER=openai` and `OPENAI_API_KEY=sk-…` |
 | Gemini API | `PROVIDER=gemini` and `GEMINI_API_KEY=…` |
@@ -281,18 +278,17 @@ By default Clinqy runs on the Antigravity CLI (`agy`) with your Google login. To
 | Ollama | `PROVIDER=ollama` and `LOCAL_MODEL=qwen3-vl` |
 | Any OpenAI-compatible server | `PROVIDER=openai-compatible`, `OPENAI_BASE_URL=…`, `OPENAI_COMPATIBLE_API_KEY=…` and `LOCAL_MODEL=…` |
 
-For example, OpenAI:
+For example, Antigravity CLI:
 
 ```bash
-PROVIDER=openai
-OPENAI_API_KEY=sk-...
+PROVIDER=agy-cli
 ```
 
 Put each `KEY=value` on its own line, with no comment after the value. `chmod 600 ~/.config/clinqy/env` keeps your keys private.
 
-If `PROVIDER` isn't set, Clinqy uses the `agy` CLI when it's installed. Without it, Clinqy uses the first API key it finds, then Claude, Codex or Gemini CLI.
+If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `agy` when `--agy` or `USE_AGY=1` is set). Without it, Clinqy uses the first API key it finds, then `agy` or Codex CLI.
 
-`AGY_MODEL` / `CLAUDE_MODEL` (the agent) and `FAST_MODEL` (the helper for routine steps) work with every provider. Leave them as `sonnet` / `haiku` / `opus` to get each provider's matching tier, or set any model id the provider accepts:
+`CLAUDE_MODEL` / `AGY_MODEL` (the agent) and `FAST_MODEL` (the helper for routine steps) work with every provider. Leave them as `sonnet` / `haiku` / `opus` to get each provider's matching tier, or set any model id the provider accepts:
 
 | Provider | `haiku` (fast) | `sonnet` (agent, default) | `opus` |
 |---|---|---|---|
@@ -301,13 +297,13 @@ If `PROVIDER` isn't set, Clinqy uses the `agy` CLI when it's installed. Without 
 | openai | gpt-5.6-luna | gpt-5.6-terra | gpt-5.6-sol |
 | gemini | gemini-3.5-flash-lite | gemini-3.6-flash | gemini-3.6-flash |
 | openrouter | anthropic/claude-haiku-4.5 | anthropic/claude-sonnet-5.5 | anthropic/claude-opus-5.5 |
-| codex-cli, gemini-cli | the CLI's default | the CLI's default | the CLI's default |
+| codex-cli | the CLI's default | the CLI's default | the CLI's default |
 | ollama, openai-compatible | `LOCAL_MODEL` | `LOCAL_MODEL` | `LOCAL_MODEL` |
 
 Notes:
 - **Use a vision model.** Clinqy sometimes sends a screenshot.
-- **Speed.** The Antigravity CLI, the Claude CLI and the HTTP APIs keep one conversation per task, so each turn costs only model time. Anthropic replies are prompt-cached, and only the newest screenshot is sent again. Codex and Gemini CLI have no long-lived chat mode, so they start once per turn and are noticeably slower.
-- **Effort.** `AGY_EFFORT` and `CLAUDE_EFFORT` also set the reasoning effort for models.
+- **Speed.** The Claude CLI, the Antigravity CLI (`agy`) and the HTTP APIs keep one conversation per task, so each turn costs only model time. Anthropic replies are prompt-cached, and only the newest screenshot is sent again. Codex CLI has no long-lived chat mode, so it starts once per turn and is noticeably slower.
+- **Effort.** `CLAUDE_EFFORT` and `AGY_EFFORT` also set the reasoning effort for models.
 - **Rate limits.** The system prompt is about 10k tokens. A free-tier OpenAI account (10k tokens/min) can't fit it on the larger models.
 - **Which one is in use.** Menu bar → **Check Permissions…** shows the current provider.
 
@@ -317,13 +313,13 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 
 | Key | Default | |
 |---|---|---|
-| `PROVIDER` | `agy-cli` | Which model service to use (see [Choosing the model](#choosing-the-model)) |
+| `PROVIDER` | `claude-cli` | Which model service to use (use `agy-cli` or `--agy` / `USE_AGY=1` for Antigravity, see [Choosing the model](#choosing-the-model)) |
 | `ANTHROPIC_API_KEY` · `OPENAI_API_KEY` · `GEMINI_API_KEY` · `OPENROUTER_API_KEY` · `OPENAI_COMPATIBLE_API_KEY` | | API keys for the HTTP providers |
 | `OPENAI_BASE_URL` | per provider | Endpoint for `openai`, `ollama` or `openai-compatible` |
 | `LOCAL_MODEL` | `qwen3-vl` | Model for `ollama` / `openai-compatible` |
-| `AGY_PATH` · `CLAUDE_PATH` · `CODEX_PATH` · `GEMINI_PATH` | auto-detected | Path to each CLI |
-| `AGY_MODEL` / `CLAUDE_MODEL` | `sonnet` (`gemini-3.8-flash`) | Model for the agent (any provider) |
-| `AGY_EFFORT` / `CLAUDE_EFFORT` | `low` | `low` is noticeably faster per step |
+| `CLAUDE_PATH` · `AGY_PATH` · `CODEX_PATH` | auto-detected | Path to each CLI |
+| `CLAUDE_MODEL` / `AGY_MODEL` | `sonnet` | Model for the agent (any provider) |
+| `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step |
 | `WHISPER_MODEL` | `large-v3-v20240930_turbo_632MB` | Any WhisperKit variant |
 | `VOICE_ENGINE` | whisper | Set `apple` to use only Apple dictation |
 | `VOICE_LANGUAGE` | `auto` | `auto`, `en`, `hinglish`, `hi`, or any Whisper code (the menu setting wins) |
@@ -380,10 +376,10 @@ Other debug commands: `--run <bundle-id|-> "<task>"` (run from the terminal with
 
 ```
 Sources/Clinqy/
-  Agent.swift        the loop: observe → Agy → act → report; actions, asking, history, memory
+  Agent.swift        the loop: observe → LLM → act → report; actions, asking, history, memory
   AgentPrompt.swift  the system prompt (action vocabulary and rules)
-  Brain.swift        persistent `agy` stream-json session, pre-warmed
-  Providers.swift    other model services: Anthropic/OpenAI/Gemini/OpenRouter/Ollama APIs, Claude, Codex & Gemini CLI
+  Brain.swift        persistent `claude` (or `agy` with `--agy`) stream-json session, pre-warmed
+  Providers.swift    other model services: Anthropic/OpenAI/Gemini/OpenRouter/Ollama APIs, Claude, Codex & Antigravity (agy) CLI
   AXEngine.swift     Accessibility: element trees, focus, typing, key combos
   Hand.swift         human-paced actions: Dock/Spotlight, address bar, clicks, typing
   Buddy.swift        the companion cursor (CoreAnimation overlay per screen)
@@ -416,4 +412,4 @@ tests/qa/            example plain-English QA tests (compiled scripts in tests/q
 
 ## Privacy
 
-Everything except the model calls stays on your Mac. That covers screen reading, voice (Whisper runs locally), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Antigravity, Claude, Codex or Gemini CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
+Everything except the model calls stays on your Mac. That covers screen reading, voice (Whisper runs locally), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), or Codex CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.

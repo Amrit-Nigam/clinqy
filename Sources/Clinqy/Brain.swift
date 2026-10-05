@@ -8,25 +8,38 @@ final class AgySession: @unchecked Sendable {
 
         var errorDescription: String? {
             switch self {
-            case .notInstalled: return "Agy CLI not found. Install Antigravity (or set AGY_PATH), or add an API key to ~/.config/clinqy/env"
+            case .notInstalled:
+                return Provider.current == .agyCLI
+                    ? "Agy CLI not found. Install Antigravity (or set AGY_PATH), or add an API key to ~/.config/clinqy/env"
+                    : "Claude CLI not found. Install Claude Code (or set CLAUDE_PATH), or add an API key to ~/.config/clinqy/env"
             case .failed(let message):
-                return message.contains("Not logged in") ? "Agy CLI isn't logged in. Run `agy` in a terminal once and log in." : message
-            case .died: return "The Agy process stopped unexpectedly"
+                if message.contains("Not logged in") {
+                    return Provider.current == .agyCLI
+                        ? "Agy CLI isn't logged in. Run `agy` in a terminal once and log in."
+                        : "Claude CLI isn't logged in. Run `claude` in a terminal once and log in."
+                }
+                return message
+            case .died: return Provider.current == .agyCLI ? "The Agy process stopped unexpectedly" : "The Claude process stopped unexpectedly"
             case .busy: return "Still waiting on the previous reply"
             }
         }
     }
 
     static var agyPath: String? {
-        if let explicit = Config.value("AGY_PATH") ?? Config.value("CLAUDE_PATH") { return explicit }
+        if let explicit = Config.value("AGY_PATH") { return explicit }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return ["\(home)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy",
-                "\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "\(home)/.claude/local/claude"]
+        return ["\(home)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    static var claudePath: String? { agyPath }
+    static var claudePath: String? {
+        if let explicit = Config.value("CLAUDE_PATH") { return explicit }
+        let home = FileManager.default.homeDirectoryForCurrentUser.path
+        return ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "\(home)/.claude/local/claude"]
+            .first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
 
+    let sessionProvider: Provider
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
@@ -49,11 +62,13 @@ final class AgySession: @unchecked Sendable {
     init(system: String, model: String) throws {
         self.systemPrompt = system
         let provider = Provider.current
+        self.sessionProvider = provider
         if provider != .agyCLI && provider != .claudeCLI {
             api = try APIChat(provider: provider, system: system, model: model)
             return
         }
-        guard let path = Self.agyPath else { throw BrainError.notInstalled }
+        let path = provider == .agyCLI ? Self.agyPath : Self.claudePath
+        guard let path else { throw BrainError.notInstalled }
         let execName = URL(fileURLWithPath: path).lastPathComponent
         isAgy = (provider == .agyCLI) || (execName == "agy")
 
@@ -281,9 +296,15 @@ enum Brain {
 
     /// Hands out the warm session (or a fresh one) and starts warming the next.
     static func session(model override: String? = nil) throws -> AgySession {
+        let currentProvider = Provider.current
         if let override, override != model { return try AgySession(system: AgentPrompt.system, model: override) }
         let s: AgySession
-        if let w = warm, w.isAlive { s = w } else { s = try AgySession(system: AgentPrompt.system, model: model) }
+        if let w = warm, w.isAlive, w.sessionProvider == currentProvider {
+            s = w
+        } else {
+            warm?.close()
+            s = try AgySession(system: AgentPrompt.system, model: model)
+        }
         warm = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { prewarm() }
         return s

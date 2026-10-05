@@ -215,6 +215,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             let test = items.first { $0.name == "test" }?.value == "1"
             let dry = items.first { $0.name == "dry" }?.value == "1"
+            if items.first(where: { $0.name == "agy" })?.value == "1" {
+                Provider.useAgy = true
+            } else if items.first(where: { $0.name == "claude" })?.value == "1" {
+                Provider.useAgy = false
+            }
             // Tests skip the review card unless they ask for it (tests/run.sh answers it through clinqy://answer).
             agent.reviewInTests = items.first { $0.name == "review" }?.value == "1"
             agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
@@ -328,6 +333,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startQA(_ url: URL) {
         let q = Dictionary((URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") },
                            uniquingKeysWith: { a, _ in a })
+        if q["agy"] == "1" { Provider.useAgy = true }
+        else if q["claude"] == "1" { Provider.useAgy = false }
         let out = URL(fileURLWithPath: q["out"] ?? NSTemporaryDirectory() + "clinqy-qa.json")
         var name = q["name"] ?? "Inline test"
         var test = q["text"] ?? ""

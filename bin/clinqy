@@ -1,12 +1,12 @@
 #!/bin/zsh
 # clinqy — drive the Clinqy app from a terminal or any coding agent (Antigravity CLI, Claude Code, Codex, Cursor, …).
 #
-#   clinqy qa <test.md | folder | "inline test"> ... [--relearn] [--model sonnet|opus|haiku] [--json]
+#   clinqy qa <test.md | folder | "inline test"> ... [--relearn] [--model sonnet|opus|haiku] [--agy] [--json]
 #       Run UI tests. The first run uses the model and compiles a deterministic script (saved in
 #       .clinqy/ next to the test); later runs replay it with no model, healing only broken steps.
 #       Test files: optional "# Title", then one step per line; lines starting with Expect/Check/Verify
 #       are assertions. Exit code 0 = all passed, 1 = something failed.
-#   clinqy run [--dry] "<task>"      Do a task (not saved to history). --dry: point at each click/keystroke, don't do it.
+#   clinqy run [--dry] [--agy] "<task>"      Do a task (not saved to history). --dry: point at each click/keystroke, don't do it. --agy: use Antigravity CLI.
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
 #   clinqy stats [days] [--last]     Success rate, model vs action time per turn, top failure reasons (default: 7 days).
@@ -43,17 +43,19 @@ wait_log() {   # wait for a run started after line $1 to finish; print its steps
 cmd=${1:-help}; shift 2>/dev/null
 case $cmd in
   qa)
-    relearn=0 model="" json=0 targets=()
+    relearn=0 model="" json=0 agy=0 targets=()
     while (( $# )); do
       case $1 in
         --relearn) relearn=1 ;;
         --model) shift; model=${1:-} ;;
         --json) json=1 ;;
+        --agy|--agy-cli) agy=1 ;;
+        --claude|--claude-cli) agy=0 ;;
         *) targets+=("$1") ;;
       esac
       shift
     done
-    (( ${#targets} )) || { echo "usage: clinqy qa <test.md|folder|\"inline test\"> [--relearn] [--model m] [--json]"; exit 2; }
+    (( ${#targets} )) || { echo "usage: clinqy qa <test.md|folder|\"inline test\"> [--relearn] [--model m] [--agy] [--json]"; exit 2; }
     ensure_app
     files=()
     for t in $targets; do
@@ -67,6 +69,7 @@ case $cmd in
       if [[ $f == inline:* ]]; then q="text=$(enc "${f#inline:}")"; else q="path=$(enc "$f")"; fi
       [[ -n $model ]] && q+="&model=$(enc $model)"
       (( relearn )) && q+="&relearn=1"
+      (( agy )) && q+="&agy=1"
       open -g "clinqy://qa?$q&out=$(enc $out)&token=$TOKEN"
       for i in $(seq 1 900); do [[ -s $out ]] && break; sleep 1; done
       [[ -s $out ]] || { echo "TIMEOUT  ${f#inline:}"; failed=1; continue; }
@@ -89,10 +92,17 @@ PY
     exit $failed ;;
   run)
     ensure_app
-    dry=""
-    [[ ${1:-} == --dry ]] && { dry="&dry=1"; shift; }
+    dry="" agy=""
+    while [[ ${1:-} == --* ]]; do
+      case $1 in
+        --dry) dry="&dry=1" ;;
+        --agy|--agy-cli) agy="&agy=1" ;;
+        --claude|--claude-cli) agy="&claude=1" ;;
+      esac
+      shift
+    done
     start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://run?task=$(enc "$*")&test=1$dry&token=$TOKEN"
+    open -g "clinqy://run?task=$(enc "$*")&test=1$dry$agy&token=$TOKEN"
     wait_log $start ;;
   workflow)
     ensure_app
