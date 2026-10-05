@@ -862,10 +862,12 @@ private struct Waveform: View {
             let t = context.date.timeIntervalSinceReferenceDate
             HStack(alignment: .center, spacing: 3) {
                 ForEach(0..<36, id: \.self) { i in
-                    let wave = (sin(t * 7 + Double(i) * 0.45) + 1) / 2
+                    let angle: Double = t * 7.0 + Double(i) * 0.45
+                    let wave: CGFloat = CGFloat((sin(angle) + 1.0) / 2.0)
+                    let barH: CGFloat = 3.0 + (4.0 + level * 22.0) * wave
                     Capsule()
                         .fill(DS.color(.listening).opacity(0.85))
-                        .frame(width: 3, height: 3 + (4 + level * 22) * wave)
+                        .frame(width: 3, height: barH)
                 }
             }
             .frame(maxWidth: .infinity)
@@ -1219,13 +1221,18 @@ private struct WorkflowRow: View {
     let onDelete: () -> Void
     @StateObject private var hover = Hover()
 
+    private var subtitle: String {
+        let schedulePart = workflow.schedule.map { " · daily \($0)" } ?? ""
+        let paramsPart = workflow.params.isEmpty ? "" : " · inputs: " + workflow.params.joined(separator: ", ")
+        return "\(workflow.steps.count) steps · run \(workflow.runs)×" + schedulePart + paramsPart
+    }
+
     var body: some View {
         HStack(alignment: .top, spacing: 10) {
             Image(systemName: "bolt.horizontal.circle").font(.system(size: 12)).foregroundStyle(Color(nsColor: Palette.accent)).padding(.top, 2)
             VStack(alignment: .leading, spacing: 2) {
                 Text(workflow.name).font(.system(size: 13, weight: .medium)).foregroundStyle(DS.text).lineLimit(1)
-                Text("\(workflow.steps.count) steps · run \(workflow.runs)×" + (workflow.schedule.map { " · daily \($0)" } ?? "")
-                     + (workflow.params.isEmpty ? "" : " · inputs: " + workflow.params.joined(separator: ", ")))
+                Text(subtitle)
                     .font(.system(size: 12)).foregroundStyle(DS.tertiary).lineLimit(1)
             }
             Spacer(minLength: 6)
