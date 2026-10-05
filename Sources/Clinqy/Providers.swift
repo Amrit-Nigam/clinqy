@@ -63,7 +63,7 @@ enum Provider: String, CaseIterable {
         let tier = ["haiku": 0, "sonnet": 1, "opus": 2][alias]
         guard let tier else { return name }
         switch self {
-        case .agyCLI: return ["gemini-3.8-flash-low", "gemini-3.8-flash-high", "gemini-3.1-pro-high"][tier]
+        case .agyCLI: return ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.1-pro"][tier]
         case .claudeCLI: return name
         // The CLIs pick their own default model for your account; only an explicit model id is passed on.
         case .codexCLI, .geminiCLI: return ""

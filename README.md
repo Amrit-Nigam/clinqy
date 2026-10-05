@@ -296,7 +296,7 @@ If `PROVIDER` isn't set, Clinqy uses the `agy` CLI when it's installed. Without 
 
 | Provider | `haiku` (fast) | `sonnet` (agent, default) | `opus` |
 |---|---|---|---|
-| agy-cli | gemini-3.8-flash-low | gemini-3.8-flash-high | gemini-3.1-pro-high |
+| agy-cli | gemini-3.8-flash (low effort) | gemini-3.8-flash | gemini-3.1-pro |
 | anthropic | claude-haiku-4-5 | claude-sonnet-5-5 | claude-opus-5-5 |
 | openai | gpt-5.6-luna | gpt-5.6-terra | gpt-5.6-sol |
 | gemini | gemini-3.5-flash-lite | gemini-3.6-flash | gemini-3.6-flash |
@@ -322,7 +322,7 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `OPENAI_BASE_URL` | per provider | Endpoint for `openai`, `ollama` or `openai-compatible` |
 | `LOCAL_MODEL` | `qwen3-vl` | Model for `ollama` / `openai-compatible` |
 | `AGY_PATH` · `CLAUDE_PATH` · `CODEX_PATH` · `GEMINI_PATH` | auto-detected | Path to each CLI |
-| `AGY_MODEL` / `CLAUDE_MODEL` | `gemini-3.8-flash-high` | Model for the agent (any provider) |
+| `AGY_MODEL` / `CLAUDE_MODEL` | `sonnet` (`gemini-3.8-flash`) | Model for the agent (any provider) |
 | `AGY_EFFORT` / `CLAUDE_EFFORT` | `low` | `low` is noticeably faster per step |
 | `WHISPER_MODEL` | `large-v3-v20240930_turbo_632MB` | Any WhisperKit variant |
 | `VOICE_ENGINE` | whisper | Set `apple` to use only Apple dictation |

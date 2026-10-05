@@ -30,6 +30,7 @@ final class AgySession: @unchecked Sendable {
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
+    private let errorPipe = Pipe()
     private let lock = NSLock()
     private var buffer = Data()
     private var pending: CheckedContinuation<String, Error>?
@@ -37,6 +38,7 @@ final class AgySession: @unchecked Sendable {
     private var partialText = ""
     private var partialHandler: (@Sendable (String) -> Void)?
     private var dead = false
+    private var lastErrorMessage: String?
     /// Set when PROVIDER is an HTTP API (see Providers.swift): turns go there instead of to a CLI process.
     private var api: APIChat?
     private var isAgy = true
@@ -69,9 +71,25 @@ final class AgySession: @unchecked Sendable {
                 "--input-format", "stream-json", "--output-format", "stream-json",
                 "--disable-slash-commands", "--dangerously-skip-permissions",
             ]
-            let effort = Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low"
-            args += ["--effort", effort.lowercased()]
-            let m = provider.model(model)
+            var m = provider.model(model)
+            let explicitEffort = Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT")
+            let effortSuffixes = ["-low", "-medium", "-high", "-xhigh", "-max"]
+            let matchedSuffix = effortSuffixes.first { m.hasSuffix($0) }
+
+            if let matchedSuffix {
+                if let explicitEffort = explicitEffort?.lowercased(), !explicitEffort.isEmpty {
+                    // Strip the baked-in suffix so agy doesn't reject explicit effort as a conflict
+                    m = String(m.dropLast(matchedSuffix.count))
+                    args += ["--effort", explicitEffort]
+                }
+                // When no explicit effort is set, let the model's baked-in suffix dictate effort; omit --effort
+            } else if !m.contains("claude") {
+                // Models without baked-in suffix (e.g. gemini-3.8-flash, gemini-3.1-pro) accept --effort
+                let defaultEffort = model.lowercased() == "opus" ? "high" : "low"
+                let effort = (explicitEffort ?? defaultEffort).lowercased()
+                args += ["--effort", effort]
+            }
+
             if !m.isEmpty && m != "default" {
                 args += ["--model", m]
             }
@@ -92,7 +110,15 @@ final class AgySession: @unchecked Sendable {
         process.currentDirectoryURL = tempDir
         process.standardInput = input
         process.standardOutput = output
-        process.standardError = FileHandle.nullDevice
+        process.standardError = errorPipe
+
+        errorPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
+            let chunk = handle.availableData
+            guard let self, !chunk.isEmpty else { return }
+            if let str = String(data: chunk, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines), !str.isEmpty {
+                self.lock.withLock { self.lastErrorMessage = str }
+            }
+        }
 
         output.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let chunk = handle.availableData
@@ -146,7 +172,12 @@ final class AgySession: @unchecked Sendable {
 
         return try await withCheckedThrowingContinuation { continuation in
             lock.lock()
-            if dead { lock.unlock(); continuation.resume(throwing: BrainError.died); return }
+            if dead {
+                let err = lastErrorMessage.map { BrainError.failed($0) } ?? BrainError.died
+                lock.unlock()
+                continuation.resume(throwing: err)
+                return
+            }
             if pending != nil { lock.unlock(); continuation.resume(throwing: BrainError.busy); return }
             pending = continuation
             partialText = ""
@@ -197,7 +228,9 @@ final class AgySession: @unchecked Sendable {
                 let text = res["response"] as? String ?? ""
                 let err = res["error"] as? String
                 if status == "ERROR" || (err != nil && !err!.isEmpty) {
-                    results.append(.failure(BrainError.failed(err ?? (text.isEmpty ? "Agy process error" : text))))
+                    let msg = err ?? (text.isEmpty ? "Agy process error" : text)
+                    lastErrorMessage = msg
+                    results.append(.failure(BrainError.failed(msg)))
                 } else {
                     results.append(.success(text))
                 }
@@ -226,8 +259,10 @@ final class AgySession: @unchecked Sendable {
         let p = pending
         pending = nil
         partialHandler = nil
+        let errMsg = lastErrorMessage
         lock.unlock()
-        p?.resume(throwing: error)
+        let errToThrow = errMsg.map { BrainError.failed($0) } ?? error
+        p?.resume(throwing: errToThrow)
     }
 }
 
@@ -236,7 +271,7 @@ typealias ClaudeSession = AgySession
 /// Keeps one session started ahead of time so a request never waits for process startup.
 @MainActor
 enum Brain {
-    static var model: String { Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "gemini-3.8-flash-high" }
+    static var model: String { Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet" }
     private static var warm: AgySession?
 
     static func prewarm() {
