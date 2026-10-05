@@ -1,33 +1,36 @@
 import Foundation
 
-/// Which model service answers: a coding CLI you're already logged into (Claude Code, the default; Codex; Gemini
-/// CLI) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env, or just add a key: with no
-/// `claude` CLI installed, the first key found is used, then the first other CLI found.
+/// Which model service answers: a coding CLI you're already logged into (Antigravity CLI, the default; Claude Code;
+/// Codex; Gemini CLI) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env, or just add a key:
+/// with no CLI installed, the first key found is used, then the first CLI found.
 enum Provider: String, CaseIterable {
-    case claudeCLI = "claude-cli", codexCLI = "codex-cli", geminiCLI = "gemini-cli"
+    case agyCLI = "agy-cli", claudeCLI = "claude-cli", codexCLI = "codex-cli", geminiCLI = "gemini-cli"
     case anthropic, openai, gemini, openrouter, ollama, compatible = "openai-compatible"
 
     static var current: Provider {
         if let raw = Config.value("PROVIDER")?.lowercased() {
             switch raw {
+            case "agy", "agy-cli", "antigravity": return .agyCLI
             case "claude", "claude-code", "cli": return .claudeCLI
             case "codex": return .codexCLI
+            case "gemini-cli": return .geminiCLI
             case "gpt", "chatgpt": return .openai
             case "google": return .gemini
             case "compatible", "custom": return .compatible
             default: if let p = Provider(rawValue: raw) { return p }
             }
         }
-        if ClaudeSession.claudePath != nil { return .claudeCLI }
+        if AgySession.agyPath != nil { return .agyCLI }
         return [.anthropic, .openai, .gemini, .openrouter].first { $0.key != nil }
-            ?? [.codexCLI, .geminiCLI].first { $0.cliPath != nil } ?? .claudeCLI
+            ?? [.codexCLI, .geminiCLI, .claudeCLI].first { $0.cliPath != nil } ?? .agyCLI
     }
 
-    /// The CLI's executable, for the CLI providers (CODEX_PATH / GEMINI_PATH, else the usual install spots).
+    /// The CLI's executable, for the CLI providers (AGY_PATH / CODEX_PATH / GEMINI_PATH / CLAUDE_PATH, else the usual install spots).
     var cliPath: String? {
         let name: String
         switch self {
-        case .claudeCLI: return ClaudeSession.claudePath
+        case .agyCLI: return AgySession.agyPath
+        case .claudeCLI: return AgySession.claudePath
         case .codexCLI: name = "codex"
         case .geminiCLI: name = "gemini"
         default: return nil
@@ -38,12 +41,12 @@ enum Provider: String, CaseIterable {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    var isCLI: Bool { self == .claudeCLI || self == .codexCLI || self == .geminiCLI }
+    var isCLI: Bool { self == .agyCLI || self == .claudeCLI || self == .codexCLI || self == .geminiCLI }
 
     var key: String? {
         let names: [String]
         switch self {
-        case .claudeCLI, .codexCLI, .geminiCLI, .ollama: return nil
+        case .agyCLI, .claudeCLI, .codexCLI, .geminiCLI, .ollama: return nil
         case .anthropic: names = ["ANTHROPIC_API_KEY"]
         case .openai: names = ["OPENAI_API_KEY"]
         case .gemini: names = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
@@ -60,6 +63,7 @@ enum Provider: String, CaseIterable {
         let tier = ["haiku": 0, "sonnet": 1, "opus": 2][alias]
         guard let tier else { return name }
         switch self {
+        case .agyCLI: return ["gemini-3.8-flash-low", "gemini-3.8-flash-high", "gemini-3.1-pro-high"][tier]
         case .claudeCLI: return name
         // The CLIs pick their own default model for your account; only an explicit model id is passed on.
         case .codexCLI, .geminiCLI: return ""
@@ -73,7 +77,8 @@ enum Provider: String, CaseIterable {
 
     var label: String {
         switch self {
-        case .claudeCLI: return "Claude Code CLI: \(ClaudeSession.claudePath ?? "❌ not found")"
+        case .agyCLI: return "Antigravity CLI (agy): \(AgySession.agyPath ?? "❌ not found")"
+        case .claudeCLI: return "Claude Code CLI: \(AgySession.claudePath ?? "❌ not found")"
         case .codexCLI: return "Codex CLI: \(cliPath ?? "❌ not found")"
         case .geminiCLI: return "Gemini CLI: \(cliPath ?? "❌ not found")"
         case .ollama: return "Ollama (\(baseURL))"
@@ -91,7 +96,7 @@ enum Provider: String, CaseIterable {
         case .compatible: return explicit ?? "http://localhost:1234/v1"
         case .anthropic: return Config.value("ANTHROPIC_BASE_URL") ?? "https://api.anthropic.com"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
-        case .claudeCLI, .codexCLI, .geminiCLI: return ""
+        case .agyCLI, .claudeCLI, .codexCLI, .geminiCLI: return ""
         }
     }
 }
@@ -235,7 +240,7 @@ final class APIChat: @unchecked Sendable {
             if !plain, provider == .openai, model.hasPrefix("gpt-5") || model.range(of: #"^o\d"#, options: .regularExpression) != nil {
                 body["reasoning_effort"] = ["min", "minimal", "none"].contains(effort) ? "minimal" : effort == "max" ? "high" : effort
             }
-        case .claudeCLI, .codexCLI, .geminiCLI:
+        case .agyCLI, .claudeCLI, .codexCLI, .geminiCLI:
             throw ClaudeSession.BrainError.failed("\(provider.rawValue) isn't an HTTP provider")
         }
         req.httpMethod = "POST"

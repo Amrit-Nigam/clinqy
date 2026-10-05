@@ -1,28 +1,31 @@
 import Foundation
 
-/// A long-lived `claude -p` process speaking stream-json. Keeping it alive means each turn costs only
+/// A long-lived `agy` (or `claude -p`) process speaking stream-json. Keeping it alive means each turn costs only
 /// model time (~1 s), and the conversation (what was tried, what the screen looked like) stays in context.
-final class ClaudeSession: @unchecked Sendable {
+final class AgySession: @unchecked Sendable {
     enum BrainError: LocalizedError {
         case notInstalled, failed(String), died, busy
 
         var errorDescription: String? {
             switch self {
-            case .notInstalled: return "Claude CLI not found. Install Claude Code (or set CLAUDE_PATH), or add an API key to ~/.config/clinqy/env"
+            case .notInstalled: return "Agy CLI not found. Install Antigravity (or set AGY_PATH), or add an API key to ~/.config/clinqy/env"
             case .failed(let message):
-                return message.contains("Not logged in") ? "Claude CLI isn't logged in. Run `claude` in a terminal once and log in." : message
-            case .died: return "The Claude process stopped unexpectedly"
+                return message.contains("Not logged in") ? "Agy CLI isn't logged in. Run `agy` in a terminal once and log in." : message
+            case .died: return "The Agy process stopped unexpectedly"
             case .busy: return "Still waiting on the previous reply"
             }
         }
     }
 
-    static var claudePath: String? {
-        if let explicit = Config.value("CLAUDE_PATH") { return explicit }
+    static var agyPath: String? {
+        if let explicit = Config.value("AGY_PATH") ?? Config.value("CLAUDE_PATH") { return explicit }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        return ["\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "\(home)/.claude/local/claude"]
+        return ["\(home)/.local/bin/agy", "/opt/homebrew/bin/agy", "/usr/local/bin/agy",
+                "\(home)/.local/bin/claude", "/opt/homebrew/bin/claude", "/usr/local/bin/claude", "\(home)/.claude/local/claude"]
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
+
+    static var claudePath: String? { agyPath }
 
     private let process = Process()
     private let input = Pipe()
@@ -34,29 +37,59 @@ final class ClaudeSession: @unchecked Sendable {
     private var partialText = ""
     private var partialHandler: (@Sendable (String) -> Void)?
     private var dead = false
-    /// Set when PROVIDER is an HTTP API (see Providers.swift): turns go there instead of to a `claude` process.
+    /// Set when PROVIDER is an HTTP API (see Providers.swift): turns go there instead of to a CLI process.
     private var api: APIChat?
+    private var isAgy = true
+    private var sessionDir: URL?
+    private var systemPrompt = ""
+    private var isFirstTurn = true
 
     init(system: String, model: String) throws {
+        self.systemPrompt = system
         let provider = Provider.current
-        if provider != .claudeCLI {
+        if provider != .agyCLI && provider != .claudeCLI {
             api = try APIChat(provider: provider, system: system, model: model)
             return
         }
-        guard let path = Self.claudePath else { throw BrainError.notInstalled }
+        guard let path = Self.agyPath else { throw BrainError.notInstalled }
+        let execName = URL(fileURLWithPath: path).lastPathComponent
+        isAgy = (provider == .agyCLI) || (execName == "agy")
+
+        let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-session-\(UUID().uuidString)")
+        try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+        self.sessionDir = tempDir
+
+        // Write AGENTS.md so agy automatically picks up system rules
+        let agentsFile = tempDir.appendingPathComponent("AGENTS.md")
+        try? system.write(to: agentsFile, atomically: true, encoding: .utf8)
+
         process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = [
-            "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-            "--model", model, "--effort", Config.value("CLAUDE_EFFORT") ?? "low", "--tools", "", "--system-prompt", system,
-            "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
-            // The reply as it's written, so the first action can start before the model has finished the rest.
-            "--include-partial-messages",
-        ]
+        if isAgy {
+            var args = [
+                "--input-format", "stream-json", "--output-format", "stream-json",
+                "--disable-slash-commands", "--dangerously-skip-permissions",
+            ]
+            let effort = Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low"
+            args += ["--effort", effort.lowercased()]
+            let m = provider.model(model)
+            if !m.isEmpty && m != "default" {
+                args += ["--model", m]
+            }
+            process.arguments = args
+        } else {
+            process.arguments = [
+                "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
+                "--model", model, "--effort", Config.value("CLAUDE_EFFORT") ?? "low", "--tools", "", "--system-prompt", system,
+                "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
+                "--include-partial-messages",
+            ]
+        }
+
         var env = ProcessInfo.processInfo.environment
         let home = FileManager.default.homeDirectoryForCurrentUser.path
         env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         process.environment = env
-        process.currentDirectoryURL = FileManager.default.temporaryDirectory
+        process.currentDirectoryURL = tempDir
         process.standardInput = input
         process.standardOutput = output
         process.standardError = FileHandle.nullDevice
@@ -81,14 +114,34 @@ final class ClaudeSession: @unchecked Sendable {
     /// called for them.
     func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         if let api { return try await api.send(text, image: image) }
-        var content: [[String: Any]] = []
-        if let image {
-            content.append(["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": image]])
+
+        var line: Data
+        if isAgy {
+            var promptText = text
+            if isFirstTurn {
+                promptText = "<instructions>\n\(systemPrompt)\n</instructions>\n\n" + promptText
+                isFirstTurn = false
+            }
+            if let image, let imgData = Data(base64Encoded: image), let dir = sessionDir {
+                let screenURL = dir.appendingPathComponent("screen.jpg")
+                try? imgData.write(to: screenURL)
+                promptText += "\n(Screenshot saved at \(screenURL.path). You can view it with view_file if needed.)"
+            }
+            let payload: [String: Any] = [
+                "event": "user",
+                "message": ["role": "user", "content": [["type": "text", "text": promptText]]]
+            ]
+            line = try JSONSerialization.data(withJSONObject: payload)
+        } else {
+            var content: [[String: Any]] = []
+            if let image {
+                content.append(["type": "image", "source": ["type": "base64", "media_type": "image/jpeg", "data": image]])
+            }
+            content.append(["type": "text", "text": text])
+            line = try JSONSerialization.data(withJSONObject: [
+                "type": "user", "message": ["role": "user", "content": content],
+            ])
         }
-        content.append(["type": "text", "text": text])
-        var line = try JSONSerialization.data(withJSONObject: [
-            "type": "user", "message": ["role": "user", "content": content],
-        ])
         line.append(0x0A)
 
         return try await withCheckedThrowingContinuation { continuation in
@@ -107,6 +160,7 @@ final class ClaudeSession: @unchecked Sendable {
         if let api { api.close(); return }
         output.fileHandleForReading.readabilityHandler = nil
         if process.isRunning { process.terminate() }
+        if let sessionDir { try? FileManager.default.removeItem(at: sessionDir) }
         fail(BrainError.died)
     }
 
@@ -119,6 +173,16 @@ final class ClaudeSession: @unchecked Sendable {
             let line = buffer[buffer.startIndex..<newline]
             buffer.removeSubrange(buffer.startIndex...newline)
             guard let event = try? JSONSerialization.jsonObject(with: line) as? [String: Any] else { continue }
+            // Agy streaming partial text
+            if event["event"] as? String == "step_update",
+               let step = event["step_update"] as? [String: Any],
+               step["step_type"] as? String == "agent_response",
+               let piece = step["text_delta"] as? String, pending != nil {
+                partialText += piece
+                grown = partialText
+                continue
+            }
+            // Claude streaming partial text
             if event["type"] as? String == "stream_event" {
                 if let e = event["event"] as? [String: Any], let delta = e["delta"] as? [String: Any],
                    delta["type"] as? String == "text_delta", let piece = delta["text"] as? String, pending != nil {
@@ -127,9 +191,24 @@ final class ClaudeSession: @unchecked Sendable {
                 }
                 continue
             }
-            guard event["type"] as? String == "result" else { continue }
-            let text = event["result"] as? String ?? ""
-            results.append(event["is_error"] as? Bool == true ? .failure(BrainError.failed(text)) : .success(text))
+            // Agy final result
+            if event["event"] as? String == "result", let res = event["result"] as? [String: Any] {
+                let status = res["status"] as? String
+                let text = res["response"] as? String ?? ""
+                let err = res["error"] as? String
+                if status == "ERROR" || (err != nil && !err!.isEmpty) {
+                    results.append(.failure(BrainError.failed(err ?? (text.isEmpty ? "Agy process error" : text))))
+                } else {
+                    results.append(.success(text))
+                }
+                continue
+            }
+            // Claude final result
+            if event["type"] as? String == "result" {
+                let text = event["result"] as? String ?? ""
+                results.append(event["is_error"] as? Bool == true ? .failure(BrainError.failed(text)) : .success(text))
+                continue
+            }
         }
         var toResume: [(CheckedContinuation<String, Error>, Result<String, Error>)] = []
         for result in results {
@@ -152,22 +231,24 @@ final class ClaudeSession: @unchecked Sendable {
     }
 }
 
+typealias ClaudeSession = AgySession
+
 /// Keeps one session started ahead of time so a request never waits for process startup.
 @MainActor
 enum Brain {
-    static var model: String { Config.value("CLAUDE_MODEL") ?? "sonnet" }
-    private static var warm: ClaudeSession?
+    static var model: String { Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "gemini-3.8-flash-high" }
+    private static var warm: AgySession?
 
     static func prewarm() {
         if warm?.isAlive == true { return }
-        warm = try? ClaudeSession(system: AgentPrompt.system, model: model)
+        warm = try? AgySession(system: AgentPrompt.system, model: model)
     }
 
     /// Hands out the warm session (or a fresh one) and starts warming the next.
-    static func session(model override: String? = nil) throws -> ClaudeSession {
-        if let override, override != model { return try ClaudeSession(system: AgentPrompt.system, model: override) }
-        let s: ClaudeSession
-        if let w = warm, w.isAlive { s = w } else { s = try ClaudeSession(system: AgentPrompt.system, model: model) }
+    static func session(model override: String? = nil) throws -> AgySession {
+        if let override, override != model { return try AgySession(system: AgentPrompt.system, model: override) }
+        let s: AgySession
+        if let w = warm, w.isAlive { s = w } else { s = try AgySession(system: AgentPrompt.system, model: model) }
         warm = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { prewarm() }
         return s
