@@ -301,9 +301,12 @@ enum Memory {
                 var s = 0.0
                 for (t, w) in expanded {
                     guard let f = tf[i][t] else { continue }
-                    let idf = log(1 + (n - Double(df[t] ?? 0) + 0.5) / (Double(df[t] ?? 0) + 0.5))
+                    let docFreq = Double(df[t] ?? 0)
+                    let idf = log(1.0 + (n - docFreq + 0.5) / (docFreq + 0.5))
                     let fd = Double(f)
-                    s += w * idf * (fd * (k1 + 1)) / (fd + k1 * (1 - b + b * Double(len[i]) / avg))
+                    let num = fd * (k1 + 1.0)
+                    let den = fd + k1 * (1.0 - b + b * Double(len[i]) / avg)
+                    s += w * idf * num / den
                 }
                 if s > 0 { out[i] = s }
             }
