@@ -59,9 +59,8 @@ final class AgySession: @unchecked Sendable {
     private var systemPrompt = ""
     private var isFirstTurn = true
 
-    init(system: String, model: String) throws {
+    init(system: String, model: String, provider: Provider = Provider.current) throws {
         self.systemPrompt = system
-        let provider = Provider.current
         self.sessionProvider = provider
         if provider != .agyCLI && provider != .claudeCLI {
             api = try APIChat(provider: provider, system: system, model: model)
@@ -83,11 +82,14 @@ final class AgySession: @unchecked Sendable {
         process.executableURL = URL(fileURLWithPath: path)
         if isAgy {
             var args = [
+                "--sandbox",
                 "--input-format", "stream-json", "--output-format", "stream-json",
                 "--disable-slash-commands", "--dangerously-skip-permissions",
             ]
             var m = provider.model(model)
-            let explicitEffort = Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT")
+            let explicitEffort = isAgy
+                ? (Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT"))
+                : (Config.value("CLAUDE_EFFORT") ?? Config.value("AGY_EFFORT"))
             let effortSuffixes = ["-low", "-medium", "-high", "-xhigh", "-max"]
             let matchedSuffix = effortSuffixes.first { m.hasSuffix($0) }
 
@@ -274,8 +276,11 @@ final class AgySession: @unchecked Sendable {
         let p = pending
         pending = nil
         partialHandler = nil
-        let errMsg = lastErrorMessage
+        var errMsg = lastErrorMessage
         lock.unlock()
+        if let msg = errMsg, (msg.contains("OAuth") || msg.contains("Not logged in") || msg.contains("Failed to authenticate")) && !msg.contains("claude auth login") {
+            errMsg = "\(msg) — run 'claude auth login' in your terminal."
+        }
         let errToThrow = errMsg.map { BrainError.failed($0) } ?? error
         p?.resume(throwing: errToThrow)
     }
@@ -286,7 +291,17 @@ typealias ClaudeSession = AgySession
 /// Keeps one session started ahead of time so a request never waits for process startup.
 @MainActor
 enum Brain {
-    static var model: String { Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet" }
+    static func defaultModel(for provider: Provider = Provider.current) -> String {
+        switch provider {
+        case .agyCLI:
+            return Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet"
+        case .claudeCLI:
+            return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
+        default:
+            return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
+        }
+    }
+    static var model: String { defaultModel(for: Provider.current) }
     private static var warm: AgySession?
 
     static func prewarm() {
@@ -295,15 +310,17 @@ enum Brain {
     }
 
     /// Hands out the warm session (or a fresh one) and starts warming the next.
-    static func session(model override: String? = nil) throws -> AgySession {
-        let currentProvider = Provider.current
-        if let override, override != model { return try AgySession(system: AgentPrompt.system, model: override) }
+    static func session(model override: String? = nil, provider overrideProvider: Provider? = nil) throws -> AgySession {
+        let currentProvider = overrideProvider ?? Provider.current
+        let defaultM = defaultModel(for: currentProvider)
+        let effectiveModel = override ?? defaultM
+        if let override, override != defaultM { return try AgySession(system: AgentPrompt.system, model: override, provider: currentProvider) }
         let s: AgySession
         if let w = warm, w.isAlive, w.sessionProvider == currentProvider {
             s = w
         } else {
             warm?.close()
-            s = try AgySession(system: AgentPrompt.system, model: model)
+            s = try AgySession(system: AgentPrompt.system, model: effectiveModel, provider: currentProvider)
         }
         warm = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { prewarm() }

@@ -215,15 +215,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             let test = items.first { $0.name == "test" }?.value == "1"
             let dry = items.first { $0.name == "dry" }?.value == "1"
+            var runProvider: Provider? = nil
             if items.first(where: { $0.name == "agy" })?.value == "1" {
-                Provider.useAgy = true
+                runProvider = .agyCLI
             } else if items.first(where: { $0.name == "claude" })?.value == "1" {
-                Provider.useAgy = false
+                runProvider = .claudeCLI
             }
             // Tests skip the review card unless they ask for it (tests/run.sh answers it through clinqy://answer).
             agent.reviewInTests = items.first { $0.name == "review" }?.value == "1"
             agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
-            agent.submit(dry ? "dry run: " + task : task, test: test)
+            agent.submit(dry ? "dry run: " + task : task, test: test, provider: runProvider)
         }
     }
 
@@ -333,8 +334,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func startQA(_ url: URL) {
         let q = Dictionary((URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []).map { ($0.name, $0.value ?? "") },
                            uniquingKeysWith: { a, _ in a })
-        if q["agy"] == "1" { Provider.useAgy = true }
-        else if q["claude"] == "1" { Provider.useAgy = false }
+        var qaProvider: Provider? = nil
+        if q["agy"] == "1" { qaProvider = .agyCLI }
+        else if q["claude"] == "1" { qaProvider = .claudeCLI }
         let out = URL(fileURLWithPath: q["out"] ?? NSTemporaryDirectory() + "clinqy-qa.json")
         var name = q["name"] ?? "Inline test"
         var test = q["text"] ?? ""
@@ -362,7 +364,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         rememberTarget()
         agent.runQA(name: name, test: test, compiled: compiled, relearn: q["relearn"] == "1",
-                    model: q["model"].flatMap { $0.isEmpty ? nil : $0 }, report: out)
+                    model: q["model"].flatMap { $0.isEmpty ? nil : $0 }, provider: qaProvider, report: out)
     }
 
     /// Runs workflows scheduled for this minute (checked every 30 s; once a day each), and scheduled requests

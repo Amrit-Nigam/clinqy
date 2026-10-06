@@ -9,27 +9,49 @@ enum Provider: String, CaseIterable {
 
     /// Flag switch: set via --agy command line flag, USE_AGY=1/true, or PROVIDER=agy-cli.
     static var useAgy: Bool {
-        get {
-            if let override = _useAgyOverride { return override }
-            if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return true }
-            if CommandLine.arguments.contains("--claude") || CommandLine.arguments.contains("--claude-cli") { return false }
-            if let val = Config.value("USE_AGY")?.lowercased() {
-                return ["1", "true", "yes", "on"].contains(val)
+        if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return true }
+        if CommandLine.arguments.contains("--claude") || CommandLine.arguments.contains("--claude-cli") { return false }
+        if let val = Config.value("USE_AGY")?.lowercased() {
+            return ["1", "true", "yes", "on"].contains(val)
+        }
+        if let raw = Config.value("PROVIDER")?.lowercased() {
+            return ["agy", "agy-cli", "antigravity", "gemini-cli"].contains(raw)
+        }
+        return false
+    }
+
+    static var isClaudeLoggedIn: Bool {
+        #if os(macOS)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 { return false }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let str = String(data: data, encoding: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: Data(str.utf8)) as? [String: Any],
+                  let oauth = obj["claudeAiOauth"] as? [String: Any],
+                  let token = oauth["accessToken"] as? String, !token.isEmpty else {
+                return false
             }
-            if let raw = Config.value("PROVIDER")?.lowercased() {
-                return ["agy", "agy-cli", "antigravity", "gemini-cli"].contains(raw)
-            }
+            return true
+        } catch {
             return false
         }
-        set {
-            _useAgyOverride = newValue
-        }
+        #else
+        return true
+        #endif
     }
-    private static var _useAgyOverride: Bool?
 
     static var current: Provider {
         if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return .agyCLI }
         if CommandLine.arguments.contains("--claude") || CommandLine.arguments.contains("--claude-cli") { return .claudeCLI }
+        if useAgy { return .agyCLI }
         if let raw = Config.value("PROVIDER")?.lowercased() {
             switch raw {
             case "agy", "agy-cli", "antigravity", "gemini-cli": return .agyCLI
@@ -41,11 +63,11 @@ enum Provider: String, CaseIterable {
             default: if let p = Provider(rawValue: raw) { return p }
             }
         }
-        if useAgy, AgySession.agyPath != nil { return .agyCLI }
-        if ClaudeSession.claudePath != nil { return .claudeCLI }
+        if ClaudeSession.claudePath != nil && isClaudeLoggedIn { return .claudeCLI }
         if AgySession.agyPath != nil { return .agyCLI }
+        if ClaudeSession.claudePath != nil { return .claudeCLI }
         return [.anthropic, .openai, .gemini, .openrouter].first { $0.key != nil }
-            ?? [.codexCLI, .claudeCLI, .agyCLI].first { $0.cliPath != nil } ?? (useAgy ? .agyCLI : .claudeCLI)
+            ?? [.codexCLI, .claudeCLI, .agyCLI].first { $0.cliPath != nil } ?? .claudeCLI
     }
 
     /// The CLI's executable, for the CLI providers (AGY_PATH / CLAUDE_PATH / CODEX_PATH, else the usual install spots).
@@ -122,8 +144,8 @@ enum Provider: String, CaseIterable {
     }
 }
 
-/// One conversation over a provider's HTTP API (or a one-shot `codex exec` / `gemini -p` per turn), standing in for
-/// the `agy` process: it keeps the whole exchange so each turn has the same context the CLI session would.
+/// One conversation over a provider's HTTP API (or a one-shot `codex exec` per turn), standing in for
+/// the CLI session: it keeps the whole exchange so each turn has the same context the CLI session would.
 final class APIChat: @unchecked Sendable {
     private struct Turn { var user: Bool; var text: String; var image: String? }
 
