@@ -811,7 +811,9 @@ enum AXEngine {
     static func press(combo: String) -> Bool {
         var flags: CGEventFlags = []
         var key: CGKeyCode?
-        for part in combo.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init) {
+        for raw in combo.lowercased().replacingOccurrences(of: " ", with: "").split(separator: "+").map(String.init) {
+            // "Page_Down", "page-up": the same keys as "pagedown", "pageup".
+            let part = raw.count > 1 ? raw.replacingOccurrences(of: "_", with: "").replacingOccurrences(of: "-", with: "") : raw
             switch part {
             case "cmd", "command", "⌘": flags.insert(.maskCommand)
             case "shift", "⇧": flags.insert(.maskShift)

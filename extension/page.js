@@ -847,7 +847,32 @@ function readText() {
     window.scrollBy({ top: dy, behavior: "instant" });
     return { y: scrollY };
   }
-  function selection() { return String(window.getSelection() || "").slice(0, 8000); }
+  // The selected text plus where its links go: "Apply here" alone loses the application URL the user meant.
+  function selection() {
+    const sel = window.getSelection();
+    const text = String(sel || "").slice(0, 8000);
+    if (!text.trim() || !sel.rangeCount) return text;
+    const links = new Map();
+    for (let i = 0; i < sel.rangeCount; i++) {
+      const range = sel.getRangeAt(i);
+      const root = range.commonAncestorContainer;
+      const scope = root.nodeType === 1 ? root : root.parentElement;
+      const around = scope && scope.closest("a[href]");
+      const anchors = [...(scope ? scope.querySelectorAll("a[href]") : []), ...(around ? [around] : [])];
+      for (const a of anchors) {
+        if (links.size >= 10 || !range.intersectsNode(a)) continue;
+        let href = a.href;
+        if (!/^https?:/.test(href)) continue;
+        try {   // LinkedIn and others wrap outside links in a redirect page
+          const u = new URL(href), inner = u.searchParams.get("url") || u.searchParams.get("q");
+          if (inner && /^https?:/.test(inner) && /\/(safety\/go|redirect|url)\b/.test(u.pathname)) href = inner;
+        } catch (e) {}
+        if (!links.has(href)) links.set(href, (a.innerText || "").trim().replace(/\s+/g, " ").slice(0, 60));
+      }
+    }
+    if (!links.size) return text;
+    return text + "\n\nLinks in the selection:\n" + [...links].map(([href, label]) => `- ${label ? label + " → " : ""}${href}`).join("\n");
+  }
 
   // Resolves as soon as `want` shows in the page's text or title — or, with gone, has stayed gone for half a second —
   // woken by the page's own changes (a MutationObserver) rather than polled; { met: false } at the timeout.

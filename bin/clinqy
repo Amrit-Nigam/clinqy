@@ -6,7 +6,9 @@
 #       .clinqy/ next to the test); later runs replay it with no model, healing only broken steps.
 #       Test files: optional "# Title", then one step per line; lines starting with Expect/Check/Verify
 #       are assertions. Exit code 0 = all passed, 1 = something failed.
-#   clinqy run [--dry] "<task>"      Do a task (not saved to history). --dry: point at each click/keystroke, don't do it.
+#   clinqy run [--dry|--test] "<task>"  Do a task like one asked in the app (history, and it carries on by itself when it
+#                                    runs out of steps). --dry: point at each click/keystroke, don't do it. --test: a
+#                                    throwaway run (not saved, no carrying on), as for checking a page.
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
 #   clinqy stats [days] [--last]     Success rate, model vs action time per turn, top failure reasons (default: 7 days).
@@ -32,12 +34,18 @@ ensure_app() {
 
 wait_log() {   # wait for a run started after line $1 to finish; print its steps
   local start=$1
-  for i in $(seq 1 600); do
+  for i in $(seq 1 14400); do   # long tasks (a whole lab) run for hours
+    pgrep -xq Clinqy || break
     sleep 1
-    tail -n +$((start+1)) $LOG 2>/dev/null | grep -qE "\] (✓|✗)" && break
+    # Finished when the newest end/restart line is an end (✓/✗) that no auto-continue followed within a few seconds.
+    local last=$(tail -n +$((start+1)) $LOG 2>/dev/null | grep -E "\] (✓|✗)|\] auto-continue " | tail -1)
+    if print -r -- "$last" | grep -qE "\] (✓|✗)"; then
+      sleep 3
+      [[ $(tail -n +$((start+1)) $LOG | grep -E "\] (✓|✗)|\] auto-continue " | tail -1) == "$last" ]] && break
+    fi
   done
   tail -n +$((start+1)) $LOG | grep -E "→|\] (✓|✗)" | sed 's/^\[ *[0-9.]*s\] *//'
-  tail -n +$((start+1)) $LOG | grep -qE "\] ✓"
+  tail -n +$((start+1)) $LOG | grep -E "\] (✓|✗)" | tail -1 | grep -qE "\] ✓"   # the last run's outcome
 }
 
 cmd=${1:-help}; shift 2>/dev/null
@@ -89,10 +97,14 @@ PY
     exit $failed ;;
   run)
     ensure_app
-    dry=""
-    [[ ${1:-} == --dry ]] && { dry="&dry=1"; shift; }
+    flags=""
+    while [[ ${1:-} == --dry || ${1:-} == --test ]]; do
+      [[ $1 == --dry ]] && flags+="&dry=1"
+      [[ $1 == --test ]] && flags+="&test=1"
+      shift
+    done
     start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://run?task=$(enc "$*")&test=1$dry&token=$TOKEN"
+    open -g "clinqy://run?task=$(enc "$*")$flags&token=$TOKEN"
     wait_log $start ;;
   workflow)
     ensure_app

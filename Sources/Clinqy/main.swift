@@ -462,6 +462,15 @@ if command == "selftest" {
     check(Agent.saysUnfinished("Steps 1–6 partly done: instance launched. Still to do: attach role, SSH check, SNS, alarm")
           && !Agent.saysUnfinished("Subscription created; it's pending until you click the confirm link in the AWS email.")
           && !Agent.saysUnfinished("Added the CloudWatch alarm steps to the Arc doc."), "done with work left isn't done")
+    check(Agent.saysUnfinished("Done through RDS creation and ECR repo; bastion SSH, ECS, ALB, pipeline, SNS and the doc remain")
+          && Agent.saysUnfinished("I got through Steps 1–6 of the 15 and stopped there.")
+          && !Agent.saysUnfinished("The instance will remain running until you stop it."), "lab summaries with steps left aren't done")
+    check(Agent.snapCaption("Step 3: RDS created", number: 5) == "Step 3: RDS created"
+          && Agent.snapCaption("RDS created", number: 5) == "Step 5: RDS created"
+          && Agent.snapCaption("", number: 2) == "Step 2", "snap captions keep the guide's step number, no double numbering")
+    check(Agent.wordsInOrder("Policy created", in: "Policy lab7-codebuild-ecr created.")
+          && !Agent.wordsInOrder("Policy created", in: "Policy name")
+          && !Agent.wordsInOrder("created", in: "Time created"), "wait matches the message with a name in it")
     check(Agent.keepsFrontApp("open Spotify") && Agent.keepsFrontApp("show me my calendar") && Agent.keepsFrontApp("please search flights to Goa")
           && !Agent.keepsFrontApp("type hello into the open TextEdit document") && !Agent.keepsFrontApp("reply to Anmol that I'm on my way"),
           "front app: kept for open/show/search requests only")

@@ -78,9 +78,13 @@ final class Agent: ObservableObject {
     fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
-    /// Step screenshots taken with snap, for paste_snaps. Kept across "continue"s of the same task (a write-up
-    /// spans several runs); each is pasted once.
+    /// Step screenshots taken with snap, for paste_snaps. A write-up spans several runs (auto-continues, and
+    /// follow-ups like "where are the screenshots?" that don't read as "continue"), so ones not yet pasted are kept
+    /// for a few hours whatever the next request is; each is pasted once. Every snap is also saved as a file.
     private var snaps: [(caption: String, png: Data, pasted: Bool)] = []
+    private var lastSnapAt = Date.distantPast
+    /// This write-up's folder of saved snaps (~/Pictures/Clinqy Screenshots/<date time>), made on the first snap.
+    private var snapFolder: URL?
     /// Runs this task continued on its own after running out of steps or stalling (see `finish`).
     private var autoContinues = 0
     /// The browser tab this task opened (the only tab it may navigate in place).
@@ -166,8 +170,55 @@ final class Agent: ObservableObject {
 
     /// A final summary that itself lists work still to do ("Steps 1–6 partly done … Still to do: …"), unless what's
     /// left needs the user (a login, a code, a confirmation link).
+    /// Whether every word of `want` appears in `line` in the same order, with at most 3 other words between
+    /// each pair (and at least two words wanted, so one common word never counts).
+    nonisolated static func wordsInOrder(_ want: String, in line: String) -> Bool {
+        let words = { (t: String) in t.lowercased().split { !$0.isLetter && !$0.isNumber }.map(String.init) }
+        let need = words(want), have = words(line)
+        guard need.count >= 2, have.count <= need.count + 8 else { return false }
+        var at = -1
+        for w in need {
+            guard let i = have[(at + 1)...].firstIndex(of: w), at < 0 || i - at <= 4 else { return false }
+            at = i
+        }
+        return true
+    }
+
+    /// A snap's caption as it goes in the doc: the model's own "Step 3: …" as is, otherwise numbered in order.
+    nonisolated static func snapCaption(_ given: String, number: Int) -> String {
+        if given.isEmpty { return "Step \(number)" }
+        if given.range(of: #"(?i)^(step|task|part|q(uestion)?)\s*\d"#, options: .regularExpression) != nil { return given }
+        return "Step \(number): \(given)"
+    }
+
+    /// Saves a snap as a numbered PNG in this write-up's folder, so the screenshots outlive the run and the doc.
+    private func saveSnap(_ png: Data, caption: String) -> URL? {
+        let fm = FileManager.default
+        if snapFolder == nil {
+            // ~/Pictures, not ~/Documents: Documents is privacy-protected and silently refuses an app without access.
+            let stamp = DateFormatter()
+            stamp.dateFormat = "yyyy-MM-dd HH.mm"
+            let name = "Clinqy Screenshots/\(stamp.string(from: Date()))"
+            let support = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/\(name)")
+            snapFolder = [fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures/\(name)"), support]
+                .first { (try? fm.createDirectory(at: $0, withIntermediateDirectories: true)) != nil }
+            if snapFolder == nil { log("    couldn't make a folder to save screenshots in") }
+        }
+        guard let folder = snapFolder else { return nil }
+        let count = ((try? fm.contentsOfDirectory(atPath: folder.path)) ?? []).filter { $0.hasSuffix(".png") }.count
+        let name = caption.replacingOccurrences(of: ":", with: " -")
+            .replacingOccurrences(of: #"[/\\\n\r\t"*?<>|]+"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces).prefix(80)
+        let url = folder.appendingPathComponent(String(format: "%02d ", count + 1) + name + ".png")
+        do { try png.write(to: url); return url } catch {
+            log("    couldn't save the screenshot to \(url.path): \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     nonisolated static func saysUnfinished(_ say: String) -> Bool {
-        let unfinished = #"(?i)\b(still to do|still need to|remaining steps?|steps? (left|remaining)|left to do|not (yet )?(done|finished)|partly done|partially (done|complete)|next,? i('ll| will)|haven't (yet )?(done|finished|captured|added|started))\b"#
+        let unfinished = #"(?i)\b(still to do|still need to|remaining steps?|steps? (left|remaining)|left to do|not (yet )?(done|finished|written|pasted|added)|partly done|partially (done|complete)|next,? i('ll| will)|haven't (yet )?(done|finished|captured|added|started|pasted)|remain\b(?! (the same|unchanged|open|running|available|in place))|(rest|doc|write-?up|steps?)\b[^.]{0,40}\bremains\b|stopped (there|here|at)|got through (steps? )?\d+\s*[-–]\s*\d+ of)"#
         let needsUser = #"(?i)\b(you need to|you'll need to|you have to|waiting (for|on) you|your (password|otp|code|login|approval|confirmation)|log ?in|sign ?in|confirm(ation)? (link|email)|click the (confirm|link))\b"#
         return say.range(of: unfinished, options: .regularExpression) != nil && say.range(of: needsUser, options: .regularExpression) == nil
     }
@@ -182,6 +233,15 @@ final class Agent: ObservableObject {
     }
 
     /// Why the step stopped when the user chose Edit on the review.
+    /// "Ready to submit?" — a go-ahead for the form's Submit, not a clarifying question that merely mentions applying
+    /// ("apply to the Headout role, message someone, or something else?"), which the user has to answer in words.
+    private static func asksToSubmit(_ action: [String: Any]) -> Bool {
+        let q = action["question"] as? String ?? ""
+        guard (action["options"] as? [Any] ?? []).count <= 2, !q.contains(" or ") else { return false }
+        return q.range(of: #"(?i)(\b(ready to|shall i|should i|ok(ay)? to|go ahead( and)?|can i|want me to|confirm|good to)\b[^?]{0,40}\b(submit|apply|send)\b|^\s*(submit|apply|send)\b[^?]{0,40}\?)"#,
+                       options: .regularExpression) != nil
+    }
+
     private static var editedReview: String {
         "the user chose Edit on the review" + (UI.lastReviewNote.map { ": \"\($0)\". Make that change, then submit again" }
             ?? " without saying what; ask them what to change")
@@ -302,12 +362,15 @@ final class Agent: ObservableObject {
         checkedMemoryForAsk = false
         lastFirst = ""
         shownFacts = []; visitedHosts = []; visitedApps = []
-        pushedOn = 0
+        pushedOn = 0; snapPushes = 0
         profileOffered = []
         turnCount = 0; fastTurnCount = 0; lookCount = 0
         reviewedForm = false
         userAnswers = []
-        if continuation == nil { snaps = [] }
+        if continuation == nil, Date().timeIntervalSince(lastSnapAt) > 3 * 3600 || !snaps.contains(where: { !$0.pasted }) {
+            snaps = []
+            snapFolder = nil
+        }
         addedNotes = []
         readText = nil
         ownedTab = nil
@@ -381,13 +444,14 @@ final class Agent: ObservableObject {
         // What the model was last shown, so later turns can say only what changed (see screenText).
         var shown: Observation?
         var lastFullTurn = 0, lookedLastTurn = false
-        let maxTurns = 50
+        let maxTurns = 80
 
         for turn in 0..<maxTurns {   // long forms take 30+ turns
             guard !Task.isCancelled else { return }
             if turn == maxTurns - 10 {
-                message += "\n(\(turn) of \(maxTurns) steps used. If the current approach isn't getting closer, change it now; "
-                    + "if the task can't be finished, finish with done:true and say where things stand.)"
+                message += "\n(\(turn) of \(maxTurns) steps used. If the current approach isn't getting closer, change it now. "
+                    + "A long task that is making progress just carries on in a new run when these run out, so don't finish early "
+                    + "for that; finish only if it truly can't be done. Before the steps run out, paste any snaps not yet in the doc.)"
             }
             let observeStart = Date()
             let obs = await Observation.capture(app)
@@ -465,7 +529,10 @@ final class Agent: ObservableObject {
                     + addedNotes.map { "- \($0)" }.joined(separator: "\n") + "\n\n" + message
                 addedNotes = []
             }
+            // The closing line keeps replies to the bare JSON: without it half of them open with a tool-call tag first
+            // (still parsed, but slower and wasted output).
             let turnText = message + "\n\n" + screen + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.\(circled != nil ? " The yellow loop is what the user circled." : ""))" : "")
+                + "\n\nReply with the JSON object only, starting with {"
 
             phase = .thinking
             buddy.mood = .thinking
@@ -655,7 +722,21 @@ final class Agent: ObservableObject {
                     + "and a say that contains the answer itself, as a full sentence (e.g. \"Your roll number is 1601…\")."
                 continue
             }
-            if isDone, failures == 0, pushedOn < 2, Self.saysUnfinished(say) {
+            // Screenshots taken for a write-up but never put in the doc are lost work: paste them before finishing.
+            let unpasted = snaps.filter { !$0.pasted }.count
+            if isDone, failures == 0, unpasted > 0, snapPushes < 2 {
+                snapPushes += 1
+                log("  \(unpasted) screenshots not in the doc yet — pasting before finishing")
+                message = (results.isEmpty ? "" : "Results:\n" + results.joined(separator: "\n") + "\n")
+                    + "You were about to finish, but \(unpasted) screenshot\(unpasted == 1 ? " is" : "s are") not in the write-up doc yet. "
+                    + "Go to the doc (open_app its browser, switch to its tab, or open_url https://docs.new if there is none), "
+                    + "click at the end of the document body, key cmd+down, then paste_snaps; check with look that they went in. "
+                    + "Then carry on with any steps of the task that remain; finish only when everything is done."
+                continue
+            }
+            // The verdict reads the whole reply: a short say ("Step 6 captured") often comes with prose after the JSON
+            // that says how much is left.
+            if isDone, failures == 0, pushedOn < 3, Self.saysUnfinished(say) || Self.saysUnfinished(String(reply.suffix(1500))) {
                 pushedOn += 1
                 log("  not done yet: “\(say.prefix(80))” — carrying on")
                 message = (results.isEmpty ? "" : "Results:\n" + results.joined(separator: "\n") + "\n")
@@ -706,6 +787,8 @@ final class Agent: ObservableObject {
     private var visitedHosts: Set<String> = [], visitedApps: Set<String> = []
     /// Times this run was told to carry on after finishing with work left (see `saysUnfinished`).
     private var pushedOn = 0
+    /// Times this run was sent back to paste screenshots it took before finishing.
+    private var snapPushes = 0
     /// Questions the profile already answered this run (the next time the model asks one, it's asked for real).
     private var profileOffered: Set<String> = []
     /// This run's numbers for runs.jsonl: model turns, turns the fast helper took, screenshots sent.
@@ -942,6 +1025,15 @@ final class Agent: ObservableObject {
         Running apps: \(running.joined(separator: ", "))
         Default browser: \(Launcher.defaultBrowserName ?? "unknown")
         """
+        // A write-up carried over from the last run: say what's already captured, so the model neither re-snaps old
+        // tabs nor thinks there's nothing to paste.
+        if !snaps.isEmpty {
+            let waiting = snaps.filter { !$0.pasted }
+            text += "\nWrite-up screenshots so far in this task: \(snaps.count) (\(snaps.count - waiting.count) already pasted in the doc"
+                + (waiting.isEmpty ? ")" : "; not pasted yet: " + waiting.map { $0.caption.prefix(60).debugDescription }.joined(separator: ", ") + " — paste_snaps puts them in)")
+                + (snapFolder.map { "; saved in \($0.path)" } ?? "")
+                + ". Last captioned: \(snaps.last!.caption.prefix(80).debugDescription)."
+        }
         if let selected = selectedText, !selected.isEmpty {
             text += "\nSelected text (the user highlighted this before asking; \"this\", \"it\", \"that\" usually mean it):\n\"\"\"\n\(selected.prefix(4000))\n\"\"\""
         }
@@ -1332,7 +1424,11 @@ final class Agent: ObservableObject {
             try? await Task.sleep(for: .milliseconds(350))
             let now = await current()
             buddy.clearHighlight()
-            if !now.isEmpty, !AXEngine.similar(now, picked), !now.lowercased().contains(picked.lowercased()) {
+            // Options often carry a description the field doesn't show (".5 vCPU Min: 1 GB Max: 4 GB" → ".5 vCPU"):
+            // the field showing the option's start, or what was asked for, is the right pick.
+            let shows = now.lowercased().trimmingCharacters(in: .whitespaces)
+            if !now.isEmpty, !AXEngine.similar(now, picked), !shows.contains(picked.lowercased()),
+               !picked.lowercased().hasPrefix(shows), !AXEngine.similar(now, want) {
                 return end(line, fail("clicked \(picked.debugDescription) but the field shows \(now.debugDescription)"))
             }
             return end(line, .init(ok: true, summary: "chose \(picked.debugDescription)\(now.isEmpty ? "" : " (field shows \(now.debugDescription))")"))
@@ -1759,8 +1855,7 @@ final class Agent: ObservableObject {
             hand.lingerBeforeHome = 3.5
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
 
-        case "ask" where !reviewedForm && !userConfirmed && context.page != nil
-                && (action["question"] as? String ?? "").range(of: #"(?i)\b(submit|apply|send (the |this |my )?(form|application))\b"#, options: .regularExpression) != nil:
+        case "ask" where !reviewedForm && !userConfirmed && context.page != nil && Self.asksToSubmit(action):
             // "Ready to submit?" is answered by the review: every answer on the form, with Submit or Edit.
             reviewedForm = true   // once per run, whatever happens
             let line = begin("Review before submitting")
@@ -1852,7 +1947,8 @@ final class Agent: ObservableObject {
 
         case "wait" where action["for"] is String:
             return await waitFor(action["for"] as! String, gone: action["gone"] as? Bool == true,
-                                 seconds: min(30, max(1, (action["timeout"] as? NSNumber)?.doubleValue ?? 10)), context: &context)
+                                 // Up to 2 minutes: a deploy or a database coming up is one long wait, not ten turns of 30 s ones.
+                                 seconds: min(120, max(1, (action["timeout"] as? NSNumber)?.doubleValue ?? 10)), context: &context)
 
         case "wait":
             let ms = min(5000, (action["ms"] as? Int) ?? 600)
@@ -1879,16 +1975,22 @@ final class Agent: ObservableObject {
         case "snap":
             // A step screenshot for a write-up: copied like ⌃⌘⇧4 (clipboard only, no file) and kept for paste_snaps.
             guard let app = context.app else { return fail("no app to screenshot") }
-            let caption = (action["caption"] as? String) ?? "Step \(snaps.count + 1)"
+            let given = ((action["caption"] as? String) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            let caption = Self.snapCaption(given, number: snaps.count + 1)
             let line = begin("Screenshot: \(caption.prefix(40))")
-            try? await Task.sleep(for: .milliseconds(300))   // let the last step finish drawing
+            await Launcher.bringToFront(app)   // a window half under another app shows the other app in the shot
+            try? await Task.sleep(for: .milliseconds(600))   // let the last step (a tab switch, a page load) finish drawing
             guard let png = await Screenshot.windowPNG(app: app) else { return end(line, fail("couldn't capture the window (Screen Recording permission?)")) }
             snaps.append((caption, png, false))
-            if snaps.count > 60 { snaps.removeFirst(snaps.count - 60) }
+            lastSnapAt = Date()
+            if snaps.count > 80 { snaps.removeFirst(snaps.count - 80) }
+            let file = saveSnap(png, caption: caption)
             let board = NSPasteboard.general
             board.clearContents()
             board.setData(png, forType: .png)
-            return end(line, .init(ok: true, summary: "screenshot \(snaps.count) taken (\(caption.prefix(60).debugDescription)) and copied"))
+            let waiting = snaps.filter { !$0.pasted }.count
+            return end(line, .init(ok: true, summary: "screenshot taken (\(caption.prefix(60).debugDescription)), copied"
+                + (file.map { " and saved to \($0.path)" } ?? "") + "; \(waiting) not pasted into the doc yet"))
 
         case "paste_snaps":
             // Into the document that has the caret: each caption, then its screenshot, in order.
@@ -1908,7 +2010,7 @@ final class Agent: ObservableObject {
                 let snap = snaps[i]
                 snaps[i].pasted = true
                 board.clearContents()
-                board.setString("Step \(i + 1): \(snap.caption)", forType: .string)
+                board.setString(snap.caption, forType: .string)
                 AXEngine.press(0x09, flags: .maskCommand)
                 try? await Task.sleep(for: .milliseconds(250))
                 AXEngine.pressReturn()
@@ -1923,7 +2025,9 @@ final class Agent: ObservableObject {
             board.clearContents()
             if let saved { board.setString(saved, forType: .string) }
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
-            return end(line, .init(ok: true, summary: "pasted \(todo.count) captioned screenshots where the caret was (steps \(todo.first! + 1)–\(todo.last! + 1))"))
+            return end(line, .init(ok: true, summary: "pasted \(todo.count) captioned screenshots where the caret was ("
+                + "\(snaps[todo.first!].caption.prefix(40).debugDescription) … \(snaps[todo.last!].caption.prefix(40).debugDescription))"
+                + (snapFolder.map { "; all of them are also saved in \($0.path)" } ?? "")))
 
         case "remember":
             guard let fact = action["fact"] as? String else { return fail("remember needs fact") }
@@ -2261,6 +2365,11 @@ final class Agent: ObservableObject {
                 var near = ""
                 if !gone, let page = context.page, let r = try? await BrowserBridge.shared.perform("read", on: page) {
                     let close = Self.closest(to: text, in: (r["title"] as? String ?? "") + "\n" + (r["text"] as? String ?? ""))
+                    // "Policy created" vs "Policy lab7-ecr created.": the same words in order, with a name between, is the
+                    // message that was meant.
+                    if let hit = close.first(where: { Self.wordsInOrder(text, in: $0) }) {
+                        return end(line, .init(ok: true, summary: "“\(hit.prefix(80))” shows (what \(text.debugDescription) meant)"))
+                    }
                     if !close.isEmpty { near = "; closest on the page: " + close.map { "“\($0)”" }.joined(separator: ", ") }
                 }
                 return end(line, fail("after \(Int(seconds)) s \(text.debugDescription) \(gone ? "still shows" : "hasn't appeared")\(near); look at what's there instead"))
@@ -2765,10 +2874,13 @@ final class Agent: ObservableObject {
         onFinish(text, ok)
         // Out of steps or stalled on one step isn't the end of the task: carry on by itself (a few times), with the
         // history as context, instead of waiting for the user to type "continue". Only Stop really stops.
-        if !ok, !isTest, !runDry, qa == nil, autoContinues < 3,
+        // A run that got real work done (a long lab, a big form) keeps going longer than one that's flailing.
+        let progressed = steps.filter { $0.state == .ok }.count >= 10
+        let limit = progressed ? 12 : 3
+        if !ok, !isTest, !runDry, qa == nil, autoContinues < limit,
            text.hasPrefix("Ran out of steps") || text.hasPrefix("I got stuck on") {
             autoContinues += 1
-            log("auto-continue \(autoContinues)/3 after: \(text.prefix(60))")
+            log("auto-continue \(autoContinues)/\(limit) after: \(text.prefix(60))")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in
                 guard let self, !self.isRunning else { return }
                 self.submit("continue", auto: true)
@@ -2786,9 +2898,11 @@ final class Agent: ObservableObject {
         watchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
             MainActor.assumeIsolated {
                 guard let self, self.isRunning else { timer.invalidate(); return }
-                guard self.phase != .waiting, Date().timeIntervalSince(self.lastProgress) > 30 else { return }
-                let step = self.steps.last?.text ?? "a step"
-                self.log("watchdog: no progress for 30 s on \(step)")
+                // A model reply with a screenshot and a long history can take well over 30 s; that's slow, not stuck.
+                let limit: TimeInterval = self.phase == .thinking ? 180 : 30
+                guard self.phase != .waiting, Date().timeIntervalSince(self.lastProgress) > limit else { return }
+                let step = self.phase == .thinking ? "waiting for the model's reply" : self.steps.last?.text ?? "a step"
+                self.log("watchdog: no progress for \(Int(limit)) s on \(step)")
                 self.task?.cancel()
                 self.session?.close()
                 self.finish(ok: false, "I got stuck on “\(step)” and stopped")

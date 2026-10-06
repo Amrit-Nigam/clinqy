@@ -208,7 +208,8 @@ clinqy qa login.md --json                # one test, machine-readable report
 clinqy qa "Go to https://example.com
 Expect: Example Domain"                     # inline test
 clinqy qa login.md --relearn --model opus
-clinqy run "open github"                 # a task (not saved to history)
+clinqy run "open github"                 # a task, like one asked in the app (saved; carries on by itself if it runs out of steps)
+clinqy run --test "open localhost:3000"  # a throwaway run: not saved, no carrying on
 clinqy run --dry "book a cab home"       # show every click and keystroke, do none
 clinqy workflow "Fill form" "Your name=Priya"
 clinqy workflows
