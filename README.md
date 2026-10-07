@@ -288,10 +288,10 @@ If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed. Witho
 
 | Provider | `haiku` (fast) | `sonnet` (agent, default) | `opus` |
 |---|---|---|---|
-| anthropic | claude-haiku-4-5 | claude-sonnet-5-5 | claude-opus-5-5 |
+| anthropic | claude-haiku-5-5 | claude-sonnet-5-5 | claude-opus-5-5 |
 | openai | gpt-5.6-luna | gpt-5.6-terra | gpt-5.6-sol |
 | gemini | gemini-3.5-flash-lite | gemini-3.6-flash | gemini-3.6-flash |
-| openrouter | anthropic/claude-haiku-4.5 | anthropic/claude-sonnet-5.5 | anthropic/claude-opus-5.5 |
+| openrouter | anthropic/claude-haiku-5.5 | anthropic/claude-sonnet-5.5 | anthropic/claude-opus-5.5 |
 | codex-cli, gemini-cli | the CLI's default | the CLI's default | the CLI's default |
 | ollama, openai-compatible | `LOCAL_MODEL` | `LOCAL_MODEL` | `LOCAL_MODEL` |
 
