@@ -361,7 +361,7 @@ final class Agent: ObservableObject {
         openedTab = false
         checkedMemoryForAsk = false
         lastFirst = ""
-        shownFacts = []; visitedHosts = []; visitedApps = []
+        shownFacts = []; lastPageMemory = ""; visitedHosts = []; visitedApps = []
         pushedOn = 0; snapPushes = 0
         profileOffered = []
         turnCount = 0; fastTurnCount = 0; lookCount = 0
@@ -485,6 +485,24 @@ final class Agent: ObservableObject {
                 message += "\nNotes you saved for \(host ?? obs.app?.cleanName ?? "this app") (how to work it; follow them here):\n"
                     + notes.map { "- \($0)" }.joined(separator: "\n")
                 log("  memory: \(notes.count) note\(notes.count == 1 ? "" : "s") for \(host ?? obs.app?.cleanName ?? "?")")
+            }
+            // Facts that answer this page's fields (or its subject), shown with it, so no recall turn is needed.
+            if let page = obs.page {
+                let labels = page.elements.filter { $0.editable || $0.dropdown || $0.question != nil }
+                    .flatMap { [$0.question, $0.placeholder, $0.editable ? $0.text : nil].compactMap { $0 } }
+                    + [page.title] + page.headings.prefix(6)
+                let signature = labels.joined(separator: "\u{1}")
+                if signature != lastPageMemory {
+                    lastPageMemory = signature
+                    let t0 = Date()
+                    let found = Memory.forPage(labels: labels, excluding: shownFacts, app: obs.app?.cleanName, host: host)
+                    if !found.isEmpty {
+                        shownFacts.formUnion(found)
+                        message += "\nFrom memory, for what's on this page (use these; no need to recall them):\n"
+                            + found.map { "- \($0)" }.joined(separator: "\n")
+                        log("  memory: \(found.count) fact\(found.count == 1 ? "" : "s") for this page (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
+                    }
+                }
             }
             if let page = obs.page {
                 let fields = page.elements.filter(\.editable).map { "w\($0.index) \($0.extra)" }.joined(separator: " | ")
@@ -783,6 +801,8 @@ final class Agent: ObservableObject {
     /// Memory facts this run was shown (up front, as notes for a site or app, or recalled): the ones the run then used
     /// rank higher next time.
     private var shownFacts: Set<String> = []
+    /// The page labels memory was last matched against (so an unchanged page isn't matched again).
+    private var lastPageMemory = ""
     /// Sites and apps this run worked in (for crediting scoped notes, and telling learning where it was).
     private var visitedHosts: Set<String> = [], visitedApps: Set<String> = []
     /// Times this run was told to carry on after finishing with work left (see `saysUnfinished`).

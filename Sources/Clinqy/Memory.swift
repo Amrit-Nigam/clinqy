@@ -257,6 +257,47 @@ enum Memory {
         return (best.sorted { $0.value > $1.value }.map { ($0.key, $0.value) }, via)
     }
 
+    /// Facts that answer what's on screen right now, matched label by label: each field's question or placeholder,
+    /// and the page's title and headings. Brought to the agent with the page, so it doesn't spend a model turn on a
+    /// recall (in the logs most recalls were a turn of their own, ~2–3 s each, for a search that takes milliseconds).
+    /// Strict, since it rides along every new page: a fact must cover at least half a label's words, including one
+    /// that few facts share (so "Email" alone doesn't drag in every fact naming an email).
+    static func forPage(labels: [String], excluding shown: Set<String>, app: String? = nil, host: String? = nil, limit: Int = 6) -> [String] {
+        let l = current
+        // Know-how kept for another site or app doesn't apply here (Workday's phone rule on a Lever form).
+        let candidates = l.entries.indices.filter { i in
+            let f = l.entries[i]
+            return !shown.contains(f.text) && !isProfile(f.text) && (f.scope.map { $0.matches(app: app, host: host) } ?? true)
+        }
+        guard !candidates.isEmpty else { return [] }
+        let distinctive = max(3, l.entries.count / 25)
+        var best: [Int: Double] = [:]
+        for label in Set(labels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where label.count >= 3 && label.count <= 200 {
+            let terms = Set(words(label).map(stem)).subtracting(formWords)
+            guard !terms.isEmpty else { continue }
+            let hits = l.index.scores(Dictionary(uniqueKeysWithValues: terms.map { ($0, 1.0) }), among: candidates)
+            guard let (i, score) = hits.max(by: { $0.value < $1.value }) else { continue }
+            // A word the fact has exactly counts 1; one it has only by prefix ("education" ~ "educational") counts ½.
+            let have = Set(l.index.tf[i].keys)
+            let exact = terms.filter(have.contains)
+            let near = terms.subtracting(exact).filter { t in have.contains { min($0.count, t.count) >= 4 && ($0.hasPrefix(t) || t.hasPrefix($0)) } }
+            let matched = Double(exact.count) + 0.5 * Double(near.count)
+            let coverage = matched / Double(terms.count)
+            let rare = exact.contains { (l.index.df[$0] ?? 0) <= distinctive }
+            guard coverage >= 0.5, rare, matched >= Double(min(2, terms.count)) else { continue }
+            best[i] = max(best[i] ?? 0, score * coverage)
+        }
+        return best.sorted { $0.value > $1.value }.prefix(limit).map { l.entries[$0.key].text }
+    }
+
+    /// Words every form uses, which say nothing about which fact a field wants (stemmed).
+    private static let formWords: Set<String> = ["detail", "info", "information", "enter", "select", "choose", "required",
+        "optional", "submit", "next", "back", "continue", "field", "value", "here", "click", "button", "page", "form",
+        "question", "answer", "option", "yes", "type", "save", "cancel", "search", "new", "add", "edit", "more", "limited",
+        "please", "provide", "mention", "specify", "below", "above", "list", "upload", "attach", "file",
+        // The profile (always sent) covers these on their own.
+        "name", "full", "first", "last", "email", "mail", "phone", "mobile", "number", "subject", "message"]
+
     /// Searches everything remembered (for the agent's recall action), best matches first.
     static func search(_ query: String) -> [String] {
         let l = current
@@ -287,6 +328,8 @@ enum Memory {
             if suffix == "es", !(w.hasSuffix("ses") || w.hasSuffix("xes") || w.hasSuffix("ches") || w.hasSuffix("shes")) { continue }
             return String(w.dropLast(suffix.count))
         }
+        // relocate ~ relocating/relocated (both → relocat).
+        if w.count >= 6, w.hasSuffix("e") { return String(w.dropLast()) }
         return w
     }
 

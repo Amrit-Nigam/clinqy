@@ -201,6 +201,14 @@ if command == "memory" {
         let changes = Memory.history
         if !changes.isEmpty { print("\nhistory: \(changes.count) updates/removals kept in memory.history.jsonl") }
     }
+    // `--fields "Label|Label|…"`: the facts that would ride along with a page showing these fields.
+    if let fields = option("--fields") {
+        let t0 = Date()
+        let found = Memory.forPage(labels: fields.split(separator: "|").map(String.init), excluding: [], app: option("--app"), host: option("--site"))
+        print("\npage fields → \(found.count) facts (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
+        found.forEach { print("  - \($0.prefix(120))") }
+        exit(0)
+    }
     if query.isEmpty {
         if args.contains("--map") { exit(0) }
         for (tag, facts) in scoped.sorted(by: { $0.value.count > $1.value.count }) {
