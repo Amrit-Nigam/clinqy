@@ -16,7 +16,9 @@
 #   clinqy watch <app> <text> [--gone] [--timeout s]   Wait for text to appear in (or vanish from) an app.
 #   clinqy replay <fixture.json|folder> [--bless]      Re-check recorded runs offline (tests/replay).
 #   clinqy memory ["request"] [--app Name] [--site host]   How memory is organised (profile, notes per site/app);
-#                                    with a request: exactly which facts it would be sent.
+#                                    with a request: exactly which facts it would be sent. --map: what links facts;
+#                                    --fields "A|B": facts a page with those fields gets; --eval cases.txt: recall
+#                                    quality; --fetch-model: download the retrieval model now; --full: whole lines.
 #   clinqy page [read|url]           What's in the focused browser tab, via the extension (read-only):
 #                                    its elements (w-ids, fields, values, errors) and visible text; read = full text.
 #   clinqy extension reload          Reload the browser extension from disk.

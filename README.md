@@ -329,6 +329,9 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | File | What |
 |---|---|
 | `~/.config/clinqy/memory.md` | Facts Clinqy remembers about you (edit freely, or menu → **Edit Memory…**) |
+| `~/Library/Application Support/Clinqy/models/bge-small-en-v1.5/` | The on-device retrieval model memory search uses (~130 MB, downloaded once from Hugging Face; nothing about you is sent). `CLINQY_EMBEDDINGS=system` in `~/.config/clinqy/env` keeps the built-in system vectors instead |
+| `~/.config/clinqy/memory.format` | The memory format version. A newer build upgrades older (or hand-edited) memory once on first launch, app or `clinqy` command: list styles and headings cleaned up, exact duplicates merged, the old file kept as `memory.backup-<date>.md` |
+| `~/.config/clinqy/memory.history.jsonl` | Every memory update and removal (old wording, new wording, why), so recall can say what a fact used to be |
 | `~/Library/Application Support/Clinqy/history.json` | Run history |
 | `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
 | `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
@@ -395,6 +398,8 @@ Sources/Clinqy/
   Clipboard.swift    what the user copied recently ("this" when nothing is selected)
   Pdf.swift, Media.swift             PDF and video/audio jobs in the background
   NameHints.swift, MemoryTidy.swift  name-aware voice correction; memory clean-up
+  MemoryGraph.swift  links facts that share a person, place, app or detail; retrieval spreads along the links
+  TextEncoder.swift  bge-small retrieval model run with Accelerate (memory and saved-run similarity)
   Applications.swift                 job-application tracker
   MCPServer.swift    `Clinqy mcp`: stdio MCP server relaying to the running app
   Watch.swift        wait for text to appear/vanish via AXObserver notifications (polling fallback)

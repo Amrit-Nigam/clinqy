@@ -13,6 +13,8 @@ do {
         try? fm.moveItem(at: old, to: new)
     }
 }
+// Memory from an older build (or edited by hand) is brought to the current format once, before anything reads it.
+if let report = Memory.upgradeIfNeeded() { print("🧠 \(report)") }
 
 // Terminal run: `Clinqy --run <bundle-id|-> "<task>"` executes the task and prints a timed log.
 if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--run" {
@@ -177,27 +179,79 @@ if command == "replay" {
     exit(failed == 0 ? 0 : 1)
 }
 
-// `Clinqy memory ["request"] [--app Name] [--site host]`: how memory is organised (profile, notes per site/app), and
-// with a request, exactly which facts it would be sent and why. Read-only.
+// `Clinqy memory ["request"] [--app Name] [--site host] [--map]`: how memory is organised (profile, notes per site/app,
+// with --map the people, places and details that link facts), and with a request, exactly which facts it would be
+// sent and why (P profile, ~ brought in by a link). Read-only.
 if command == "memory" {
     let args = Array(CommandLine.arguments.dropFirst(2))
     func option(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
     let query = args.enumerated().filter { i, a in !a.hasPrefix("--") && (i == 0 || !args[i - 1].hasPrefix("--")) }.map(\.1).joined(separator: " ")
+    // `--fetch-model`: download the retrieval model now (the app does it by itself on its first launch).
+    if args.contains("--fetch-model") {
+        print("downloading \(TextEncoder.modelName) (~130 MB)…")
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        Task.detached { ok = await TextEncoder.fetch(); sem.signal() }
+        sem.wait()
+        print(ok ? "ready: \(TextEncoder.dir.path)" : "download failed (check the connection, or CLINQY_EMBEDDINGS=system is set)")
+        if !ok { exit(1) }
+    }
+    Embedder.shared.activate(wait: true)
     Embedder.shared.warmNow(Memory.facts)
+    if !Embedder.shared.usesModel, !TextEncoder.downloaded {
+        print("(using the system vectors: open the Clinqy app once, or run `clinqy memory --fetch-model`, for the retrieval model)")
+    }
     let entries = Memory.entries
     let profile = entries.filter { Memory.isProfile($0.text) }
     let scoped = Dictionary(grouping: entries.filter { $0.scope != nil }, by: { $0.scope!.tag })
+    print("vectors: \(Embedder.shared.usesModel ? TextEncoder.modelName : "system (NaturalLanguage)")")
     print("\(entries.count) facts · \(profile.count) profile (always sent) · \(scoped.values.map(\.count).reduce(0, +)) notes for \(scoped.count) sites/apps")
+    if args.contains("--map") {
+        let graph = MemoryGraph(entries)
+        let linked = graph.links.filter { !$0.isEmpty }.count
+        print("\nmemory map: \(graph.postings.count) entities · \(linked) of \(entries.count) facts linked to another")
+        let shared = graph.postings.filter { $0.value.count >= 2 }.sorted { $0.value.count > $1.value.count }
+        for (entity, docs) in shared.prefix(query.isEmpty ? 40 : 0) {
+            print("\n\(entity)  (\(docs.count) facts\(docs.count > max(5, entries.count / 12) ? ", too common to link" : ""))")
+            docs.prefix(6).forEach { print("  - \(entries[$0].text.prefix(100))") }
+        }
+        let changes = Memory.history
+        if !changes.isEmpty { print("\nhistory: \(changes.count) updates/removals kept in memory.history.jsonl") }
+    }
+    // `--eval cases.txt` (lines "request|text the right fact contains"): where recall ranks the right fact.
+    if let file = option("--eval"), let text = try? String(contentsOfFile: file, encoding: .utf8) {
+        var ranks: [Int] = []
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let hits = Memory.search(parts[0])
+            let r = (hits.firstIndex { $0.contains(parts[1]) } ?? 98) + 1
+            ranks.append(r)
+            print("  \(r == 99 ? "–" : "#\(r)")\t\(parts[0])")
+        }
+        let mrr = ranks.map { $0 == 99 ? 0 : 1 / Double($0) }.reduce(0, +) / Double(max(1, ranks.count))
+        print("recall: #1 for \(ranks.filter { $0 == 1 }.count)/\(ranks.count) · top 3 \(ranks.filter { $0 <= 3 }.count) · top 25 \(ranks.filter { $0 <= 25 }.count) · MRR \(String(format: "%.2f", mrr))")
+        exit(0)
+    }
+    // `--fields "Label|Label|…"`: the facts that would ride along with a page showing these fields.
+    if let fields = option("--fields") {
+        let t0 = Date()
+        let found = Memory.forPage(labels: fields.split(separator: "|").map(String.init), excluding: [], app: option("--app"), host: option("--site"))
+        print("\npage fields → \(found.count) facts (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
+        found.forEach { print("  - \($0.prefix(120))") }
+        exit(0)
+    }
     if query.isEmpty {
+        if args.contains("--map") { exit(0) }
         for (tag, facts) in scoped.sorted(by: { $0.value.count > $1.value.count }) {
             print("\n\(tag)\(facts.allSatisfy(\.tagged) ? "" : " (some inferred)")")
             facts.forEach { print("  - \($0.text.prefix(110))") }
         }
     } else {
         let t0 = Date()
-        let (facts, omitted) = Memory.relevant(to: query, app: option("--app"), host: option("--site"))
-        print("\n“\(query)” → \(facts.count) facts, \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
-        for f in facts { print("  \(Memory.isProfile(f) ? "P" : " ") \(f.prefix(120))") }
+        let (facts, omitted, linked) = Memory.relevantExplained(to: query, app: option("--app"), host: option("--site"))
+        print("\n“\(query)” → \(facts.count) facts (\(linked.count) via links), \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
+        for f in facts { print("  \(Memory.isProfile(f) ? "P" : linked.contains(f) ? "~" : " ") \(args.contains("--full") ? f : String(f.prefix(120)))") }
     }
     exit(0)
 }
@@ -228,6 +282,7 @@ if command == "selftest" {
     // Memory relevance: a maths question gets only core facts; food brings in the Swiggy facts.
     MainActor.assumeIsolated {
         let t0 = Date()
+        Embedder.shared.activate(wait: true)
         Embedder.shared.warmNow(Memory.facts)   // the app does this in the background at launch
         let warmMs = Int(Date().timeIntervalSince(t0) * 1000)
         let t1 = Date()
@@ -274,6 +329,40 @@ if command == "selftest" {
         let hits = index.scores(Memory.expand("order me something to eat"), among: [0, 1, 2])
         check(hits.keys.sorted() == [0], "BM25 finds the ordering fact and nothing else")
         check(Memory.details("call +91 93267 70790 or mail a@b.co about 'Waje+'", quoted: true).count == 3, "details: phone, email, quoted name")
+        let graph = MemoryGraph(Memory.parse("""
+        - Mom's WhatsApp chat is named 'Mom ❤️'
+        - His mother lives in Pune and prefers calls after 7pm
+        - Likes lofi music
+        - Sends invoices to billing@acme.dev every month
+        - The billing@acme.dev inbox auto-replies on weekends
+        """))
+        check(graph.links[0].contains { $0.0 == 1 } && graph.links[3].contains { $0.0 == 4 } && graph.links[2].isEmpty,
+              "memory graph links facts about the same person or detail, not unrelated ones")
+        check(graph.spread(from: [(0, 1.0)], damping: 0.8)[1].map { $0 > 0.3 } == true, "activation spreads to a linked fact")
+        let changes = [Memory.Change(at: Date(), old: "Phone is 1111", new: "Phone is 2222", why: "updated"),
+                       Memory.Change(at: Date(), old: "Phone is 2222", new: "Phone is 3333", why: "updated")]
+        check(Memory.earlier("Phone is 3333", in: changes) == ["Phone is 2222", "Phone is 1111"], "earlier versions follow the update chain")
+        let old = Memory.parse("""
+        # My memory
+        * Likes lofi music
+        1. Orders food through Swiggy
+        - [ ] [app:Find My] open it as 'FindMy'
+        <!-- note to self -->
+        • Likes lofi music
+        - Find My app: open it as 'FindMy'
+        """)
+        check(old.map(\.text) == ["Likes lofi music", "Orders food through Swiggy", "open it as 'FindMy'", "Likes lofi music", "Find My app: open it as 'FindMy'"]
+              && old[2].tagged, "older and hand-written list styles parse (headings and comments skipped)")
+        let (lines, merged) = Memory.normalized(old)
+        check(lines == ["Orders food through Swiggy", "[app:Find My] open it as 'FindMy'", "Likes lofi music", "Find My app: open it as 'FindMy'"]
+              && merged == ["Likes lofi music"], "upgrade merges exact duplicates, keeping the newest and its tag")
+        if let enc = TextEncoder.load() {
+            check(enc.tokens("Hello, world!") == [101, 7592, 1010, 2088, 999, 102], "retrieval model tokenizer (BERT WordPiece)")
+            let a = enc.embed("That is a happy person"), b = enc.embed("That is a very happy person"), c = enc.embed("Today is a sunny day")
+            check(Embedder.cosine(a, b) > 0.9 && Embedder.cosine(a, b) > Embedder.cosine(a, c) + 0.15, "retrieval model: close sentences are close")
+        } else {
+            print("     (retrieval model not downloaded: skipped its checks)")
+        }
         check(Set(Agent.closest(to: "Application submitted", in: "Home\nYour application was sent · Thanks!\nApplication received"))
               == ["Your application was sent", "Application received"],
               "a missed wait shows the closest text on the page")
@@ -328,10 +417,13 @@ if command == "selftest" {
     if let notes = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
         let sem = DispatchSemaphore(value: 0)
         var dict: String?
+        // Close Notes again afterwards, unless it was already open.
+        let wasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Notes").isEmpty
         Task.detached {
             let app = try? await NSWorkspace.shared.openApplication(at: notes, configuration: {
                 let c = NSWorkspace.OpenConfiguration(); c.activates = false; c.hides = true; return c }())
             if let app { dict = await Scripting.dictionary(for: app) }
+            if !wasRunning { app?.terminate() }
             sem.signal()
         }
         sem.wait()

@@ -2,13 +2,16 @@ import CryptoKit
 import Foundation
 import NaturalLanguage
 
-/// On-device sentence vectors (NaturalLanguage), cached by text. One embedding costs ~9 ms, so memory facts and
-/// saved runs are embedded once, in the background, and kept in Caches across launches; a request then costs a
-/// single embedding (its own) instead of one per fact.
+/// On-device sentence vectors, cached by text: from the retrieval model (TextEncoder, bge-small) once it's downloaded,
+/// else the system's (NaturalLanguage). One embedding costs ~7–9 ms, so memory facts and saved runs are embedded
+/// once, in the background, and kept in Caches across launches; a request then costs a single embedding (its own)
+/// instead of one per fact.
 final class Embedder: @unchecked Sendable {
     static let shared = Embedder()
 
     private let model = NLEmbedding.sentenceEmbedding(for: .english)
+    /// The retrieval model, once loaded (guarded by `lock`). Its vectors are cached under their own keys.
+    private var encoder: TextEncoder?
     private let words = NLEmbedding.wordEmbedding(for: .english)
     /// Guards `cache`, `touched`, `neighbors` and `dirty`.
     private let lock = NSLock()
@@ -35,7 +38,33 @@ final class Embedder: @unchecked Sendable {
         }
     }
 
-    var available: Bool { model != nil }
+    var available: Bool { model != nil || usesModel }
+
+    /// Vectors come from the retrieval model (similarities run higher than the system vectors': thresholds differ).
+    var usesModel: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return encoder != nil
+    }
+
+    /// Loads the retrieval model if its files are there (off the caller's thread when `wait` is false), then embeds
+    /// `texts` with it.
+    func activate(warming texts: [String] = [], wait: Bool = false) {
+        let work = { [self] in
+            guard !usesModel, let enc = TextEncoder.load() else { return }
+            lock.lock()
+            encoder = enc
+            lock.unlock()
+            for text in texts { _ = vector(text) }
+            save()
+        }
+        if wait { queue.sync(execute: work) } else { queue.async(execute: work) }
+    }
+
+    /// The cache key for a text in the current vector space.
+    private func cacheKey(_ text: String) -> String {
+        lock.lock(); defer { lock.unlock() }
+        return (encoder != nil ? "bge:" : "") + Self.key(text)
+    }
 
     static func key(_ text: String) -> String {
         let digest = SHA256.hash(data: Data(normalize(text).utf8))
@@ -48,7 +77,7 @@ final class Embedder: @unchecked Sendable {
 
     /// The vector if it's already cached; never computes (safe to call in a loop over many texts).
     func cached(_ text: String) -> [Float]? {
-        let k = Self.key(text)
+        let k = cacheKey(text)
         lock.lock(); defer { lock.unlock() }
         if let v = cache[k] { touched.insert(k); return v }
         return nil
@@ -57,13 +86,21 @@ final class Embedder: @unchecked Sendable {
     /// The vector, computed now if needed (for the one text a request is about).
     func vector(_ text: String) -> [Float]? {
         if let v = cached(text) { return v }
-        guard let model else { return nil }
-        modelLock.lock()
-        let raw = model.vector(for: Self.normalize(text))
-        modelLock.unlock()
-        guard let raw else { return nil }
-        let v = raw.map(Float.init)
-        let k = Self.key(text)
+        let k = cacheKey(text)
+        lock.lock()
+        let enc = encoder
+        lock.unlock()
+        let v: [Float]
+        if let enc {
+            v = enc.embed(Self.normalize(text))
+        } else {
+            guard let model else { return nil }
+            modelLock.lock()
+            let raw = model.vector(for: Self.normalize(text))
+            modelLock.unlock()
+            guard let raw else { return nil }
+            v = raw.map(Float.init)
+        }
         lock.lock()
         cache[k] = v
         touched.insert(k)
@@ -74,7 +111,7 @@ final class Embedder: @unchecked Sendable {
 
     /// Embeds these texts in the background (skipping cached ones), then saves the cache.
     func warm(_ texts: [String]) {
-        guard model != nil else { return }
+        guard available else { return }
         let missing = texts.filter { cached($0) == nil }
         guard !missing.isEmpty else { return }
         queue.async { [self] in
@@ -116,7 +153,9 @@ final class Embedder: @unchecked Sendable {
         lock.lock()
         guard dirty else { lock.unlock(); return }
         dirty = false
-        // Don't grow without bound: past 4000 vectors, keep only the ones used this launch.
+        // Don't grow without bound: past 4000 vectors, keep only the ones used this launch. Once the retrieval model is
+        // in use, the system vectors are dead weight.
+        if encoder != nil, cache.keys.contains(where: { !$0.hasPrefix("bge:") }) { cache = cache.filter { $0.key.hasPrefix("bge:") } }
         if cache.count > 4000 { cache = cache.filter { touched.contains($0.key) } }
         let snapshot = cache
         lock.unlock()

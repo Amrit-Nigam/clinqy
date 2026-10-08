@@ -45,8 +45,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         installEditMenu()
         dismissOnOutsideClick()
         Brain.prewarm()
-        // Vectors for memory and saved runs, in the background, so no request waits on embedding them.
-        Embedder.shared.warm(Memory.facts + ReplayCache.shared.all.map(\.request))
+        // Vectors for memory and saved runs, in the background, so no request waits on embedding them: from the
+        // retrieval model when it's downloaded (fetched once, in the background, the first time), else the system's.
+        let texts = Memory.facts + ReplayCache.shared.all.map(\.request)
+        if TextEncoder.downloaded {
+            Embedder.shared.activate(warming: texts)
+        } else {
+            Embedder.shared.warm(texts)
+            Task.detached(priority: .utility) {
+                if await TextEncoder.fetch() { Embedder.shared.activate(warming: texts) }
+            }
+        }
         Whisper.shared.prepare()
         BrowserBridge.shared.start()
         Clipboard.start()

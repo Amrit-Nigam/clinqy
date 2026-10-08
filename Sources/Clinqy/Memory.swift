@@ -78,6 +78,7 @@ enum Memory {
         let size: Int
         let entries: [Fact]
         let index: Index
+        let graph: MemoryGraph
     }
     nonisolated(unsafe) private static var loaded: Loaded?
     private static let lock = NSLock()
@@ -89,7 +90,7 @@ enum Memory {
         defer { lock.unlock() }
         if let l = loaded, l.stamp == stamp, l.size == size { return l }
         let entries = parse((try? String(contentsOf: url, encoding: .utf8)) ?? "")
-        let l = Loaded(stamp: stamp, size: size, entries: entries, index: Index(entries.map(\.text)))
+        let l = Loaded(stamp: stamp, size: size, entries: entries, index: Index(entries.map(\.text)), graph: MemoryGraph(entries))
         loaded = l
         // New or edited facts get their vectors in the background.
         Embedder.shared.warm(entries.map(\.text))
@@ -104,7 +105,14 @@ enum Memory {
 
     static func parse(_ text: String) -> [Fact] {
         text.split(separator: "\n").compactMap { raw -> Fact? in
-            var line = raw.trimmingCharacters(in: CharacterSet(charactersIn: "- "))
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            // Headings and comments in a hand-edited file aren't facts.
+            if line.hasPrefix("#") && line.range(of: #"^#{1,6}\s"#, options: .regularExpression) != nil || line.hasPrefix("<!--") { return nil }
+            // Any list style: "- ", "* ", "• ", "1. ", "2) ", "- [ ] ".
+            if let bullet = line.range(of: #"^(?:[-*•+]|\d{1,3}[.)])\s+(?:\[[ xX]\]\s+)?"#, options: .regularExpression) {
+                line = String(line[bullet.upperBound...])
+            }
+            line = line.trimmingCharacters(in: CharacterSet(charactersIn: "- "))
             guard !line.isEmpty else { return nil }
             if let m = line.range(of: #"^\[(site|app)\s*:\s*[^\]]+\]\s*"#, options: [.regularExpression, .caseInsensitive]) {
                 let tag = line[m].trimmingCharacters(in: .whitespaces).dropFirst().dropLast()
@@ -115,16 +123,62 @@ enum Memory {
         }
     }
 
+    // MARK: Upgrading
+
+    /// The memory format this build writes. Raise it when a change needs existing memory rewritten, and say how
+    /// in `upgradeIfNeeded`.
+    static let format = 2
+    private static let formatURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.format")
+
+    /// Brings memory written by an older Clinqy (or edited by hand) to the current format, once, on the first launch
+    /// of a newer build (app or `clinqy` command): one "- fact" line each, headings and other list styles cleaned
+    /// up, exact duplicates merged (the newest kept, with any scope tag the older copy had). The old file is kept as
+    /// a memory.backup-<date>.md first, and every merged line is logged in memory.history.jsonl. Returns a report
+    /// when something changed.
+    @discardableResult
+    static func upgradeIfNeeded() -> String? {
+        let have = (try? String(contentsOf: formatURL, encoding: .utf8)).flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 1
+        guard have < format else { return nil }
+        defer {
+            try? FileManager.default.createDirectory(at: formatURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? "\(format)\n".write(to: formatURL, atomically: true, encoding: .utf8)
+        }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let (lines, merged) = normalized(parse(text))
+        let rewritten = lines.map { "- \($0)" }.joined(separator: "\n") + "\n"
+        guard rewritten != text else { return nil }
+        replaceAll(with: lines, backup: true)
+        for fact in merged { record(old: fact, new: nil, why: "upgrade: duplicate") }
+        return "memory upgraded to format \(format): \(lines.count) facts\(merged.isEmpty ? "" : ", \(merged.count) duplicates merged")"
+    }
+
+    /// One line per fact, newest copy of a duplicate kept (in its place) with a scope tag if any copy had one.
+    static func normalized(_ entries: [Fact]) -> (lines: [String], merged: [String]) {
+        var lastIndex: [String: Int] = [:], tagged: [String: Scope] = [:]
+        for (i, e) in entries.enumerated() {
+            let k = e.text.lowercased()
+            lastIndex[k] = i
+            if e.tagged, let scope = e.scope { tagged[k] = scope }
+        }
+        var lines: [String] = [], merged: [String] = []
+        for (i, e) in entries.enumerated() {
+            let k = e.text.lowercased()
+            guard lastIndex[k] == i else { merged.append(e.text); continue }
+            lines.append(Fact(text: e.text, scope: tagged[k] ?? e.scope, tagged: tagged[k] != nil).line)
+        }
+        return (lines, merged)
+    }
+
     // MARK: Scopes
 
     /// Words that make a fact know-how for a place (how to work a site or app) rather than a fact about the user.
     private static let howTo = #"(?i)(\b(click|clicking|press|tap|type into|button|field|fields|dropdown|combobox|listbox|picker|menu|selector|segment|shortcut|open_app|opened with|opens with|reached via|managed at|is at|go-to|scroll|upload|sign-?in|log-?in|sidebar|toolbar|tab group|spaces?)\b|\b(cmd|ctrl|shift|option|alt)\+)"#
-    private static let hostRegex = try? NSRegularExpression(pattern: hostPattern, options: [.caseInsensitive])
+    static let hostRegex = try? NSRegularExpression(pattern: hostPattern, options: [.caseInsensitive])
     private static let hostPattern = #"(?<![@\w.])(?:https?://)?((?:[a-z0-9-]+\.)+(?:com|io|in|org|net|ai|edu|co|dev|app|so|xyz|me|gg|tv))(?![\w-])"#
 
     /// Web products by name, so "In Google Forms…" or "Greenhouse forms: …" is know-how for that site even when
     /// no address is written out.
-    private static let webProducts: [(name: String, host: String)] = [
+    static let webProducts: [(name: String, host: String)] = [
         ("Google Forms", "docs.google.com"), ("Google Docs", "docs.google.com"), ("Google Doc", "docs.google.com"),
         ("Google Sheets", "docs.google.com"), ("Google Slides", "docs.google.com"), ("Google Drive", "drive.google.com"),
         ("Google Meet", "meet.google.com"), ("Google Calendar", "calendar.google.com"), ("Gmail", "mail.google.com"),
@@ -160,7 +214,7 @@ enum Memory {
 
     /// Names of the apps on this Mac, longest first (so "Google Chrome" wins over "Chrome"), each with the way it's
     /// written in prose ("FindMy" → "Find My").
-    private static let installedApps: [(name: String, spaced: String)] = {
+    static let installedApps: [(name: String, spaced: String)] = {
         let fm = FileManager.default
         let dirs = ["/Applications", "/System/Applications", "/System/Applications/Utilities",
                     fm.homeDirectoryForCurrentUser.appendingPathComponent("Applications").path]
@@ -212,15 +266,23 @@ enum Memory {
     /// The facts worth sending for this request: the profile always, know-how for the app or site in use (or named),
     /// and the best matches among the rest. Everything while memory is small.
     static func relevant(to context: String, app: String? = nil, host: String? = nil, limit: Int = 40) -> (facts: [String], omitted: Int) {
+        let r = relevantExplained(to: context, app: app, host: host, limit: limit)
+        return (r.facts, r.omitted)
+    }
+
+    /// `relevant`, also naming the facts that came in only through a link to a matching fact (for `clinqy memory`).
+    static func relevantExplained(to context: String, app: String? = nil, host: String? = nil, limit: Int = 40)
+        -> (facts: [String], omitted: Int, linked: Set<String>) {
         let l = current
         let all = l.entries
         let profile = all.indices.filter { isProfile(all[$0].text) }
         let rest = all.indices.filter { !isProfile(all[$0].text) }
-        if all.map(\.line).joined().count <= sendAllBudget { return ((profile + rest).map { all[$0].text }, 0) }
+        if all.map(\.line).joined().count <= sendAllBudget { return ((profile + rest).map { all[$0].text }, 0, []) }
         var here = rest.filter { i in all[i].scope.map { $0.matches(app: app, host: host) || $0.mentioned(in: context) } ?? false }
         let others = rest.filter { !here.contains($0) }
         let room = max(0, limit - profile.count - here.count)
-        var ranked = Array(rank(context, among: others, in: l).prefix(room).map(\.0))
+        let (merged, viaLinks) = withLinks(rank(context, among: others, in: l), among: others, in: l)
+        var ranked = Array(merged.prefix(room).map(\.0))
         // The best matches may name a place ("Uses Find My on Mac" for "where's mom"): bring that place's notes too
         // ("open it as 'FindMy'"), since that's where the task is about to go.
         let leads = ranked.prefix(5).map { all[$0].text }.joined(separator: "\n")
@@ -229,8 +291,65 @@ enum Memory {
         here += notes
         ranked.removeAll { notes.contains($0) }
         let chosen = profile + here + ranked
-        return (chosen.map { all[$0].text }, all.count - chosen.count)
+        let linked = Set(ranked.filter(viaLinks.contains).map { all[$0].text })
+        return (chosen.map { all[$0].text }, all.count - chosen.count, linked)
     }
+
+    /// Spreads from the best matches along the memory graph: a fact that shares a person, place, account or detail
+    /// with a strong match ("Mom's chat is 'Mom ❤️'" → "Mom is in Pune") scores a damped share of that match, in the
+    /// same units, so the two lists merge into one ranking. Returns it, plus the facts that only links brought in.
+    private static func withLinks(_ scored: [(Int, Double)], among: [Int], in l: Loaded) -> ([(Int, Double)], Set<Int>) {
+        guard let strongest = scored.first?.1 else { return (scored, []) }
+        var best = Dictionary(scored, uniquingKeysWith: max)
+        var via: Set<Int> = []
+        let allowed = Set(among)
+        for (j, a) in l.graph.spread(from: Array(scored.prefix(6)), damping: 0.8) where allowed.contains(j) && a >= strongest * 0.3 {
+            if best[j] == nil { via.insert(j) }
+            best[j] = max(best[j] ?? 0, a)
+        }
+        return (best.sorted { $0.value > $1.value }.map { ($0.key, $0.value) }, via)
+    }
+
+    /// Facts that answer what's on screen right now, matched label by label: each field's question or placeholder,
+    /// and the page's title and headings. Brought to the agent with the page, so it doesn't spend a model turn on a
+    /// recall (in the logs most recalls were a turn of their own, ~2–3 s each, for a search that takes milliseconds).
+    /// Strict, since it rides along every new page: a fact must cover at least half a label's words, including one
+    /// that few facts share (so "Email" alone doesn't drag in every fact naming an email).
+    static func forPage(labels: [String], excluding shown: Set<String>, app: String? = nil, host: String? = nil, limit: Int = 6) -> [String] {
+        let l = current
+        // Know-how kept for another site or app doesn't apply here (Workday's phone rule on a Lever form).
+        let candidates = l.entries.indices.filter { i in
+            let f = l.entries[i]
+            return !shown.contains(f.text) && !isProfile(f.text) && (f.scope.map { $0.matches(app: app, host: host) } ?? true)
+        }
+        guard !candidates.isEmpty else { return [] }
+        let distinctive = max(3, l.entries.count / 25)
+        var best: [Int: Double] = [:]
+        for label in Set(labels.map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where label.count >= 3 && label.count <= 200 {
+            let terms = Set(words(label).map(stem)).subtracting(formWords)
+            guard !terms.isEmpty else { continue }
+            let hits = l.index.scores(Dictionary(uniqueKeysWithValues: terms.map { ($0, 1.0) }), among: candidates)
+            guard let (i, score) = hits.max(by: { $0.value < $1.value }) else { continue }
+            // A word the fact has exactly counts 1; one it has only by prefix ("education" ~ "educational") counts ½.
+            let have = Set(l.index.tf[i].keys)
+            let exact = terms.filter(have.contains)
+            let near = terms.subtracting(exact).filter { t in have.contains { min($0.count, t.count) >= 4 && ($0.hasPrefix(t) || t.hasPrefix($0)) } }
+            let matched = Double(exact.count) + 0.5 * Double(near.count)
+            let coverage = matched / Double(terms.count)
+            let rare = exact.contains { (l.index.df[$0] ?? 0) <= distinctive }
+            guard coverage >= 0.5, rare, matched >= Double(min(2, terms.count)) else { continue }
+            best[i] = max(best[i] ?? 0, score * coverage)
+        }
+        return best.sorted { $0.value > $1.value }.prefix(limit).map { l.entries[$0.key].text }
+    }
+
+    /// Words every form uses, which say nothing about which fact a field wants (stemmed).
+    private static let formWords: Set<String> = ["detail", "info", "information", "enter", "select", "choose", "required",
+        "optional", "submit", "next", "back", "continue", "field", "value", "here", "click", "button", "page", "form",
+        "question", "answer", "option", "yes", "type", "save", "cancel", "search", "new", "add", "edit", "more", "limited",
+        "please", "provide", "mention", "specify", "below", "above", "list", "upload", "attach", "file",
+        // The profile (always sent) covers these on their own.
+        "name", "full", "first", "last", "email", "mail", "phone", "mobile", "number", "subject", "message"]
 
     /// Searches everything remembered (for the agent's recall action), best matches first.
     static func search(_ query: String) -> [String] {
@@ -239,7 +358,8 @@ enum Memory {
         if q.isEmpty { return l.entries.map(\.text) }
         // A recall that names a site or app also gets everything kept for it.
         let named = l.entries.indices.filter { l.entries[$0].scope?.mentioned(in: q) == true }
-        let ranked = rank(q, among: Array(l.entries.indices), in: l).map(\.0).filter { !named.contains($0) }
+        let all = Array(l.entries.indices)
+        let ranked = withLinks(rank(q, among: all, in: l), among: all, in: l).0.map(\.0).filter { !named.contains($0) }
         return (named + ranked).prefix(25).map { l.entries[$0].text }
     }
 
@@ -261,6 +381,8 @@ enum Memory {
             if suffix == "es", !(w.hasSuffix("ses") || w.hasSuffix("xes") || w.hasSuffix("ches") || w.hasSuffix("shes")) { continue }
             return String(w.dropLast(suffix.count))
         }
+        // relocate ~ relocating/relocated (both → relocat).
+        if w.count >= 6, w.hasSuffix("e") { return String(w.dropLast()) }
         return w
     }
 
@@ -353,11 +475,14 @@ enum Memory {
             }
         }
         let usage = usageBoosts(among.map { l.entries[$0].text })
+        // The retrieval model's vectors find the fact a request *means* ("something to eat" → Swiggy); the system's
+        // only roughly, so then meaning alone must stand far out.
+        let (alone, weight) = Embedder.shared.usesModel ? (2.2, 0.5) : (3.0, 0.35)
         let scored = among.compactMap { i -> (Int, Double)? in
             let lex = best > 0 ? (lexical[i] ?? 0) / best : 0
             let zi = z[i] ?? 0
-            guard lex > 0 || zi >= 3.0 else { return nil }
-            return (i, lex + 0.35 * max(0, zi - 1) + (usage[l.entries[i].text] ?? 0))
+            guard lex > 0 || zi >= alone else { return nil }
+            return (i, lex + weight * max(0, zi - 1) + (usage[l.entries[i].text] ?? 0))
         }.sorted { $0.1 > $1.1 }
         // A long tail of weak matches (one shared common word) is noise: keep what's within reach of the best.
         let strongest = scored.first?.1 ?? 0
@@ -389,15 +514,71 @@ enum Memory {
         let lines = all.indices.compactMap { j -> String? in j == i ? fact.line : (all[j].text == text ? nil : all[j].line) }
         write(lines)
         touch(text, added: true)
+        record(old: old, new: text, why: "updated")
         return true
     }
 
     @discardableResult
-    static func remove(_ fact: String) -> Bool {
+    static func remove(_ fact: String, why: String? = nil) -> Bool {
         let all = entries
         guard all.contains(where: { $0.text == fact }) else { return false }
         write(all.filter { $0.text != fact }.map(\.line))
+        record(old: fact, new: nil, why: why ?? "removed")
         return true
+    }
+
+    // MARK: Versions
+
+    /// What memory used to say: every update and removal, oldest first, in memory.history.jsonl. A newer phone
+    /// number replaces the old line, but "what was my old number" still has an answer, and a wrong removal can be
+    /// put back.
+    struct Change: Codable {
+        let at: Date
+        let old: String
+        let new: String?
+        let why: String
+    }
+
+    private static let historyURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.history.jsonl")
+
+    static func record(old: String, new: String?, why: String) {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(Change(at: Date(), old: old, new: new, why: why)) else { return }
+        let line = data + Data("\n".utf8)
+        if let handle = try? FileHandle(forWritingTo: historyURL) {
+            defer { try? handle.close() }
+            _ = try? handle.seekToEnd()
+            try? handle.write(contentsOf: line)
+        } else {
+            try? line.write(to: historyURL, options: .atomic)
+        }
+    }
+
+    static var history: [Change] {
+        guard let text = try? String(contentsOf: historyURL, encoding: .utf8) else { return [] }
+        return text.split(separator: "\n").compactMap { try? JSONDecoder.iso8601.decode(Change.self, from: Data($0.utf8)) }
+    }
+
+    /// The earlier wordings of a fact, newest first (following update after update back).
+    static func earlier(_ fact: String, in changes: [Change]? = nil, max: Int = 3) -> [String] {
+        let changes = changes ?? history
+        var out: [String] = [], current = fact
+        while out.count < max, let c = changes.last(where: { $0.new == current && !out.contains($0.old) && $0.old != fact }) {
+            out.append(c.old)
+            current = c.old
+        }
+        return out
+    }
+
+    /// Lines that were dropped or replaced and match the query (for a recall about how things used to be).
+    static func searchHistory(_ query: String, limit: Int = 5) -> [Change] {
+        let want = Set(words(query).map(stem))
+        guard !want.isEmpty else { return [] }
+        return history.reversed().filter { c in
+            let mine = Set(words(c.old).map(stem))
+            return Double(mine.intersection(want).count) >= max(1, Double(want.count) * 0.5)
+        }.prefix(limit).map { $0 }
     }
 
     /// Replaces every line (memory tidy-up), keeping the previous file as memory.backup-<date>.md (last 3 kept).
