@@ -329,6 +329,7 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | File | What |
 |---|---|
 | `~/.config/clinqy/memory.md` | Facts Clinqy remembers about you (edit freely, or menu → **Edit Memory…**) |
+| `~/.config/clinqy/memory.history.jsonl` | Every memory update and removal (old wording, new wording, why), so recall can say what a fact used to be |
 | `~/Library/Application Support/Clinqy/history.json` | Run history |
 | `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
 | `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
@@ -395,6 +396,7 @@ Sources/Clinqy/
   Clipboard.swift    what the user copied recently ("this" when nothing is selected)
   Pdf.swift, Media.swift             PDF and video/audio jobs in the background
   NameHints.swift, MemoryTidy.swift  name-aware voice correction; memory clean-up
+  MemoryGraph.swift  links facts that share a person, place, app or detail; retrieval spreads along the links
   Applications.swift                 job-application tracker
   MCPServer.swift    `Clinqy mcp`: stdio MCP server relaying to the running app
   Watch.swift        wait for text to appear/vanish via AXObserver notifications (polling fallback)

@@ -177,8 +177,9 @@ if command == "replay" {
     exit(failed == 0 ? 0 : 1)
 }
 
-// `Clinqy memory ["request"] [--app Name] [--site host]`: how memory is organised (profile, notes per site/app), and
-// with a request, exactly which facts it would be sent and why. Read-only.
+// `Clinqy memory ["request"] [--app Name] [--site host] [--map]`: how memory is organised (profile, notes per site/app,
+// with --map the people, places and details that link facts), and with a request, exactly which facts it would be
+// sent and why (P profile, ~ brought in by a link). Read-only.
 if command == "memory" {
     let args = Array(CommandLine.arguments.dropFirst(2))
     func option(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
@@ -188,16 +189,29 @@ if command == "memory" {
     let profile = entries.filter { Memory.isProfile($0.text) }
     let scoped = Dictionary(grouping: entries.filter { $0.scope != nil }, by: { $0.scope!.tag })
     print("\(entries.count) facts · \(profile.count) profile (always sent) · \(scoped.values.map(\.count).reduce(0, +)) notes for \(scoped.count) sites/apps")
+    if args.contains("--map") {
+        let graph = MemoryGraph(entries)
+        let linked = graph.links.filter { !$0.isEmpty }.count
+        print("\nmemory map: \(graph.postings.count) entities · \(linked) of \(entries.count) facts linked to another")
+        let shared = graph.postings.filter { $0.value.count >= 2 }.sorted { $0.value.count > $1.value.count }
+        for (entity, docs) in shared.prefix(query.isEmpty ? 40 : 0) {
+            print("\n\(entity)  (\(docs.count) facts\(docs.count > max(5, entries.count / 12) ? ", too common to link" : ""))")
+            docs.prefix(6).forEach { print("  - \(entries[$0].text.prefix(100))") }
+        }
+        let changes = Memory.history
+        if !changes.isEmpty { print("\nhistory: \(changes.count) updates/removals kept in memory.history.jsonl") }
+    }
     if query.isEmpty {
+        if args.contains("--map") { exit(0) }
         for (tag, facts) in scoped.sorted(by: { $0.value.count > $1.value.count }) {
             print("\n\(tag)\(facts.allSatisfy(\.tagged) ? "" : " (some inferred)")")
             facts.forEach { print("  - \($0.text.prefix(110))") }
         }
     } else {
         let t0 = Date()
-        let (facts, omitted) = Memory.relevant(to: query, app: option("--app"), host: option("--site"))
-        print("\n“\(query)” → \(facts.count) facts, \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
-        for f in facts { print("  \(Memory.isProfile(f) ? "P" : " ") \(f.prefix(120))") }
+        let (facts, omitted, linked) = Memory.relevantExplained(to: query, app: option("--app"), host: option("--site"))
+        print("\n“\(query)” → \(facts.count) facts (\(linked.count) via links), \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
+        for f in facts { print("  \(Memory.isProfile(f) ? "P" : linked.contains(f) ? "~" : " ") \(f.prefix(120))") }
     }
     exit(0)
 }
@@ -274,6 +288,19 @@ if command == "selftest" {
         let hits = index.scores(Memory.expand("order me something to eat"), among: [0, 1, 2])
         check(hits.keys.sorted() == [0], "BM25 finds the ordering fact and nothing else")
         check(Memory.details("call +91 93267 70790 or mail a@b.co about 'Waje+'", quoted: true).count == 3, "details: phone, email, quoted name")
+        let graph = MemoryGraph(Memory.parse("""
+        - Mom's WhatsApp chat is named 'Mom ❤️'
+        - His mother lives in Pune and prefers calls after 7pm
+        - Likes lofi music
+        - Sends invoices to billing@acme.dev every month
+        - The billing@acme.dev inbox auto-replies on weekends
+        """))
+        check(graph.links[0].contains { $0.0 == 1 } && graph.links[3].contains { $0.0 == 4 } && graph.links[2].isEmpty,
+              "memory graph links facts about the same person or detail, not unrelated ones")
+        check(graph.spread(from: [(0, 1.0)], damping: 0.8)[1].map { $0 > 0.3 } == true, "activation spreads to a linked fact")
+        let changes = [Memory.Change(at: Date(), old: "Phone is 1111", new: "Phone is 2222", why: "updated"),
+                       Memory.Change(at: Date(), old: "Phone is 2222", new: "Phone is 3333", why: "updated")]
+        check(Memory.earlier("Phone is 3333", in: changes) == ["Phone is 2222", "Phone is 1111"], "earlier versions follow the update chain")
         check(Set(Agent.closest(to: "Application submitted", in: "Home\nYour application was sent · Thanks!\nApplication received"))
               == ["Your application was sent", "Application received"],
               "a missed wait shows the closest text on the page")
@@ -328,10 +355,13 @@ if command == "selftest" {
     if let notes = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.apple.Notes") {
         let sem = DispatchSemaphore(value: 0)
         var dict: String?
+        // Close Notes again afterwards, unless it was already open.
+        let wasRunning = !NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.Notes").isEmpty
         Task.detached {
             let app = try? await NSWorkspace.shared.openApplication(at: notes, configuration: {
                 let c = NSWorkspace.OpenConfiguration(); c.activates = false; c.hides = true; return c }())
             if let app { dict = await Scripting.dictionary(for: app) }
+            if !wasRunning { app?.terminate() }
             sem.signal()
         }
         sem.wait()

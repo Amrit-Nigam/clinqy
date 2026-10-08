@@ -1005,7 +1005,7 @@ final class Agent: ObservableObject {
                 if Memory.update(old, to: new) { log("🧠 updated: \(old) → \(new)") }
             } else if let old = fact(op["remove"]), removed < 2, !Memory.isProfile(old) {
                 // The old line stays in the log, so a wrong removal can be put back.
-                if Memory.remove(old) {
+                if Memory.remove(old, why: (op["why"] as? String).map { String($0.prefix(120)) }) {
                     removed += 1
                     log("🧠 forgot (\((op["why"] as? String ?? "superseded").prefix(60))): \(old)")
                 }
@@ -1932,8 +1932,20 @@ final class Agent: ObservableObject {
             let line = begin("Recall \(query.prefix(40))")
             let hits = Memory.search(query)
             shownFacts.formUnion(hits.prefix(5))
-            return end(line, .init(ok: true, summary: hits.isEmpty ? "nothing remembered about that"
-                                   : "remembered:\n" + hits.map { "- \($0)" }.joined(separator: "\n")))
+            // What memory used to say, too: earlier wordings of a hit, and dropped lines that match.
+            let changes = Memory.history
+            var lines = hits.map { hit -> String in
+                let was = Memory.earlier(hit, in: changes)
+                return "- \(hit)" + (was.isEmpty ? "" : " (earlier: " + was.map { "“\($0)”" }.joined(separator: "; ") + ")")
+            }
+            let live = Set(Memory.facts)
+            let gone = Memory.searchHistory(query).filter { c in c.new == nil && !live.contains(c.old) }
+            if !gone.isEmpty {
+                lines.append("No longer true (forgotten):")
+                lines += gone.map { "- \($0.old) (\($0.why), \($0.at.formatted(date: .abbreviated, time: .omitted)))" }
+            }
+            return end(line, .init(ok: true, summary: lines.isEmpty ? "nothing remembered about that"
+                                   : "remembered:\n" + lines.joined(separator: "\n")))
 
         case "dictionary":
             // The app's own scripting vocabulary, for an applescript fallback.
