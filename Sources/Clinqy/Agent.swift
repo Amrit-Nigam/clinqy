@@ -359,9 +359,9 @@ final class Agent: ObservableObject {
         input = ""
         narration = ""
         openedTab = false
-        checkedMemoryForAsk = false
+        memoryCheckedAsks = []
         lastFirst = ""
-        shownFacts = []; lastPageMemory = ""; visitedHosts = []; visitedApps = []
+        shownFacts = []; lastPageMemory = ""; formSeen = [:]; agentEntered = []; visitedHosts = []; visitedApps = []
         pushedOn = 0; snapPushes = 0
         profileOffered = []
         turnCount = 0; fastTurnCount = 0; lookCount = 0
@@ -486,6 +486,7 @@ final class Agent: ObservableObject {
                     + notes.map { "- \($0)" }.joined(separator: "\n")
                 log("  memory: \(notes.count) note\(notes.count == 1 ? "" : "s") for \(host ?? obs.app?.cleanName ?? "?")")
             }
+            if let page = obs.page, let host { trackForm(page, host: host) }
             // Facts that answer this page's fields (or its subject), shown with it, so no recall turn is needed.
             if let page = obs.page {
                 let labels = page.elements.filter { $0.editable || $0.dropdown || $0.question != nil }
@@ -779,7 +780,8 @@ final class Agent: ObservableObject {
         finish(ok: false, "Ran out of steps, so I stopped. Last done: \(steps.last?.text ?? "nothing"). Check the screen before retrying.")
     }
 
-    private var checkedMemoryForAsk = false
+    /// Questions already checked against memory before asking (each once, so a real ask then goes through).
+    private var memoryCheckedAsks: Set<String> = []
     /// The last turn's first action (canonical JSON): the same one again isn't started early, since a repeat may be
     /// a loop the turn's checks stop.
     private var lastFirst = ""
@@ -803,6 +805,11 @@ final class Agent: ObservableObject {
     private var shownFacts: Set<String> = []
     /// The page labels memory was last matched against (so an unchanged page isn't matched again).
     private var lastPageMemory = ""
+    /// Form fields seen this run (by site and field: question, first and latest value), and the values the agent itself
+    /// entered, so that afterwards the answers the user typed in by hand can be kept (see `learnFromForms`).
+    private var formSeen: [String: FormField] = [:]
+    private var agentEntered: Set<String> = []
+    private struct FormField { let question: String; let first: String; var last: String }
     /// Sites and apps this run worked in (for crediting scoped notes, and telling learning where it was).
     private var visitedHosts: Set<String> = [], visitedApps: Set<String> = []
     /// Times this run was told to carry on after finishing with work left (see `saysUnfinished`).
@@ -969,6 +976,45 @@ final class Agent: ObservableObject {
         return !words.contains { verbs.contains($0.lowercased().trimmingCharacters(in: .punctuationCharacters)) }
     }
 
+    private func trackForm(_ page: BrowserBridge.Page, host: String) {
+        // A form, not a chat or search box: a few fields on the page.
+        let fields = page.elements.filter { $0.editable || $0.dropdown }
+        guard fields.count >= 3 else { return }
+        for el in fields {
+            guard let q = (el.question ?? el.placeholder ?? (el.text.isEmpty ? nil : el.text))?
+                    .trimmingCharacters(in: .whitespacesAndNewlines), q.count >= 3, q.count <= 200 else { continue }
+            let key = host + "|" + (el.key.isEmpty ? q : el.key)
+            let v = (el.value ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if formSeen[key] == nil { formSeen[key] = FormField(question: q, first: v, last: v) } else { formSeen[key]!.last = v }
+        }
+    }
+
+    nonisolated static func squashValue(_ v: String) -> String { v.lowercased().filter { $0.isLetter || $0.isNumber } }
+
+    /// Never kept from a form: secrets and codes, and free text that isn't an answer about the user.
+    private static let notAnAnswer = #"(?i)\b(password|passcode|otp|one[- ]time|code|pin|cvv|cvc|card|expiry|captcha|ssn|aadhaar|pan|search|message|comment|chat|reply|compose|note|caption|tweet|post|subject|body|cover letter|description|why)\b"#
+
+    /// Answers the user typed into a form by hand during the run (a field that changed, to a value the agent didn't
+    /// enter): kept in the application profile like answers they give when asked, so the next form that asks gets
+    /// them filled. Only short answers to plain questions, never secrets, and nothing already known.
+    private func learnFromForms() {
+        guard qa == nil, Self.mayMeetForms(request) || !formSeen.isEmpty else { return }
+        let known = (Memory.facts + [Profile.promptBlock]).joined(separator: "\n").lowercased()
+        var kept = 0
+        for f in formSeen.values.sorted(by: { $0.question < $1.question }) where kept < 15 {
+            let v = f.last
+            guard !v.isEmpty, v != f.first, v.count <= 160, !v.hasPrefix("••"),
+                  !agentEntered.contains(Self.squashValue(v)),
+                  f.question.range(of: Self.notAnAnswer, options: .regularExpression) == nil,
+                  v.range(of: #"(?i)^(select|choose|--|please select|pick)"#, options: .regularExpression) == nil,
+                  Profile.answer(for: f.question) != v,
+                  v.count < 4 || !known.contains(v.lowercased()) else { continue }
+            Profile.remember(question: f.question, answer: v)
+            kept += 1
+            log("🧠 learned from the form: “\(f.question.prefix(70))” → \(v.prefix(60))")
+        }
+    }
+
     /// After a task, keep anything lasting it revealed about the user (people, preferences, usual apps and
     /// places) and know-how for the sites and apps it worked in, so next time is faster. The model sees only the
     /// facts closest to this task (not the whole memory) and answers with edits — add, update, remove — so memory
@@ -976,6 +1022,7 @@ final class Agent: ObservableObject {
     /// already has their answer.
     private func learn(from session: ClaudeSession) async {
         guard !Task.isCancelled, !isTest else { return }
+        learnFromForms()
         let about = ([request] + steps.suffix(25).map(\.text) + [answer]).joined(separator: "\n")
         let near = Memory.relevant(to: about, app: targetApp?.cleanName, limit: 30).facts
         let places = (visitedHosts.sorted() + visitedApps.sorted()).joined(separator: ", ")
@@ -1154,6 +1201,12 @@ final class Agent: ObservableObject {
     fileprivate func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let kind = (action["do"] as? String ?? "").lowercased()
         if runDry, let shown = await rehearse(kind, action, context: &context) { return shown }
+        for key in ["text", "option", "value"] where ["type", "choose", "autofill", "fill"].contains(kind) {
+            if let v = action[key] as? String { agentEntered.insert(Self.squashValue(v)) }
+        }
+        if let fields = action["fields"] as? [[String: Any]] {
+            for f in fields { for v in f.values { if let v = v as? String { agentEntered.insert(Self.squashValue(v)) } } }
+        }
         switch kind {
         case "open_app":
             guard let name = action["name"] as? String else { return fail("open_app needs a name") }
@@ -1891,13 +1944,22 @@ final class Agent: ObservableObject {
             log("  profile answers “\(q.prefix(60))”")
             return .init(ok: false, summary: "NOT ASKED — the job-application profile already answers this: \(q) → \(a). Use it.")
 
-        case "ask" where !checkedMemoryForAsk && Self.asksForPersonalDetails(action["question"] as? String ?? ""):
-            // Before bothering the user for their own details, look in memory once; they may already be there.
-            checkedMemoryForAsk = true
-            let hits = Memory.search(action["question"] as? String ?? "")
+        case "ask" where !memoryCheckedAsks.contains(action["question"] as? String ?? ""):
+            // Before bothering the user, look in memory (once per question): each part of the question is matched like
+            // a form field ("your 10th and 12th details: board, percentage" → the school marks fact), and a question
+            // for their own details also gets a full search. Facts already shown don't stop it: the model saw them.
+            // So asking straight away costs one turn whether memory has it or not (recall, then ask, costs two).
+            let q = action["question"] as? String ?? ""
+            memoryCheckedAsks.insert(q)
+            let parts = [q] + q.components(separatedBy: CharacterSet(charactersIn: ",;:?()\n")).filter { $0.count >= 3 }
+            var hits = Memory.forPage(labels: parts, excluding: shownFacts, app: context.app?.cleanName,
+                                      host: context.page.map { Memory.bareHost($0.url) }, limit: 8)
+            if hits.isEmpty, Self.asksForPersonalDetails(q) { hits = Array(Memory.search(q).prefix(15)) }
             guard !hits.isEmpty else { return await perform(action, context: &context) }
+            shownFacts.formUnion(hits)
+            log("  memory answers the question (\(hits.count) fact\(hits.count == 1 ? "" : "s")) — not asked")
             return .init(ok: false, summary: "NOT ASKED — you already remember this about the user (use it, and ask only for what's truly missing):\n"
-                         + hits.prefix(15).map { "- \($0)" }.joined(separator: "\n"))
+                         + hits.map { "- \($0)" }.joined(separator: "\n"))
 
         case "ask" where qa != nil:
             return fail("this is an unattended test — nobody can answer; assert the missing information as a failed check and finish")

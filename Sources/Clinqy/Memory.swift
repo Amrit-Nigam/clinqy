@@ -105,7 +105,14 @@ enum Memory {
 
     static func parse(_ text: String) -> [Fact] {
         text.split(separator: "\n").compactMap { raw -> Fact? in
-            var line = raw.trimmingCharacters(in: CharacterSet(charactersIn: "- "))
+            var line = raw.trimmingCharacters(in: .whitespaces)
+            // Headings and comments in a hand-edited file aren't facts.
+            if line.hasPrefix("#") && line.range(of: #"^#{1,6}\s"#, options: .regularExpression) != nil || line.hasPrefix("<!--") { return nil }
+            // Any list style: "- ", "* ", "• ", "1. ", "2) ", "- [ ] ".
+            if let bullet = line.range(of: #"^(?:[-*•+]|\d{1,3}[.)])\s+(?:\[[ xX]\]\s+)?"#, options: .regularExpression) {
+                line = String(line[bullet.upperBound...])
+            }
+            line = line.trimmingCharacters(in: CharacterSet(charactersIn: "- "))
             guard !line.isEmpty else { return nil }
             if let m = line.range(of: #"^\[(site|app)\s*:\s*[^\]]+\]\s*"#, options: [.regularExpression, .caseInsensitive]) {
                 let tag = line[m].trimmingCharacters(in: .whitespaces).dropFirst().dropLast()
@@ -114,6 +121,52 @@ enum Memory {
             }
             return Fact(text: line, scope: inferScope(line), tagged: false)
         }
+    }
+
+    // MARK: Upgrading
+
+    /// The memory format this build writes. Raise it when a change needs existing memory rewritten, and say how
+    /// in `upgradeIfNeeded`.
+    static let format = 2
+    private static let formatURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.format")
+
+    /// Brings memory written by an older Clinqy (or edited by hand) to the current format, once, on the first launch
+    /// of a newer build (app or `clinqy` command): one "- fact" line each, headings and other list styles cleaned
+    /// up, exact duplicates merged (the newest kept, with any scope tag the older copy had). The old file is kept as
+    /// a memory.backup-<date>.md first, and every merged line is logged in memory.history.jsonl. Returns a report
+    /// when something changed.
+    @discardableResult
+    static func upgradeIfNeeded() -> String? {
+        let have = (try? String(contentsOf: formatURL, encoding: .utf8)).flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 1
+        guard have < format else { return nil }
+        defer {
+            try? FileManager.default.createDirectory(at: formatURL.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? "\(format)\n".write(to: formatURL, atomically: true, encoding: .utf8)
+        }
+        guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
+        let (lines, merged) = normalized(parse(text))
+        let rewritten = lines.map { "- \($0)" }.joined(separator: "\n") + "\n"
+        guard rewritten != text else { return nil }
+        replaceAll(with: lines, backup: true)
+        for fact in merged { record(old: fact, new: nil, why: "upgrade: duplicate") }
+        return "memory upgraded to format \(format): \(lines.count) facts\(merged.isEmpty ? "" : ", \(merged.count) duplicates merged")"
+    }
+
+    /// One line per fact, newest copy of a duplicate kept (in its place) with a scope tag if any copy had one.
+    static func normalized(_ entries: [Fact]) -> (lines: [String], merged: [String]) {
+        var lastIndex: [String: Int] = [:], tagged: [String: Scope] = [:]
+        for (i, e) in entries.enumerated() {
+            let k = e.text.lowercased()
+            lastIndex[k] = i
+            if e.tagged, let scope = e.scope { tagged[k] = scope }
+        }
+        var lines: [String] = [], merged: [String] = []
+        for (i, e) in entries.enumerated() {
+            let k = e.text.lowercased()
+            guard lastIndex[k] == i else { merged.append(e.text); continue }
+            lines.append(Fact(text: e.text, scope: tagged[k] ?? e.scope, tagged: tagged[k] != nil).line)
+        }
+        return (lines, merged)
     }
 
     // MARK: Scopes
@@ -422,11 +475,14 @@ enum Memory {
             }
         }
         let usage = usageBoosts(among.map { l.entries[$0].text })
+        // The retrieval model's vectors find the fact a request *means* ("something to eat" → Swiggy); the system's
+        // only roughly, so then meaning alone must stand far out.
+        let (alone, weight) = Embedder.shared.usesModel ? (2.2, 0.5) : (3.0, 0.35)
         let scored = among.compactMap { i -> (Int, Double)? in
             let lex = best > 0 ? (lexical[i] ?? 0) / best : 0
             let zi = z[i] ?? 0
-            guard lex > 0 || zi >= 3.0 else { return nil }
-            return (i, lex + 0.35 * max(0, zi - 1) + (usage[l.entries[i].text] ?? 0))
+            guard lex > 0 || zi >= alone else { return nil }
+            return (i, lex + weight * max(0, zi - 1) + (usage[l.entries[i].text] ?? 0))
         }.sorted { $0.1 > $1.1 }
         // A long tail of weak matches (one shared common word) is noise: keep what's within reach of the best.
         let strongest = scored.first?.1 ?? 0

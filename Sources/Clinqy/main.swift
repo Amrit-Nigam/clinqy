@@ -13,6 +13,8 @@ do {
         try? fm.moveItem(at: old, to: new)
     }
 }
+// Memory from an older build (or edited by hand) is brought to the current format once, before anything reads it.
+if let report = Memory.upgradeIfNeeded() { print("🧠 \(report)") }
 
 // Terminal run: `Clinqy --run <bundle-id|-> "<task>"` executes the task and prints a timed log.
 if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--run" {
@@ -184,10 +186,25 @@ if command == "memory" {
     let args = Array(CommandLine.arguments.dropFirst(2))
     func option(_ name: String) -> String? { args.firstIndex(of: name).flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil } }
     let query = args.enumerated().filter { i, a in !a.hasPrefix("--") && (i == 0 || !args[i - 1].hasPrefix("--")) }.map(\.1).joined(separator: " ")
+    // `--fetch-model`: download the retrieval model now (the app does it by itself on its first launch).
+    if args.contains("--fetch-model") {
+        print("downloading \(TextEncoder.modelName) (~130 MB)…")
+        let sem = DispatchSemaphore(value: 0)
+        var ok = false
+        Task.detached { ok = await TextEncoder.fetch(); sem.signal() }
+        sem.wait()
+        print(ok ? "ready: \(TextEncoder.dir.path)" : "download failed (check the connection, or CLINQY_EMBEDDINGS=system is set)")
+        if !ok { exit(1) }
+    }
+    Embedder.shared.activate(wait: true)
     Embedder.shared.warmNow(Memory.facts)
+    if !Embedder.shared.usesModel, !TextEncoder.downloaded {
+        print("(using the system vectors: open the Clinqy app once, or run `clinqy memory --fetch-model`, for the retrieval model)")
+    }
     let entries = Memory.entries
     let profile = entries.filter { Memory.isProfile($0.text) }
     let scoped = Dictionary(grouping: entries.filter { $0.scope != nil }, by: { $0.scope!.tag })
+    print("vectors: \(Embedder.shared.usesModel ? TextEncoder.modelName : "system (NaturalLanguage)")")
     print("\(entries.count) facts · \(profile.count) profile (always sent) · \(scoped.values.map(\.count).reduce(0, +)) notes for \(scoped.count) sites/apps")
     if args.contains("--map") {
         let graph = MemoryGraph(entries)
@@ -200,6 +217,21 @@ if command == "memory" {
         }
         let changes = Memory.history
         if !changes.isEmpty { print("\nhistory: \(changes.count) updates/removals kept in memory.history.jsonl") }
+    }
+    // `--eval cases.txt` (lines "request|text the right fact contains"): where recall ranks the right fact.
+    if let file = option("--eval"), let text = try? String(contentsOfFile: file, encoding: .utf8) {
+        var ranks: [Int] = []
+        for line in text.split(separator: "\n") {
+            let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let hits = Memory.search(parts[0])
+            let r = (hits.firstIndex { $0.contains(parts[1]) } ?? 98) + 1
+            ranks.append(r)
+            print("  \(r == 99 ? "–" : "#\(r)")\t\(parts[0])")
+        }
+        let mrr = ranks.map { $0 == 99 ? 0 : 1 / Double($0) }.reduce(0, +) / Double(max(1, ranks.count))
+        print("recall: #1 for \(ranks.filter { $0 == 1 }.count)/\(ranks.count) · top 3 \(ranks.filter { $0 <= 3 }.count) · top 25 \(ranks.filter { $0 <= 25 }.count) · MRR \(String(format: "%.2f", mrr))")
+        exit(0)
     }
     // `--fields "Label|Label|…"`: the facts that would ride along with a page showing these fields.
     if let fields = option("--fields") {
@@ -219,7 +251,7 @@ if command == "memory" {
         let t0 = Date()
         let (facts, omitted, linked) = Memory.relevantExplained(to: query, app: option("--app"), host: option("--site"))
         print("\n“\(query)” → \(facts.count) facts (\(linked.count) via links), \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
-        for f in facts { print("  \(Memory.isProfile(f) ? "P" : linked.contains(f) ? "~" : " ") \(f.prefix(120))") }
+        for f in facts { print("  \(Memory.isProfile(f) ? "P" : linked.contains(f) ? "~" : " ") \(args.contains("--full") ? f : String(f.prefix(120)))") }
     }
     exit(0)
 }
@@ -250,6 +282,7 @@ if command == "selftest" {
     // Memory relevance: a maths question gets only core facts; food brings in the Swiggy facts.
     MainActor.assumeIsolated {
         let t0 = Date()
+        Embedder.shared.activate(wait: true)
         Embedder.shared.warmNow(Memory.facts)   // the app does this in the background at launch
         let warmMs = Int(Date().timeIntervalSince(t0) * 1000)
         let t1 = Date()
@@ -309,6 +342,27 @@ if command == "selftest" {
         let changes = [Memory.Change(at: Date(), old: "Phone is 1111", new: "Phone is 2222", why: "updated"),
                        Memory.Change(at: Date(), old: "Phone is 2222", new: "Phone is 3333", why: "updated")]
         check(Memory.earlier("Phone is 3333", in: changes) == ["Phone is 2222", "Phone is 1111"], "earlier versions follow the update chain")
+        let old = Memory.parse("""
+        # My memory
+        * Likes lofi music
+        1. Orders food through Swiggy
+        - [ ] [app:Find My] open it as 'FindMy'
+        <!-- note to self -->
+        • Likes lofi music
+        - Find My app: open it as 'FindMy'
+        """)
+        check(old.map(\.text) == ["Likes lofi music", "Orders food through Swiggy", "open it as 'FindMy'", "Likes lofi music", "Find My app: open it as 'FindMy'"]
+              && old[2].tagged, "older and hand-written list styles parse (headings and comments skipped)")
+        let (lines, merged) = Memory.normalized(old)
+        check(lines == ["Orders food through Swiggy", "[app:Find My] open it as 'FindMy'", "Likes lofi music", "Find My app: open it as 'FindMy'"]
+              && merged == ["Likes lofi music"], "upgrade merges exact duplicates, keeping the newest and its tag")
+        if let enc = TextEncoder.load() {
+            check(enc.tokens("Hello, world!") == [101, 7592, 1010, 2088, 999, 102], "retrieval model tokenizer (BERT WordPiece)")
+            let a = enc.embed("That is a happy person"), b = enc.embed("That is a very happy person"), c = enc.embed("Today is a sunny day")
+            check(Embedder.cosine(a, b) > 0.9 && Embedder.cosine(a, b) > Embedder.cosine(a, c) + 0.15, "retrieval model: close sentences are close")
+        } else {
+            print("     (retrieval model not downloaded: skipped its checks)")
+        }
         check(Set(Agent.closest(to: "Application submitted", in: "Home\nYour application was sent · Thanks!\nApplication received"))
               == ["Your application was sent", "Application received"],
               "a missed wait shows the closest text on the page")
