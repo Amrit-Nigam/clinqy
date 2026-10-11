@@ -53,7 +53,7 @@ export function AsciiField({ running }: { running: boolean }) {
       canvas.width = innerWidth * dpr
       canvas.height = innerHeight * dpr
       ctx.setTransform(dpr, 0, 0, dpr, 0, 0)
-      ctx.font = `${FONT}px "IBM Plex Mono", ui-monospace, monospace`
+      ctx.font = `${FONT}px "Geist Mono", ui-monospace, monospace`
       ctx.textBaseline = 'top'
       cw = ctx.measureText('M').width
       cols = Math.ceil(innerWidth / cw)

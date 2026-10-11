@@ -160,9 +160,9 @@
   display: flex;
   align-items: center;
   gap: 0.35em;
-  font: 800 clamp(48px, 10vmin, 128px) / 1 var(--head);
-  font-variation-settings: 'wdth' 75;
-  letter-spacing: -0.04em;
+  font: 400 clamp(48px, 10vmin, 128px) / 1 var(--head);
+  font-synthesis: none;
+  letter-spacing: 0;
   color: #f4f6ff;
   text-shadow:
     2px 0 0 rgba(255, 50, 90, 0.5),

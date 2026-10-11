@@ -2,6 +2,20 @@
 @import './crt.css';
 @import './site.css';
 
+/* Geist, by Vercel (vercel.com/font), self-hosted. SIL Open Font License: public/fonts/GEIST-LICENSE.txt */
+@font-face {
+  font-family: 'Geist Mono';
+  src: url('/fonts/GeistMono-Variable.woff2') format('woff2');
+  font-weight: 100 900;
+  font-display: swap;
+}
+@font-face {
+  font-family: 'Geist Pixel';
+  src: url('/fonts/GeistPixel-Square.woff2') format('woff2');
+  font-weight: 400;
+  font-display: swap;
+}
+
 :root {
   /* Cool black and soft white: the tube, switched off. */
   --bg: #08090d;
@@ -14,10 +28,10 @@
   --blue: #4a8cff;
   --blue-deep: #2f6fe0;
   --phosphor: #8dffb0;
-  --display: 'Bricolage Grotesque', system-ui, sans-serif;
-  --osd: 'VT323', ui-monospace, monospace;
-  --mono: 'IBM Plex Mono', ui-monospace, monospace;
-  --head: 'Martian Mono', ui-monospace, monospace;
+  --display: 'Geist Mono', ui-monospace, monospace;
+  --osd: 'Geist Pixel', 'Geist Mono', ui-monospace, monospace;
+  --mono: 'Geist Mono', ui-monospace, monospace;
+  --head: 'Geist Pixel', 'Geist Mono', ui-monospace, monospace;
   color-scheme: dark;
 }
 
@@ -38,7 +52,6 @@ body {
   font-family: var(--display);
   font-size: 18px;
   line-height: 1.55;
-  font-variation-settings: 'opsz' 16;
   -webkit-font-smoothing: antialiased;
 }
 

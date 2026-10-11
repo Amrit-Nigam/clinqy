@@ -43,10 +43,10 @@
 .site h1,
 .site h2 {
   font-family: var(--head);
-  font-variation-settings: 'wdth' 75;
-  font-weight: 800;
-  letter-spacing: -0.045em;
-  line-height: 1;
+  font-weight: 400;
+  font-synthesis: none;
+  letter-spacing: -0.01em;
+  line-height: 1.05;
 }
 .site h2 {
   font-size: clamp(30px, 4.2vw, 56px);
@@ -136,9 +136,8 @@ main > section {
   display: flex;
   align-items: center;
   gap: 10px;
-  font: 700 18px / 1 var(--head);
-  font-variation-settings: 'wdth' 75;
-  letter-spacing: -0.03em;
+  font: 400 19px / 1 var(--head);
+  letter-spacing: 0;
   color: var(--text);
   text-decoration: none;
 }
@@ -235,8 +234,7 @@ main > section {
 .hero-sub {
   margin-top: 0.35em !important;
   font: 400 clamp(20px, 2.1vw, 30px) / 1.15 var(--head);
-  font-variation-settings: 'wdth' 75;
-  letter-spacing: -0.03em;
+  letter-spacing: 0;
   color: var(--text-soft);
 }
 .lede {
@@ -393,9 +391,9 @@ main > section {
 .stage-quote {
   position: relative;
   margin-top: 14px !important;
-  font: 700 clamp(26px, 3vw, 42px) / 1.12 var(--head);
-  font-variation-settings: 'wdth' 75;
-  letter-spacing: -0.035em;
+  font: 400 clamp(26px, 3vw, 42px) / 1.15 var(--head);
+  font-synthesis: none;
+  letter-spacing: 0;
   color: var(--text);
   text-wrap: balance;
 }
