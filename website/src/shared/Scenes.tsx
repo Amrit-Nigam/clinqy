@@ -1,3 +1,4 @@
+import { createContext, useContext } from 'react'
 import { CursorArrow } from './Cursor'
 import { cursorAt, easeOut, Key, lastClick, span, typed } from './timeline'
 
@@ -10,23 +11,34 @@ type SceneProps = { t: number; cur: { x: number; y: number; down: boolean } }
 export type Scene = {
   id: string
   label: string
+  app: string
   osd: string
   request: string
   keys: Key[]
   Body: (p: SceneProps) => JSX.Element
 }
 
-function Desktop({ title, app, children }: { title: string; app: string; children: React.ReactNode }) {
+/** bare: the host draws the wallpaper and menu bar itself (full-bleed CRT). */
+const StageCtx = createContext({ bare: false, app: '' })
+
+export function MenuBar({ app }: { app: string }) {
   return (
-    <div className="sc-desktop">
-      <div className="sc-menubar">
-        <span className="sc-apple" />
-        <b>{app}</b>
-        <span>File</span>
-        <span>Edit</span>
-        <span>View</span>
-        <span className="sc-menu-right">⌃⌥ Clinqy</span>
-      </div>
+    <div className="sc-menubar">
+      <span className="sc-apple" />
+      <b>{app}</b>
+      <span>File</span>
+      <span>Edit</span>
+      <span>View</span>
+      <span className="sc-menu-right">⌃⌥ Clinqy</span>
+    </div>
+  )
+}
+
+function Desktop({ title, children }: { title: string; children: React.ReactNode }) {
+  const { bare, app } = useContext(StageCtx)
+  return (
+    <div className={'sc-desktop' + (bare ? ' is-bare' : '')}>
+      {!bare && <MenuBar app={app} />}
       <div className="sc-window">
         <div className="sc-titlebar">
           <i style={{ background: '#ff5f57' }} />
@@ -85,7 +97,7 @@ function ShotBody({ t, cur }: SceneProps) {
     ['Akasa QP 1104', '19:05', '₹4,420'],
   ]
   return (
-    <Desktop title="Flights to Mumbai" app="Safari">
+    <Desktop title="Flights to Mumbai">
       <div className="sc-url">flights.example.com/del-bom</div>
       <h3 className="sc-h" style={{ left: 30, top: 50 }}>Delhi to Mumbai, Fri 17 Oct</h3>
       {rows.map((r, i) => (
@@ -136,7 +148,7 @@ function EditBody({ t, cur }: SceneProps) {
   const warm = span(t, 0.3, 0.6)
   const exported = easeOut(span(t, 0.86, 0.94))
   return (
-    <Desktop title="beach.jpg" app="Photos">
+    <Desktop title="beach.jpg">
       <div
         className="sc-photo"
         style={{ filter: `brightness(${0.62 + dragP * 0.55}) saturate(${0.7 + warm * 0.6})` }}
@@ -186,7 +198,7 @@ function AwsBody({ t }: SceneProps) {
   const confirm = t >= 0.76 && t < 0.9 ? easeOut(span(t, 0.76, 0.8)) : 0
   const done = easeOut(span(t, 0.9, 0.96))
   return (
-    <Desktop title="EC2 · Launch an instance" app="Chrome">
+    <Desktop title="EC2 · Launch an instance">
       <div className="sc-url">console.aws.amazon.com/ec2/launch</div>
       <div className="sc-aws-bar">Console <span>›</span> EC2 <span>›</span> Launch an instance</div>
       <Field x={30} y={118} label="Name" value={name} active={t > 0.1 && t < 0.42} />
@@ -239,7 +251,7 @@ function JobBody({ t }: SceneProps) {
   const ticked = t >= 0.69
   const sent = easeOut(span(t, 0.84, 0.92))
   return (
-    <Desktop title="Careers · Product Designer" app="Arc">
+    <Desktop title="Careers · Product Designer">
       <div className="sc-url">jobs.example.com/apply/product-designer</div>
       <h3 className="sc-h" style={{ left: 30, top: 46 }}>Product Designer, Bengaluru</h3>
       <Field x={30} y={106} label="Full name" value={nameV} active={t > 0.07 && t < 0.29} />
@@ -261,20 +273,184 @@ function JobBody({ t }: SceneProps) {
   )
 }
 
+/* 5. Messages: open Mom's chat, type, send. */
+const msgKeys: Key[] = [
+  { t: 0, x: 560, y: 420 },
+  { t: 0.14, x: 120, y: 136, click: true },
+  { t: 0.3, x: 360, y: 413, click: true },
+  { t: 0.68, x: 372, y: 418 },
+  { t: 0.76, x: 555, y: 413, click: true },
+  { t: 1, x: 555, y: 413 },
+]
+function MsgBody({ t }: SceneProps) {
+  const open = t >= 0.15
+  const draft = t >= 0.77 ? '' : typed('I’ll be late, stuck in traffic', t, 0.32, 0.68)
+  const sent = easeOut(span(t, 0.77, 0.83))
+  const chats = [
+    ['Mom', 'Call me when you’re free'],
+    ['Raj', 'Sent the deck'],
+    ['Priya', 'Thursday works'],
+    ['Design team', 'New mocks are up'],
+  ]
+  return (
+    <Desktop title="WhatsApp">
+      <div className="sc-chats">
+        <b className="sc-chats-title">Chats</b>
+        {chats.map(([n, m], i) => (
+          <div key={n} className={'sc-chat' + (open && i === 0 ? ' is-open' : '')} style={{ top: 50 + i * 48 }}>
+            <span className="sc-avatar">{n[0]}</span>
+            <div><b>{n}</b><small>{m}</small></div>
+          </div>
+        ))}
+      </div>
+      {open && (
+        <div className="sc-thread">
+          <div className="sc-bubble">Call me when you’re free</div>
+          {sent > 0 && (
+            <div className="sc-bubble is-me" style={{ opacity: sent, transform: `translateY(${(1 - sent) * 10}px)` }}>
+              I’ll be late, stuck in traffic <small>✓✓</small>
+            </div>
+          )}
+        </div>
+      )}
+      <div className={'sc-input sc-compose' + (t > 0.3 && t < 0.77 ? ' is-active' : '')}>
+        {draft || <small>Type a message</small>}
+      </div>
+      <div className={'sc-btn sc-btn-green sc-send' + (t > 0.76 && t < 0.8 ? ' is-pressed' : '')}>Send</div>
+    </Desktop>
+  )
+}
+
+/* 6. Calendar: scan Thursday for a free slot, book it. */
+const calKeys: Key[] = [
+  { t: 0, x: 560, y: 420 },
+  { t: 0.22, x: 436, y: 130 },
+  { t: 0.5, x: 436, y: 244 },
+  { t: 0.56, x: 436, y: 250, click: true },
+  { t: 1, x: 480, y: 330 },
+]
+function CalBody({ t, cur }: SceneProps) {
+  const days = ['Mon 13', 'Tue 14', 'Wed 15', 'Thu 16', 'Fri 17']
+  const busy: [number, number, number, string][] = [
+    [0, 0, 1, 'Standup'],
+    [1, 1, 3, 'Workshop'],
+    [2, 0, 2, 'Reviews'],
+    [3, 0, 2, 'Interviews'],
+    [3, 3, 4, '1:1 with Sam'],
+    [4, 1, 2, 'Lunch'],
+  ]
+  const scanning = t >= 0.22 && t < 0.56
+  const booked = easeOut(span(t, 0.57, 0.66))
+  const toast = easeOut(span(t, 0.68, 0.76))
+  const ROW = 60
+  return (
+    <Desktop title="Calendar">
+      {days.map((d, i) => (
+        <div key={d} className="sc-cal-day" style={{ left: 60 + i * 96, top: 14 }}>{d}</div>
+      ))}
+      {['1 PM', '2 PM', '3 PM', '4 PM', '5 PM'].map((h, i) => (
+        <div key={h} className="sc-cal-hour" style={{ top: 46 + i * ROW }}>{h}</div>
+      ))}
+      <div className="sc-cal-grid" />
+      {busy.map(([d, a, b, n]) => (
+        <div key={n} className="sc-cal-ev" style={{ left: 62 + d * 96, top: 50 + a * ROW, height: (b - a) * ROW - 4 }}>{n}</div>
+      ))}
+      {scanning && (
+        <div className="sc-cal-scan" style={{ left: 348, top: Math.max(50, cur.y - 64 - 20), height: 30 }} />
+      )}
+      {booked > 0 && (
+        <div className="sc-cal-ev is-new" style={{ left: 350, top: 170, height: 28, opacity: booked, transform: `scale(${0.9 + booked * 0.1})` }}>
+          Call with Priya
+        </div>
+      )}
+      <Toast show={toast}>Added Call with Priya, Thu 3:00 PM</Toast>
+    </Desktop>
+  )
+}
+
+/* 7. Files: sort Downloads into folders. */
+const FILES: [string, number][] = [
+  ['invoice-sept.pdf', 0],
+  ['beach.jpg', 1],
+  ['Zoom.pkg', 2],
+  ['offer-letter.pdf', 0],
+  ['screenshot.png', 1],
+  ['resume.pdf', 0],
+]
+const drags = [
+  [0.12, 0.26],
+  [0.3, 0.44],
+  [0.48, 0.62],
+]
+const fileKeys: Key[] = [
+  { t: 0, x: 560, y: 420 },
+  ...drags.flatMap(([a, b], i) => {
+    const rowY = 101 + i * 40
+    const folderY = 131 + FILES[i][1] * 90
+    return [
+      { t: a, x: 120, y: rowY },
+      { t: a + 0.02, x: 120, y: rowY, down: true },
+      { t: b, x: 480, y: folderY, down: true },
+      { t: b + 0.02, x: 480, y: folderY },
+    ]
+  }),
+  { t: 1, x: 520, y: 400 },
+]
+function FilesBody({ t, cur }: SceneProps) {
+  const folders = ['PDFs', 'Images', 'Installers']
+  // When each file lands: the first three are dragged, the rest follow in bulk.
+  const landed = FILES.map((_, i) => (i < 3 ? drags[i][1] + 0.02 : 0.68 + (i - 3) * 0.04))
+  const dragging = drags.findIndex(([a, b]) => t >= a + 0.02 && t < b + 0.02)
+  const counts = folders.map((_, f) => FILES.filter(([, ff], i) => ff === f && t >= landed[i]).length)
+  const toast = easeOut(span(t, 0.84, 0.9))
+  return (
+    <Desktop title="Downloads">
+      {FILES.map(([name], i) => {
+        const gone = t >= landed[i]
+        const fading = i >= 3 ? 1 - span(t, landed[i] - 0.04, landed[i]) : gone ? 0 : 1
+        return (
+          <div key={name} className="sc-file" style={{ left: 20, top: 20 + i * 40, opacity: dragging === i ? 0.3 : fading }}>
+            <span className={'sc-file-ico ' + name.split('.')[1]} />
+            {name}
+          </div>
+        )
+      })}
+      {folders.map((f, j) => (
+        <div key={f} className={'sc-folder' + (dragging >= 0 && FILES[dragging][1] === j ? ' is-target' : '')} style={{ left: 340, top: 30 + j * 90 }}>
+          <span className="sc-folder-ico" />
+          <div><b>{f}</b><small>{counts[j]} {counts[j] === 1 ? 'file' : 'files'}</small></div>
+        </div>
+      ))}
+      {dragging >= 0 && (
+        <div className="sc-file is-ghost" style={{ left: cur.x - 40 - 60, top: cur.y - 64 - 17 }}>
+          <span className={'sc-file-ico ' + FILES[dragging][0].split('.')[1]} />
+          {FILES[dragging][0]}
+        </div>
+      )}
+      <Toast show={toast}>Sorted 6 files. You can undo this.</Toast>
+    </Desktop>
+  )
+}
+
 export const SCENES: Scene[] = [
-  { id: 'shot', label: 'Screenshots', osd: 'SCREENSHOT', request: 'grab the cheapest flights', keys: shotKeys, Body: ShotBody },
-  { id: 'edit', label: 'Photo edits', osd: 'PHOTO EDIT', request: 'brighten this photo and export it', keys: editKeys, Body: EditBody },
-  { id: 'aws', label: 'AWS console', osd: 'AWS CONSOLE', request: 'launch a t3.micro called tf-server', keys: awsKeys, Body: AwsBody },
-  { id: 'job', label: 'Job applications', osd: 'JOB PORTAL', request: 'apply to this job with my resume', keys: jobKeys, Body: JobBody },
+  { id: 'shot', label: 'Screenshots', app: 'Safari', osd: 'SCREENSHOT', request: 'grab the cheapest flights', keys: shotKeys, Body: ShotBody },
+  { id: 'edit', label: 'Photo edits', app: 'Photos', osd: 'PHOTO EDIT', request: 'brighten this photo and export it', keys: editKeys, Body: EditBody },
+  { id: 'aws', label: 'AWS console', app: 'Chrome', osd: 'AWS CONSOLE', request: 'launch a t3.micro called tf-server', keys: awsKeys, Body: AwsBody },
+  { id: 'job', label: 'Job applications', app: 'Arc', osd: 'JOB PORTAL', request: 'apply to this job with my resume', keys: jobKeys, Body: JobBody },
+  { id: 'msg', label: 'Messages', app: 'WhatsApp', osd: 'MESSAGES', request: 'message mom I’ll be late', keys: msgKeys, Body: MsgBody },
+  { id: 'cal', label: 'Calendar', app: 'Calendar', osd: 'CALENDAR', request: 'schedule a call with Priya Thursday afternoon', keys: calKeys, Body: CalBody },
+  { id: 'files', label: 'Files', app: 'Finder', osd: 'FILES', request: 'sort my Downloads into folders', keys: fileKeys, Body: FilesBody },
 ]
 
+
 /** Renders one scene at progress t (0..1), with the companion cursor and click ripples. */
-export function SceneStage({ scene, t, showRequest = true }: { scene: Scene; t: number; showRequest?: boolean }) {
+export function SceneStage({ scene, t, showRequest = true, bare = false }: { scene: Scene; t: number; showRequest?: boolean; bare?: boolean }) {
   const cur = cursorAt(scene.keys, t)
   const click = lastClick(scene.keys, t)
   const ripple = click ? span(t, click.t, click.t + 0.08) : 1
   const { Body } = scene
   return (
+    <StageCtx.Provider value={{ bare, app: scene.app }}>
     <div className="sc-stage" style={{ width: STAGE_W, height: STAGE_H }}>
       <Body t={t} cur={cur} />
       {showRequest && (
@@ -292,5 +468,6 @@ export function SceneStage({ scene, t, showRequest = true }: { scene: Scene; t: 
       {cur.down && <div className="sc-ripple sc-hold" style={{ left: cur.x, top: cur.y }} />}
       <CursorArrow className="sc-cursor" size={20} style={{ transform: `translate(${cur.x}px, ${cur.y}px)` }} />
     </div>
+    </StageCtx.Provider>
   )
 }

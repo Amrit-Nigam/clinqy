@@ -1,14 +1,47 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import { Grain } from './Grain'
 import { CrtSound } from './sound'
-import { SCENES, SceneStage, STAGE_W } from '../shared/Scenes'
-import { span } from '../shared/timeline'
+import { barrelMap } from './barrel'
+import { MenuBar, SCENES, SceneStage, STAGE_W } from '../shared/Scenes'
+import { easeOut, span } from '../shared/timeline'
 import { useClock } from '../shared/useLoop'
-import { useFitScale } from '../shared/useFitScale'
+
+/** Size of an element, kept current. */
+function useSize<T extends HTMLElement>() {
+  const ref = useRef<T>(null)
+  const [size, setSize] = useState({ w: 0, h: 0 })
+  useLayoutEffect(() => {
+    const el = ref.current
+    if (!el) return
+    const ro = new ResizeObserver(() => setSize({ w: el.clientWidth, h: el.clientHeight }))
+    ro.observe(el)
+    return () => ro.disconnect()
+  }, [])
+  return [ref, size] as const
+}
+
+const byId = Object.fromEntries(SCENES.map((s) => [s.id, s]))
+
+/**
+ * The jumble: windows pile onto the tube one after another, overlapping,
+ * each with its own Clinqy cursor mid-task. x/y are fractions of the glass,
+ * w is the window width relative to the glass.
+ */
+const PILE = [
+  { id: 'shot', x: 0.04, y: 0.1, w: 0.4, r: -3, speed: 1 },
+  { id: 'edit', x: 0.58, y: 0.06, w: 0.38, r: 2.5, speed: 0.9 },
+  { id: 'job', x: 0.03, y: 0.5, w: 0.38, r: 2, speed: 1.1 },
+  { id: 'msg', x: 0.6, y: 0.52, w: 0.36, r: -2, speed: 0.95 },
+  { id: 'files', x: 0.4, y: 0.02, w: 0.28, r: 4, speed: 1.05 },
+  { id: 'cal', x: 0.38, y: 0.6, w: 0.3, r: -1, speed: 0.92 },
+  { id: 'aws', x: 0.28, y: 0.24, w: 0.44, r: 0.5, speed: 1 },
+]
 
 const POWER = 700
-const SCENE = 2200
-const SCENES_END = POWER + SCENE * SCENES.length
+const SPAWN_GAP = 520
+const LOOP = 4300
+const JUMBLE = 8200
+const SCENES_END = POWER + JUMBLE
 const BUZZ = 1500
 const BUZZ_END = SCENES_END + BUZZ
 const DIVE = 1100
@@ -21,13 +54,11 @@ export function CrtLoader({ onReveal, onDone }: Props) {
   const ms = useClock(true)
   // Skipping jumps straight to the buzz, so the exit still plays.
   const t = skipAt !== null ? Math.max(ms, SCENES_END + (ms - skipAt)) : ms
-  const [stageRef, scale] = useFitScale<HTMLDivElement>(STAGE_W)
-  const tvRef = useRef<HTMLDivElement>(null)
-  const screenRef = useRef<HTMLDivElement>(null)
+  const [picRef, pic] = useSize<HTMLDivElement>()
+  const map = useState(barrelMap)[0]
   const sound = useRef(new CrtSound())
   const [soundOn, setSoundOn] = useState(false)
   const fired = useRef({ buzz: false, reveal: false, done: false })
-  const [origin, setOrigin] = useState('50% 45%')
 
   const phase = t < POWER ? 'power' : t < SCENES_END ? 'scenes' : t < BUZZ_END ? 'buzz' : 'dive'
 
@@ -50,14 +81,6 @@ export function CrtLoader({ onReveal, onDone }: Props) {
 
   useEffect(() => () => sound.current.stop(), [])
 
-  // Zoom toward the centre of the glass, wherever the TV lands in the viewport.
-  useLayoutEffect(() => {
-    const tv = tvRef.current?.getBoundingClientRect()
-    const sc = screenRef.current?.getBoundingClientRect()
-    if (!tv || !sc) return
-    setOrigin(`${sc.left + sc.width / 2 - tv.left}px ${sc.top + sc.height / 2 - tv.top}px`)
-  }, [phase === 'buzz'])
-
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === 'Escape' || e.key === 'Enter') skip()
@@ -76,96 +99,120 @@ export function CrtLoader({ onReveal, onDone }: Props) {
     setSoundOn(sound.current.on)
   }
 
-  // Scene + progress
-  const sceneIdx = Math.min(SCENES.length - 1, Math.max(0, Math.floor((t - POWER) / SCENE)))
-  const sceneT = phase === 'scenes' ? span(t - POWER - sceneIdx * SCENE, 0, SCENE) : phase === 'power' ? 0 : 1
-  const scene = SCENES[sceneIdx]
   const loadPct = Math.round(span(t, 0, SCENES_END) * 100)
+  const spawned = PILE.filter((_, i) => t >= POWER + 200 + i * SPAWN_GAP).length
+  // Once they're all up, a different window keeps jumping to the front.
+  const allUp = POWER + 200 + PILE.length * SPAWN_GAP
+  const focus = t > allUp ? Math.floor((t - allUp) / 1100) % PILE.length : -1
+  const front = focus >= 0 ? PILE[focus] : PILE[Math.max(0, spawned - 1)]
 
   // Power-on: a bright line opens into the picture.
   const powerP = span(t, 120, POWER)
   const powerClip = phase === 'power' ? `inset(${(1 - powerP) * 49.6}% 0 ${(1 - powerP) * 49.6}% 0)` : 'none'
 
   // Buzz: jitter, rolling bars, then colour bars.
-  const b = phase === 'buzz' ? span(t, SCENES_END, BUZZ_END) : phase === 'dive' ? 1 : 0
-  const jitter = phase === 'buzz' ? Math.sin(t * 0.9) * 6 * (1 - b * 0.4) + (Math.random() - 0.5) * 8 : 0
-  const showBars = phase === 'buzz' && b > 0.35
-  const chroma = 1.3 + (phase === 'buzz' ? 3 + Math.random() * 4 : 0)
-
-  // Scene transitions get a short channel-flip hiccup.
-  const flip = phase === 'scenes' && sceneT < 0.04 && sceneIdx > 0
+  const jitter = phase === 'buzz' ? Math.sin(t * 0.9) * 6 + (Math.random() - 0.5) * 9 : 0
+  const showBars = phase === 'buzz' && span(t, SCENES_END, BUZZ_END) > 0.35
 
   // Dive: push into the glass.
   const d = phase === 'dive' ? span(t, BUZZ_END, BUZZ_END + 700) : 0
   const diveEase = d * d * d
   const fade = phase === 'dive' ? 1 - span(t, BUZZ_END + 300, LOADER_TOTAL - 150) : 1
 
+  // How hard the glass bends, in px at the corners. More while it buzzes.
+  const bulge = Math.min(pic.w, pic.h) * (phase === 'buzz' ? 0.17 + Math.random() * 0.04 : 0.14)
+  // Window size is set by the shorter side so phones still get a pile, not specks.
+  const base = Math.min(pic.w, pic.h * 1.45)
+
   return (
     <div className="crt-room" style={{ opacity: fade }} aria-label="Clinqy intro" role="img">
       <svg width="0" height="0" style={{ position: 'absolute' }} aria-hidden="true">
-        <filter id="crt-chroma" x="-5%" y="-5%" width="110%" height="110%">
-          <feColorMatrix in="SourceGraphic" type="matrix" values="1 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 1 0" result="r" />
-          <feOffset in="r" dx={chroma} dy="0" result="r2" />
-          <feColorMatrix in="SourceGraphic" type="matrix" values="0 0 0 0 0  0 1 0 0 0  0 0 0 0 0  0 0 0 1 0" result="g" />
-          <feColorMatrix in="SourceGraphic" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 1 0 0  0 0 0 1 0" result="b" />
-          <feOffset in="b" dx={-chroma} dy="0" result="b2" />
-          <feBlend in="r2" in2="g" mode="screen" result="rg" />
-          <feBlend in="rg" in2="b2" mode="screen" />
-        </filter>
+        <defs>
+          <clipPath id="crt-glass-shape" clipPathUnits="objectBoundingBox">
+            {/* Rounded rectangle whose sides bow outward: the tube's face. */}
+            <path d="M0.055 0.022 Q0.5 0 0.945 0.022 Q0.988 0.03 0.982 0.085 Q1 0.5 0.982 0.915 Q0.988 0.97 0.945 0.978 Q0.5 1 0.055 0.978 Q0.012 0.97 0.018 0.915 Q0 0.5 0.018 0.085 Q0.012 0.03 0.055 0.022 Z" />
+          </clipPath>
+        </defs>
+        {pic.w > 0 && (
+          <filter id="crt-barrel" filterUnits="userSpaceOnUse" primitiveUnits="userSpaceOnUse" x="0" y="0" width={pic.w} height={pic.h} colorInterpolationFilters="sRGB">
+            <feImage href={map} x="0" y="0" width={pic.w} height={pic.h} preserveAspectRatio="none" result="map" />
+            <feDisplacementMap in="SourceGraphic" in2="map" scale={bulge} xChannelSelector="R" yChannelSelector="G" />
+          </filter>
+        )}
       </svg>
 
-      <div className="crt-glow" style={{ opacity: phase === 'power' ? powerP * 0.8 : 0.9 + (phase === 'buzz' ? Math.random() * 0.3 : 0) }} />
-
-      <div
-        ref={tvRef}
-        className="crt-tv"
-        style={{ transform: `scale(${1 + diveEase * 7})`, transformOrigin: origin }}
-      >
-        <div className="crt-brand">Clinqytron</div>
+      <div className="crt-tv" style={{ transform: `scale(${1 + diveEase * 1.6})` }}>
         <div className="crt-bezel">
-          <div ref={screenRef} className={'crt-screen' + (phase === 'buzz' ? ' is-buzzing' : '')}>
-            <div className="crt-picture" style={{ clipPath: powerClip, transform: `translateX(${jitter}px) skewX(${jitter * 0.15}deg)` }}>
-              <div ref={stageRef} className="crt-stage-fit">
-                <div className="crt-stage" style={{ transform: `scale(${scale})`, filter: 'url(#crt-chroma)' }}>
-                  {phase !== 'power' && !showBars && <SceneStage scene={scene} t={sceneT} />}
-                  {phase === 'power' && <div className="crt-powerline" style={{ opacity: 1 - powerP * 0.6 }} />}
-                  {showBars && <ColorBars />}
-                </div>
-              </div>
+          <div className={'crt-screen' + (phase === 'buzz' ? ' is-buzzing' : '')}>
+            <div className="crt-picture" ref={picRef} style={{ clipPath: powerClip, filter: pic.w ? 'url(#crt-barrel)' : undefined }}>
+              <div className="crt-signal" style={{ transform: `translateX(${jitter}px) skewX(${jitter * 0.15}deg)` }}>
+                {phase !== 'power' && !showBars && pic.w > 0 && (
+                  <>
+                    <div className="crt-wall" />
+                    <div className="crt-menubar" style={{ width: pic.w / (base / 900), transform: `scale(${base / 900})` }}>
+                      <MenuBar app={byId[front.id].app} />
+                    </div>
+                    {PILE.map((p, i) => {
+                      const born = POWER + 200 + i * SPAWN_GAP
+                      if (t < born) return null
+                      const pop = easeOut(span(t, born, born + 260))
+                      const sceneT = (((t - born) * p.speed) / LOOP) % 1
+                      const isFront = p === front
+                      const s = ((p.w * base) / STAGE_W) * (0.86 + pop * 0.14) * (isFront ? 1.32 : 1)
+                      const drift = Math.sin(t / 1700 + i * 1.7) * 6
+                      // Centre each 640x480 stage on its slot.
+                      const cx = p.x * pic.w + (p.w * base) / 2
+                      const cy = p.y * pic.h + (p.w * base * 0.75) / 2
+                      return (
+                        <div
+                          key={p.id}
+                          className="crt-tile"
+                          style={{
+                            transform: `translate(${cx - 320 + drift}px, ${cy - 240 - drift * 0.6}px) scale(${s}) rotate(${p.r}deg)`,
+                            opacity: pop,
+                            zIndex: isFront ? 50 : i,
+                            // Dark-mode windows glow like phosphor; the ones behind sit dimmer.
+                            filter: `invert(0.9) hue-rotate(180deg) brightness(${isFront ? 1.25 : 0.7})`,
+                          }}
+                        >
+                          <SceneStage scene={byId[p.id]} t={sceneT} bare />
+                        </div>
+                      )
+                    })}
+                    <div className="crt-beam" />
+                  </>
+                )}
+                {phase === 'power' && <div className="crt-powerline" style={{ opacity: 1 - powerP * 0.6 }} />}
+                {showBars && <ColorBars />}
 
-              <div className="crt-osd crt-osd-tl">
-                {showBars ? 'NO SIGNAL' : `CH 0${sceneIdx + 1}  ${scene.osd}`}
-              </div>
-              <div className="crt-osd crt-osd-tr">{phase === 'buzz' ? '◼ STOP' : '▶ PLAY'}</div>
-              <div className="crt-osd crt-osd-bl">
-                LOADING CLINQY <span className="crt-bar">{'█'.repeat(Math.round(loadPct / 10)).padEnd(10, '░')}</span> {loadPct}%
+                <div className="crt-osd crt-osd-tl">
+                  {showBars ? 'NO SIGNAL' : `CH 03  ${spawned} TASK${spawned === 1 ? '' : 'S'} RUNNING`}
+                </div>
+                <div className="crt-osd crt-osd-tr">{phase === 'buzz' ? '◼ STOP' : '▶ PLAY'}</div>
+                <div className="crt-osd crt-osd-bl">
+                  LOADING CLINQY <span className="crt-bar">{'█'.repeat(Math.round(loadPct / 10)).padEnd(10, '░')}</span> {loadPct}%
+                </div>
               </div>
               {phase === 'buzz' && <div className="crt-roll" style={{ top: `${((t * 0.25) % 140) - 20}%` }} />}
             </div>
 
-            <div className="crt-scanlines" />
-            <div className="crt-grille" />
-            <Grain amount={phase === 'buzz' ? 0.8 + Math.random() * 0.2 : flip ? 0.9 : 0.12} className="crt-grain" />
+            <Grain amount={phase === 'buzz' ? 0.8 + Math.random() * 0.2 : 0.1} className="crt-grain" />
             <div className="crt-flicker" />
             <div className="crt-glass" />
-            {(flip || d > 0) && <div className="crt-white" style={{ opacity: flip ? 0.5 : d * 0.9 }} />}
+            {d > 0 && <div className="crt-white" style={{ opacity: d * 0.9 }} />}
           </div>
         </div>
-        <div className="crt-panel">
-          <span className="crt-led" data-on={phase !== 'power' || powerP > 0.2} />
-          <span className="crt-grillelines" />
-          <button type="button" className="crt-knob" onClick={toggleSound} aria-pressed={soundOn} aria-label={soundOn ? 'Turn sound off' : 'Turn sound on'}>
-            <i />
-          </button>
-          <button type="button" className="crt-knob" onClick={skip} aria-label="Change channel (skip intro)">
-            <i style={{ transform: `rotate(${sceneIdx * 45}deg)` }} />
-          </button>
-        </div>
-      </div>
 
-      <div className="crt-controls" style={{ opacity: phase === 'scenes' || phase === 'power' ? 1 : 0 }}>
-        <button type="button" onClick={toggleSound}>{soundOn ? 'Sound on' : 'Sound off'}</button>
-        <button type="button" onClick={skip}>Skip intro</button>
+        <div className="crt-chin">
+          <span className="crt-brand">Clinqytron</span>
+          <div className="crt-controls" style={{ opacity: phase === 'scenes' || phase === 'power' ? 1 : 0 }}>
+            <button type="button" onClick={toggleSound} aria-pressed={soundOn}>
+              {soundOn ? 'Sound on' : 'Sound off'}
+            </button>
+            <button type="button" onClick={skip}>Skip intro</button>
+            <span className="crt-led" data-on={phase !== 'power' || powerP > 0.2} />
+          </div>
+        </div>
       </div>
     </div>
   )

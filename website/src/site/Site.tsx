@@ -2,6 +2,7 @@ import { useState } from 'react'
 import { BuddyCursor } from './BuddyCursor'
 import { CommandBar } from './CommandBar'
 import { ScenePlayer } from './ScenePlayer'
+import { ScreenWall } from './ScreenWall'
 import { SETUP_PROMPT } from './setupPrompt'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
@@ -54,6 +55,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
 
   return (
     <div className="site">
+      <ScreenWall running={live} />
       <BuddyCursor enabled={live} />
 
       <header className="nav">
@@ -81,7 +83,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               types into the address bar, ticks the boxes and fills the form.
             </p>
             <div className="hero-ctas">
-              <button type="button" className="btn btn-blue" onClick={copyPrompt} data-buddy>
+              <button type="button" className="btn btn-primary" onClick={copyPrompt} data-buddy>
                 {copied ? 'Setup prompt copied' : 'Copy the setup prompt'}
               </button>
               <a className="btn btn-quiet" href={GITHUB} target="_blank" rel="noreferrer" data-buddy>
@@ -97,6 +99,28 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               click, so nothing happens behind your back.
             </p>
           </div>
+        </section>
+
+        <section className="how" aria-labelledby="how-title">
+          <h2 id="how-title">How it works</h2>
+          <ol className="how-steps">
+            <li>
+              <h3>You ask</h3>
+              <p>Tap ⌃⌥ and type, or hold it and talk. Whatever you’ve highlighted goes along, so “reply to this” just works.</p>
+            </li>
+            <li>
+              <h3>It looks</h3>
+              <p>It reads the screen the way assistive tech does: buttons, fields and lists by name, plus text recognition when an app hides them.</p>
+            </li>
+            <li>
+              <h3>It acts, then checks</h3>
+              <p>The blue cursor flies to the target and clicks or types for real. If nothing changed, it tries another way.</p>
+            </li>
+            <li>
+              <h3>It asks when it matters</h3>
+              <p>Missing details, choices and anything like Pay or Send come back to you first, with quick buttons or a voice answer.</p>
+            </li>
+          </ol>
         </section>
 
         <section className="watch" id="watch">
@@ -142,8 +166,8 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               Click <b>Pay ₹4,420</b> on flights.example.com for Akasa QP 1104, Delhi to Mumbai?
             </p>
             <div className="ask-card-actions">
-              <button type="button" className="btn btn-quiet-dark" data-buddy>Not now</button>
-              <button type="button" className="btn btn-blue" data-buddy>Pay ₹4,420</button>
+              <button type="button" className="btn btn-ghost-dark" data-buddy>Not now</button>
+              <button type="button" className="btn btn-primary" data-buddy>Pay ₹4,420</button>
             </div>
           </div>
         </section>
@@ -182,7 +206,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           <div className="prompt">
             <div className="prompt-head">
               <span>Setup prompt</span>
-              <button type="button" className="btn btn-blue btn-small" onClick={copyPrompt} data-buddy>
+              <button type="button" className="btn btn-primary btn-small" onClick={copyPrompt} data-buddy>
                 {copied ? 'Copied' : 'Copy prompt'}
               </button>
             </div>

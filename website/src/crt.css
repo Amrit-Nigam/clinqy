@@ -1,0 +1,294 @@
+/* ───────────────────────── CRT intro ───────────────────────── */
+
+.crt-room {
+  position: fixed;
+  inset: 0;
+  z-index: 50;
+  overflow: hidden;
+  background: #000;
+  --dot: clamp(3.5px, 0.58vmin, 8px);
+}
+
+/* The set fills the viewport: a cream casing and a deep sloped bezel. */
+.crt-tv {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  background:
+    radial-gradient(140% 90% at 50% 0%, #e7dec9 0%, #d6ccb4 60%, #c2b79d 100%);
+  transform-origin: 50% 46%;
+  will-change: transform;
+}
+
+.crt-bezel {
+  flex: 1;
+  min-height: 0;
+  margin: clamp(10px, 2vmin, 28px) clamp(10px, 2vmin, 28px) 0;
+  border-style: solid;
+  border-width: clamp(18px, 4.2vmin, 56px);
+  /* Light falls from above: the top wall of the tunnel is in shadow. */
+  border-color: #a59a80 #c3b9a1 #ece4d1 #bbb198;
+  border-radius: clamp(16px, 3vmin, 40px);
+  box-shadow:
+    0 1px 0 rgba(255, 255, 255, 0.7),
+    inset 0 0 0 1px rgba(0, 0, 0, 0.25);
+  background: #000;
+}
+
+.crt-screen {
+  position: relative;
+  height: 100%;
+  overflow: hidden;
+  background: #040302;
+  clip-path: url(#crt-glass-shape);
+}
+
+.crt-picture {
+  position: absolute;
+  inset: 0;
+}
+
+/* Everything on the tube is drawn through phosphor dots. */
+.crt-signal {
+  position: absolute;
+  inset: 0;
+  filter: brightness(1.25) contrast(1.1) saturate(1.15) sepia(0.1) blur(0.5px);
+  -webkit-mask-image: radial-gradient(circle, #000 0 38%, rgba(0, 0, 0, 0.5) 50%, transparent 62%);
+  mask-image: radial-gradient(circle, #000 0 38%, rgba(0, 0, 0, 0.5) 50%, transparent 62%);
+  -webkit-mask-size: var(--dot) var(--dot);
+  mask-size: var(--dot) var(--dot);
+}
+
+.crt-screen.is-buzzing .crt-signal {
+  animation: buzz-flash 90ms steps(2) infinite;
+}
+
+@keyframes buzz-flash {
+  50% {
+    filter: brightness(2.1) contrast(1.4) saturate(0.5) blur(1px);
+  }
+}
+
+/* The desktop behind the jumble: a warm beam, hot in the middle. */
+.crt-wall {
+  position: absolute;
+  inset: 0;
+  background:
+    radial-gradient(48% 46% at 50% 50%, #fff3d9 0%, #e8c98f 28%, #8a6a3e 58%, #2a1e10 82%, #0a0705 100%);
+}
+
+.crt-beam {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(55% 50% at 50% 50%, rgba(255, 238, 200, 0.22), transparent 70%);
+  mix-blend-mode: screen;
+  pointer-events: none;
+}
+
+.crt-menubar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  transform-origin: 0 0;
+  opacity: 0.85;
+}
+
+.crt-tile {
+  position: absolute;
+  left: 0;
+  top: 0;
+  width: 640px;
+  height: 480px;
+  transform-origin: 50% 50%;
+  transition: filter 0.25s;
+}
+/* Big enough to follow through the phosphor dots. */
+.crt-tile .sc-cursor {
+  width: 54px;
+  height: 70px;
+  /* Pre-inverted, so it comes out Clinqy blue on the dark-mode tile. */
+  filter: invert(1) hue-rotate(180deg) drop-shadow(0 0 10px rgba(180, 120, 0, 0.9));
+}
+.crt-tile .sc-window {
+  box-shadow: 0 30px 60px rgba(0, 0, 0, 0.7), 0 0 0 1px rgba(0, 0, 0, 0.4);
+}
+
+.crt-powerline {
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(60% 6% at 50% 50%, #fff, #ffe7b8 40%, transparent 70%);
+}
+
+.crt-osd {
+  position: absolute;
+  font: 400 clamp(18px, 3.8vmin, 44px) / 1 var(--osd);
+  color: var(--phosphor);
+  text-shadow:
+    0 0 2px #000,
+    0 1px 3px rgba(0, 0, 0, 0.9),
+    0 0 10px rgba(141, 255, 176, 0.8);
+  letter-spacing: 0.04em;
+  white-space: pre;
+  pointer-events: none;
+  z-index: 100;
+}
+.crt-osd-tl {
+  top: 8%;
+  left: 7%;
+}
+.crt-osd-tr {
+  top: 8%;
+  right: 7%;
+}
+.crt-osd-bl {
+  bottom: 8%;
+  left: 7%;
+}
+.crt-bar {
+  letter-spacing: -0.05em;
+}
+
+.crt-roll {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 18%;
+  background: linear-gradient(180deg, transparent, rgba(255, 255, 255, 0.22), rgba(0, 0, 0, 0.35), transparent);
+  mix-blend-mode: hard-light;
+}
+
+.crt-grain,
+.crt-flicker,
+.crt-glass,
+.crt-white {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  pointer-events: none;
+}
+
+.crt-grain {
+  image-rendering: pixelated;
+  mix-blend-mode: overlay;
+  opacity: 0.4;
+}
+
+.crt-flicker {
+  background: rgba(255, 240, 210, 0.025);
+  animation: flicker 120ms steps(3) infinite;
+}
+@keyframes flicker {
+  33% {
+    opacity: 0.2;
+  }
+  66% {
+    opacity: 0.9;
+  }
+}
+
+/* Curved glass: deep falloff at the rim and a soft reflection up top. */
+.crt-glass {
+  background:
+    radial-gradient(55% 35% at 32% 16%, rgba(255, 250, 235, 0.1), transparent 70%),
+    radial-gradient(115% 115% at 50% 50%, transparent 45%, rgba(0, 0, 0, 0.6) 75%, rgba(0, 0, 0, 0.95) 100%);
+  box-shadow:
+    inset 0 0 140px rgba(0, 0, 0, 0.8),
+    inset 0 0 30px rgba(0, 0, 0, 0.7);
+}
+
+.crt-white {
+  background: #fff4dc;
+}
+
+.crt-bars {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+}
+.crt-bars > div {
+  display: flex;
+}
+.crt-bars i {
+  flex: 1;
+}
+.crt-bars-top {
+  flex: 67;
+}
+.crt-bars-mid {
+  flex: 8;
+}
+.crt-bars-low {
+  flex: 25;
+}
+.crt-bars-label {
+  position: absolute;
+  top: 40%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  padding: 10px 34px 4px;
+  background: rgba(20, 20, 22, 0.92);
+  font: 400 clamp(40px, 10vmin, 120px) / 1 var(--osd);
+  letter-spacing: 0.18em;
+  color: #fff;
+}
+
+.crt-chin {
+  flex: none;
+  height: clamp(40px, 7vmin, 76px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 clamp(20px, 4vmin, 56px);
+}
+.crt-brand {
+  font: 600 clamp(11px, 1.6vmin, 16px) / 1 var(--display);
+  letter-spacing: 0.08em;
+  color: #8d836d;
+  text-shadow: 0 1px 0 rgba(255, 255, 255, 0.65);
+}
+.crt-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  transition: opacity 0.3s;
+}
+.crt-controls button {
+  border: 0;
+  padding: 7px 14px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, #ebe3d0, #c9bea5);
+  box-shadow:
+    inset 0 1px 0 rgba(255, 255, 255, 0.8),
+    0 1px 2px rgba(0, 0, 0, 0.35);
+  color: #4f4635;
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.crt-controls button:active {
+  box-shadow: inset 0 1px 3px rgba(0, 0, 0, 0.35);
+}
+.crt-led {
+  width: clamp(6px, 0.9vmin, 9px);
+  aspect-ratio: 1;
+  margin-left: 6px;
+  border-radius: 50%;
+  background: #4a2a22;
+}
+.crt-led[data-on='true'] {
+  background: #ff5a3a;
+  box-shadow: 0 0 8px #ff5a3a;
+}
+
+@media (max-width: 700px) {
+  .crt-brand {
+    display: none;
+  }
+  .crt-osd {
+    font-size: 16px;
+  }
+}
