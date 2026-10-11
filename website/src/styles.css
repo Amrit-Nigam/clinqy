@@ -3,15 +3,13 @@
 @import './site.css';
 
 :root {
-  /* Warm black and phosphor cream: the room with the TV on. */
-  --bg: #0f0d0a;
-  --bg-raised: #17140f;
-  --line: #2c2720;
-  --text: #f0e8d6;
-  --text-soft: #a69e8c;
-  --glow: #ffe7b8;
-  --casing: #ddd3bc;
-  --casing-ink: #2a251c;
+  /* Cool black and soft white: the tube, switched off. */
+  --bg: #08090d;
+  --bg-raised: #10121a;
+  --line: #1f2330;
+  --text: #e9ecf3;
+  --text-soft: #8d94a5;
+  --glow: #ffffff;
   /* Blue belongs to Clinqy's cursor and nothing else. */
   --blue: #4a8cff;
   --blue-deep: #2f6fe0;

@@ -27,15 +27,12 @@ const ARROW = [
   '       ██ ',
 ]
 
-const GLYPHS = '░▒▓<>/\\[]{}=+*#%@'
 
 /** The sign-off: the banner and the companion arrow decode in, then it clicks. */
 export function AsciiFinale() {
   const ref = useRef<HTMLDivElement>(null)
   const [p, setP] = useState(0)
   const [clicked, setClicked] = useState(false)
-  // Each character resolves at its own moment, left to right with jitter.
-  const delays = useRef(BANNER.map((l) => [...l].map((_, i) => i / l.length * 0.7 + Math.random() * 0.3)))
 
   useEffect(() => {
     const el = ref.current
@@ -68,11 +65,7 @@ export function AsciiFinale() {
     }
   }, [])
 
-  const banner = BANNER.map((line, r) =>
-    [...line]
-      .map((ch, i) => (ch === ' ' || delays.current[r][i] <= p ? ch : p > 0 ? GLYPHS[Math.floor(Math.random() * GLYPHS.length)] : ' '))
-      .join(''),
-  )
+  const banner = BANNER
   const arrowRows = Math.round(p * ARROW.length)
 
   return (
@@ -81,7 +74,7 @@ export function AsciiFinale() {
         {ARROW.map((l, i) => (i < arrowRows ? l : ' '.repeat(l.length))).join('\n')}
         <span className="finale-ring" />
       </pre>
-      <pre className="finale-banner" aria-hidden="true">{banner.join('\n')}</pre>
+      <pre className="finale-banner" aria-hidden="true" style={{ opacity: p }}>{banner.join('\n')}</pre>
     </div>
   )
 }

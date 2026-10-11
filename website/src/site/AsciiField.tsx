@@ -22,14 +22,12 @@ const ACTIONS = [
   'scroll Results until “Akasa QP 1104”',
 ]
 
-const GLYPHS = '!<>-_\\/[]{}=+*^?#%$@&ABCDEFabcdef0123456789'
 const RAMP = '.·:-=+*#'
 const ARROW = ['█', '██', '█▓█', '█▓▓█', '█▓▓▓█', '█▓▓▓▓█', '█▓▓███', '██ █▓█', '    ██']
 
 type Snip = { text: string; col: number; row: number; born: number; clicked: number; drift: number }
 
 const rnd = (n: number) => Math.floor(Math.random() * n)
-const glyph = () => GLYPHS[rnd(GLYPHS.length)]
 
 /**
  * A full-screen ASCII field: drifting noise, Clinqy's actions decoding in and
@@ -118,31 +116,34 @@ export function AsciiField({ running }: { running: boolean }) {
 
     function frame(now: number) {
       raf = requestAnimationFrame(frame)
-      if (now - last < 33) return
+      if (now - last < 50 || document.hidden) return
       last = now
       const t = (now - t0) / 1000
       ctx!.clearRect(0, 0, innerWidth, innerHeight)
 
-      // 1. Drifting noise. Mostly empty; brighter around the pointer.
-      const mc = mouse.x / cw
-      const mr = mouse.y / LINE
+      // 1. Drifting noise. Mostly empty. The left of wide screens sits under
+      // the text veil, so it isn't drawn at all. Glyphs are grouped by
+      // brightness so the colour changes 8 times a frame, not per glyph.
+      const c0 = innerWidth > 900 ? Math.floor(cols * 0.3) : 0
+      const colA = new Float32Array(cols)
+      for (let c = c0; c < cols; c++) colA[c] = Math.sin(c * 0.07 + t * 0.5)
+      const buckets: number[][] = Array.from({ length: RAMP.length }, () => [])
       for (let r = 0; r < rows; r++) {
-        for (let c = 0; c < cols; c++) {
-          let v =
-            Math.sin(c * 0.07 + t * 0.5) +
-            Math.sin(r * 0.17 - t * 0.35) +
-            Math.sin((c + r * 2) * 0.045 + t * 0.25) +
-            Math.sin(Math.hypot(c - cols * 0.7, (r - rows * 0.4) * 2) * 0.09 - t * 0.8)
-          v = (v + 4) / 8
-          const dm = Math.hypot(c - mc, (r - mr) * 2)
-          const near = dm < 14 ? (1 - dm / 14) * 0.5 : 0
-          const i = v + near
-          if (i < 0.62) continue
-          const k = Math.min(RAMP.length - 1, Math.floor((i - 0.62) * 22))
-          ctx!.fillStyle = `rgba(240, 232, 214, ${0.05 + (i - 0.62) * 0.5 + near * 0.4})`
-          ctx!.fillText(RAMP[k], c * cw, r * LINE)
+        const rowA = Math.sin(r * 0.17 - t * 0.35)
+        const dy = (r - rows * 0.4) * 2
+        for (let c = c0; c < cols; c++) {
+          const dx = c - cols * 0.7
+          const v =
+            (colA[c] + rowA + Math.sin((c + r * 2) * 0.045 + t * 0.25) + Math.sin(Math.sqrt(dx * dx + dy * dy) * 0.09 - t * 0.8) + 4) / 8
+          if (v < 0.62) continue
+          buckets[Math.min(RAMP.length - 1, Math.floor((v - 0.62) * 22))].push(c, r)
         }
       }
+      buckets.forEach((cells, k) => {
+        if (!cells.length) return
+        ctx!.fillStyle = `rgba(214, 222, 240, ${0.05 + (k / 22) * 0.5})`
+        for (let i = 0; i < cells.length; i += 2) ctx!.fillText(RAMP[k], cells[i] * cw, cells[i + 1] * LINE)
+      })
 
       // 2. Actions: decode in, hold, scramble out.
       if (now - lastSpawn > 1100 && snips.length < 7) {
@@ -158,16 +159,15 @@ export function AsciiField({ running }: { running: boolean }) {
           continue
         }
         const shown = age < DECODE ? age / DECODE : age > DECODE + HOLD ? 1 - (age - DECODE - HOLD) / OUT : 1
-        const n = Math.floor(shown * s.text.length)
         const flash = s.clicked ? Math.max(0, 1 - (now - s.clicked) / 700) : 0
         const y = s.row * LINE - (age / LIFE) * 10 * s.drift
         const text = s.clicked && now > s.clicked ? s.text + '  ✓' : s.text
         for (let j = 0; j < text.length; j++) {
-          const ch = j < n || j >= s.text.length ? text[j] : j < n + 6 ? glyph() : ''
+          const ch = text[j]
           if (!ch || ch === ' ') continue
           const isPrompt = j === 0
           const done = j >= s.text.length
-          ctx!.fillStyle = isPrompt || done ? `rgba(141, 255, 176, ${0.75 * Math.min(1, shown * 1.5)})` : `rgba(240, 232, 214, ${(j < n ? 0.62 : 0.3) + flash * 0.38})`
+          ctx!.fillStyle = isPrompt || done ? `rgba(141, 255, 176, ${0.75 * shown})` : `rgba(214, 222, 240, ${(0.62 + flash * 0.38) * shown})`
           ctx!.fillText(ch, (s.col + j) * cw, y)
         }
       }
@@ -218,8 +218,6 @@ export function AsciiField({ running }: { running: boolean }) {
       }
 
       ctx!.save()
-      ctx!.shadowColor = 'rgba(74, 140, 255, 0.9)'
-      ctx!.shadowBlur = 12
       ARROW.forEach((line, i) => {
         for (let j = 0; j < line.length; j++) {
           const ch = line[j]

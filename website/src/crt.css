@@ -170,7 +170,6 @@
     0 0 40px rgba(200, 215, 255, 0.35);
 }
 .crt-mark svg {
-  filter: drop-shadow(0 0 14px rgba(74, 140, 255, 0.8));
 }
 
 /* What's left when the tube switches off. */

@@ -14,6 +14,8 @@ export type Scene = {
   app: string
   osd: string
   request: string
+  /** What Clinqy is doing, for captions: “Clinqy is …”. */
+  doing: string
   keys: Key[]
   Body: (p: SceneProps) => JSX.Element
 }
@@ -532,13 +534,13 @@ function FilesBody({ t, cur }: SceneProps) {
 }
 
 export const SCENES: Scene[] = [
-  { id: 'shot', label: 'Screenshots', app: 'Safari', osd: 'SCREENSHOT', request: 'grab the cheapest flights', keys: shotKeys, Body: ShotBody },
-  { id: 'edit', label: 'Photo edits', app: 'Photos', osd: 'PHOTO EDIT', request: 'brighten this photo and export it', keys: editKeys, Body: EditBody },
-  { id: 'aws', label: 'AWS console', app: 'Chrome', osd: 'AWS CONSOLE', request: 'launch a t3.micro called tf-server', keys: awsKeys, Body: AwsBody },
-  { id: 'job', label: 'Job applications', app: 'Arc', osd: 'JOB PORTAL', request: 'apply to this job with my resume', keys: jobKeys, Body: JobBody },
-  { id: 'msg', label: 'Messages', app: 'WhatsApp', osd: 'MESSAGES', request: 'message mom I’ll be late', keys: msgKeys, Body: MsgBody },
-  { id: 'cal', label: 'Calendar', app: 'Calendar', osd: 'CALENDAR', request: 'schedule a call with Priya Thursday afternoon', keys: calKeys, Body: CalBody },
-  { id: 'files', label: 'Files', app: 'Finder', osd: 'FILES', request: 'sort my Downloads into folders', keys: fileKeys, Body: FilesBody },
+  { id: 'shot', label: 'Screenshots', app: 'Safari', osd: 'SCREENSHOT', request: 'grab the cheapest flights', doing: 'grabbing the cheapest flights', keys: shotKeys, Body: ShotBody },
+  { id: 'edit', label: 'Photo edits', app: 'Photos', osd: 'PHOTO EDIT', request: 'brighten this photo and export it', doing: 'brightening beach.jpg', keys: editKeys, Body: EditBody },
+  { id: 'aws', label: 'AWS console', app: 'Chrome', osd: 'AWS CONSOLE', request: 'launch a t3.micro called tf-server', doing: 'launching tf-server on AWS', keys: awsKeys, Body: AwsBody },
+  { id: 'job', label: 'Job forms', app: 'Arc', osd: 'JOB PORTAL', request: 'apply to this job with my resume', doing: 'applying to Northwind', keys: jobKeys, Body: JobBody },
+  { id: 'msg', label: 'Messages', app: 'WhatsApp', osd: 'MESSAGES', request: 'message mom I’ll be late', doing: 'telling Mom you’ll be late', keys: msgKeys, Body: MsgBody },
+  { id: 'cal', label: 'Calendar', app: 'Calendar', osd: 'CALENDAR', request: 'schedule a call with Priya Thursday afternoon', doing: 'booking a call with Priya', keys: calKeys, Body: CalBody },
+  { id: 'files', label: 'Files', app: 'Finder', osd: 'FILES', request: 'sort my Downloads into folders', doing: 'tidying your Downloads', keys: fileKeys, Body: FilesBody },
 ]
 
 

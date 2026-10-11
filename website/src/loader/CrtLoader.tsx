@@ -28,13 +28,13 @@ const byId = Object.fromEntries(SCENES.map((s) => [s.id, s]))
  * px; d is depth (1 = in focus, lower sits further back and drifts slower).
  */
 const DESK = [
-  { id: 'shot', x: 0, y: -120, d: 1, caption: 'grabbing the cheapest flights' },
-  { id: 'aws', x: 560, y: 230, d: 0.9, caption: 'launching tf-server on AWS' },
-  { id: 'msg', x: 1060, y: -200, d: 1.04, caption: 'telling Mom you’ll be late' },
-  { id: 'job', x: 1580, y: 200, d: 0.93, caption: 'applying to Northwind' },
-  { id: 'cal', x: 2080, y: -170, d: 0.86, caption: 'booking a call with Priya' },
-  { id: 'edit', x: 2580, y: 190, d: 1.03, caption: 'brightening beach.jpg' },
-  { id: 'files', x: 3080, y: -110, d: 0.9, caption: 'tidying your Downloads' },
+  { id: 'shot', x: 0, y: -120, d: 1 },
+  { id: 'aws', x: 560, y: 230, d: 0.9 },
+  { id: 'msg', x: 1060, y: -200, d: 1.04 },
+  { id: 'job', x: 1580, y: 200, d: 0.93 },
+  { id: 'cal', x: 2080, y: -170, d: 0.86 },
+  { id: 'edit', x: 2580, y: 190, d: 1.03 },
+  { id: 'files', x: 3080, y: -110, d: 0.9 },
 ]
 
 const POWER = 700
@@ -152,7 +152,7 @@ export function CrtLoader({ onReveal, onDone }: Props) {
 
   // ── Caption: the newest window, in plain words ──
   const newest = [...DESK].reverse().find((w) => T >= openAt[w.id])
-  const captionText = phase === 'take' && newest ? `Clinqy is ${newest.caption}` : ''
+  const captionText = phase === 'take' && newest ? `Clinqy is ${byId[newest.id].doing}` : ''
   const captionShown = newest ? captionText.slice(0, Math.round(captionText.length * span(T, openAt[newest.id], openAt[newest.id] + 900))) : ''
 
   const windows = DESK.map((w) => {
