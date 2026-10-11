@@ -70,7 +70,8 @@ enum Stats {
     }
 
     private static func top(_ items: [String], _ n: Int) -> [(String, Int)] {
-        Dictionary(items.map { (reason($0), 1) }, uniquingKeysWith: +).sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
+        let counts: [String: Int] = Dictionary(items.map { (reason($0), 1) }, uniquingKeysWith: +)
+        return counts.sorted { $0.value != $1.value ? $0.value > $1.value : $0.key < $1.key }
             .prefix(n).map { ($0.key, $0.value) }
     }
 

@@ -1,4 +1,4 @@
-import AVFoundation
+@preconcurrency import AVFoundation
 import AppKit
 
 // Clinqy was called CursorBoy: carry its memory, history, skills, workflows, models and settings over once.
@@ -128,7 +128,7 @@ if CommandLine.arguments.count >= 3, ["--click-label", "--type", "--key"].contai
 let command = CommandLine.arguments.count >= 2 && !CommandLine.arguments[1].hasPrefix("-psn")
     ? String(CommandLine.arguments[1].drop { $0 == "-" }) : ""
 
-// `Clinqy mcp`: an MCP server on stdio for other agents (`claude mcp add clinqy -- …/Clinqy mcp`).
+// `Clinqy mcp`: an MCP server on stdio for other agents (`agy mcp add clinqy -- …/Clinqy mcp`).
 if command == "mcp" { MCPServer.serve() }
 
 // `Clinqy stats [days] [--last]`: success rate, model vs action time per turn, top failure reasons.

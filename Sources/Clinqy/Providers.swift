@@ -1,15 +1,60 @@
 import Foundation
 
-/// Which model service answers: a coding CLI you're already logged into (Claude Code, the default; Codex; Gemini
-/// CLI) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env, or just add a key: with no
-/// `claude` CLI installed, the first key found is used, then the first other CLI found.
+/// Which model service answers: a coding CLI you're already logged into (Claude Code, the default; Antigravity CLI / agy;
+/// Codex) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env, or just add a key:
+/// with no CLI installed, the first key found is used, then the first CLI found.
 enum Provider: String, CaseIterable {
-    case claudeCLI = "claude-cli", codexCLI = "codex-cli", geminiCLI = "gemini-cli"
+    case claudeCLI = "claude-cli", agyCLI = "agy-cli", codexCLI = "codex-cli"
     case anthropic, openai, gemini, openrouter, ollama, compatible = "openai-compatible"
 
+    /// Flag switch: set via --agy command line flag, USE_AGY=1/true, or PROVIDER=agy-cli.
+    static var useAgy: Bool {
+        if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return true }
+        if CommandLine.arguments.contains("--claude") || CommandLine.arguments.contains("--claude-cli") { return false }
+        if let val = Config.value("USE_AGY")?.lowercased() {
+            return ["1", "true", "yes", "on"].contains(val)
+        }
+        if let raw = Config.value("PROVIDER")?.lowercased() {
+            return ["agy", "agy-cli", "antigravity", "gemini-cli"].contains(raw)
+        }
+        return false
+    }
+
+    static var isClaudeLoggedIn: Bool {
+        #if os(macOS)
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = Pipe()
+        do {
+            try process.run()
+            process.waitUntilExit()
+            if process.terminationStatus != 0 { return false }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            guard let str = String(data: data, encoding: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: Data(str.utf8)) as? [String: Any],
+                  let oauth = obj["claudeAiOauth"] as? [String: Any],
+                  let token = oauth["accessToken"] as? String, !token.isEmpty else {
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
+        #else
+        return true
+        #endif
+    }
+
     static var current: Provider {
+        if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return .agyCLI }
+        if CommandLine.arguments.contains("--claude") || CommandLine.arguments.contains("--claude-cli") { return .claudeCLI }
+        if useAgy { return .agyCLI }
         if let raw = Config.value("PROVIDER")?.lowercased() {
             switch raw {
+            case "agy", "agy-cli", "antigravity", "gemini-cli": return .agyCLI
             case "claude", "claude-code", "cli": return .claudeCLI
             case "codex": return .codexCLI
             case "gpt", "chatgpt": return .openai
@@ -18,18 +63,20 @@ enum Provider: String, CaseIterable {
             default: if let p = Provider(rawValue: raw) { return p }
             }
         }
+        if ClaudeSession.claudePath != nil && isClaudeLoggedIn { return .claudeCLI }
+        if AgySession.agyPath != nil { return .agyCLI }
         if ClaudeSession.claudePath != nil { return .claudeCLI }
         return [.anthropic, .openai, .gemini, .openrouter].first { $0.key != nil }
-            ?? [.codexCLI, .geminiCLI].first { $0.cliPath != nil } ?? .claudeCLI
+            ?? [.codexCLI, .claudeCLI, .agyCLI].first { $0.cliPath != nil } ?? .claudeCLI
     }
 
-    /// The CLI's executable, for the CLI providers (CODEX_PATH / GEMINI_PATH, else the usual install spots).
+    /// The CLI's executable, for the CLI providers (AGY_PATH / CLAUDE_PATH / CODEX_PATH, else the usual install spots).
     var cliPath: String? {
         let name: String
         switch self {
-        case .claudeCLI: return ClaudeSession.claudePath
+        case .agyCLI: return AgySession.agyPath
+        case .claudeCLI: return AgySession.claudePath
         case .codexCLI: name = "codex"
-        case .geminiCLI: name = "gemini"
         default: return nil
         }
         if let explicit = Config.value(name.uppercased() + "_PATH") { return explicit }
@@ -38,12 +85,12 @@ enum Provider: String, CaseIterable {
             .first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    var isCLI: Bool { self == .claudeCLI || self == .codexCLI || self == .geminiCLI }
+    var isCLI: Bool { self == .agyCLI || self == .claudeCLI || self == .codexCLI }
 
     var key: String? {
         let names: [String]
         switch self {
-        case .claudeCLI, .codexCLI, .geminiCLI, .ollama: return nil
+        case .agyCLI, .claudeCLI, .codexCLI, .ollama: return nil
         case .anthropic: names = ["ANTHROPIC_API_KEY"]
         case .openai: names = ["OPENAI_API_KEY"]
         case .gemini: names = ["GEMINI_API_KEY", "GOOGLE_API_KEY"]
@@ -60,9 +107,10 @@ enum Provider: String, CaseIterable {
         let tier = ["haiku": 0, "sonnet": 1, "opus": 2][alias]
         guard let tier else { return name }
         switch self {
+        case .agyCLI: return ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.1-pro"][tier]
         case .claudeCLI: return alias == "haiku" ? "claude-haiku-5-5" : name
         // The CLIs pick their own default model for your account; only an explicit model id is passed on.
-        case .codexCLI, .geminiCLI: return ""
+        case .codexCLI: return ""
         case .anthropic: return ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"][tier]
         case .openrouter: return ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"][tier]
         case .openai: return ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"][tier]
@@ -73,9 +121,9 @@ enum Provider: String, CaseIterable {
 
     var label: String {
         switch self {
-        case .claudeCLI: return "Claude Code CLI: \(ClaudeSession.claudePath ?? "❌ not found")"
+        case .claudeCLI: return "Claude Code CLI: \(AgySession.claudePath ?? "❌ not found")"
+        case .agyCLI: return "Antigravity CLI (agy): \(AgySession.agyPath ?? "❌ not found")"
         case .codexCLI: return "Codex CLI: \(cliPath ?? "❌ not found")"
-        case .geminiCLI: return "Gemini CLI: \(cliPath ?? "❌ not found")"
         case .ollama: return "Ollama (\(baseURL))"
         case .compatible: return "OpenAI-compatible API (\(baseURL)\(key == nil ? ", no key" : ""))"
         default: return "\(rawValue) API (\(key == nil ? "❌ no key" : "key set"))"
@@ -91,13 +139,13 @@ enum Provider: String, CaseIterable {
         case .compatible: return explicit ?? "http://localhost:1234/v1"
         case .anthropic: return Config.value("ANTHROPIC_BASE_URL") ?? "https://api.anthropic.com"
         case .gemini: return "https://generativelanguage.googleapis.com/v1beta"
-        case .claudeCLI, .codexCLI, .geminiCLI: return ""
+        case .agyCLI, .claudeCLI, .codexCLI: return ""
         }
     }
 }
 
-/// One conversation over a provider's HTTP API (or a one-shot `codex exec` / `gemini -p` per turn), standing in for
-/// the `claude` process: it keeps the whole exchange so each turn has the same context the CLI session would.
+/// One conversation over a provider's HTTP API (or a one-shot `codex exec` per turn), standing in for
+/// the CLI session: it keeps the whole exchange so each turn has the same context the CLI session would.
 final class APIChat: @unchecked Sendable {
     private struct Turn { var user: Bool; var text: String; var image: String? }
 
@@ -116,16 +164,17 @@ final class APIChat: @unchecked Sendable {
     init(provider: Provider, system: String, model: String) throws {
         let key = provider.key
         if provider.isCLI, provider.cliPath == nil {
-            throw ClaudeSession.BrainError.failed("\(provider.rawValue): not found. Install it, or set \(provider == .codexCLI ? "CODEX_PATH" : "GEMINI_PATH") in ~/.config/clinqy/env")
+            let pathEnv = provider == .codexCLI ? "CODEX_PATH" : provider == .agyCLI ? "AGY_PATH" : "CLAUDE_PATH"
+            throw AgySession.BrainError.failed("\(provider.rawValue): not found. Install it, or set \(pathEnv) in ~/.config/clinqy/env")
         }
         if key == nil, !provider.isCLI, provider != .ollama, provider != .compatible {
-            throw ClaudeSession.BrainError.failed("No API key for \(provider.rawValue). Add it to ~/.config/clinqy/env (see the README).")
+            throw AgySession.BrainError.failed("No API key for \(provider.rawValue). Add it to ~/.config/clinqy/env (see the README).")
         }
         self.provider = provider
         self.key = key
         self.system = system
         self.model = provider.model(model)
-        effort = (Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
+        effort = (Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
     }
 
     var isAlive: Bool { lock.withLock { !closed } }
@@ -178,7 +227,7 @@ final class APIChat: @unchecked Sendable {
     }
 
     private func request(_ history: [Turn], plain: Bool) async throws -> String {
-        if provider == .codexCLI || provider == .geminiCLI { return try await runCLI(history) }
+        if provider == .codexCLI { return try await runCLI(history) }
         var req: URLRequest
         var body: [String: Any]
         switch provider {
@@ -235,7 +284,7 @@ final class APIChat: @unchecked Sendable {
             if !plain, provider == .openai, model.hasPrefix("gpt-5") || model.range(of: #"^o\d"#, options: .regularExpression) != nil {
                 body["reasoning_effort"] = ["min", "minimal", "none"].contains(effort) ? "minimal" : effort == "max" ? "high" : effort
             }
-        case .claudeCLI, .codexCLI, .geminiCLI:
+        case .agyCLI, .claudeCLI, .codexCLI:
             throw ClaudeSession.BrainError.failed("\(provider.rawValue) isn't an HTTP provider")
         }
         req.httpMethod = "POST"
@@ -268,7 +317,7 @@ final class APIChat: @unchecked Sendable {
         return text
     }
 
-    /// Codex and Gemini CLI have no long-lived chat mode to talk to, so each turn runs the CLI once with the
+    /// Codex CLI has no long-lived chat mode to talk to, so each turn runs the CLI once with the
     /// instructions and the conversation so far on stdin, and the screenshot as a file.
     private func runCLI(_ history: [Turn]) async throws -> String {
         guard let path = provider.cliPath else { throw ClaudeSession.BrainError.notInstalled }
@@ -283,17 +332,10 @@ final class APIChat: @unchecked Sendable {
         for t in history { transcript += t.user ? "<user>\n\(t.text)\n</user>\n\n" : "<assistant>\n\(t.text)\n</assistant>\n\n" }
         transcript += "Write only the assistant's next reply to the last <user> turn, following <instructions>. Don't run commands or edit files."
 
-        var args: [String]
-        switch provider {
-        case .codexCLI:
-            args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message", lastURL.path]
-            if hasImage { args += ["--image", imageURL.path] }
-        default:
-            // Gemini CLI appends stdin to -p; `@file` attaches the screenshot.
-            args = ["-p", hasImage ? "The current screen is attached: @\(imageURL.path)" : "Reply as asked below."]
-        }
+        var args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message", lastURL.path]
+        if hasImage { args += ["--image", imageURL.path] }
         if !model.isEmpty { args += ["--model", model] }
-        if provider == .codexCLI { args.append("-") }
+        args.append("-")
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: path)

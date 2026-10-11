@@ -1,6 +1,6 @@
 import AppKit
 
-/// `Clinqy mcp`: Clinqy as an MCP server on stdio, so other agents (Claude Code, Codex, Cursor…) can hand it
+/// `Clinqy mcp`: Clinqy as an MCP server on stdio, so other agents (Antigravity CLI, Claude Code, Codex, Cursor…) can hand it
 /// on-screen tasks. Dependency-free: newline-delimited JSON-RPC 2.0, as the MCP stdio transport specifies.
 /// This process only relays: tasks go to the running app over clinqy:// links (like the `clinqy` command),
 /// because the app holds the permissions, the browser extension and the cursor.

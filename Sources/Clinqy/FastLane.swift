@@ -28,7 +28,7 @@ final class FastLane {
 
     private let model: String?
     private let intro: String
-    private var session: ClaudeSession?
+    private var session: AgySession?
     /// The lead's routine plan; set = the next turns go to the helper.
     private var plan: String?
     /// The current stint was started on its own: the helper may only navigate (no typing, no picking options).
@@ -82,7 +82,7 @@ final class FastLane {
     /// Gets this turn's reply: from the helper when the lead planned routine steps and nothing speaks against it,
     /// otherwise (or when the helper hands back) from the lead, told first what the helper did. `partial` sees the lead's
     /// reply as it's written (the helper's isn't streamed: its actions are vetted only once it's complete).
-    func reply(to turnText: String, message: String, image: String?, failures: Int, lead: ClaudeSession,
+    func reply(to turnText: String, message: String, image: String?, failures: Int, lead: AgySession,
                partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         absorb(message: message, turnText: turnText, failures: failures)
         tag = ""
@@ -126,7 +126,7 @@ final class FastLane {
         guard let model, let plan else { return nil }
         await briefing?.value
         briefing = nil
-        if session?.isAlive != true { session = try? ClaudeSession(system: Self.system, model: model); briefed = false }
+        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model); briefed = false }
         var text = ""
         if !briefed {
             text += "The lead's context for this task:\n\(intro)\n\n"
@@ -140,7 +140,7 @@ final class FastLane {
         text += turnText + Self.jsonOnly
         let reply: String
         do {
-            if session?.isAlive != true { session = try ClaudeSession(system: Self.system, model: model) }
+            if session?.isAlive != true { session = try AgySession(system: Self.system, model: model) }
             guard let s = session else { return nil }
             reply = try await withTaskCancellationHandler { try await s.send(text, image: image) } onCancel: { s.close() }
         } catch {
@@ -174,7 +174,7 @@ final class FastLane {
         return reply
     }
 
-    private func leadReply(_ turnText: String, image: String?, lead: ClaudeSession,
+    private func leadReply(_ turnText: String, image: String?, lead: AgySession,
                            partial: (@Sendable (String) -> Void)?) async throws -> String {
         var text = turnText
         if !unreported.isEmpty || handback != nil {
@@ -245,7 +245,7 @@ final class FastLane {
     /// message: read cold, the briefing made that turn ~3 s slower than the rest.
     private func warm() {
         guard let model else { return }
-        if session?.isAlive != true { session = try? ClaudeSession(system: Self.system, model: model); briefed = false }
+        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model); briefed = false }
         guard !briefed, briefing == nil, let s = session else { return }
         briefed = true
         let text = "The lead's context for this task:\n\(intro)\n\nNo steps for you yet; reply {\"say\":\"ready\",\"actions\":[]}."

@@ -1,7 +1,7 @@
 import AppKit
 import UniformTypeIdentifiers
 
-/// Runs a request as a conversation with one Claude session: observe the screen → Claude picks actions →
+/// Runs a request as a conversation with one Agy session: observe the screen → Agy picks actions →
 /// the buddy carries them out the way a person would (travel, point, click, type) → report → repeat.
 @MainActor
 final class Agent: ObservableObject {
@@ -74,7 +74,7 @@ final class Agent: ObservableObject {
     private let buddy: Buddy
     private let hand: Hand
     fileprivate var task: Task<Void, Never>?
-    private var session: ClaudeSession?
+    private var session: AgySession?
     fileprivate var started = Date()
     /// Whether this task already opened a browser tab (so later website visits reuse it).
     private var openedTab = false
@@ -109,8 +109,10 @@ final class Agent: ObservableObject {
     var lastTarget: WorkflowStep.Target?
     /// QA mode: the run is a UI test; checks are collected instead of asking the user anything.
     var qa: QAContext?
-    /// Use a different Claude model for this run (e.g. from `clinqy qa --model`).
+    /// Use a different model for this run (e.g. from `clinqy qa --model`).
     var modelOverride: String?
+    /// Use a different provider for this run (e.g. from `clinqy://run?agy=1` or `clinqy://qa?agy=1`).
+    var providerOverride: Provider?
 
     /// Things the user added while the task was running; folded into the next step.
     private var addedNotes: [String] = []
@@ -295,7 +297,7 @@ final class Agent: ObservableObject {
         hand = Hand(buddy: buddy)
     }
 
-    func submit(_ raw: String, test: Bool = false, auto: Bool = false) {
+    func submit(_ raw: String, test: Bool = false, auto: Bool = false, model: String? = nil, provider: Provider? = nil) {
         if !auto { autoContinues = 0 }
         var request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
@@ -316,10 +318,14 @@ final class Agent: ObservableObject {
             self?.selectedFiles = []
             self?.copied = nil
             self?.continuation = nil
+            self?.providerOverride = nil
+            self?.modelOverride = nil
         }
         // A saved workflow that does exactly this: replay it with no model (the model only heals a broken step).
         if !test, !dry, let match = workflowFirst(request) {
             prepare(request, test: false)
+            self.modelOverride = model
+            self.providerOverride = provider
             let params = (match.workflow.defaults ?? [:]).merging(match.params) { _, new in new }
             steps.append(Step(text: "Saved workflow “\(match.workflow.name.prefix(40))” — no model needed", state: .info))
             log("workflow-first: “\(match.workflow.name)” · params \(match.params)")
@@ -330,6 +336,8 @@ final class Agent: ObservableObject {
             return
         }
         prepare(request, test: test, dry: dry)
+        self.modelOverride = model
+        self.providerOverride = provider
         task = Task {
             await run(request)
             clear()
@@ -349,6 +357,8 @@ final class Agent: ObservableObject {
 
     /// Resets per-run state; shared by requests, workflow replays and QA runs.
     fileprivate func prepare(_ request: String, test: Bool, dry: Bool = false) {
+        providerOverride = nil
+        modelOverride = nil
         isTest = test || echo
         runDry = dry
         started = Date()
@@ -423,8 +433,8 @@ final class Agent: ObservableObject {
             phase = .thinking
         }
 
-        let session: ClaudeSession
-        do { session = try Brain.session(model: modelOverride) } catch { return finish(ok: false, error.localizedDescription) }
+        let session: AgySession
+        do { session = try Brain.session(model: modelOverride, provider: providerOverride) } catch { return finish(ok: false, error.localizedDescription) }
         self.session = session
         defer { session.close() }
 
@@ -1020,7 +1030,7 @@ final class Agent: ObservableObject {
     /// facts closest to this task (not the whole memory) and answers with edits — add, update, remove — so memory
     /// stays one clean line per thing instead of piling up near-duplicates. Runs in the background once the user
     /// already has their answer.
-    private func learn(from session: ClaudeSession) async {
+    private func learn(from session: AgySession) async {
         guard !Task.isCancelled, !isTest else { return }
         learnFromForms()
         let about = ([request] + steps.suffix(25).map(\.text) + [answer]).joined(separator: "\n")
@@ -2929,6 +2939,8 @@ final class Agent: ObservableObject {
 
     fileprivate func finish(ok: Bool, _ text: String) {
         guard isRunning else { return }
+        providerOverride = nil
+        modelOverride = nil
         phase = ok ? .done : .failed
         narration = text
         answer = text
@@ -3210,7 +3222,7 @@ extension Agent {
     }
 
     /// Runs a UI test: replays its compiled script (no model) or learns it (first run / --relearn), then writes a report.
-    func runQA(name: String, test: String, compiled: URL, relearn: Bool, model: String?, report out: URL) {
+    func runQA(name: String, test: String, compiled: URL, relearn: Bool, model: String?, provider: Provider? = nil, report out: URL) {
         guard !isRunning else {
             Self.writeReport(QAReport(name: name, passed: false, mode: "none", durationMs: 0, steps: [], checks: [],
                                       message: "Clinqy is busy with another task"), to: out)
@@ -3219,6 +3231,7 @@ extension Agent {
         prepare("QA: \(name)", test: true)
         qa = QAContext(name: name)
         modelOverride = model
+        providerOverride = provider
         buddy.qaMode = true
         let started = Date()
         task = Task {
@@ -3251,6 +3264,7 @@ extension Agent {
             buddy.qaMode = false
             qa = nil
             modelOverride = nil
+            providerOverride = nil
         }
     }
 

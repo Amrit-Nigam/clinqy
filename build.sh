@@ -53,7 +53,7 @@ rm -rf "$INSTALLED"
 ditto "$APP" "$INSTALLED"
 echo "Installed $INSTALLED"
 
-# The `clinqy` command (for terminals and coding agents), on the PATH next to `claude`.
+# The `clinqy` command (for terminals and coding agents), on the PATH next to `agy`.
 mkdir -p "$HOME/.local/bin"
 ln -sf "$PWD/bin/clinqy" "$HOME/.local/bin/clinqy"
 
