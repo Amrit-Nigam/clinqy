@@ -1,0 +1,75 @@
+@import './scenes.css';
+@import './crt.css';
+@import './site.css';
+
+:root {
+  /* Cool black and soft white: the tube, switched off. */
+  --bg: #08090d;
+  --bg-raised: #10121a;
+  --line: #1f2330;
+  --text: #e9ecf3;
+  --text-soft: #8d94a5;
+  --glow: #ffffff;
+  /* Blue belongs to Clinqy's cursor and nothing else. */
+  --blue: #4a8cff;
+  --blue-deep: #2f6fe0;
+  --phosphor: #8dffb0;
+  --display: 'Bricolage Grotesque', system-ui, sans-serif;
+  --osd: 'VT323', ui-monospace, monospace;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --head: 'Martian Mono', ui-monospace, monospace;
+  color-scheme: dark;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--display);
+  font-size: 18px;
+  line-height: 1.55;
+  font-variation-settings: 'opsz' 16;
+  -webkit-font-smoothing: antialiased;
+}
+
+img {
+  display: block;
+}
+
+button {
+  font: inherit;
+  color: inherit;
+}
+
+::selection {
+  background: var(--glow);
+  color: var(--bg);
+}
+
+:focus-visible {
+  outline: 3px solid var(--blue);
+  outline-offset: 3px;
+  border-radius: 6px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+  }
+}
