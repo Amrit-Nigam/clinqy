@@ -23,7 +23,56 @@ const ACTIONS = [
 ]
 
 const RAMP = '.·:-=+*#'
-const ARROW = ['█', '██', '█▓█', '█▓▓█', '█▓▓▓█', '█▓▓▓▓█', '█▓▓███', '██ █▓█', '    ██']
+/**
+ * Clinqy's cursor, as the app draws it (Buddy.swift): a plain triangle with its tip at the origin, no stem.
+ * Here it's rasterised onto a coarse pixel grid.
+ */
+const TRI: [number, number][] = [[0, 0], [0, 19], [5.2, 14.2], [13.6, 14.2]]
+/** The direction the tip points at rest (from the body toward the tip). */
+const REST = Math.atan2(-(19 + 14.2 + 14.2) / 4, -(5.2 + 13.6) / 4)
+const PX = 4 // one "pixel"
+const SIZE = 2.7 // triangle scale, in screen px per unit
+
+function inside(x: number, y: number, poly: [number, number][]) {
+  let hit = false
+  for (let i = 0, j = poly.length - 1; i < poly.length; j = i++) {
+    const [xi, yi] = poly[i]
+    const [xj, yj] = poly[j]
+    if (yi > y !== yj > y && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi) hit = !hit
+  }
+  return hit
+}
+
+/** Fills the triangle cell by cell: a light rim, a deeper blue inside, and a one-cell drop shadow. */
+function drawPixelCursor(ctx: CanvasRenderingContext2D, x: number, y: number, turn: number, press: number) {
+  const k = SIZE * (1 - press * 0.14)
+  const c = Math.cos(turn)
+  const s = Math.sin(turn)
+  const poly = TRI.map(([px, py]) => [px * k * c - py * k * s, px * k * s + py * k * c] as [number, number])
+  const xs = poly.map((p) => p[0])
+  const ys = poly.map((p) => p[1])
+  const x0 = Math.floor(Math.min(...xs) / PX) - 1
+  const x1 = Math.ceil(Math.max(...xs) / PX) + 1
+  const y0 = Math.floor(Math.min(...ys) / PX) - 1
+  const y1 = Math.ceil(Math.max(...ys) / PX) + 1
+  const on = (i: number, j: number) => inside((i + 0.5) * PX, (j + 0.5) * PX, poly)
+  // Snap the tip to the grid so the cursor crawls in whole pixels, like an old screen.
+  const ox = Math.round(x / PX) * PX
+  const oy = Math.round(y / PX) * PX
+  const cells: [number, number, boolean][] = []
+  for (let j = y0; j <= y1; j++)
+    for (let i = x0; i <= x1; i++) {
+      if (!on(i, j)) continue
+      const rim = !on(i - 1, j) || !on(i + 1, j) || !on(i, j - 1) || !on(i, j + 1)
+      cells.push([i, j, rim])
+    }
+  ctx.fillStyle = 'rgba(0, 0, 0, 0.45)'
+  for (const [i, j] of cells) ctx.fillRect(ox + (i + 1) * PX, oy + (j + 1) * PX, PX, PX)
+  for (const [i, j, rim] of cells) {
+    ctx.fillStyle = rim ? '#cfe0ff' : '#3b82f6'
+    ctx.fillRect(ox + i * PX, oy + j * PX, PX - 0.5, PX - 0.5)
+  }
+}
 
 type Snip = { text: string; col: number; row: number; born: number; clicked: number; drift: number }
 
@@ -79,6 +128,7 @@ export function AsciiField({ running }: { running: boolean }) {
     let next = 0
     const cur = { x: innerWidth * 0.7, y: innerHeight * 0.3, fx: 0, fy: 0, tx: 0, ty: 0, start: 0, target: null as Snip | null }
     const trail: { x: number; y: number }[] = []
+    const heading = { turn: 0, px: cur.x, py: cur.y }
     let ripple: { x: number; y: number; at: number } | null = null
 
     const DECODE = 800
@@ -197,39 +247,45 @@ export function AsciiField({ running }: { running: boolean }) {
         // Idle: float gently, like the app does.
         cur.y += Math.sin(t * 1.6) * 0.4
       }
+      // Point the tip where it's going, easing back to rest when it stops, like the app's companion.
+      const vx = cur.x - heading.px
+      const vy = cur.y - heading.py
+      heading.px = cur.x
+      heading.py = cur.y
+      const speed = Math.hypot(vx, vy)
+      // Only a lean (±17°): any more and it reads as a spinning arrowhead, not a cursor.
+      const off = speed > 1.5 ? Math.atan2(Math.sin(Math.atan2(vy, vx) - REST), Math.cos(Math.atan2(vy, vx) - REST)) : 0
+      const want = Math.max(-0.3, Math.min(0.3, off * 0.4))
+      heading.turn += (want - heading.turn) * 0.18
+
+      // A short trail of fading pixels while it flies.
       trail.push({ x: cur.x, y: cur.y })
-      if (trail.length > 14) trail.shift()
-      trail.forEach((q, i) => {
-        ctx!.fillStyle = `rgba(74, 140, 255, ${(i / trail.length) * 0.5})`
-        ctx!.fillText('·', q.x, q.y)
-      })
+      if (trail.length > 7) trail.shift()
+      if (speed > 1.5)
+        trail.forEach((q, i) => {
+          ctx!.fillStyle = `rgba(59, 130, 246, ${(i / trail.length) * 0.35})`
+          ctx!.fillRect(Math.round(q.x / PX) * PX + PX, Math.round(q.y / PX) * PX + PX * 2, PX, PX)
+        })
 
       if (ripple) {
         const rp = (now - ripple.at) / 600
         if (rp >= 1) ripple = null
         else {
-          const rad = 4 + rp * 46
-          const count = 12 + Math.floor(rp * 16)
-          ctx!.fillStyle = `rgba(74, 140, 255, ${1 - rp})`
+          // A ring of square pixels opening out from the tip.
+          const rad = 6 + rp * 40
+          const count = 10 + Math.floor(rp * 18)
+          ctx!.fillStyle = `rgba(120, 170, 255, ${1 - rp})`
           for (let k = 0; k < count; k++) {
             const a = (k / count) * Math.PI * 2
-            ctx!.fillText(rp < 0.4 ? 'o' : '·', ripple.x + Math.cos(a) * rad - cw / 2, ripple.y + Math.sin(a) * rad * 0.8 - LINE / 2)
+            ctx!.fillRect(Math.round((ripple.x + Math.cos(a) * rad) / PX) * PX, Math.round((ripple.y + Math.sin(a) * rad) / PX) * PX, PX, PX)
           }
         }
       }
 
       // Below the hero the field is just texture: no cursor over the content.
       if (!inHero && !cur.target && !ripple) return
-      ctx!.save()
-      ARROW.forEach((line, i) => {
-        for (let j = 0; j < line.length; j++) {
-          const ch = line[j]
-          if (ch === ' ') continue
-          ctx!.fillStyle = ch === '▓' ? '#2f6fe0' : '#8fb6ff'
-          ctx!.fillText(ch, cur.x + j * cw, cur.y + i * (LINE - 3))
-        }
-      })
-      ctx!.restore()
+      const press = ripple ? Math.max(0, 1 - (now - ripple.at) / 160) : 0
+      drawPixelCursor(ctx!, cur.x, cur.y, heading.turn, press)
     }
 
     if (calm) {

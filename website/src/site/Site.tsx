@@ -5,6 +5,7 @@ import { ScenePlayer } from './ScenePlayer'
 import { AsciiField } from './AsciiField'
 import { AsciiFinale } from './AsciiFinale'
 import { Scramble } from './Scramble'
+import { HowArt, SafetyArt, SetupArt } from './IsoArt'
 import { SETUP_PROMPT } from './setupPrompt'
 import { Tour, TourOffer } from './Tour'
 
@@ -196,9 +197,14 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
         </div>
 
         <section className="how" id="how" aria-labelledby="how-title">
-          <div className="section-head">
-            <Scramble as="h2" id="how-title" text="One request, start to finish" />
-            <p>Every task runs the same loop. Here it is for one message.</p>
+          <div className="section-head has-art">
+            <div>
+              <Scramble as="h2" id="how-title" text="One request, start to finish" />
+              <p>Every task runs the same loop. Here it is for one message, layer by layer.</p>
+            </div>
+            <div className="art">
+              <HowArt />
+            </div>
           </div>
           <ol className="trace">
             {TRACE.map((r) => (
@@ -249,21 +255,20 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               <li>Renames and moves can be undone. Deleting only moves to the Trash.</li>
             </ul>
           </div>
-          <div className="alert" data-tour="alert" role="img" aria-label="Example: Clinqy asks before paying ₹4,420">
-            <img src="/icon.png" alt="" width={44} height={44} />
-            <b>Pay ₹4,420 for Akasa QP 1104?</b>
-            <p>Clinqy is about to click Pay on skyfare.example for Delhi to Mumbai, Fri 17 Oct.</p>
-            <div className="alert-actions">
-              <span>Not now</span>
-              <span className="is-default">Pay ₹4,420</span>
-            </div>
+          <div className="art art-safety" data-tour="alert">
+            <SafetyArt />
           </div>
         </section>
 
         <section className="setup" id="setup">
-          <div className="section-head">
-            <Scramble as="h2" text="Set up in one paste" />
-            <p>Your coding agent does the setup. It builds Clinqy, installs it, and only stops when it needs you.</p>
+          <div className="section-head has-art">
+            <div>
+              <Scramble as="h2" text="Set up in one paste" />
+              <p>Your coding agent does the setup. It builds Clinqy, installs it, and only stops when it needs you.</p>
+            </div>
+            <div className="art">
+              <SetupArt />
+            </div>
           </div>
           <div className="setup-grid">
             <ol className="steps">

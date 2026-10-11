@@ -85,8 +85,7 @@ const STEPS: Step[] = [
   {
     target: '[data-tour="alert"]',
     view: '.safety',
-    below: true,
-    at: [0.72, 0.84],
+    at: [0.55, 0.45],
     say: 'Anything you can’t take back, like paying or sending, waits for your OK.',
     do: 'frame',
     dwell: 700,
