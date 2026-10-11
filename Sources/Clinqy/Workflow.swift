@@ -205,7 +205,7 @@ final class ReplayCache {
             // The same ask in other words ("fill this job application" / "apply for this job"): sentence vectors add
             // a little when they're very close, and only on top of at least one shared word.
             if shared > 0, let a = wantVector, let b = Embedder.shared.cached(r.request) {
-                score += max(0, Double(Embedder.cosine(a, b)) - 0.7)
+                score += max(0, Double(Embedder.cosine(a, b)) - (Embedder.shared.usesModel ? 0.8 : 0.7))
             }
             if r.site != nil {
                 // It opened its own page: the words decide (naming the site counts as agreeing).

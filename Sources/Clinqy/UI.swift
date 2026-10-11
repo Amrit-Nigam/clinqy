@@ -267,7 +267,9 @@ struct CommandView: View {
 
     /// The run that just failed or was stopped, which the next thing typed corrects ("no, click the other one").
     private var fixable: History.Entry? {
+        // Something newly selected or circled is a new task about it, not a correction of the last run.
         guard !agent.isRunning, agent.question == nil, review.pending == nil, agent.phase == .failed,
+              agent.selectedText == nil, agent.selectedFiles.isEmpty, agent.annotation == nil,
               let last = history.entries.first, !last.ok, last.id != fix.dismissed,
               Date().timeIntervalSince(last.date) < 30 * 60, !last.request.hasPrefix("Dry run:") else { return nil }
         return last
@@ -279,7 +281,18 @@ struct CommandView: View {
         guard !correction.isEmpty else { return }
         fix.dismissed = entry.id
         agent.continuation = entry
-        agent.submit("Correction for “\(entry.request.prefix(120))”: \(correction)")
+        agent.submit("Correction for “\(Self.originalRequest(entry.request).prefix(120))”: \(correction)")
+    }
+
+    /// The request a chain of corrections started from: "Correction for “Correction for “X”: a”: b" → "X", so
+    /// correcting again doesn't wrap it once more (earlier corrections are in the continued run's history).
+    private static func originalRequest(_ request: String) -> String {
+        let prefix = "Correction for “"
+        guard request.hasPrefix(prefix) else { return request }
+        var rest = Substring(request)
+        while rest.hasPrefix(prefix) { rest = rest.dropFirst(prefix.count) }
+        if let end = rest.range(of: "”: ") { rest = rest[..<end.lowerBound] }
+        return String(rest)
     }
 
     private func submitInput() {

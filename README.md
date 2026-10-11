@@ -208,7 +208,8 @@ clinqy qa login.md --json                # one test, machine-readable report
 clinqy qa "Go to https://example.com
 Expect: Example Domain"                     # inline test
 clinqy qa login.md --relearn --model opus
-clinqy run "open github"                 # a task (not saved to history)
+clinqy run "open github"                 # a task, like one asked in the app (saved; carries on by itself if it runs out of steps)
+clinqy run --test "open localhost:3000"  # a throwaway run: not saved, no carrying on
 clinqy run --dry "book a cab home"       # show every click and keystroke, do none
 clinqy workflow "Fill form" "Your name=Priya"
 clinqy workflows
@@ -293,10 +294,10 @@ If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `a
 | Provider | `haiku` (fast) | `sonnet` (agent, default) | `opus` |
 |---|---|---|---|
 | agy-cli | gemini-3.8-flash (low effort) | gemini-3.8-flash | gemini-3.1-pro |
-| anthropic | claude-haiku-4-5 | claude-sonnet-5-5 | claude-opus-5-5 |
+| anthropic | claude-haiku-5-5 | claude-sonnet-5-5 | claude-opus-5-5 |
 | openai | gpt-5.6-luna | gpt-5.6-terra | gpt-5.6-sol |
 | gemini | gemini-3.5-flash-lite | gemini-3.6-flash | gemini-3.6-flash |
-| openrouter | anthropic/claude-haiku-4.5 | anthropic/claude-sonnet-5.5 | anthropic/claude-opus-5.5 |
+| openrouter | anthropic/claude-haiku-5.5 | anthropic/claude-sonnet-5.5 | anthropic/claude-opus-5.5 |
 | codex-cli | the CLI's default | the CLI's default | the CLI's default |
 | ollama, openai-compatible | `LOCAL_MODEL` | `LOCAL_MODEL` | `LOCAL_MODEL` |
 
@@ -334,6 +335,9 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | File | What |
 |---|---|
 | `~/.config/clinqy/memory.md` | Facts Clinqy remembers about you (edit freely, or menu → **Edit Memory…**) |
+| `~/Library/Application Support/Clinqy/models/bge-small-en-v1.5/` | The on-device retrieval model memory search uses (~130 MB, downloaded once from Hugging Face; nothing about you is sent). `CLINQY_EMBEDDINGS=system` in `~/.config/clinqy/env` keeps the built-in system vectors instead |
+| `~/.config/clinqy/memory.format` | The memory format version. A newer build upgrades older (or hand-edited) memory once on first launch, app or `clinqy` command: list styles and headings cleaned up, exact duplicates merged, the old file kept as `memory.backup-<date>.md` |
+| `~/.config/clinqy/memory.history.jsonl` | Every memory update and removal (old wording, new wording, why), so recall can say what a fact used to be |
 | `~/Library/Application Support/Clinqy/history.json` | Run history |
 | `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
 | `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
@@ -400,6 +404,8 @@ Sources/Clinqy/
   Clipboard.swift    what the user copied recently ("this" when nothing is selected)
   Pdf.swift, Media.swift             PDF and video/audio jobs in the background
   NameHints.swift, MemoryTidy.swift  name-aware voice correction; memory clean-up
+  MemoryGraph.swift  links facts that share a person, place, app or detail; retrieval spreads along the links
+  TextEncoder.swift  bge-small retrieval model run with Accelerate (memory and saved-run similarity)
   Applications.swift                 job-application tracker
   MCPServer.swift    `Clinqy mcp`: stdio MCP server relaying to the running app
   Watch.swift        wait for text to appear/vanish via AXObserver notifications (polling fallback)

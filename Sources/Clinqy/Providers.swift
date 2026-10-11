@@ -108,11 +108,11 @@ enum Provider: String, CaseIterable {
         guard let tier else { return name }
         switch self {
         case .agyCLI: return ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.1-pro"][tier]
-        case .claudeCLI: return name
+        case .claudeCLI: return alias == "haiku" ? "claude-haiku-5-5" : name
         // The CLIs pick their own default model for your account; only an explicit model id is passed on.
         case .codexCLI: return ""
-        case .anthropic: return ["claude-haiku-4-5", "claude-sonnet-5-5", "claude-opus-5-5"][tier]
-        case .openrouter: return ["anthropic/claude-haiku-4.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"][tier]
+        case .anthropic: return ["claude-haiku-5-5", "claude-sonnet-5-5", "claude-opus-5-5"][tier]
+        case .openrouter: return ["anthropic/claude-haiku-5.5", "anthropic/claude-sonnet-5.5", "anthropic/claude-opus-5.5"][tier]
         case .openai: return ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"][tier]
         case .gemini: return ["gemini-3.5-flash-lite", "gemini-3.6-flash", "gemini-3.6-flash"][tier]
         case .ollama, .compatible: return Config.value("LOCAL_MODEL") ?? "qwen3-vl"
