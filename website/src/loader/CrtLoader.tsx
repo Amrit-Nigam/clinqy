@@ -67,7 +67,9 @@ export function CrtLoader({ onReveal, onDone }: Props) {
   const W = pic.w || 1
   const H = pic.h || 1
   // A window fills about a third of the width, so two or three share the frame.
-  const zBase = Math.min((W * 0.34) / 560, (H * 0.44) / 400)
+  // Tall screens (phones, portrait tablets): the desk runs top to bottom instead.
+  const tall = H > W * 1.1
+  const zBase = tall ? Math.min((W * 0.74) / 560, (H * 0.3) / 400) : Math.min((W * 0.34) / 560, (H * 0.44) / 400)
   const zAt = (t: number) => zBase * (1.04 - 0.08 * smooth(span(t, POWER, TAKE_END)))
 
   // Each window opens as the camera brings it to the right third of the frame.
@@ -76,8 +78,8 @@ export function CrtLoader({ onReveal, onDone }: Props) {
     for (const w of DESK) {
       let t = 0
       for (; t < TAKE_END; t += 16) {
-        const x = W / 2 + (w.x - camXAt(t)) * zAt(t) * w.d
-        if (x < W * 0.78) break
+        const along = (tall ? H : W) / 2 + (w.x - camXAt(t)) * zAt(t) * w.d
+        if (along < (tall ? H : W) * 0.8) break
       }
       out[w.id] = Math.max(POWER + 150, t)
     }
@@ -158,8 +160,11 @@ export function CrtLoader({ onReveal, onDone }: Props) {
   const windows = DESK.map((w) => {
     const open = easeOutExpo(span(T, openAt[w.id], openAt[w.id] + 700))
     const s = z * w.d * (0.92 + 0.08 * open)
-    const cx = W / 2 + (w.x - camX) * z * w.d
-    const cy = H / 2 + (w.y - camY) * z * w.d + (1 - open) * 10
+    // Along the desk is x on wide screens and y on tall ones; across is a small stagger.
+    const along = (w.x - camX) * z * w.d
+    const across = (w.y * (tall ? 0.3 : 1) - camY) * z * w.d
+    const cx = tall ? W / 2 + across : W / 2 + along
+    const cy = (tall ? H / 2 + along : H / 2 + across) + (1 - open) * 10
     const sceneT = clamp((T - openAt[w.id] - 250) / SCENE_LEN)
     // Further back: softer and a little darker, like a shallow depth of field.
     const depth = Math.max(0, 1 - w.d)
@@ -202,7 +207,7 @@ export function CrtLoader({ onReveal, onDone }: Props) {
             opacity: phase === 'off' && offX >= 1 ? 0 : 1,
           }}
         >
-          <div className="crt-grid" style={{ transform: `translate(${(-camX * z * 0.25) % 36}px, ${(-camY * z * 0.25) % 36}px)` }} />
+          <div className="crt-grid" style={{ transform: `translate(${((tall ? -camY : -camX) * z * 0.25) % 36}px, ${((tall ? -camX : -camY) * z * 0.25) % 36}px)` }} />
           {pic.w > 0 && (
             <div className="crt-windows" style={{ opacity: 1 - outro * 0.72 }}>
               {windows.map(({ w, open, s, cx, cy, sceneT, blur, dim }) =>

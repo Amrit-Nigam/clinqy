@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { BuddyCursor } from './BuddyCursor'
 import { LiveDesk } from './LiveDesk'
 import { ScenePlayer } from './ScenePlayer'
@@ -6,6 +6,7 @@ import { AsciiField } from './AsciiField'
 import { AsciiFinale } from './AsciiFinale'
 import { Scramble } from './Scramble'
 import { SETUP_PROMPT } from './setupPrompt'
+import { Tour, TourOffer } from './Tour'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
 
@@ -98,6 +99,26 @@ function Rule() {
 
 export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }) {
   const [copied, setCopied] = useState(false)
+  const [tour, setTour] = useState<'offer' | 'on' | 'off' | null>(null)
+  const [toast, setToast] = useState('')
+
+  // Offer the tour a moment after the page switches on.
+  useEffect(() => {
+    if (!live) {
+      setTour(null)
+      return
+    }
+    const id = setTimeout(() => setTour((t) => t ?? 'offer'), 700)
+    return () => clearTimeout(id)
+  }, [live])
+
+  function endTour(how: 'done' | 'stopped' | 'taken') {
+    setTour('off')
+    if (how !== 'done') {
+      setToast(how === 'taken' ? 'Stopped. You’re in control.' : 'Stopped.')
+      setTimeout(() => setToast(''), 2400)
+    }
+  }
 
   async function copyPrompt() {
     try {
@@ -114,7 +135,10 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
   return (
     <div className="site">
       <AsciiField running={live} />
-      <BuddyCursor enabled={live} />
+      <BuddyCursor enabled={live && tour !== 'on'} />
+      {tour === 'offer' && <TourOffer onYes={() => setTour('on')} onNo={() => setTour('off')} />}
+      <Tour running={tour === 'on'} onEnd={endTour} />
+      {toast && <div className="tour-toast" role="status">{toast}</div>}
 
       <header className="nav">
         <a className="nav-logo" href="#top" data-buddy>
@@ -126,6 +150,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           <a href="#watch">Watch it</a>
           <a href="#safety">Safety</a>
           <a href="#setup">Set up</a>
+          <button type="button" className="linklike nav-tour" onClick={() => setTour('on')} disabled={tour === 'on'}>
+            Show me around
+          </button>
         </nav>
         <a className="btn btn-quiet" href={GITHUB} target="_blank" rel="noreferrer" data-buddy>
           GitHub
@@ -135,10 +162,12 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
       <main id="top">
         <section className="hero">
           <div className="hero-copy">
-            <Scramble as="h1" text={'Your Mac,\non autopilot.'} start={live} />
+            <div data-tour="hello">
+              <Scramble as="h1" text={'Your Mac,\non autopilot.'} start={live} />
+            </div>
             <p className="hero-sub">And you can watch it work.</p>
             <p className="lede">
-              Press ⌃⌥ and say what you want. A small blue cursor goes and does it on screen. It clicks the Dock, types
+              Press <kbd data-tour="keys">⌃⌥</kbd> and say what you want. A small blue cursor goes and does it on screen. It clicks the Dock, types
               into the address bar, ticks the boxes and fills the form, then hands your pointer back.
             </p>
             <div className="hero-ctas">
@@ -151,7 +180,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
             </div>
             <p className="fineprint">Free and open source. macOS 14+ on Apple silicon.</p>
           </div>
-          <LiveDesk running={live} />
+          <div data-tour="desk">
+            <LiveDesk running={live} />
+          </div>
         </section>
 
         <div className="asks" aria-label="Things you can ask">
@@ -197,7 +228,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           <Scramble as="h2" text="Say it like you’d say it" />
           <ul className="can-list">
             {CAN.map((c) => (
-              <li key={c.title}>
+              <li key={c.title} data-tour={c.say.startsWith('mummy') ? 'voice' : undefined}>
                 <q className="can-say">{c.say}</q>
                 <div>
                   <h3>{c.title}</h3>
@@ -218,7 +249,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               <li>Renames and moves can be undone. Deleting only moves to the Trash.</li>
             </ul>
           </div>
-          <div className="alert" role="img" aria-label="Example: Clinqy asks before paying ₹4,420">
+          <div className="alert" data-tour="alert" role="img" aria-label="Example: Clinqy asks before paying ₹4,420">
             <img src="/icon.png" alt="" width={44} height={44} />
             <b>Pay ₹4,420 for Akasa QP 1104?</b>
             <p>Clinqy is about to click Pay on skyfare.example for Delhi to Mumbai, Fri 17 Oct.</p>
@@ -266,7 +297,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                 <i />
                 <i />
                 <span>setup prompt</span>
-                <button type="button" className="btn btn-primary btn-small" onClick={copyPrompt} data-buddy>
+                <button type="button" className="btn btn-primary btn-small" onClick={copyPrompt} data-buddy data-tour="copy">
                   {copied ? 'Copied' : 'Copy'}
                 </button>
               </div>
@@ -275,10 +306,10 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           </div>
         </section>
 
-        <section className="finale" aria-labelledby="finale-title">
+        <section className="finale" aria-labelledby="finale-title" data-tour="finale">
           <AsciiFinale />
           <p id="finale-title" className="finale-line">Press ⌃⌥. Say it. Watch it happen.</p>
-          <div className="hero-ctas">
+          <div className="hero-ctas" data-tour="finale-cta">
             <button type="button" className="btn btn-primary" onClick={copyPrompt} data-buddy>
               {copyLabel}
             </button>

@@ -116,7 +116,7 @@ main > section {
   inset: 0;
   background:
     linear-gradient(90deg, rgba(8, 9, 13, 0.92) 0%, rgba(8, 9, 13, 0.7) 45%, rgba(8, 9, 13, 0.35) 100%),
-    rgba(8, 9, 13, calc(var(--veil, 0) * 0.6));
+    rgba(8, 9, 13, calc(var(--veil, 0) * 0.82));
 }
 
 /* ── Nav ── */
@@ -892,5 +892,314 @@ main > section.finale {
   }
   .asks-track {
     gap: 28px;
+  }
+}
+
+/* ───────────────────────── Tour ───────────────────────── */
+
+.lede kbd {
+  font: inherit;
+  color: var(--text);
+}
+.nav-tour {
+  font-size: 14px !important;
+  color: var(--text) !important;
+}
+.nav-tour::before {
+  content: '';
+  display: inline-block;
+  width: 6px;
+  height: 6px;
+  margin-right: 8px;
+  border-radius: 50%;
+  background: var(--blue);
+  vertical-align: 2px;
+}
+.nav-tour:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+/* The offer: Clinqy's command bar, bottom centre. */
+.offer {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  z-index: 60;
+  translate: -50% 0;
+  width: min(820px, calc(100vw - 32px));
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  padding: 14px 14px 14px 18px;
+  border-radius: 16px;
+  background: rgba(22, 24, 32, 0.96);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.09),
+    0 30px 80px -20px rgba(0, 0, 0, 0.9);
+  animation: offer-in 0.5s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+@keyframes offer-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+}
+.offer img {
+  border-radius: 8px;
+}
+.offer-text {
+  flex: 1;
+  min-width: 260px;
+  display: grid;
+  gap: 2px;
+}
+.offer-text b {
+  font-weight: 600;
+  font-size: 15px;
+}
+.offer-text span {
+  font-size: 12.5px;
+  color: var(--text-soft);
+}
+.offer-actions {
+  flex: none;
+  display: flex;
+  gap: 6px;
+}
+.offer .btn {
+  min-height: 40px;
+  font-size: 13.5px;
+}
+
+.tour {
+  position: fixed;
+  inset: 0;
+  z-index: 70;
+  pointer-events: none;
+}
+.tour-bar {
+  position: absolute;
+  bottom: 24px;
+  left: 50%;
+  translate: -50% 0;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 6px 6px 12px;
+  border-radius: 999px;
+  background: rgba(22, 24, 32, 0.96);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09), 0 12px 30px rgba(0, 0, 0, 0.5);
+  font-size: 13px;
+  pointer-events: auto;
+}
+.tour-bar img {
+  border-radius: 4px;
+}
+.tour-bar small {
+  margin-left: 6px;
+  color: var(--text-soft);
+}
+.tour-bar button {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  padding: 5px 12px;
+  border: 0;
+  border-radius: 999px;
+  background: rgba(255, 255, 255, 0.1);
+  font: 600 12.5px / 1 var(--mono);
+  cursor: pointer;
+}
+.tour-bar button:hover {
+  background: rgba(255, 255, 255, 0.18);
+}
+.tour-bar button i {
+  width: 8px;
+  height: 8px;
+  border-radius: 1.5px;
+  background: #ff6b5a;
+}
+
+.tour-cursor {
+  position: absolute;
+  left: 0;
+  top: 0;
+  margin: -2px 0 0 -2px;
+  will-change: transform;
+}
+.tour-cursor svg {
+  transition: transform 0.12s;
+}
+.tour-cursor.is-down svg {
+  transform: scale(0.86);
+}
+.tour-frame {
+  position: absolute;
+  left: 0;
+  top: 0;
+  opacity: 0;
+  border-radius: 10px;
+  border: 1.5px dashed var(--blue);
+  background: rgba(74, 140, 255, 0.05);
+  transition:
+    opacity 0.25s,
+    transform 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+    width 0.3s cubic-bezier(0.16, 1, 0.3, 1),
+    height 0.3s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.tour-circle {
+  position: absolute;
+  overflow: visible;
+}
+.tour-circle path {
+  fill: none;
+  stroke: var(--blue);
+  stroke-width: 2.4;
+  stroke-linecap: round;
+  vector-effect: non-scaling-stroke;
+  stroke-dasharray: 1;
+  stroke-dashoffset: 1;
+  animation: draw 0.6s cubic-bezier(0.6, 0, 0.3, 1) forwards;
+}
+@keyframes draw {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+.tour-ripple {
+  position: absolute;
+  width: 40px;
+  height: 40px;
+  translate: -50% -50%;
+  border-radius: 50%;
+  border: 2px solid var(--blue);
+  animation: ripple 0.6s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+@keyframes ripple {
+  from {
+    transform: scale(0.2);
+    opacity: 1;
+  }
+  to {
+    transform: scale(1.4);
+    opacity: 0;
+  }
+}
+
+/* What Clinqy says: its result card. */
+.tour-card {
+  position: absolute;
+  width: min(340px, calc(100vw - 32px));
+  padding: 14px 16px;
+  border-radius: 12px;
+  background: rgba(22, 24, 32, 0.97);
+  box-shadow:
+    0 0 0 1px rgba(255, 255, 255, 0.09),
+    0 24px 60px -16px rgba(0, 0, 0, 0.9);
+  font-size: 14px;
+  line-height: 1.55;
+  pointer-events: auto;
+  transition:
+    left 0.25s cubic-bezier(0.16, 1, 0.3, 1),
+    top 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+.tour-ask {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 12px;
+}
+.tour-ask button {
+  padding: 7px 12px;
+  border: 0;
+  border-radius: 7px;
+  background: rgba(255, 255, 255, 0.1);
+  font: 600 13px / 1 var(--mono);
+  cursor: pointer;
+}
+.tour-ask .is-yes {
+  background: #0a84ff;
+  color: #fff;
+}
+
+.tour-toast {
+  position: fixed;
+  left: 50%;
+  bottom: 28px;
+  z-index: 75;
+  translate: -50% 0;
+  padding: 10px 18px;
+  border-radius: 999px;
+  background: rgba(22, 24, 32, 0.96);
+  box-shadow: 0 0 0 1px rgba(255, 255, 255, 0.09);
+  font-size: 13.5px;
+  animation: offer-in 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+@media (max-width: 600px) {
+  .offer {
+    flex-wrap: wrap;
+  }
+  .offer-actions {
+    width: 100%;
+  }
+  .offer-actions .btn {
+    flex: 1;
+  }
+}
+
+.streak-layer {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  z-index: 99;
+  pointer-events: none;
+}
+.tour .streak-layer {
+  position: absolute;
+}
+
+@media (max-width: 600px) {
+  main > section {
+    padding-top: 64px;
+    padding-bottom: 64px;
+  }
+  .section-head {
+    gap: 16px;
+    margin-bottom: 32px;
+  }
+  .stage-body {
+    padding: 24px 18px 18px;
+  }
+  .stage-quote {
+    font-size: 26px;
+  }
+  .tour-bar {
+    bottom: 14px;
+    max-width: calc(100vw - 24px);
+    white-space: nowrap;
+  }
+}
+
+.tour-bar-short {
+  display: none;
+}
+@media (max-width: 600px) {
+  .tour-bar-long {
+    display: none;
+  }
+  .tour-bar-short {
+    display: inline;
+  }
+  .offer .btn {
+    padding: 0 8px;
+    font-size: 13px;
+    white-space: nowrap;
+  }
+  .offer .btn::before,
+  .offer .btn::after {
+    margin: 0 0.4ch;
   }
 }

@@ -146,7 +146,8 @@ export function AsciiField({ running }: { running: boolean }) {
       })
 
       // 2. Actions: decode in, hold, scramble out.
-      if (now - lastSpawn > 1100 && snips.length < 7) {
+      const inHero = scrollY < innerHeight * 0.5
+      if (inHero && now - lastSpawn > 1100 && snips.length < 7) {
         spawn(now)
         lastSpawn = now
       }
@@ -217,6 +218,8 @@ export function AsciiField({ running }: { running: boolean }) {
         }
       }
 
+      // Below the hero the field is just texture: no cursor over the content.
+      if (!inHero && !cur.target && !ripple) return
       ctx!.save()
       ARROW.forEach((line, i) => {
         for (let j = 0; j < line.length; j++) {

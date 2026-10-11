@@ -185,3 +185,11 @@
     0 0 12px 4px rgba(255, 255, 255, 0.9),
     0 0 40px 12px rgba(170, 200, 255, 0.5);
 }
+
+/* Narrow screens: the caption sits above the Sound / Skip buttons, not on them. */
+@media (max-width: 700px) {
+  .crt-caption {
+    bottom: calc(6% + 44px);
+    max-width: calc(100% - 10%);
+  }
+}

@@ -1224,3 +1224,8 @@
 .sc-panel > .sc-btn {
   position: absolute;
 }
+
+/* Clinqy's trail, as the app draws it. */
+.streak-layer path {
+  fill: #3b82f6;
+}
