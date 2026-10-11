@@ -50,6 +50,25 @@ export class CrtSound {
     src.start()
   }
 
+  /** A short mechanical tick for each of Clinqy's clicks. */
+  click() {
+    const ctx = this.ctx
+    if (!ctx || !this.master) return
+    const len = Math.floor(ctx.sampleRate * 0.03)
+    const buf = ctx.createBuffer(1, len, ctx.sampleRate)
+    const d = buf.getChannelData(0)
+    for (let i = 0; i < len; i++) d[i] = (Math.random() * 2 - 1) * Math.pow(1 - i / len, 6)
+    const src = ctx.createBufferSource()
+    src.buffer = buf
+    const hp = ctx.createBiquadFilter()
+    hp.type = 'highpass'
+    hp.frequency.value = 2200
+    const g = ctx.createGain()
+    g.gain.value = 0.5
+    src.connect(hp).connect(g).connect(this.master)
+    src.start()
+  }
+
   thunk() {
     const ctx = this.ctx
     if (!ctx || !this.master) return

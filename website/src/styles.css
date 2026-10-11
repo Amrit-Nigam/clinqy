@@ -18,6 +18,8 @@
   --phosphor: #8dffb0;
   --display: 'Bricolage Grotesque', system-ui, sans-serif;
   --osd: 'VT323', ui-monospace, monospace;
+  --mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --head: 'Martian Mono', ui-monospace, monospace;
   color-scheme: dark;
 }
 

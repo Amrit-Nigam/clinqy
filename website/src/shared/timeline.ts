@@ -2,6 +2,9 @@ export type Key = { t: number; x: number; y: number; down?: boolean; click?: boo
 
 export const clamp = (v: number, lo = 0, hi = 1) => Math.min(hi, Math.max(lo, v))
 export const easeInOut = (t: number) => (t < 0.5 ? 4 * t * t * t : 1 - Math.pow(-2 * t + 2, 3) / 2)
+/** Minimum-jerk curve: starts and stops with zero velocity and acceleration, like a hand. */
+export const smooth = (t: number) => t * t * t * (t * (t * 6 - 15) + 10)
+export const easeOutExpo = (t: number) => (t >= 1 ? 1 : 1 - Math.pow(2, -10 * t))
 export const easeOut = (t: number) => 1 - Math.pow(1 - t, 3)
 
 /** Progress of t through [a, b], clamped to 0..1. */
@@ -21,7 +24,7 @@ export function cursorAt(keys: Key[], t: number) {
     const a = keys[i - 1]
     const b = keys[i]
     if (t <= b.t) {
-      const p = easeInOut(span(t, a.t, b.t))
+      const p = smooth(span(t, a.t, b.t))
       const dx = b.x - a.x
       const dy = b.y - a.y
       const drag = a.down && b.down

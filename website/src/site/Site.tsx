@@ -2,7 +2,9 @@ import { useState } from 'react'
 import { BuddyCursor } from './BuddyCursor'
 import { CommandBar } from './CommandBar'
 import { ScenePlayer } from './ScenePlayer'
-import { ScreenWall } from './ScreenWall'
+import { AsciiField } from './AsciiField'
+import { AsciiFinale } from './AsciiFinale'
+import { Scramble } from './Scramble'
 import { SETUP_PROMPT } from './setupPrompt'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
@@ -40,6 +42,15 @@ const MODELS = [
   ['A local model', 'Any vision model through Ollama, LM Studio or an OpenAI-compatible server.'],
 ]
 
+/** A box-drawing divider that always fills its row. */
+function Rule() {
+  return (
+    <div className="rule" aria-hidden="true">
+      {'─'.repeat(400)}
+    </div>
+  )
+}
+
 export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }) {
   const [copied, setCopied] = useState(false)
 
@@ -55,7 +66,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
 
   return (
     <div className="site">
-      <ScreenWall running={live} />
+      <AsciiField running={live} />
       <BuddyCursor enabled={live} />
 
       <header className="nav">
@@ -77,7 +88,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
       <main id="top">
         <section className="hero">
           <div className="hero-copy">
-            <h1>Your Mac, on autopilot. And you can watch it work.</h1>
+            <Scramble as="h1" text="Your Mac, on autopilot. And you can watch it work." start={live} />
             <p className="lede">
               Press ⌃⌥ and say what you want. A small blue cursor goes and does it on screen: it clicks the Dock,
               types into the address bar, ticks the boxes and fills the form.
@@ -101,8 +112,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           </div>
         </section>
 
+        <Rule />
         <section className="how" aria-labelledby="how-title">
-          <h2 id="how-title">How it works</h2>
+          <Scramble as="h2" id="how-title" text="How it works" />
           <ol className="how-steps">
             <li>
               <h3>You ask</h3>
@@ -123,9 +135,10 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           </ol>
         </section>
 
+        <Rule />
         <section className="watch" id="watch">
           <div className="section-head">
-            <h2>It uses your Mac the way you would</h2>
+            <Scramble as="h2" text="It uses your Mac the way you would" />
             <p>
               No hidden APIs and no headless browser. It opens apps from the Dock, types at a human rhythm and clicks
               for real, then puts your pointer back where it was. Each step takes a second or two.
@@ -134,8 +147,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           <ScenePlayer />
         </section>
 
+        <Rule />
         <section className="features" id="features">
-          <h2>What it can do</h2>
+          <Scramble as="h2" text="What it can do" />
           <dl className="feature-list">
             {FEATURES.map((f) => (
               <div key={f.title} className="feature">
@@ -146,9 +160,10 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           </dl>
         </section>
 
+        <Rule />
         <section className="safety" id="safety">
           <div className="safety-copy">
-            <h2>It asks before anything you can’t take back</h2>
+            <Scramble as="h2" text="It asks before anything you can’t take back" />
             <ul>
               <li>Pay, Buy, Book, Send, Submit and Delete need your OK, unless you asked for exactly that.</li>
               <li>On a call? It checks with you before acting.</li>
@@ -172,8 +187,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           </div>
         </section>
 
+        <Rule />
         <section className="models">
-          <h2>Bring your own model</h2>
+          <Scramble as="h2" text="Bring your own model" />
           <ul>
             {MODELS.map(([a, b]) => (
               <li key={a}>
@@ -184,8 +200,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           </ul>
         </section>
 
+        <Rule />
         <section className="setup" id="setup">
-          <h2>Set it up in three steps</h2>
+          <Scramble as="h2" text="Set it up in three steps" />
           <ol className="steps">
             <li>
               <h3>Fill in two lines</h3>
@@ -211,6 +228,19 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               </button>
             </div>
             <pre tabIndex={0}>{SETUP_PROMPT}</pre>
+          </div>
+        </section>
+        <Rule />
+        <section className="finale" aria-labelledby="finale-title">
+          <AsciiFinale />
+          <p id="finale-title" className="finale-line">Press ⌃⌥. Say it. Watch it happen.</p>
+          <div className="hero-ctas">
+            <button type="button" className="btn btn-primary" onClick={copyPrompt} data-buddy>
+              {copied ? 'Setup prompt copied' : 'Copy the setup prompt'}
+            </button>
+            <a className="btn btn-quiet" href={GITHUB} target="_blank" rel="noreferrer" data-buddy>
+              View on GitHub
+            </a>
           </div>
         </section>
       </main>

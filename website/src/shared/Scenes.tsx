@@ -34,17 +34,32 @@ export function MenuBar({ app }: { app: string }) {
   )
 }
 
-function Desktop({ title, children }: { title: string; children: React.ReactNode }) {
+/**
+ * A macOS window. Browser scenes pass `url` and get a toolbar with the
+ * address in a pill; app scenes get a plain centred title. `dark` is for
+ * apps that edit in dark mode (Photos).
+ */
+function Desktop({ title, url, dark, children }: { title: string; url?: string; dark?: boolean; children: React.ReactNode }) {
   const { bare, app } = useContext(StageCtx)
   return (
     <div className={'sc-desktop' + (bare ? ' is-bare' : '')}>
       {!bare && <MenuBar app={app} />}
-      <div className="sc-window">
-        <div className="sc-titlebar">
+      <div className={'sc-window' + (dark ? ' is-dark' : '')}>
+        <div className={'sc-titlebar' + (url ? ' is-browser' : '')}>
           <i style={{ background: '#ff5f57' }} />
           <i style={{ background: '#febc2e' }} />
           <i style={{ background: '#28c840' }} />
-          <span>{title}</span>
+          {url ? (
+            <>
+              <span className="sc-nav">‹ ›</span>
+              <span className="sc-addr">
+                <span className="sc-lock" />
+                {url}
+              </span>
+            </>
+          ) : (
+            <span className="sc-title">{title}</span>
+          )}
         </div>
         <div className="sc-content">{children}</div>
       </div>
@@ -52,12 +67,12 @@ function Desktop({ title, children }: { title: string; children: React.ReactNode
   )
 }
 
-function Field({ x, y, w = 300, label, value, active }: { x: number; y: number; w?: number; label: string; value: string; active?: boolean }) {
+function Field({ x, y, w = 300, label, value, active, placeholder }: { x: number; y: number; w?: number; label: string; value: string; active?: boolean; placeholder?: string }) {
   return (
     <div className="sc-field" style={{ left: x, top: y, width: w }}>
       <label>{label}</label>
       <div className={'sc-input' + (active ? ' is-active' : '')}>
-        {value}
+        {value || (!active && placeholder ? <small>{placeholder}</small> : null)}
         {active && <span className="sc-caret" />}
       </div>
     </div>
@@ -90,22 +105,34 @@ function ShotBody({ t, cur }: SceneProps) {
   const dragging = t >= 0.26 && t < 0.64
   const flash = t >= 0.64 ? Math.max(0, 1 - span(t, 0.64, 0.74)) : 0
   const thumb = easeOut(span(t, 0.7, 0.82))
-  const rows = [
-    ['IndiGo 6E 2131', '06:10', '₹4,860'],
-    ['Air India AI 805', '08:45', '₹5,320'],
-    ['Vistara UK 943', '13:20', '₹6,110'],
-    ['Akasa QP 1104', '19:05', '₹4,420'],
+  const rows: [string, string, string, string, string, string][] = [
+    ['6E', '#1d3f9a', 'IndiGo', '06:10 – 08:20', '2h 10m · Non-stop', '₹4,860'],
+    ['AI', '#c8102e', 'Air India', '08:45 – 11:05', '2h 20m · Non-stop', '₹5,320'],
+    ['UK', '#5b2d82', 'Vistara', '13:20 – 15:35', '2h 15m · Non-stop', '₹6,110'],
+    ['QP', '#f26522', 'Akasa Air', '19:05 – 21:15', '2h 10m · Non-stop', '₹4,420'],
   ]
   return (
-    <Desktop title="Flights to Mumbai">
-      <div className="sc-url">flights.example.com/del-bom</div>
-      <h3 className="sc-h" style={{ left: 30, top: 50 }}>Delhi to Mumbai, Fri 17 Oct</h3>
+    <Desktop title="Flights to Mumbai" url="skyfare.example/del-bom">
+      <div className="sc-site-head">
+        <b className="sc-logo">✈ skyfare</b>
+        <span className="is-on">Flights</span>
+        <span>Hotels</span>
+        <span>Trips</span>
+        <i className="sc-me">R</i>
+      </div>
+      <h3 className="sc-h" style={{ left: 30, top: 48 }}>Delhi → Mumbai</h3>
+      <div className="sc-meta" style={{ left: 30, top: 70 }}>Fri, 17 Oct · 1 adult · Economy · 24 flights</div>
+      <div className="sc-chips" style={{ right: 30, top: 50 }}>
+        <span className="is-on">Cheapest</span>
+        <span>Fastest</span>
+        <span>Non-stop</span>
+      </div>
       {rows.map((r, i) => (
-        <div key={i} className="sc-row" style={{ left: 30, top: 92 + i * 52 }}>
-          <span className="sc-dot" />
-          <b>{r[0]}</b>
-          <span>{r[1]}</span>
-          <em>{r[2]}</em>
+        <div key={i} className={'sc-row' + (i === 3 ? ' is-best' : '')} style={{ left: 30, top: 92 + i * 52 }}>
+          <span className="sc-airline" style={{ background: r[1] }}>{r[0]}</span>
+          <div className="sc-row-name"><b>{r[2]}</b><small>{r[0]} {[2131, 805, 943, 1104][i]}</small></div>
+          <div className="sc-row-time"><b>{r[3]}</b><small>{r[4]}</small></div>
+          <em>{r[5]}</em>
         </div>
       ))}
       {(dragging || (t >= 0.6 && t < 0.66)) && (
@@ -148,7 +175,7 @@ function EditBody({ t, cur }: SceneProps) {
   const warm = span(t, 0.3, 0.6)
   const exported = easeOut(span(t, 0.86, 0.94))
   return (
-    <Desktop title="beach.jpg">
+    <Desktop title="beach.jpg — Edit" dark>
       <div
         className="sc-photo"
         style={{ filter: `brightness(${0.62 + dragP * 0.55}) saturate(${0.7 + warm * 0.6})` }}
@@ -158,6 +185,12 @@ function EditBody({ t, cur }: SceneProps) {
         <div className="sc-sand" />
       </div>
       <div className="sc-panel">
+        <div className="sc-seg" style={{ top: 12 }}>
+          <span className="is-on">Adjust</span>
+          <span>Filters</span>
+          <span>Crop</span>
+        </div>
+        <div className="sc-panel-head" style={{ top: 44 }}>Light</div>
         <div className="sc-slider" style={{ top: 66 }}>
           <label>Brightness <b>{value > 0 ? '+' : ''}{value}</b></label>
           <div className="sc-track"><i style={{ width: knobX - 470 }} /><span style={{ left: knobX - 470 - 7 }} /></div>
@@ -170,7 +203,14 @@ function EditBody({ t, cur }: SceneProps) {
           <label>Contrast <b>0</b></label>
           <div className="sc-track"><i style={{ width: 50 }} /><span style={{ left: 43 }} /></div>
         </div>
-        <div className={'sc-btn sc-btn-blue' + (t > 0.84 && t < 0.9 ? ' is-pressed' : '')} style={{ left: 18, top: 308, width: 96 }}>Export</div>
+        <div className="sc-panel-head" style={{ top: 236 }}>Color</div>
+        <div className="sc-swatches" style={{ top: 256 }}>
+          <i style={{ background: '#e8574a' }} />
+          <i style={{ background: '#f2b33d' }} />
+          <i style={{ background: '#4cae6a' }} />
+          <i style={{ background: '#3b82f6' }} />
+        </div>
+        <div className={'sc-btn sc-btn-yellow' + (t > 0.84 && t < 0.9 ? ' is-pressed' : '')} style={{ left: 18, top: 308, width: 96 }}>Export</div>
       </div>
       <Toast show={exported}>Exported beach-edit.jpg</Toast>
     </Desktop>
@@ -198,30 +238,47 @@ function AwsBody({ t }: SceneProps) {
   const confirm = t >= 0.76 && t < 0.9 ? easeOut(span(t, 0.76, 0.8)) : 0
   const done = easeOut(span(t, 0.9, 0.96))
   return (
-    <Desktop title="EC2 · Launch an instance">
-      <div className="sc-url">console.aws.amazon.com/ec2/launch</div>
-      <div className="sc-aws-bar">Console <span>›</span> EC2 <span>›</span> Launch an instance</div>
-      <Field x={30} y={118} label="Name" value={name} active={t > 0.1 && t < 0.42} />
+    <Desktop title="Launch an instance | EC2" url="console.aws.amazon.com/ec2">
+      <div className="sc-aws-nav">
+        <b className="sc-aws-logo">aws</b>
+        <span>Services</span>
+        <span className="sc-aws-search">Search <small>[Option+S]</small></span>
+        <span className="sc-aws-right">Mumbai ▾</span>
+        <span>riya ▾</span>
+      </div>
+      <div className="sc-aws-crumbs">EC2 <span>›</span> Instances <span>›</span> <b>Launch an instance</b></div>
+      <div className="sc-aws-card" style={{ left: 18, top: 90, width: 524, height: 200 }}>
+        <b>Name and tags</b>
+      </div>
+      <Field x={30} y={118} label="Name" value={name} active={t > 0.1 && t < 0.42} placeholder="e.g. My Web Server" />
       <div className="sc-field" style={{ left: 30, top: 188, width: 300 }}>
         <label>Instance type</label>
-        <div className={'sc-input sc-select' + (open ? ' is-active' : '')}>{picked ? 't3.micro' : 't2.nano'}</div>
+        <div className={'sc-input sc-select' + (open ? ' is-active' : '')}>
+          {picked ? 't3.micro' : 't2.nano'}
+          <small className="sc-select-note">{picked ? '2 vCPU · 1 GiB · Free tier' : '1 vCPU · 0.5 GiB'}</small>
+        </div>
       </div>
       {open && (
         <div className="sc-dropdown" style={{ left: 30, top: 236 }}>
           <div>t2.nano</div>
-          <div className={t > 0.55 ? 'is-hover' : ''}>t3.micro <small>Free tier</small></div>
+          <div className={t > 0.55 ? 'is-hover' : ''}>t3.micro <small>Free tier eligible</small></div>
           <div>t3.large</div>
         </div>
       )}
-      <div className="sc-field" style={{ left: 360, top: 118, width: 190 }}>
+      <div className="sc-field" style={{ left: 360, top: 118, width: 170 }}>
         <label>Region</label>
-        <div className="sc-input">ap-south-1</div>
+        <div className="sc-input">Asia Pacific (Mumbai)</div>
       </div>
-      <div className={'sc-btn sc-btn-orange' + (t > 0.74 && t < 0.78 ? ' is-pressed' : '')} style={{ left: 410, top: 324, width: 140 }}>Launch instance</div>
+      <div className="sc-aws-summary" style={{ left: 360, top: 188, width: 170 }}>
+        <small>Number of instances</small>
+        <b>1</b>
+      </div>
+      <div className="sc-btn sc-btn-ghost" style={{ left: 320, top: 324, width: 80 }}>Cancel</div>
+      <div className={'sc-btn sc-btn-aws' + (t > 0.74 && t < 0.78 ? ' is-pressed' : '')} style={{ left: 410, top: 324, width: 140 }}>Launch instance</div>
       {confirm > 0 && (
         <div className="sc-ask" style={{ opacity: confirm, transform: `scale(${0.94 + confirm * 0.06})` }}>
           <b>Launch tf-server (t3.micro)?</b>
-          <span>This starts a billable instance.</span>
+          <span>Clinqy needs your OK. This starts a billable instance.</span>
           <div><i>Cancel</i><i className="is-yes">Launch</i></div>
         </div>
       )}
@@ -251,21 +308,36 @@ function JobBody({ t }: SceneProps) {
   const ticked = t >= 0.69
   const sent = easeOut(span(t, 0.84, 0.92))
   return (
-    <Desktop title="Careers · Product Designer">
-      <div className="sc-url">jobs.example.com/apply/product-designer</div>
-      <h3 className="sc-h" style={{ left: 30, top: 46 }}>Product Designer, Bengaluru</h3>
-      <Field x={30} y={106} label="Full name" value={nameV} active={t > 0.07 && t < 0.29} />
-      <Field x={30} y={168} label="Email" value={mailV} active={t > 0.3 && t < 0.5} />
+    <Desktop title="Product Designer — Northwind" url="careers.northwind.example/jobs/2041">
+      <div className="sc-job-head">
+        <span className="sc-job-logo">N</span>
+        <b>Northwind</b>
+        <span className="sc-job-links">Teams · Life · <u>Open roles</u></span>
+      </div>
+      <h3 className="sc-h" style={{ left: 30, top: 44 }}>Product Designer</h3>
+      <div className="sc-tags" style={{ left: 30, top: 70 }}>
+        <span>Bengaluru</span>
+        <span>Full-time</span>
+        <span>Hybrid</span>
+      </div>
+      <Field x={30} y={106} label="Full name" value={nameV} active={t > 0.07 && t < 0.29} placeholder="Your name" />
+      <Field x={30} y={168} label="Email" value={mailV} active={t > 0.3 && t < 0.5} placeholder="you@example.com" />
       <div className="sc-field" style={{ left: 30, top: 230, width: 300 }}>
-        <label>Resume</label>
+        <label>Resume / CV</label>
         <div className="sc-upload">
           <span className="sc-btn-mini">Upload</span>
-          {uploaded ? <em>resume.pdf · 182 KB</em> : <small>No file chosen</small>}
+          {uploaded ? <em>📄 resume.pdf · 182 KB</em> : <small>PDF, DOC up to 5 MB</small>}
         </div>
       </div>
       <div className="sc-check" style={{ left: 30, top: 306 }}>
         <span className={ticked ? 'is-on' : ''}>{ticked ? '✓' : ''}</span>
         I agree to the privacy notice
+      </div>
+      <div className="sc-job-about" style={{ left: 360, top: 106, width: 180 }}>
+        <b>About the role</b>
+        <p>Own flows end to end with a small team, from research to polished UI.</p>
+        <b>You’ll bring</b>
+        <p>4+ years in product design and a portfolio of shipped work.</p>
       </div>
       <div className={'sc-btn sc-btn-blue' + (t > 0.82 && t < 0.86 ? ' is-pressed' : '')} style={{ left: 410, top: 320, width: 140 }}>Submit application</div>
       <Toast show={sent}>Application sent</Toast>
@@ -286,33 +358,47 @@ function MsgBody({ t }: SceneProps) {
   const open = t >= 0.15
   const draft = t >= 0.77 ? '' : typed('I’ll be late, stuck in traffic', t, 0.32, 0.68)
   const sent = easeOut(span(t, 0.77, 0.83))
-  const chats = [
-    ['Mom', 'Call me when you’re free'],
-    ['Raj', 'Sent the deck'],
-    ['Priya', 'Thursday works'],
-    ['Design team', 'New mocks are up'],
+  const chats: [string, string, string, string][] = [
+    ['Mom', 'Call me when you’re free', '9:12', '#e8a87c'],
+    ['Raj', 'Sent the deck', '8:47', '#85b8e8'],
+    ['Priya', 'Thursday works', 'Yesterday', '#c9a0dc'],
+    ['Design team', 'Ana: new mocks are up', 'Yesterday', '#8fd1a8'],
   ]
   return (
     <Desktop title="WhatsApp">
       <div className="sc-chats">
         <b className="sc-chats-title">Chats</b>
-        {chats.map(([n, m], i) => (
+        <span className="sc-chats-search">Search or start a new chat</span>
+        {chats.map(([n, m, time, color], i) => (
           <div key={n} className={'sc-chat' + (open && i === 0 ? ' is-open' : '')} style={{ top: 50 + i * 48 }}>
-            <span className="sc-avatar">{n[0]}</span>
+            <span className="sc-avatar" style={{ background: color }}>{n[0]}</span>
             <div><b>{n}</b><small>{m}</small></div>
+            <time>{time}</time>
           </div>
         ))}
       </div>
-      {open && (
-        <div className="sc-thread">
-          <div className="sc-bubble">Call me when you’re free</div>
-          {sent > 0 && (
-            <div className="sc-bubble is-me" style={{ opacity: sent, transform: `translateY(${(1 - sent) * 10}px)` }}>
-              I’ll be late, stuck in traffic <small>✓✓</small>
-            </div>
-          )}
-        </div>
-      )}
+      <div className="sc-thread-head">
+        {open ? (
+          <>
+            <span className="sc-avatar" style={{ background: '#e8a87c' }}>M</span>
+            <div><b>Mom</b><small>online</small></div>
+          </>
+        ) : null}
+      </div>
+      <div className="sc-thread">
+        {open && (
+          <>
+            <div className="sc-day">TODAY</div>
+            <div className="sc-bubble">Call me when you’re free <time>9:12</time></div>
+            {sent > 0 && (
+              <div className="sc-bubble is-me" style={{ opacity: sent, transform: `translateY(${(1 - sent) * 10}px)` }}>
+                I’ll be late, stuck in traffic <time>9:41 <span>✓✓</span></time>
+              </div>
+            )}
+          </>
+        )}
+      </div>
+      <div className="sc-composer" />
       <div className={'sc-input sc-compose' + (t > 0.3 && t < 0.77 ? ' is-active' : '')}>
         {draft || <small>Type a message</small>}
       </div>
@@ -330,31 +416,37 @@ const calKeys: Key[] = [
   { t: 1, x: 480, y: 330 },
 ]
 function CalBody({ t, cur }: SceneProps) {
-  const days = ['Mon 13', 'Tue 14', 'Wed 15', 'Thu 16', 'Fri 17']
-  const busy: [number, number, number, string][] = [
-    [0, 0, 1, 'Standup'],
-    [1, 1, 3, 'Workshop'],
-    [2, 0, 2, 'Reviews'],
-    [3, 0, 2, 'Interviews'],
-    [3, 3, 4, '1:1 with Sam'],
-    [4, 1, 2, 'Lunch'],
+  const days: [string, number][] = [['Mon', 13], ['Tue', 14], ['Wed', 15], ['Thu', 16], ['Fri', 17]]
+  const busy: [number, number, number, string, string][] = [
+    [0, 0, 1, 'Standup', 'blue'],
+    [1, 1, 3, 'Design workshop', 'purple'],
+    [2, 0, 2, 'Portfolio reviews', 'green'],
+    [3, 0, 2, 'Interviews', 'orange'],
+    [3, 3, 4, '1:1 with Sam', 'blue'],
+    [4, 1, 2, 'Lunch with Raj', 'green'],
   ]
   const scanning = t >= 0.22 && t < 0.56
   const booked = easeOut(span(t, 0.57, 0.66))
   const toast = easeOut(span(t, 0.68, 0.76))
   const ROW = 60
   return (
-    <Desktop title="Calendar">
-      {days.map((d, i) => (
-        <div key={d} className="sc-cal-day" style={{ left: 60 + i * 96, top: 14 }}>{d}</div>
+    <Desktop title="October 2026">
+      {days.map(([d, n], i) => (
+        <div key={d} className={'sc-cal-day' + (i === 3 ? ' is-today' : '')} style={{ left: 60 + i * 96, top: 12 }}>
+          {d} <b>{n}</b>
+        </div>
       ))}
       {['1 PM', '2 PM', '3 PM', '4 PM', '5 PM'].map((h, i) => (
         <div key={h} className="sc-cal-hour" style={{ top: 46 + i * ROW }}>{h}</div>
       ))}
       <div className="sc-cal-grid" />
-      {busy.map(([d, a, b, n]) => (
-        <div key={n} className="sc-cal-ev" style={{ left: 62 + d * 96, top: 50 + a * ROW, height: (b - a) * ROW - 4 }}>{n}</div>
+      {busy.map(([d, a, b, n, c]) => (
+        <div key={n} className={'sc-cal-ev is-' + c} style={{ left: 62 + d * 96, top: 50 + a * ROW, height: (b - a) * ROW - 4 }}>
+          {n}
+          <small>{a + 1}:00 PM</small>
+        </div>
       ))}
+      <div className="sc-cal-now" style={{ top: 50 + 1.4 * ROW }} />
       {scanning && (
         <div className="sc-cal-scan" style={{ left: 348, top: Math.max(50, cur.y - 64 - 20), height: 30 }} />
       )}
@@ -369,13 +461,13 @@ function CalBody({ t, cur }: SceneProps) {
 }
 
 /* 7. Files: sort Downloads into folders. */
-const FILES: [string, number][] = [
-  ['invoice-sept.pdf', 0],
-  ['beach.jpg', 1],
-  ['Zoom.pkg', 2],
-  ['offer-letter.pdf', 0],
-  ['screenshot.png', 1],
-  ['resume.pdf', 0],
+const FILES: [string, number, string, string][] = [
+  ['invoice-sept.pdf', 0, 'Today, 9:02', '84 KB'],
+  ['beach.jpg', 1, 'Today, 8:40', '3.2 MB'],
+  ['Zoom.pkg', 2, 'Yesterday', '41 MB'],
+  ['offer-letter.pdf', 0, 'Yesterday', '120 KB'],
+  ['screenshot.png', 1, '14 Oct', '612 KB'],
+  ['resume.pdf', 0, '12 Oct', '182 KB'],
 ]
 const drags = [
   [0.12, 0.26],
@@ -405,26 +497,33 @@ function FilesBody({ t, cur }: SceneProps) {
   const toast = easeOut(span(t, 0.84, 0.9))
   return (
     <Desktop title="Downloads">
-      {FILES.map(([name], i) => {
+      <div className="sc-cols" style={{ left: 20, top: 2 }}>
+        <span>Name</span>
+        <span>Date Modified</span>
+        <span>Size</span>
+      </div>
+      {FILES.map(([name, , date, size], i) => {
         const gone = t >= landed[i]
         const fading = i >= 3 ? 1 - span(t, landed[i] - 0.04, landed[i]) : gone ? 0 : 1
         return (
           <div key={name} className="sc-file" style={{ left: 20, top: 20 + i * 40, opacity: dragging === i ? 0.3 : fading }}>
             <span className={'sc-file-ico ' + name.split('.')[1]} />
-            {name}
+            <span className="sc-file-name">{name}</span>
+            <small>{date}</small>
+            <small>{size}</small>
           </div>
         )
       })}
       {folders.map((f, j) => (
         <div key={f} className={'sc-folder' + (dragging >= 0 && FILES[dragging][1] === j ? ' is-target' : '')} style={{ left: 340, top: 30 + j * 90 }}>
           <span className="sc-folder-ico" />
-          <div><b>{f}</b><small>{counts[j]} {counts[j] === 1 ? 'file' : 'files'}</small></div>
+          <div><b>{f}</b><small>{counts[j]} {counts[j] === 1 ? 'item' : 'items'}</small></div>
         </div>
       ))}
       {dragging >= 0 && (
         <div className="sc-file is-ghost" style={{ left: cur.x - 40 - 60, top: cur.y - 64 - 17 }}>
           <span className={'sc-file-ico ' + FILES[dragging][0].split('.')[1]} />
-          {FILES[dragging][0]}
+          <span className="sc-file-name">{FILES[dragging][0]}</span>
         </div>
       )}
       <Toast show={toast}>Sorted 6 files. You can undo this.</Toast>
@@ -444,7 +543,20 @@ export const SCENES: Scene[] = [
 
 
 /** Renders one scene at progress t (0..1), with the companion cursor and click ripples. */
-export function SceneStage({ scene, t, showRequest = true, bare = false }: { scene: Scene; t: number; showRequest?: boolean; bare?: boolean }) {
+export function SceneStage({
+  scene,
+  t,
+  showRequest = true,
+  bare = false,
+  hideCursor = false,
+}: {
+  scene: Scene
+  t: number
+  showRequest?: boolean
+  bare?: boolean
+  /** The host draws the cursor itself (the CRT does, above its colour filter). */
+  hideCursor?: boolean
+}) {
   const cur = cursorAt(scene.keys, t)
   const click = lastClick(scene.keys, t)
   const ripple = click ? span(t, click.t, click.t + 0.08) : 1
@@ -466,7 +578,7 @@ export function SceneStage({ scene, t, showRequest = true, bare = false }: { sce
         />
       )}
       {cur.down && <div className="sc-ripple sc-hold" style={{ left: cur.x, top: cur.y }} />}
-      <CursorArrow className="sc-cursor" size={20} style={{ transform: `translate(${cur.x}px, ${cur.y}px)` }} />
+      {!hideCursor && <CursorArrow className="sc-cursor" size={20} style={{ transform: `translate(${cur.x}px, ${cur.y}px)` }} />}
     </div>
     </StageCtx.Provider>
   )

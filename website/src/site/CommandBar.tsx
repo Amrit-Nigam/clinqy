@@ -36,7 +36,7 @@ export function CommandBar({ running }: { running: boolean }) {
   return (
     <div className="cmdbar" aria-label={`Example request: ${text}`}>
       <div className="cmdbar-input">
-        <kbd>⌃⌥</kbd>
+        <kbd>clinqy&gt;</kbd>
         <span>{shown}</span>
         {!working && <span className="cmdbar-caret" />}
       </div>
