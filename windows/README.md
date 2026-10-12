@@ -16,6 +16,9 @@ replays on Windows.
 
 **Requirements:** Windows 10 (1903+) or 11, x64. WebView2 (built into Windows 11 and current Windows 10).
 
+**One line** (in PowerShell): `irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex`
+does steps 1–2 for you. Or by hand:
+
 1. Download `Clinqy-windows-x64.zip` from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest)
    and unzip it.
 2. Right-click `install.ps1` → **Run with PowerShell**. No admin rights needed. It installs to

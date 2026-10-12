@@ -12,7 +12,7 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 "message mom I'll be late"           "in the background, add a reminder to call Raj"
 ```
 
-> **On Windows?** Clinqy runs there too, with the same extension, settings and workflows: see [windows/README.md](windows/README.md).
+> **On Windows?** Clinqy runs there too, with the same browser extension, settings and workflows. [**Download it for Windows**](https://github.com/Amrit-Nigam/clinqy/releases/latest) and see [Setup on Windows](#setup-on-windows).
 
 ## Setup guide
 
@@ -96,6 +96,61 @@ Connect to: cursor
 
 **Doing it by hand instead?** Copy [`env.example`](env.example) to `~/.config/clinqy/env`, uncomment your model option, then follow [Build & run](#build--run). All the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration).
 
+## Setup on Windows
+
+Clinqy for Windows is a ready-made download: no building, no admin rights. It needs Windows 10 (1903 or later) or Windows 11, on x64.
+
+**1. Install it.** Pick one:
+
+- **One line:** open PowerShell and paste:
+  ```powershell
+  irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex
+  ```
+- **By hand:**
+  1. Download **`Clinqy-windows-x64.zip`** from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest) and unzip it.
+  2. Right-click **`install.ps1`** → **Run with PowerShell**.
+
+The installer puts Clinqy in `%LOCALAPPDATA%\Programs\Clinqy` and adds it to the Start menu. It puts the `clinqy` command on your PATH and opens Clinqy at login, then starts it. Clinqy's icon appears in the system tray. The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**.
+
+**2. Pick a model.** Clinqy uses **Claude Code** unless you choose something else:
+
+```powershell
+winget install Anthropic.ClaudeCode
+claude        # log in once, then close it
+```
+
+To use agy, Codex, an Anthropic / OpenAI / Gemini / OpenRouter key, or a local model with Ollama, go to the tray icon → **Settings (model, keys)…**. Uncomment one block and save. It's the same settings file as on the Mac (`%USERPROFILE%\.config\clinqy\env`), and the options are explained in [Choosing the model](#choosing-the-model).
+
+**3. Add the browser extension** (Chrome, Edge or Brave). This lets Clinqy read and use web pages exactly:
+
+1. Go to the tray icon → **Browser extension…**. This opens the extension folder and your browser's extensions page, and copies the folder's path.
+2. Turn on **Developer mode**.
+3. Click **Load unpacked** and pick that folder.
+
+**4. Check it.** Go to the tray icon → **Check setup…**, or run `clinqy doctor` in a new terminal. Everything should say ready.
+
+**5. Use it.**
+
+| | |
+|---|---|
+| **Tap Ctrl+Alt** | open the command bar, type what you want, press Enter |
+| **Hold Ctrl+Alt** | talk (the voice model downloads the first time), let go to send |
+| **Ctrl+Alt while it works** | add something or change the plan |
+| **Click the tray icon while it works** | stop |
+| **Esc** | close the bar |
+
+The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and **History**, the same as on the Mac. Only the left Alt key counts, so typing with AltGr never opens Clinqy. To use another key combination, set `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) in the settings file.
+
+**Use it from coding agents (optional).** `clinqy run`, `clinqy qa` and `clinqy look` work in any terminal, as on the Mac (see [The `clinqy` command](#the-clinqy-command-qa-and-workflows-for-any-coding-agent)). To add Clinqy as an MCP server:
+
+```powershell
+claude mcp add clinqy -- "$env:LOCALAPPDATA\Programs\Clinqy\clinqy.exe" mcp
+```
+
+For other agents, use the same command and the argument `mcp`.
+
+**Updating** means running the installer again; your settings, memory and history are kept. **Uninstalling** means running `uninstall.ps1` in `%LOCALAPPDATA%\Programs\Clinqy`; add `-Purge` to also delete your settings and data. More detail, including building from source, is in [windows/README.md](windows/README.md).
+
 ---
 
 ## Features
@@ -138,7 +193,7 @@ Connect to: cursor
 
 ## Requirements
 
-- macOS 14+ on Apple silicon (tested on an M4)
+- macOS 14+ on Apple silicon (tested on an M4), or Windows 10 (1903+) / 11 on x64 with the [Windows download](#setup-on-windows) (the rest of this list is for building the Mac app)
 - Swift 5.9+ (Xcode Command Line Tools are enough)
 - A model to drive it, one of:
   - [Claude Code](https://claude.com/claude-code), [Codex CLI](https://github.com/openai/codex) or [Antigravity CLI (`agy`)](https://antigravity.google/docs/cli/overview), installed and logged in (your existing login is used), or
