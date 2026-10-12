@@ -509,3 +509,17 @@ pub fn window_titled(pid: u32, title: &str) -> Option<isize> {
 pub fn main_window_of(pid: u32) -> Option<isize> {
     top_windows().into_iter().find(|h| pid_of(*h) == pid)
 }
+
+/// The process owning the top-level window at a screen point. Apps built on WebView2 (WhatsApp, Teams, the new
+/// Outlook…) draw their content in a child window of another process (msedgewebview2.exe); its top-level window is
+/// still the app's.
+pub fn root_pid_at(x: f64, y: f64) -> Option<u32> {
+    unsafe {
+        let h = WindowFromPoint(windows::Win32::Foundation::POINT { x: x as i32, y: y as i32 });
+        if h.0.is_null() {
+            return None;
+        }
+        let root = GetAncestor(h, GA_ROOT);
+        Some(pid_of(if root.0.is_null() { h.0 as isize } else { root.0 as isize }))
+    }
+}

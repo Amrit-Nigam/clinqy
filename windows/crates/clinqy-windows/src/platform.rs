@@ -439,6 +439,10 @@ impl Platform for WindowsPlatform {
         if owner == pid || owner == apps::own_pid() || owner == 0 {
             return None;
         }
+        // Content hosted in the app's own window by another process (WebView2 apps like WhatsApp).
+        if apps::root_pid_at(point.x, point.y) == Some(pid) {
+            return None;
+        }
         let other = apps::exe_path(owner).map(|p| apps::friendly_name(0, &p)).unwrap_or_else(|| "another app".into());
         // A browser's page can answer from a helper process of the same browser.
         let target_exe = apps::exe_path(pid).unwrap_or_default();

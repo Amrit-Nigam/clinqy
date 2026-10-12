@@ -15,6 +15,11 @@ use windows::Win32::Foundation::{HWND, POINT, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Accessibility::*;
 
+/// Window classes whose whole-subtree reads are slow or fail (see `Uia::walk`).
+/// WinUI 3 windows are known to be: their whole-subtree read stalls ~2 s and misses hosted WebView2 content.
+static SLOW_SUBTREE: parking_lot::Mutex<std::collections::BTreeSet<String>> = parking_lot::Mutex::new(std::collections::BTreeSet::new());
+const SLOW_KNOWN: [&str; 1] = ["WinUIDesktopWin32WindowClass"];
+
 pub struct Uia {
     pub automation: IUIAutomation,
     handles: Mutex<HashMap<u64, IUIAutomationElement>>,
@@ -237,10 +242,19 @@ impl Uia {
     fn walk(&self, root: &IUIAutomationElement, props: &[UIA_PROPERTY_ID], prune_documents: bool, cap: usize) -> Vec<(Node, usize)> {
         com::ensure();
         let mut out = vec![];
-        if !prune_documents {
-            // One cross-process call for the whole window.
+        let class = unsafe { root.CurrentClassName() }.map(|c| c.to_string()).unwrap_or_default();
+        if !prune_documents && !SLOW_KNOWN.contains(&class.as_str()) && !SLOW_SUBTREE.lock().contains(&class) {
+            // One cross-process call for the whole window. Some frameworks (WinUI 3 hosting WebView2, like
+            // WhatsApp) take seconds to answer it, or fail: those windows are walked level by level from then on.
             let Some(cr) = self.cache_request(props, TreeScope_Subtree) else { return out };
-            let Ok(cached) = (unsafe { root.BuildUpdatedCache(&cr) }) else { return out };
+            let t0 = std::time::Instant::now();
+            let cached = unsafe { root.BuildUpdatedCache(&cr) };
+            if cached.is_err() || t0.elapsed() > std::time::Duration::from_millis(700) {
+                clinqy_core::log::write(&format!("    (UI Automation: {class} windows are slow to read whole; reading them level by level)"));
+                SLOW_SUBTREE.lock().insert(class);
+                return self.walk_levels(root, props, false, cap);
+            }
+            let Ok(cached) = cached else { return out };
             let mut queue: VecDeque<(IUIAutomationElement, usize)> = VecDeque::from([(cached, 0)]);
             while let Some((el, depth)) = queue.pop_front() {
                 if out.len() >= cap {
@@ -262,7 +276,12 @@ impl Uia {
             }
             return out;
         }
-        // Browsers: level by level, children of each container in one call, stopping at the page.
+        self.walk_levels(root, props, prune_documents, cap)
+    }
+
+    /// Level by level, the children of each container in one call; `prune_documents` stops at a browser's page.
+    fn walk_levels(&self, root: &IUIAutomationElement, props: &[UIA_PROPERTY_ID], prune_documents: bool, cap: usize) -> Vec<(Node, usize)> {
+        let mut out = vec![];
         let Some(cr) = self.cache_request(props, TreeScope_Element) else { return out };
         let Ok(cond) = (unsafe { self.automation.ControlViewCondition() }) else { return out };
         let Ok(start) = (unsafe { root.BuildUpdatedCache(&cr) }) else { return out };
@@ -274,7 +293,7 @@ impl Uia {
             }
             visited += 1;
             let Some(n) = read(&el) else { continue };
-            let enter = n.ct != UIA_DocumentControlTypeId && depth < 30;
+            let enter = (!prune_documents || n.ct != UIA_DocumentControlTypeId) && depth < 30;
             out.push((n, depth));
             if !enter {
                 continue;

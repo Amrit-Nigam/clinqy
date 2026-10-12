@@ -619,6 +619,7 @@ impl Agent {
             return self.end(line, ActionResult::fail(why));
         }
         let mut target = "the focused field".to_string();
+        let mut field: Option<u64> = None;
         if action.contains_key("id") {
             let Some(el) = self.resolve(action.get("id"), ctx, rs).await else {
                 return self.end(line, ActionResult::fail("element isn't on screen anymore"));
@@ -627,6 +628,7 @@ impl Agent {
                 return self.end(line, ActionResult::fail(why));
             }
             target = el.describe();
+            field = Some(el.handle);
         }
         self.buddy.set_typing(true);
         let r = self.platform.type_text(text, &app).await;
@@ -634,14 +636,38 @@ impl Agent {
         if let Err(why) = r {
             return self.end(line, ActionResult::fail(why));
         }
+        // The field itself says whether the text is in it. Apps that host web content (WhatsApp, Teams) report
+        // focus on their outer window, so the focused value can't tell; the field we typed into can.
+        let reads = |h: u64| self.platform.element_value(h);
+        if let Some(h) = field.filter(|h| reads(*h).is_some()) {
+            if !reads(h).map(|v| observation::similar(&v, text)).unwrap_or(false) {
+                // Once more: focus it again and paste, replacing whatever is there.
+                let _ = self.platform.focus_element(h, &app).await;
+                self.platform.select_all();
+                tokio::time::sleep(Duration::from_millis(60)).await;
+                self.platform.paste(text);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+                if !reads(h).map(|v| observation::similar(&v, text)).unwrap_or(false) {
+                    let shows = reads(h).unwrap_or_default().trim().chars().take(60).collect::<String>();
+                    return self.end(line, ActionResult::fail(format!("the text didn't go into {target} (it shows {shows:?}); look again before retrying")));
+                }
+            }
+        }
+        let mut sent_note = "";
         if submit {
             tokio::time::sleep(Duration::from_millis(120)).await;
             let _ = self.platform.press("enter");
             let _ = self.screen_changed(&app, ctx.fingerprint, 500).await;
+            // A chat or search box empties when Enter sends it; if the text is still there, nothing was sent.
+            if let Some(h) = field.filter(|h| reads(*h).is_some()) {
+                if reads(h).map(|v| observation::similar(&v, text)).unwrap_or(false) {
+                    sent_note = " — but the text is still in the field, so it may not have been sent (check before saying it was)";
+                }
+            }
         }
         ctx.fingerprint = self.platform.fingerprint(&app).await;
         self.buddy.clear_highlight();
-        self.end(line, ActionResult::ok(format!("typed {:?} into {target}{}", text.chars().take(60).collect::<String>(), if submit { " and pressed Enter" } else { "" })))
+        self.end(line, ActionResult::ok(format!("typed {:?} into {target}{}{sent_note}", text.chars().take(60).collect::<String>(), if submit { " and pressed Enter" } else { "" })))
     }
 
     /// Best source first: the web page, a PDF in the browser, a file the window has open, then OCR of the screen.
