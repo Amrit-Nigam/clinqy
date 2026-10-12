@@ -1,0 +1,82 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Clinqy status</title>
+<style>
+  :root { --bg: #17171a; --panel: #1f1f24; --line: #2c2c33; --text: #ececf1; --dim: #9a9aa6; --faint: #6b6b76; --accent: #3b82f6; --accent2: #60a5fa;
+    --ok: #22c55e; --bad: #ef4444; --think: #8b5cf6; --listen: #10b981; --warn: #f59e0b; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg); color: var(--text); overflow: hidden; font: 13px/1.45 "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; user-select: none; }
+  .cap { display: flex; align-items: center; gap: 10px; padding: 10px 12px 10px 14px; height: 48px; }
+  .dot { width: 10px; height: 10px; border-radius: 50%; flex: none; background: var(--accent); box-shadow: 0 0 10px var(--accent); }
+  .dot.thinking { background: var(--think); box-shadow: 0 0 10px var(--think); animation: breathe 1.1s infinite; }
+  .dot.acting { background: var(--accent); }
+  .dot.waiting { background: var(--warn); box-shadow: 0 0 10px var(--warn); animation: breathe 1.6s infinite; }
+  .dot.listening { background: var(--listen); box-shadow: 0 0 10px var(--listen); animation: breathe .8s infinite; }
+  .dot.done { background: var(--ok); box-shadow: 0 0 10px var(--ok); } .dot.failed { background: var(--bad); box-shadow: 0 0 10px var(--bad); }
+  @keyframes breathe { 50% { opacity: .45; } }
+  .say { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; font-size: 13.5px; }
+  .count { color: var(--faint); font-size: 12px; }
+  .btn { border: 1px solid #3a3a44; background: #26262d; color: var(--dim); border-radius: 8px; height: 28px; padding: 0 10px; font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; }
+  .btn:hover { color: var(--text); border-color: var(--bad); }
+  .btn.ghost:hover { border-color: var(--accent); }
+  .card { border-top: 1px solid var(--line); padding: 10px 14px 12px; max-height: 420px; overflow-y: auto; }
+  .card::-webkit-scrollbar { width: 8px; } .card::-webkit-scrollbar-thumb { background: #33333b; border-radius: 4px; }
+  .card h3 { margin: 0 0 6px; font-size: 14px; display: flex; gap: 8px; align-items: center; }
+  .card h3 span { flex: 1; }
+  .card .text { white-space: pre-wrap; color: var(--dim); margin-bottom: 8px; user-select: text; }
+  .item { padding: 8px 10px; border-radius: 10px; background: var(--panel); border: 1px solid var(--line); margin-bottom: 6px; user-select: text; }
+  .item .t { font-weight: 600; } .item .s { color: var(--dim); font-size: 12.5px; } .item .d { color: var(--accent2); font-size: 12.5px; float: right; }
+  a { color: var(--accent2); }
+</style>
+</head>
+<body>
+<div class="cap">
+  <span class="dot" id="dot"></span>
+  <span class="say" id="say">Ready</span>
+  <span class="count" id="count"></span>
+  <button class="btn ghost" id="open" title="Open the command bar">Open</button>
+  <button class="btn" id="stop" title="Stop the current task">■ Stop</button>
+</div>
+<div class="card" id="card" style="display:none"></div>
+<script>
+const $ = (s) => document.querySelector(s);
+const send = (o) => window.ipc.postMessage(JSON.stringify(o));
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+let showCard = false, last = null;
+function render(s) {
+  last = s;
+  const phase = s.listening ? "listening" : s.phase;
+  $("#dot").className = "dot " + phase;
+  const steps = s.steps || [];
+  $("#say").textContent = s.listening ? (s.transcript || "Listening…") : (s.running ? (s.narration || "Working…") : (s.answer || s.narration || "Done"));
+  $("#say").title = $("#say").textContent;
+  $("#count").textContent = s.running && steps.length ? `${steps.filter((x) => x.state === "ok").length}/${steps.length}` : "";
+  $("#stop").style.display = s.running ? "" : "none";
+  $("#open").style.display = s.running ? "none" : "";
+  const card = $("#card");
+  if (s.result && showCard) {
+    const r = s.result;
+    card.style.display = "";
+    card.innerHTML = `<h3><span>${esc(r.title)}</span><button class="btn ghost" id="copy">Copy</button><button class="btn ghost" id="close">✕</button></h3>`
+      + (r.text ? `<div class="text">${esc(r.text)}</div>` : "")
+      + r.items.map((i) => `<div class="item">${i.detail ? `<span class="d">${esc(i.detail)}</span>` : ""}<div class="t">${i.link ? `<a href="#" data-link="${esc(i.link)}">${esc(i.title)}</a>` : esc(i.title)}</div>${i.subtitle ? `<div class="s">${esc(i.subtitle)}</div>` : ""}</div>`).join("");
+    $("#copy").onclick = () => send({ type: "copy" });
+    $("#close").onclick = () => { showCard = false; send({ type: "dismiss" }); render(last); };
+  } else {
+    card.style.display = "none";
+  }
+  requestAnimationFrame(() => send({ type: "resize", height: document.body.scrollHeight }));
+}
+window.clinqy = {
+  update(s) { render(s); },
+  card(on) { showCard = on; if (last) render(last); },
+};
+$("#stop").onclick = () => send({ type: "cancel" });
+$("#open").onclick = () => send({ type: "open" });
+document.addEventListener("click", (e) => { const a = e.target.closest("[data-link]"); if (a) { e.preventDefault(); send({ type: "link", url: a.dataset.link }); } });
+send({ type: "ready" });
+</script>
+</body>
+</html>

@@ -1,0 +1,38 @@
+# Clinqy for Windows. Three crates, split by what they may depend on:
+#   clinqy-core     the agent itself: models, prompt, loop, memory, history, browser bridge, MCP. No OS APIs.
+#   clinqy-windows  the Windows platform layer: UI Automation, input, screen capture, OCR, overlay cursor, hotkey.
+#   clinqy-app      clinqy.exe: tray, command bar, IPC for the `clinqy` command, and the wiring between the two.
+[workspace]
+resolver = "2"
+members = ["crates/clinqy-core", "crates/clinqy-windows", "crates/clinqy-app"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["Clinqy contributors"]
+
+[workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+parking_lot = "0.12"
+rand = "0.8"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "net", "fs"] }
+uuid = { version = "1", features = ["v4"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
