@@ -6,6 +6,7 @@ import ServiceManagement
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var onboarding: OnboardingWindow?
     private var buddy: Buddy!
     private var agent: Agent!
     private var voice: Voice!
@@ -58,6 +59,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         Whisper.shared.prepare()
         BrowserBridge.shared.start()
+        // First launch of a downloaded copy: walk through setup. A Mac that already has settings skips it.
+        if !OnboardingWindow.isDone {
+            if FileManager.default.fileExists(atPath: Config.fileURL.path) {
+                UserDefaults.standard.set(true, forKey: OnboardingWindow.doneKey)
+            } else {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.showOnboarding() }
+            }
+        }
         Clipboard.start()
         startScheduler()
 
@@ -125,6 +134,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Open Clinqy  (⌃⌥)", action: #selector(togglePanel), keyEquivalent: "")
         menu.addItem(withTitle: "Talk  (hold ⌃⌥)", action: #selector(toggleMic), keyEquivalent: "")
         menu.addItem(withTitle: "Circle Something…", action: #selector(startCircling), keyEquivalent: "")
+        menu.addItem(withTitle: "Set Up Clinqy…", action: #selector(showOnboarding), keyEquivalent: "")
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
@@ -676,6 +686,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             try? "".write(to: url, atomically: true, encoding: .utf8)
         }
         NSWorkspace.shared.open(url)
+    }
+
+    @objc func showOnboarding() {
+        if onboarding == nil {
+            onboarding = OnboardingWindow(onFinish: { [weak self] in
+                Brain.prewarm()
+                // Show where Clinqy lives now that it's ready.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.panel.showCentered() }
+            }, run: { [weak self] task in
+                self?.agent.submit(task, test: true)
+            }, isRunning: { [weak self] in
+                self?.agent.isRunning ?? false
+            })
+        }
+        onboarding?.present()
     }
 
     @objc func checkPermissions() {

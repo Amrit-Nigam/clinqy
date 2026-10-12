@@ -1,5 +1,6 @@
 #!/bin/bash
 # Builds Clinqy.app (no Xcode needed) and optionally launches it: ./build.sh [run]
+# ./build.sh --bundle-only builds build/Clinqy.app and stops there (make-dmg.sh uses it).
 set -euo pipefail
 cd "$(dirname "$0")"
 
@@ -9,6 +10,11 @@ rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
 cp assets/AppIcon.icns "$APP/Contents/Resources/AppIcon.icns"
 cp .build/release/Clinqy "$APP/Contents/MacOS/Clinqy"
+# What a downloaded copy needs without the repo: the browser extension (setup copies it out for "Load unpacked"),
+# the `clinqy` command (setup links it into ~/.local/bin) and the fonts setup is drawn with.
+cp -R extension "$APP/Contents/Resources/extension"
+cp bin/clinqy "$APP/Contents/Resources/clinqy"
+cp website/public/fonts/GeistPixel-Square.woff2 website/public/fonts/GeistMono-Variable.woff2 "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
@@ -45,6 +51,7 @@ else
   codesign --force --deep --sign - "$APP"
 fi
 echo "Built $APP"
+[[ "${1:-}" == "--bundle-only" ]] && exit 0
 
 # Run from /Applications, not from inside ~/Desktop: an app living in a protected folder keeps
 # getting macOS's "access files in your Desktop/Documents folder" prompt on every launch.

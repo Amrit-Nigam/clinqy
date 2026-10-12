@@ -205,6 +205,15 @@ main > section {
 .btn-quiet:hover {
   background: rgba(233, 236, 243, 0.08);
 }
+.btn-outline {
+  background: transparent;
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px rgba(233, 236, 243, 0.32);
+}
+.btn-outline:hover {
+  background: rgba(233, 236, 243, 0.08);
+  box-shadow: inset 0 0 0 1px rgba(233, 236, 243, 0.7);
+}
 .nav .btn {
   min-height: 34px;
   font-size: 13.5px;
@@ -2230,4 +2239,116 @@ main > section.finale {
   .field-scrim {
     background: rgba(8, 9, 13, 0.72);
   }
+}
+
+/* ── Setup: Mac / Windows ── */
+
+.platform-tabs {
+  display: inline-flex;
+  gap: 2px;
+  margin-bottom: 36px;
+  padding: 3px;
+  border-radius: 9px;
+  background: rgba(255, 255, 255, 0.05);
+  box-shadow: inset 0 0 0 1px var(--line);
+}
+.platform-tabs button {
+  border: 0;
+  padding: 7px 18px;
+  border-radius: 7px;
+  background: transparent;
+  font: 500 14px / 1 var(--mono);
+  color: var(--text-soft);
+  cursor: pointer;
+  transition:
+    background-color 0.2s,
+    color 0.2s;
+}
+.platform-tabs button:hover {
+  color: var(--text);
+}
+.platform-tabs button.is-on {
+  background: var(--text);
+  color: var(--bg);
+}
+.platform-tabs button:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+}
+.step-cta {
+  margin-top: 14px;
+}
+.setup-alt h3 {
+  font: 600 17px / 1.35 var(--mono);
+}
+.setup-alt > p {
+  margin: 6px 0 0 !important;
+  color: var(--text-soft);
+}
+.setup-alt .models {
+  margin-bottom: 20px;
+}
+.setup-alt .term {
+  margin-top: 20px;
+}
+.fineprint a {
+  color: var(--text);
+  text-underline-offset: 3px;
+}
+.steps a:not(.btn) {
+  color: var(--text);
+  text-underline-offset: 3px;
+}
+
+/* ── Brand marks in the hero buttons ── */
+
+.brand-icon {
+  width: 1.05em;
+  height: 1.05em;
+  flex: none;
+  margin-right: 0.6ch;
+}
+.agent-cycle {
+  position: relative;
+  display: inline-block;
+  width: 1.05em;
+  height: 1.05em;
+  margin-right: 0.6ch;
+  overflow: hidden;
+  flex: none;
+}
+.agent-cycle .brand-icon {
+  margin: 0;
+}
+.agent-cycle-item {
+  position: absolute;
+  inset: 0;
+  display: flex;
+  transform: translateY(110%);
+  opacity: 0;
+  transition:
+    transform 0.35s cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 0.35s;
+}
+.agent-cycle-item.is-on {
+  transform: none;
+  opacity: 1;
+}
+.agent-cycle-item.is-off {
+  transform: translateY(-110%);
+}
+@media (prefers-reduced-motion: reduce) {
+  .agent-cycle-item {
+    transition: none;
+  }
+}
+/* the marks add width; keep both downloads on one row */
+.hero-ctas .btn {
+  padding: 0 12px;
+}
+.hero-ctas .btn::before {
+  margin-right: 0.55ch;
+}
+.hero-ctas .btn::after {
+  margin-left: 0.55ch;
 }

@@ -32,7 +32,7 @@ enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]
 
 ensure_app() {
   pgrep -x Clinqy >/dev/null && return
-  open -b com.amritnigam.clinqy 2>/dev/null || { echo "Clinqy isn't installed (run ./build.sh in the repo)"; exit 2; }
+  open -b com.amritnigam.clinqy 2>/dev/null || { echo "Clinqy isn't installed. Get it from https://clinqy.vercel.app (or run ./build.sh in the repo)"; exit 2; }
   sleep 3
 }
 
@@ -149,7 +149,7 @@ PY
   stats|mcp|watch|replay|memory)
     # Handled by the app binary itself (no running app needed): stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>, memory.
     APP=/Applications/Clinqy.app/Contents/MacOS/Clinqy
-    [[ -x $APP ]] || { echo "Clinqy isn't installed (run ./build.sh in the repo)"; exit 2; }
+    [[ -x $APP ]] || { echo "Clinqy isn't installed. Get it from https://clinqy.vercel.app (or run ./build.sh in the repo)"; exit 2; }
     exec $APP "$cmd" "$@" ;;
   *) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
 esac

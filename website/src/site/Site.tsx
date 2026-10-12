@@ -9,8 +9,21 @@ import { HowArt, SafetyArt, SetupArt } from './IsoArt'
 import { AgentSection, QaSection } from './AgentSections'
 import { SETUP_PROMPT } from './setupPrompt'
 import { Tour, TourOffer } from './Tour'
+import { AgentCycle, BrandIcon } from './BrandIcons'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
+const MAC_DMG = `${GITHUB}/releases/download/mac-v0.2.0/Clinqy.dmg`
+// Windows releases are the repo's "latest", so this link follows each new one.
+const WIN_ZIP = `${GITHUB}/releases/latest/download/Clinqy-windows-x64.zip`
+const WIN_INSTALL = `irm ${GITHUB}/releases/latest/download/install.ps1 | iex`
+
+type Platform = 'mac' | 'windows'
+const detected: Platform = /Windows/i.test(navigator.userAgent) ? 'windows' : 'mac'
+const DOWNLOAD: Record<Platform, { href: string; label: string }> = {
+  mac: { href: MAC_DMG, label: 'Download for Mac' },
+  windows: { href: WIN_ZIP, label: 'Download for Windows' },
+}
+const other = (p: Platform): Platform => (p === 'mac' ? 'windows' : 'mac')
 
 /** Real requests from the README, for the strip under the hero. */
 const ASKS = [
@@ -79,14 +92,14 @@ const CAN = [
   {
     say: 'check how localhost:5173 looks in my browser',
     title: 'Works with your coding agent',
-    body: 'Add Clinqy as an MCP server to Claude Code, Cursor, Codex or Gemini CLI, and they can see how your page really renders, logged in, in your own browser.',
+    body: 'Add Clinqy as an MCP server to Claude Code, Cursor, Codex or agy, and they can see how your page really renders, logged in, in your own browser.',
   },
 ]
 
 const MODELS: [string, string][] = [
   ['claude cli', 'your Claude login'],
   ['codex cli', 'your ChatGPT login'],
-  ['gemini cli', 'your Google login'],
+  ['agy cli', 'your Google login'],
   ['anthropic api key', 'or openai, gemini, openrouter'],
   ['ollama qwen3-vl', 'any local vision model'],
 ]
@@ -101,6 +114,8 @@ function Rule() {
 
 export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }) {
   const [copied, setCopied] = useState(false)
+  const [platform, setPlatform] = useState<Platform>(detected)
+  const [winCopied, setWinCopied] = useState(false)
   const [tour, setTour] = useState<'offer' | 'on' | 'off' | null>(null)
   const [toast, setToast] = useState('')
 
@@ -157,7 +172,23 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
     }
   }
 
+  async function copyWinInstall() {
+    try {
+      await navigator.clipboard.writeText(WIN_INSTALL)
+      setWinCopied(true)
+      setTimeout(() => setWinCopied(false), 2200)
+    } catch {
+      /* the command is visible to select by hand */
+    }
+  }
+
   const copyLabel = copied ? 'Copied. Paste it into your agent' : 'Copy the setup prompt'
+  const download = (p: Platform, primary: boolean) => (
+    <a className={'btn ' + (primary ? 'btn-primary' : 'btn-outline')} href={DOWNLOAD[p].href} data-buddy>
+      <BrandIcon name={p === 'mac' ? 'apple' : 'windows'} />
+      {DOWNLOAD[p].label}
+    </a>
+  )
 
   return (
     <div className="site">
@@ -194,22 +225,22 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               {ARROW.join('\n')}
             </pre>
             <div data-tour="hello">
-              <Scramble as="h1" text={'Your Mac,\non autopilot.'} start={live} />
+              <Scramble as="h1" text={'Your cursor’s\nnew buddy.'} start={live} />
             </div>
-            <p className="hero-sub">And you can watch it work.</p>
+            <p className="hero-sub">It does the clicking. You watch it work.</p>
             <p className="lede">
-              Press <kbd data-tour="keys">⌃⌥</kbd> and say what you want. A small blue cursor goes and does it on screen. It clicks the Dock, types
-              into the address bar, ticks the boxes and fills the form, then hands your pointer back.
+              Press <kbd data-tour="keys">⌃⌥</kbd> (Ctrl+Alt on Windows) and say what you want. A small blue cursor goes and does it on
+              screen. It opens the app, types into the address bar, ticks the boxes and fills the form, then hands your pointer back.
             </p>
             <div className="hero-ctas">
-              <button type="button" className="btn btn-primary" onClick={copyPrompt} data-buddy>
-                {copyLabel}
+              {download(detected, true)}
+              {download(other(detected), false)}
+              <button type="button" className="btn btn-outline" onClick={copyPrompt} data-buddy>
+                <AgentCycle />
+                {copied ? 'Copied. Paste it into your agent' : 'Copy the one-prompt install'}
               </button>
-              <a className="btn btn-quiet" href={GITHUB} target="_blank" rel="noreferrer" data-buddy>
-                View on GitHub
-              </a>
             </div>
-            <p className="fineprint">Free and open source. macOS 14+ on Apple silicon.</p>
+            <p className="fineprint">Free and open source. macOS 14+ on Apple silicon, or Windows 10 and 11.</p>
           </div>
           <div data-tour="desk">
             <LiveDesk running={live} />
@@ -256,7 +287,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
         <Rule />
         <section className="watch" id="watch">
           <div className="section-head">
-            <Scramble as="h2" text="It uses your Mac the way you would" />
+            <Scramble as="h2" text="It uses your computer the way you would" />
             <p>
               No hidden APIs and no headless browser. It opens apps from the Dock, types at a human rhythm and clicks
               for real. Pick a request.
@@ -299,20 +330,66 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
         <section className="setup" id="setup">
           <div className="section-head has-art">
             <div>
-              <Scramble as="h2" text="Set up in one paste" />
-              <p>Your coding agent does the setup. It builds Clinqy, installs it, and only stops when it needs you.</p>
+              <Scramble as="h2" text="Get Clinqy" />
+              <p>Download the app and follow a few steps, or paste one prompt into your coding agent and it sets everything up.</p>
             </div>
             <div className="art">
               <SetupArt />
             </div>
           </div>
-          <div className="setup-grid">
-            <ol className="steps">
-              <li>
-                <h3>Fill in two lines</h3>
+
+          <div className="platform-tabs" role="tablist" aria-label="Your computer">
+            {(['mac', 'windows'] as const).map((p) => (
+              <button
+                key={p}
+                type="button"
+                role="tab"
+                aria-selected={platform === p}
+                className={platform === p ? 'is-on' : undefined}
+                onClick={() => setPlatform(p)}
+                data-buddy
+              >
+                {p === 'mac' ? 'Mac' : 'Windows'}
+              </button>
+            ))}
+          </div>
+
+          {platform === 'mac' ? (
+            <div className="setup-grid" role="tabpanel" aria-label="Mac">
+              <div>
+                <ol className="steps">
+                  <li>
+                    <h3>Download and install</h3>
+                    <p>
+                      Open <code>Clinqy.dmg</code> and drag Clinqy into Applications.
+                    </p>
+                    <div className="step-cta">{download('mac', true)}</div>
+                  </li>
+                  <li>
+                    <h3>Open it once from Settings</h3>
+                    <p>
+                      Clinqy isn’t notarized by Apple yet, so macOS blocks the first launch. Open System Settings → Privacy &amp; Security,
+                      scroll down and click Open Anyway.
+                    </p>
+                  </li>
+                  <li>
+                    <h3>Follow the setup window</h3>
+                    <p>
+                      It walks you through picking a model (Claude Code, agy, Codex, an API key or Ollama), the permissions, and the
+                      browser extension, which Clinqy can load for you. Then it shows you the keys.
+                    </p>
+                  </li>
+                  <li>
+                    <h3>Press ⌃⌥</h3>
+                    <p>Tap to type, hold to talk. Ask it something, like “where’s the brightness setting?”</p>
+                  </li>
+                </ol>
+              </div>
+              <div className="setup-alt">
+                <h3>Or let your coding agent do it</h3>
                 <p>
-                  <code>Model:</code> is what drives Clinqy. <code>Connect to:</code> lists the coding agents that can
-                  use it.
+                  Fill in the first two lines, then paste it into Claude Code, Cursor, Codex, agy or Windsurf. It builds Clinqy from source,
+                  sets up your model and the extension, and only stops when it needs you.
                 </p>
                 <dl className="models">
                   {MODELS.map(([k, v]) => (
@@ -322,41 +399,86 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                     </div>
                   ))}
                 </dl>
-              </li>
-              <li>
-                <h3>Paste it into your agent</h3>
-                <p>Claude Code, Cursor, Codex, Gemini CLI or Windsurf.</p>
-              </li>
-              <li>
-                <h3>Allow access, press ⌃⌥</h3>
-                <p>Accessibility, Screen Recording, Microphone and Speech Recognition. Then ask it something.</p>
-              </li>
-            </ol>
-            <div className="term">
-              <div className="term-bar">
-                <i />
-                <i />
-                <i />
-                <span>setup prompt</span>
-                <button type="button" className="btn btn-primary btn-small" onClick={copyPrompt} data-buddy data-tour="copy">
-                  {copied ? 'Copied' : 'Copy'}
-                </button>
+                <div className="term">
+                  <div className="term-bar">
+                    <i />
+                    <i />
+                    <i />
+                    <span>setup prompt</span>
+                    <button type="button" className="btn btn-primary btn-small" onClick={copyPrompt} data-buddy data-tour="copy">
+                      {copied ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <pre tabIndex={0}>{SETUP_PROMPT}</pre>
+                </div>
               </div>
-              <pre tabIndex={0}>{SETUP_PROMPT}</pre>
             </div>
-          </div>
+          ) : (
+            <div className="setup-grid" role="tabpanel" aria-label="Windows">
+              <div>
+                <ol className="steps">
+                  <li>
+                    <h3>Download and install</h3>
+                    <p>
+                      Unzip <code>Clinqy-windows-x64.zip</code>, right-click <code>install.ps1</code> and choose Run with PowerShell. No admin
+                      rights needed. If SmartScreen warns you, click More info → Run anyway.
+                    </p>
+                    <div className="step-cta">{download('windows', true)}</div>
+                  </li>
+                  <li>
+                    <h3>Pick a model</h3>
+                    <p>
+                      With nothing set, Clinqy uses Claude Code: <code>winget install Anthropic.ClaudeCode</code>, then run <code>claude</code>{' '}
+                      once to log in. For anything else, tray icon → Settings (model, keys)…
+                    </p>
+                  </li>
+                  <li>
+                    <h3>Add the browser extension</h3>
+                    <p>
+                      Tray icon → Browser extension… opens the folder and your extensions page. Turn on Developer mode, click Load unpacked
+                      and pick that folder.
+                    </p>
+                  </li>
+                  <li>
+                    <h3>Check it</h3>
+                    <p>
+                      Tray icon → Check setup…, or run <code>clinqy doctor</code> in a new terminal. Everything should say ready.
+                    </p>
+                  </li>
+                  <li>
+                    <h3>Tap Ctrl+Alt</h3>
+                    <p>Type what you want and press Enter, or hold Ctrl+H and say it.</p>
+                  </li>
+                </ol>
+              </div>
+              <div className="setup-alt">
+                <h3>Or install from PowerShell</h3>
+                <p>This one line downloads Clinqy and does step 1 for you.</p>
+                <div className="term">
+                  <div className="term-bar">
+                    <i />
+                    <i />
+                    <i />
+                    <span>PowerShell</span>
+                    <button type="button" className="btn btn-primary btn-small" onClick={copyWinInstall} data-buddy data-tour="copy">
+                      {winCopied ? 'Copied' : 'Copy'}
+                    </button>
+                  </div>
+                  <pre tabIndex={0}>{WIN_INSTALL}</pre>
+                </div>
+              </div>
+            </div>
+          )}
         </section>
 
         <section className="finale" aria-labelledby="finale-title" data-tour="finale">
           <AsciiFinale />
-          <p id="finale-title" className="finale-line">Press ⌃⌥. Say it. Watch it happen.</p>
+          <p id="finale-title" className="finale-line">Press {detected === 'mac' ? '⌃⌥' : 'Ctrl+Alt'}. Say it. Watch it happen.</p>
           <div className="hero-ctas" data-tour="finale-cta">
-            <button type="button" className="btn btn-primary" onClick={copyPrompt} data-buddy>
+            {download(detected, true)}
+            <button type="button" className="btn btn-quiet" onClick={copyPrompt} data-buddy>
               {copyLabel}
             </button>
-            <a className="btn btn-quiet" href={GITHUB} target="_blank" rel="noreferrer" data-buddy>
-              View on GitHub
-            </a>
           </div>
         </section>
       </main>

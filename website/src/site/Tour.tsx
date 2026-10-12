@@ -31,7 +31,7 @@ const STEPS: Step[] = [
   {
     target: '[data-tour="hello"]',
     at: [0.62, 0.45],
-    say: 'Hi, I’m Clinqy. On your Mac I move to things, look, click and type, just like you. Let me show you this page the same way.',
+    say: 'Hi, I’m Clinqy. On your computer I move to things, look, click and type, just like you. Let me show you this page the same way.',
     do: 'frame',
     dwell: 700,
   },
@@ -94,7 +94,7 @@ const STEPS: Step[] = [
     target: '[data-tour="copy"]',
     view: '.term',
     at: [0.5, 0.55],
-    say: 'Want the setup prompt? I’ll copy it to your clipboard, but only if you say so.',
+    say: 'Want the setup command? I’ll copy it to your clipboard, but only if you say so.',
     do: 'ask',
     ask: ['Not now', 'Copy it'],
   },
@@ -102,7 +102,7 @@ const STEPS: Step[] = [
     target: '[data-tour="finale-cta"]',
     view: '[data-tour="finale"]',
     at: [0.5, 0.6],
-    say: 'That’s the tour. Paste the prompt into your coding agent and I’ll be on your Mac in a few minutes.',
+    say: 'That’s the tour. Download me, or paste the prompt into your coding agent, and I’ll be on your computer in a few minutes.',
     dwell: 1800,
   },
 ]

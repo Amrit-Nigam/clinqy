@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import AppKit
+import SwiftUI
 
 // Clinqy was called CursorBoy: carry its memory, history, skills, workflows, models and settings over once.
 do {
@@ -252,6 +253,36 @@ if command == "memory" {
         let (facts, omitted, linked) = Memory.relevantExplained(to: query, app: option("--app"), host: option("--site"))
         print("\n“\(query)” → \(facts.count) facts (\(linked.count) via links), \(omitted) left out (\(Int(Date().timeIntervalSince(t0) * 1000)) ms)")
         for f in facts { print("  \(Memory.isProfile(f) ? "P" : linked.contains(f) ? "~" : " ") \(args.contains("--full") ? f : String(f.prefix(120)))") }
+    }
+    exit(0)
+}
+
+// `Clinqy onboarding-snapshot <dir>`: renders each setup page to a PNG offscreen (for docs and checking the layout).
+if command == "onboarding-snapshot" {
+    let dir = URL(fileURLWithPath: CommandLine.arguments.dropFirst(2).first ?? ".")
+    MainActor.assumeIsolated {
+        let app = NSApplication.shared
+        app.setActivationPolicy(.prohibited)
+        Brand.registerFonts()
+        let model = OnboardingModel()
+        // An optional step name renders just that page.
+        let only = CommandLine.arguments.dropFirst(3).first
+        for step in OnboardingModel.Step.allCases where only == nil || only == "\(step)" {
+            model.step = step
+            let view = NSHostingView(rootView: OnboardingView(model: model))
+            let window = NSWindow(contentRect: NSRect(origin: CGPoint(x: -4000, y: 0), size: OnboardingView.size), styleMask: [.borderless], backing: .buffered, defer: false)
+            window.appearance = NSAppearance(named: .darkAqua)
+            window.contentView = view
+            view.layoutSubtreeIfNeeded()
+            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
+            view.cacheDisplay(in: view.bounds, to: rep)
+            let url = dir.appendingPathComponent("onboarding-\(step.rawValue)-\(step).png")
+            try? rep.representation(using: .png, properties: [:])?.write(to: url)
+            print(url.path)
+            window.contentView = nil   // stop its animations before the next page
+        }
+        UserDefaults.standard.removeObject(forKey: OnboardingWindow.stepKey)
     }
     exit(0)
 }
