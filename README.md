@@ -1,3 +1,5 @@
+<p align="center"><img src="assets/AppIcon.png" alt="" width="128" height="128"></p>
+
 # Clinqy
 
 **Your cursor's clingy partner.** Your Mac, on autopilot — and you can watch it work.
