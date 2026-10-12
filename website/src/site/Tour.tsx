@@ -60,7 +60,7 @@ const STEPS: Step[] = [
     dwell: 900,
   },
   {
-    target: '.stage-index button:nth-child(3)',
+    target: '.stage-index button:nth-child(2)',
     view: '.stage',
     at: [0.4, 0.55],
     say: 'Pick any request and I’ll play it. Here’s me launching a server on AWS.',
@@ -68,7 +68,7 @@ const STEPS: Step[] = [
     dwell: 3200,
   },
   {
-    target: '.stage-index button:nth-child(5)',
+    target: '.stage-index button:nth-child(4)',
     view: '.stage',
     at: [0.4, 0.55],
     say: 'And telling your mom you’ll be late.',

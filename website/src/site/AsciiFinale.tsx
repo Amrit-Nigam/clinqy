@@ -9,7 +9,7 @@ const BANNER = [
   ' ╚═════╝╚══════╝╚═╝╚═╝  ╚═══╝ ╚══▀▀═╝    ╚═╝   ',
 ]
 
-const ARROW = [
+export const ARROW = [
   '█         ',
   '██        ',
   '█▓█       ',

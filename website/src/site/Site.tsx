@@ -3,9 +3,10 @@ import { BuddyCursor } from './BuddyCursor'
 import { LiveDesk } from './LiveDesk'
 import { ScenePlayer } from './ScenePlayer'
 import { AsciiField } from './AsciiField'
-import { AsciiFinale } from './AsciiFinale'
+import { ARROW, AsciiFinale } from './AsciiFinale'
 import { Scramble } from './Scramble'
 import { HowArt, SafetyArt, SetupArt } from './IsoArt'
+import { AgentSection, QaSection } from './AgentSections'
 import { SETUP_PROMPT } from './setupPrompt'
 import { Tour, TourOffer } from './Tour'
 
@@ -103,6 +104,31 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
   const [tour, setTour] = useState<'offer' | 'on' | 'off' | null>(null)
   const [toast, setToast] = useState('')
 
+  // The nav hides once you scroll down, and comes back when the pointer nears the top (or you scroll back up).
+  const [navHidden, setNavHidden] = useState(false)
+  useEffect(() => {
+    let lastY = scrollY
+    let nearTop = false
+    const onScroll = () => {
+      const y = scrollY
+      if (y < 80) setNavHidden(false)
+      else if (y > lastY + 4 && !nearTop) setNavHidden(true)
+      else if (y < lastY - 30) setNavHidden(false)
+      lastY = y
+    }
+    const onMove = (e: PointerEvent) => {
+      nearTop = e.clientY < 72
+      if (nearTop) setNavHidden(false)
+      else if (scrollY > 80 && e.clientY > 140) setNavHidden(true)
+    }
+    addEventListener('scroll', onScroll, { passive: true })
+    addEventListener('pointermove', onMove, { passive: true })
+    return () => {
+      removeEventListener('scroll', onScroll)
+      removeEventListener('pointermove', onMove)
+    }
+  }, [])
+
   // Offer the tour a moment after the page switches on.
   useEffect(() => {
     if (!live) {
@@ -141,7 +167,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
       <Tour running={tour === 'on'} onEnd={endTour} />
       {toast && <div className="tour-toast" role="status">{toast}</div>}
 
-      <header className="nav">
+      <header className={'nav' + (navHidden && tour !== 'on' ? ' is-hidden' : '')} onFocus={() => setNavHidden(false)}>
         <a className="nav-logo" href="#top" data-buddy>
           <img src="/icon.png" alt="" width={26} height={26} />
           clinqy
@@ -149,6 +175,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
         <nav aria-label="Sections">
           <a href="#how">How it works</a>
           <a href="#watch">Watch it</a>
+          <a href="#agents">For agents</a>
           <a href="#safety">Safety</a>
           <a href="#setup">Set up</a>
           <button type="button" className="linklike nav-tour" onClick={() => setTour('on')} disabled={tour === 'on'}>
@@ -163,6 +190,9 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
       <main id="top">
         <section className="hero">
           <div className="hero-copy">
+            <pre className="hero-mark" aria-hidden="true">
+              {ARROW.join('\n')}
+            </pre>
             <div data-tour="hello">
               <Scramble as="h1" text={'Your Mac,\non autopilot.'} start={live} />
             </div>
@@ -216,6 +246,12 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
             ))}
           </ol>
         </section>
+
+        <Rule />
+        <QaSection />
+
+        <Rule />
+        <AgentSection />
 
         <Rule />
         <section className="watch" id="watch">

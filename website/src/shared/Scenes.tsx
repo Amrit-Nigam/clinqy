@@ -41,7 +41,7 @@ export function MenuBar({ app }: { app: string }) {
  * address in a pill; app scenes get a plain centred title. `dark` is for
  * apps that edit in dark mode (Photos).
  */
-function Desktop({ title, url, dark, children }: { title: string; url?: string; dark?: boolean; children: React.ReactNode }) {
+export function Desktop({ title, url, dark, children }: { title: string; url?: string; dark?: boolean; children: React.ReactNode }) {
   const { bare, app } = useContext(StageCtx)
   return (
     <div className={'sc-desktop' + (bare ? ' is-bare' : '')}>
@@ -69,7 +69,7 @@ function Desktop({ title, url, dark, children }: { title: string; url?: string; 
   )
 }
 
-function Field({ x, y, w = 300, label, value, active, placeholder }: { x: number; y: number; w?: number; label: string; value: string; active?: boolean; placeholder?: string }) {
+export function Field({ x, y, w = 300, label, value, active, placeholder }: { x: number; y: number; w?: number; label: string; value: string; active?: boolean; placeholder?: string }) {
   return (
     <div className="sc-field" style={{ left: x, top: y, width: w }}>
       <label>{label}</label>
@@ -81,7 +81,7 @@ function Field({ x, y, w = 300, label, value, active, placeholder }: { x: number
   )
 }
 
-function Toast({ show, children }: { show: number; children: React.ReactNode }) {
+export function Toast({ show, children }: { show: number; children: React.ReactNode }) {
   return (
     <div className="sc-toast" style={{ opacity: show, transform: `translateY(${(1 - show) * 16}px)` }}>
       {children}

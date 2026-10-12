@@ -13,35 +13,45 @@ const S = 0.5
 const P = (x: number, y: number, z = 0): [number, number] => [(x - y) * C, (x + y) * S - z]
 const pts = (...p: [number, number, number][]) => p.map(([x, y, z]) => P(x, y, z).join(',')).join(' ')
 
-/** Scene progress 0..1, ~30 fps, only while visible. */
-function usePhase(period: number) {
-  const ref = useRef<SVGSVGElement>(null)
-  const [phase, setPhase] = useState(0.62)
+/**
+ * Scene progress 0..1, ~30 fps. Starts from the beginning each time the scene scrolls into view
+ * (mostly visible), and stops while it's off screen. Reduced motion: one still, finished frame.
+ */
+export function usePhase<T extends Element = SVGSVGElement>(period: number) {
+  const ref = useRef<T>(null)
+  const calm = typeof matchMedia !== 'undefined' && matchMedia('(prefers-reduced-motion: reduce)').matches
+  const [phase, setPhase] = useState(calm ? 0.62 : 0)
   useEffect(() => {
     const el = ref.current
-    if (!el || matchMedia('(prefers-reduced-motion: reduce)').matches) return
+    if (!el || calm) return
     let raf = 0
     let last = 0
-    let visible = false
-    const t0 = performance.now()
+    let t0 = 0
     const tick = (now: number) => {
-      if (!visible) return
       raf = requestAnimationFrame(tick)
       if (now - last < 32) return
       last = now
       setPhase(((now - t0) % period) / period)
     }
-    const io = new IntersectionObserver(([e]) => {
-      visible = e.isIntersecting
-      cancelAnimationFrame(raf)
-      if (visible) raf = requestAnimationFrame(tick)
-    })
+    const io = new IntersectionObserver(
+      ([e]) => {
+        cancelAnimationFrame(raf)
+        if (e.isIntersecting) {
+          t0 = performance.now()
+          setPhase(0)
+          raf = requestAnimationFrame(tick)
+        } else {
+          setPhase(0)
+        }
+      },
+      { threshold: 0.4 },
+    )
     io.observe(el)
     return () => {
       io.disconnect()
       cancelAnimationFrame(raf)
     }
-  }, [period])
+  }, [period, calm])
   return [ref, phase] as const
 }
 

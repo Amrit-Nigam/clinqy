@@ -232,6 +232,18 @@ Expect: the page title shows name=Amrit Nigam
 - Tests run unattended: the agent never asks questions, doesn't touch History or memory, and loads pages fresh.
 - **QA cursor:** during tests the companion becomes an **amber targeting reticle with a "QA" tag**. Checks flash ✓ (green pop) or ✕ (red shake).
 
+### The `/clinqy` skill for coding agents
+
+[`skills/clinqy/SKILL.md`](skills/clinqy/SKILL.md) teaches a coding agent when and how to use the `clinqy` command: read the tab you have open (`clinqy page`, `clinqy page read`), click through a flow in your real browser (`clinqy run --test "…"`), and run your plain-English UI tests (`clinqy qa`). It also tells the agent to say before it takes over your screen and never to submit, send, pay or delete unless you asked for exactly that.
+
+Install it for Claude Code:
+
+```bash
+mkdir -p ~/.claude/skills/clinqy && curl -fsSL https://raw.githubusercontent.com/Amrit-Nigam/clinqy/main/skills/clinqy/SKILL.md -o ~/.claude/skills/clinqy/SKILL.md
+```
+
+Claude Code then uses it on its own when you say things like "check my browser" or "test this in the browser", or when you type `/clinqy`. Other agents (Cursor, Codex, agy, Gemini CLI) can use Clinqy over MCP instead; see step 7 of the [setup guide](#setup-guide).
+
 **Workflows (routines without a model).** Every successful run records exactly what it did. In **History**, hover a run and click **Save workflow**. Typed text becomes named inputs, defaulting to the original values. Saved workflows appear under **Skills → Workflows**:
 - **Run:** replays it with no model.
 - **Daily…:** schedules it (for example 09:00, once a day).

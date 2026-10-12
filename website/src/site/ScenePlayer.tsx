@@ -1,5 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
-import { SCENES, SceneStage } from '../shared/Scenes'
+import { SCENES as ALL_SCENES, SceneStage } from '../shared/Scenes'
+
+/** The requests the player offers (the photo edit only appears in the intro). */
+const SCENES = ALL_SCENES.filter((s) => s.id !== 'edit')
 import { useFitScale } from '../shared/useFitScale'
 import { useClock } from '../shared/useLoop'
 

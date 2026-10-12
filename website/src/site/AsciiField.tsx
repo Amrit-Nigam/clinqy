@@ -196,7 +196,8 @@ export function AsciiField({ running }: { running: boolean }) {
       })
 
       // 2. Actions: decode in, hold, scramble out.
-      const inHero = scrollY < innerHeight * 0.5
+      // Narrow screens have no free column beside the text, so the action lines and cursor stay off.
+      const inHero = scrollY < innerHeight * 0.5 && innerWidth > 900
       if (inHero && now - lastSpawn > 1100 && snips.length < 7) {
         spawn(now)
         lastSpawn = now
