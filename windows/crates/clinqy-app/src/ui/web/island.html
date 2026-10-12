@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Clinqy status</title>
+<style>/*SHARED_CSS*/</style>
+<style>
+  /* The status capsule at the top of the screen, as in IslandView (UI.swift). Click-through. */
+  body { display: flex; justify-content: center; align-items: center; height: 60px; }
+  .cap { display: inline-flex; align-items: center; gap: 10px; height: 36px; padding: 0 14px; border-radius: 999px; max-width: 556px;
+    background: rgba(0, 0, 0, 0.82); box-shadow: inset 0 0 0 1px var(--hairline); }
+  #orb { width: 16px; height: 16px; flex: none; }
+  #say { font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; transition: opacity .2s; }
+  #say.head { direction: rtl; text-align: left; }
+  #hint { font-size: 11px; color: var(--tertiary); white-space: nowrap; flex: none; }
+</style>
+</head>
+<body>
+<div class="cap"><canvas id="orb"></canvas><span id="say">Thinking…</span><span id="hint"></span></div>
+<script>/*ICONS_JS*/</script>
+<script>
+const O = orb(document.getElementById("orb"));
+const moods = { idle: "idle", listening: "listening", thinking: "thinking", acting: "acting", waiting: "idle", done: "success", failed: "failure" };
+window.clinqy = {
+  update(s) {
+    O.mood = s.listening ? "listening" : moods[s.phase] || "idle";
+    O.level = s.level || 0;
+    let text;
+    if (s.listening) text = s.transcript || (s.followUp ? "Anything else? I'm listening…" : "Listening…");
+    else if (s.recording) text = `Watching you… do the task, then ${s.hotkey || "Ctrl+Alt"} or ■ to stop`;
+    else if (s.transcribing) text = "Transcribing…";
+    else if (s.notice) text = s.notice;
+    else if (s.question) text = `Needs your input: ${s.question.text}`;
+    else if (s.review) text = `Check before I submit: ${s.review.title}`;
+    else text = s.running ? (s.narration || "Thinking…") : (s.answer || s.narration || "Thinking…");
+    const say = document.getElementById("say");
+    say.textContent = text;
+    say.classList.toggle("head", !!s.listening);
+    document.getElementById("hint").textContent = s.running ? (s.dry ? "dry run · ■ to stop" : `${s.hotkey || "Ctrl+Alt"} to add · ■ to stop`) : "";
+  },
+  level(l) { O.level = l; },
+};
+window.ipc.postMessage(JSON.stringify({ type: "ready" }));
+</script>
+</body>
+</html>

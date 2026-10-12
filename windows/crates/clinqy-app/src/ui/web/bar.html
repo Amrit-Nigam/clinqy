@@ -1,0 +1,309 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Clinqy</title>
+<style>/*SHARED_CSS*/</style>
+<style>
+  /* The command bar, as in CommandView (UI.swift). */
+  .card { background: var(--card); border: 1px solid var(--hairline); border-radius: var(--corner); overflow: hidden; }
+  .chip { display: flex; align-items: center; gap: 8px; margin: 12px 18px 0; padding: 6px 10px; border-radius: 8px; background: rgba(255,255,255,0.07);
+    font-size: 12px; color: var(--secondary); }
+  .chip .ic { font-size: 11px; color: var(--accent); flex: none; }
+  .chip .ic.dim { color: var(--secondary); }
+  .chip .t { flex: 1; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .chip .n { font-size: 10px; color: var(--tertiary); flex: none; }
+  .chip .x { font-size: 9px; color: var(--tertiary); flex: none; }
+  .qcard { margin: 16px 18px 0; display: flex; flex-direction: column; gap: 10px; }
+  .qhead { display: flex; gap: 8px; align-items: baseline; }
+  .qhead .ic { font-size: 13px; color: var(--accent); flex: none; position: relative; top: 1px; }
+  .qhead .t { font-size: 15px; font-weight: 500; color: var(--text); white-space: pre-wrap; user-select: text; }
+  .qhead .meta { margin-left: auto; font-size: 11px; color: var(--tertiary); white-space: nowrap; padding-left: 6px; }
+  .qhead .meta.bad { color: var(--failure); }
+  .flow { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .choice { font-size: 13px; font-weight: 500; color: var(--text); padding: 6px 12px; border-radius: 999px; background: rgba(255,255,255,0.09);
+    box-shadow: inset 0 0 0 1px rgba(59,130,255,0.3); }
+  .choice:hover { background: rgba(255,255,255,0.16); box-shadow: inset 0 0 0 1px rgba(59,130,255,0.7); }
+  .reviewbox { max-height: 170px; overflow-y: auto; padding: 8px 10px; border-radius: 10px; background: rgba(255,255,255,0.05); display: flex; flex-direction: column; gap: 5px; }
+  .rrow { display: flex; gap: 10px; align-items: baseline; font-size: 12px; }
+  .rrow .k { width: 190px; flex: none; color: var(--secondary); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; }
+  .rrow .v { flex: 1; font-weight: 500; color: var(--text); user-select: text; overflow: hidden; display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; }
+  .rrow .v.empty { color: var(--failure); }
+  .small { font-size: 11px; color: var(--tertiary); }
+  .bar { display: flex; align-items: center; gap: 14px; height: 64px; padding: 0 18px; }
+  #orb { width: 26px; height: 26px; flex: none; }
+  .field { flex: 1; min-width: 0; position: relative; }
+  #input { width: 100%; background: transparent; border: 0; outline: 0; color: var(--text); font: 20px var(--font); padding: 0; user-select: text; caret-color: var(--text); }
+  #input::placeholder { color: var(--tertiary); }
+  #heard { font-size: 20px; color: var(--text); white-space: nowrap; overflow: hidden; direction: rtl; text-align: left; }
+  #heard.empty { color: var(--tertiary); }
+  .ib { width: 34px; height: 34px; border-radius: 50%; background: rgba(255,255,255,0.06); display: grid; place-items: center; font-size: 14px; flex: none; color: var(--secondary); transition: background .12s; }
+  .ib:hover { background: rgba(255,255,255,0.12); }
+  .ib.white { color: #fff; } .ib.listening { color: var(--accent); }
+  .hair { height: 1px; background: var(--hairline); }
+  .content { padding: 14px 18px; }
+  .sugg { display: flex; flex-direction: column; gap: 6px; }
+  .srow { display: flex; align-items: center; gap: 12px; padding: 8px 10px; border-radius: 10px; color: var(--secondary); font-size: 14px; transition: background .12s; }
+  .srow .ic { font-size: 12px; color: var(--tertiary); width: 18px; text-align: center; flex: none; }
+  .srow .t { flex: 1; }
+  .srow .ret { font-size: 11px; color: var(--tertiary); opacity: 0; }
+  .srow:hover { background: rgba(255,255,255,0.07); color: var(--text); } .srow:hover .ret { opacity: 1; }
+  .answer { font-size: 15px; font-weight: 500; color: var(--text); white-space: pre-wrap; user-select: text; padding-bottom: 2px; }
+  .steps { display: flex; flex-direction: column; gap: 9px; }
+  .step { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--secondary); animation: rise .25s ease; }
+  .step .m { width: 14px; flex: none; font-size: 10px; display: grid; place-items: center; }
+  .step .t { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .step.running { color: var(--text); }
+  .step.ok .m { color: var(--secondary); } .step.failed .m { color: var(--failure); } .step.info .m { color: var(--accent); }
+  .spin { width: 10px; height: 10px; border-radius: 50%; border: 1.6px solid rgba(255,255,255,0.25); border-top-color: rgba(255,255,255,0.85); animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  @keyframes rise { from { opacity: 0; transform: translateY(6px); } }
+  .label { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--secondary); }
+  .wave { display: flex; align-items: center; justify-content: center; gap: 3px; height: 26px; }
+  .wave i { width: 3px; border-radius: 2px; background: rgba(59,130,255,0.85); height: 3px; }
+  .list { display: flex; flex-direction: column; gap: 4px; max-height: 250px; overflow-y: auto; }
+  .row { display: flex; align-items: flex-start; gap: 10px; padding: 7px 10px; border-radius: 9px; transition: background .12s; }
+  .row:hover { background: rgba(255,255,255,0.07); }
+  .row .ic { font-size: 12px; padding-top: 2px; flex: none; color: var(--secondary); } .row .ic.bad { color: var(--failure); } .row .ic.acc { color: var(--accent); }
+  .row .body { flex: 1; min-width: 0; }
+  .row .t1 { font-size: 13px; font-weight: 500; color: var(--text); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .t2 { font-size: 12px; color: var(--tertiary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .row .steps2 { font-size: 11px; color: var(--secondary); padding-top: 3px; white-space: pre-wrap; display: none; }
+  .row:hover .steps2 { display: block; }
+  .row .when { font-size: 11px; color: var(--tertiary); flex: none; }
+  .row .acts { display: none; gap: 4px; align-items: center; flex: none; } .row:hover .acts { display: flex; } .row:hover .when { display: none; }
+  .sb { font-size: 11px; font-weight: 500; color: var(--text); padding: 3px 8px; border-radius: 999px; background: rgba(255,255,255,0.1); }
+  .sb:hover { background: rgba(255,255,255,0.16); }
+  .del { font-size: 10px; color: var(--tertiary); }
+  .sect { font-size: 10px; font-weight: 600; color: var(--tertiary); letter-spacing: .02em; }
+  .empty { font-size: 13px; color: var(--tertiary); }
+  .foot { display: flex; align-items: center; gap: 11px; padding: 9px 16px; white-space: nowrap; background: rgba(255,255,255,0.03); color: var(--tertiary); font-size: 11px; }
+  .hint { display: flex; align-items: center; gap: 4px; flex: none; }
+  .keys { font: 500 10px var(--rounded); padding: 2px 5px; border-radius: 4px; background: rgba(255,255,255,0.08); }
+  .fb { display: flex; align-items: center; gap: 4px; color: var(--tertiary); flex: none; white-space: nowrap; }
+  .fb:hover { color: var(--secondary); }
+  .fb.on { color: var(--text); } .fb.acc { color: var(--accent); }
+  .fb .ic { font-size: 11px; }
+  .rec { width: 7px; height: 7px; border-radius: 50%; background: rgba(255,59,48,0.85); }
+  .spacer { flex: 1; }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+<div class="card" id="card">
+  <div id="top"></div>
+  <div class="bar">
+    <canvas id="orb"></canvas>
+    <div class="field">
+      <input id="input" autocomplete="off" spellcheck="false">
+      <div id="heard" class="hide"></div>
+    </div>
+    <span id="buttons" style="display:flex;gap:8px"></span>
+  </div>
+  <div id="bodywrap"></div>
+  <div class="foot" id="foot"></div>
+</div>
+<script>/*ICONS_JS*/</script>
+<script>
+const $ = (s) => document.querySelector(s);
+const send = (o) => window.ipc.postMessage(JSON.stringify(o));
+const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+const O = orb($("#orb"));
+let S = { snap: {}, history: [], workflows: [], skills: [], listening: false, transcript: "", status: "", hotkey: "Ctrl+Alt",
+          context: {}, tab: "home", fixDismissed: null, recording: false, learning: false };
+
+const suggestions = [
+  ["bubble.left.fill", "Say good morning to mom on WhatsApp"],
+  ["play.rectangle.fill", "Play lo-fi beats on YouTube"],
+  ["moon.fill", "Turn on dark mode"],
+  ["note.text", "Make a note: buy milk, eggs, bread"],
+];
+
+function moodOf(s) {
+  if (S.listening) return "listening";
+  return { idle: "idle", listening: "listening", thinking: "thinking", acting: "acting", waiting: "idle", done: "success", failed: "failure" }[s.phase] || "idle";
+}
+// The run that just failed, which the next thing typed corrects ("no, click the other one").
+function fixable(s) {
+  const last = S.history[0];
+  if (s.running || s.question || s.review || s.phase !== "failed" || !last || last.ok || last.id === S.fixDismissed) return null;
+  const c = S.context || {};
+  if (c.selected || (c.files || []).length || c.circled) return null;
+  if (String(last.request).startsWith("Dry run:")) return null;
+  return last;
+}
+function placeholder(s) {
+  if (s.review) return "Type a change, or click Submit";
+  if (s.question) return s.question.sensitive ? "Type it here (kept private)" : "Your answer";
+  if (s.running) return "Add to this task or change the plan…";
+  if (fixable(s)) return "What should I do differently? e.g. “no, click the other one”";
+  return s.dry_run ? "What should I show you? (dry run)" : "What should I do?";
+}
+function chip(ic, text, kind, extra = "", dim = false) {
+  return `<div class="chip"><span class="ic ${dim ? "dim" : ""}">${icon(ic)}</span><span class="t">${esc(text)}</span>${extra}<button class="x" data-unchip="${kind}">${icon("xmark")}</button></div>`;
+}
+function rel(iso) {
+  const d = (Date.now() - new Date(iso)) / 1000;
+  if (d < 60) return "now"; if (d < 3600) return Math.floor(d / 60) + " min. ago"; if (d < 86400) return Math.floor(d / 3600) + " hr. ago";
+  if (d < 172800) return "yesterday"; return Math.floor(d / 86400) + " days ago";
+}
+
+function render() {
+  const s = S.snap || {};
+  O.mood = moodOf(s); O.level = S.level || 0;
+  // Above the bar: review, correction chip, question, context chips.
+  let top = "";
+  if (s.review) {
+    const empty = s.review.items.filter(([, v]) => !String(v).trim()).length;
+    top += `<div class="qcard"><div class="qhead"><span class="ic">${icon("checkmark.shield.fill")}</span><span class="t" style="display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden">${esc(s.review.title)}</span>
+      <span class="meta ${empty ? "bad" : ""}">${s.review.items.length} fields${empty ? ` · ${empty} empty` : ""}</span></div>
+      <div class="reviewbox">${s.review.items.map(([k, v]) => `<div class="rrow"><span class="k">${esc(k)}</span><span class="v ${String(v).trim() ? "" : "empty"}">${esc(String(v).trim() || "(empty)")}</span></div>`).join("")}</div>
+      <div class="flow"><button class="choice" data-review="submit">Submit</button><button class="choice" data-review="edit">Edit</button><span class="small">or type a change and press Enter</span></div></div>`;
+  }
+  const fx = fixable(s);
+  if (fx) top += chip("wrench.and.screwdriver", `Didn't finish: ${fx.request} — tell me what to do differently`, "fix");
+  if (s.question) {
+    top += `<div class="qcard"><div class="qhead"><span class="ic">${icon(s.question.sensitive ? "lock.fill" : "questionmark.bubble.fill")}</span><span class="t">${esc(s.question.text)}</span></div>`
+      + (s.question.options.length ? `<div class="flow">${s.question.options.map((o) => `<button class="choice" data-answer="${esc(o)}">${esc(o)}</button>`).join("")}</div>` : "") + `</div>`;
+  }
+  const c = S.context || {};
+  if (!s.running) {
+    if (c.continuing) top += chip("arrow.turn.down.right", `Continuing: ${c.continuing}`, "continuation");
+    if (c.selected) top += chip("text.quote", c.selected.replace(/\n/g, " "), "selection", `<span class="n">${c.selected.length} chars</span>`, true);
+    if ((c.files || []).length) top += chip("doc.on.doc", c.files.length === 1 ? c.files[0] : `${c.files.length} files · ${c.files.join(", ")}`, "files");
+    if (c.copied && !c.selected && !(c.files || []).length) top += chip("doc.on.clipboard", `Copied ${c.copied}`, "copied");
+    if (c.circled) top += chip("lasso", `Circled area · ${c.circled}`, "circled");
+  }
+  $("#top").innerHTML = top;
+
+  // The bar: orb, field (or what's being heard), buttons.
+  const input = $("#input"), heard = $("#heard");
+  input.classList.toggle("hide", !!S.listening);
+  heard.classList.toggle("hide", !S.listening);
+  heard.classList.toggle("empty", !S.transcript);
+  heard.textContent = S.transcript || "Listening…";
+  input.placeholder = placeholder(s);
+  input.type = s.question && s.question.sensitive ? "password" : "text";
+  const mic = `<button class="ib ${S.listening ? "listening" : ""}" data-act="mic" title="${s.question ? "Answer by voice" : "Talk"}">${icon(S.listening ? "waveform" : "mic.fill")}</button>`;
+  let btns;
+  if (s.review) btns = `<button class="ib white" data-act="cancel" title="Stop">${icon("stop.fill")}</button>`;
+  else if (s.question) btns = mic + `<button class="ib white" data-act="send" title="Answer">${icon("arrow.up")}</button>`;
+  else if (s.running) btns = `<button class="ib white" data-act="cancel" title="Stop">${icon("stop.fill")}</button>`;
+  else btns = mic;
+  $("#buttons").innerHTML = btns;
+
+  // The body: skills, history, or the run (steps, answer), voice, suggestions.
+  const empty = !input.value;
+  const hasRun = (s.steps || []).length || s.answer;
+  const showBody = S.tab !== "home" || S.learning || S.status || S.listening || hasRun || empty;
+  let body = "";
+  if (S.tab === "skills" && !s.question && !S.listening) {
+    if (S.workflows.length) {
+      body += `<div class="sect">WORKFLOWS · replay without the model</div><div class="list" style="max-height:130px;margin:8px 0">`
+        + S.workflows.map((w) => `<div class="row"><span class="ic acc">${icon("bolt.horizontal.circle")}</span><div class="body"><div class="t1">${esc(w.name)}</div>
+          <div class="t2">${w.steps} steps · run ${w.runs}×${w.schedule ? " · daily " + esc(w.schedule) : ""}${w.params && w.params.length ? " · inputs: " + esc(w.params.join(", ")) : ""}</div></div>
+          <div class="acts"><button class="sb" data-runwf="${esc(w.name)}">Run</button><button class="sb" data-daily="${esc(w.id)}">${w.schedule ? "Schedule…" : "Daily…"}</button><button class="del" data-delwf="${esc(w.id)}">${icon("trash")}</button></div></div>`).join("")
+        + `</div><div class="sect" style="margin-bottom:8px">SKILLS · learned by watching</div>`;
+    }
+    body += S.skills.length ? `<div class="list">` + S.skills.map((k) => `<div class="row"><span class="ic acc">${icon("graduationcap")}</span><div class="body"><div class="t1">${esc(k.name)}</div>
+        <div class="t2" style="white-space:normal">${esc(k.summary)}${k.parameters && k.parameters.length ? " · asks for " + esc(k.parameters.join(", ")) : ""}</div>
+        <div class="steps2">${esc((k.steps || []).map((x, i) => `${i + 1}. ${x}`).join("\n"))}</div></div>
+        <div class="acts"><button class="sb" data-runskill="${esc(k.name)}">Run</button><button class="del" data-delskill="${esc(k.id)}">${icon("trash")}</button></div></div>`).join("") + `</div>`
+      : `<div class="empty">No skills yet. Click “Watch &amp; learn”, do the task yourself, then press ${esc(S.hotkey)} to stop — I'll learn it.</div>`;
+  } else if (S.tab === "history" && !s.question && !S.listening) {
+    body += S.history.length ? `<div class="list">` + S.history.slice(0, 60).map((h) => `<div class="row"><span class="ic ${h.ok ? "" : "bad"}">${icon(h.ok ? "checkmark.circle" : "xmark.circle")}</span>
+        <div class="body"><div class="t1">${esc(h.request)}</div><div class="t2">${esc(h.answer)}</div></div>
+        <span class="when">${rel(h.date)}</span>
+        <div class="acts">${h.result ? `<button class="sb" data-result="${esc(h.id)}">Result</button>` : ""}${h.ok && h.trace ? `<button class="sb" data-savewf="${esc(h.id)}">Save workflow</button>` : ""}
+          <button class="sb" data-cont="${esc(h.id)}">Continue</button><button class="sb" data-again="${esc(h.id)}">Run again</button><button class="del" data-delhist="${esc(h.id)}">${icon("trash")}</button></div></div>`).join("") + `</div>`
+      : `<div class="empty">Nothing yet — your requests will show up here.</div>`;
+  } else {
+    if (S.learning) body += `<div class="label">${icon("graduationcap")} Learning what you showed me…</div>`;
+    if (S.status && !(s.steps || []).length) body += `<div class="label" style="font-size:12px;color:var(--tertiary);padding-bottom:4px">${icon("waveform.badge.plus")} ${esc(S.status)}</div>`;
+    if (S.transcribing) body += `<div class="label">${icon("waveform")} Transcribing…</div>`;
+    else if (S.listening) body += `<div class="wave" id="wave">${"<i></i>".repeat(36)}</div>`;
+    else if (!(s.steps || []).length && !s.answer) {
+      body += `<div class="sugg">${suggestions.map(([ic, t]) => `<button class="srow" data-suggest="${esc(t)}"><span class="ic">${icon(ic)}</span><span class="t" style="text-align:left">${esc(t)}</span><span class="ret">${icon("return")}</span></button>`).join("")}</div>`;
+    } else {
+      body += `<div class="steps">`;
+      if (s.answer) body += `<div class="answer">${esc(s.answer)}</div>`;
+      body += (s.steps || []).slice(-7).map((st) => `<div class="step ${st.state}"><span class="m">${st.state === "running" ? `<span class="spin"></span>` : st.state === "ok" ? icon("checkmark") : st.state === "failed" ? icon("xmark") : icon("sparkle", "f")}</span><span class="t">${esc(st.text)}</span></div>`).join("");
+      body += `</div>`;
+    }
+  }
+  $("#bodywrap").innerHTML = showBody ? `<div class="hair"></div><div class="content">${body}</div>` : "";
+
+  // The footer.
+  $("#foot").innerHTML = `<span class="hint"><span class="keys">${esc(S.hotkey)}</span>open</span><span class="hint">hold <span class="keys">${esc(S.hotkey)}</span>talk</span>
+    <span class="spacer"></span>
+    <button class="fb ${s.dry_run ? "acc" : ""}" data-act="dry" title="Dry run: Clinqy points at everything it would click and type, without doing it"><span class="ic">${icon(s.dry_run ? "eye.fill" : "eye")}</span>Dry run</button>
+    <button class="fb" data-act="circle" title="Circle something on screen to point Clinqy at it"><span class="ic">${icon("lasso")}</span>Circle</button>
+    <button class="fb" data-act="watch" title="Show Clinqy how to do something: it watches, then learns it as a skill"><span class="rec"></span>${S.recording ? "Stop watching" : "Watch &amp; learn"}</button>
+    <button class="fb ${S.tab === "skills" ? "on" : ""}" data-tab="skills"><span class="ic">${icon("graduationcap")}</span>${S.tab === "skills" ? "Back" : "Skills"}</button>
+    <button class="fb ${S.tab === "history" ? "on" : ""}" data-tab="history"><span class="ic">${icon("clock.arrow.circlepath")}</span>${S.tab === "history" ? "Back" : "History"}</button>
+    <span class="hint"><span class="keys">esc</span>close</span>`;
+  requestAnimationFrame(() => send({ type: "resize", height: $("#card").getBoundingClientRect().height }));
+}
+
+// The voice waveform: 36 bars riding a travelling sine, taller with the level (Waveform in UI.swift).
+(function wave() {
+  const w = document.getElementById("wave");
+  if (w) {
+    const t = performance.now() / 1000;
+    [...w.children].forEach((b, i) => { const v = (Math.sin(t * 7 + i * 0.45) + 1) / 2; b.style.height = (3 + (4 + (S.level || 0) * 22) * v) + "px"; });
+  }
+  requestAnimationFrame(wave);
+})();
+
+window.clinqy = {
+  update(o) { Object.assign(S, o); render(); },
+  level(l) { S.level = l; O.level = l; },
+  focus() { const i = $("#input"); i.focus(); },
+  clear() { $("#input").value = ""; render(); },
+};
+
+function submitInput() {
+  const s = S.snap || {};
+  const text = $("#input").value.trim();
+  if (s.review) { send({ type: "review", submit: false, note: text }); $("#input").value = ""; return; }
+  if (s.question) { send({ type: "answer", text }); $("#input").value = ""; return; }
+  if (!text) return;
+  const fx = fixable(s);
+  if (s.running) send({ type: "add", text });
+  else if (fx) { S.fixDismissed = fx.id; send({ type: "fix", id: fx.id, text }); }
+  else send({ type: "submit", text });
+  $("#input").value = "";
+}
+$("#input").addEventListener("keydown", (e) => {
+  if (e.key === "Escape") { send({ type: "hide" }); return; }
+  if (e.key === "Enter") { e.preventDefault(); submitInput(); }
+});
+$("#input").addEventListener("input", () => { if (!$("#input").value || $("#input").value.length === 1) render(); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") send({ type: "hide" }); });
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b) return;
+  const d = b.dataset;
+  if (d.act === "send") submitInput();
+  else if (d.act) send({ type: d.act });
+  else if (d.answer !== undefined) send({ type: "answer", text: d.answer });
+  else if (d.review === "submit") send({ type: "review", submit: true });
+  else if (d.review === "edit") { send({ type: "review", submit: false, note: $("#input").value.trim() }); $("#input").value = ""; }
+  else if (d.unchip) { if (d.unchip === "fix") { S.fixDismissed = (S.history[0] || {}).id; render(); } else send({ type: "unchip", kind: d.unchip }); }
+  else if (d.tab) { S.tab = S.tab === d.tab ? "home" : d.tab; render(); $("#input").focus(); }
+  else if (d.suggest) send({ type: "submit", text: d.suggest });
+  else if (d.cont) { S.tab = "home"; send({ type: "continue", id: d.cont }); }
+  else if (d.again) { S.tab = "home"; send({ type: "again", id: d.again }); }
+  else if (d.result) send({ type: "result", id: d.result });
+  else if (d.savewf) send({ type: "savewf", id: d.savewf });
+  else if (d.delhist) send({ type: "delhist", id: d.delhist });
+  else if (d.runwf) { S.tab = "home"; send({ type: "runwf", name: d.runwf }); }
+  else if (d.delwf) send({ type: "delwf", id: d.delwf });
+  else if (d.daily) { const t = prompt("Run it every day at… (24-hour time, like 09:00; empty turns the schedule off)", "09:00"); if (t !== null) send({ type: "daily", id: d.daily, time: t }); }
+  else if (d.runskill) { S.tab = "home"; send({ type: "submit", text: `Use the skill “${d.runskill}”.` }); }
+  else if (d.delskill) send({ type: "delskill", id: d.delskill });
+});
+render();
+send({ type: "ready" });
+</script>
+</body>
+</html>

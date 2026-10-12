@@ -1,0 +1,23 @@
+/* Design tokens and shared pieces, ported one-to-one from the Mac app's SwiftUI (UI.swift: DS, Palette, Orb). */
+:root {
+  --card: rgb(23, 23, 23);            /* Color(white: 0.09) */
+  --hairline: rgba(255, 255, 255, 0.08);
+  --text: rgba(255, 255, 255, 0.92);
+  --secondary: rgba(255, 255, 255, 0.55);
+  --tertiary: rgba(255, 255, 255, 0.32);
+  --accent: rgb(59, 130, 255);        /* Palette.accent (0.23, 0.51, 1.0) */
+  --failure: rgb(255, 84, 77);        /* (1.0, 0.33, 0.30) */
+  --success: rgb(51, 204, 115);       /* (0.2, 0.8, 0.45) */
+  --corner: 22px;
+  --font: "SF Pro Text", "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif;
+  --rounded: "SF Pro Rounded", "Segoe UI Variable Display", "Segoe UI", system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; background: transparent; color: var(--text); font: 13px/1.35 var(--font); overflow: hidden;
+  -webkit-font-smoothing: antialiased; user-select: none; }
+button { font: inherit; color: inherit; background: none; border: 0; padding: 0; cursor: default; }
+svg.i { width: 1em; height: 1em; display: inline-block; vertical-align: -0.125em; fill: none; stroke: currentColor;
+  stroke-width: 2.2; stroke-linecap: round; stroke-linejoin: round; }
+svg.i.f { fill: currentColor; stroke: none; }
+.hide { display: none !important; }
+::-webkit-scrollbar { width: 6px; } ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.14); border-radius: 3px; }
