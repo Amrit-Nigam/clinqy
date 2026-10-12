@@ -109,7 +109,7 @@ const $ = (s) => document.querySelector(s);
 const send = (o) => window.ipc.postMessage(JSON.stringify(o));
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const O = orb($("#orb"));
-let S = { snap: {}, history: [], workflows: [], skills: [], listening: false, transcript: "", status: "", hotkey: "Ctrl+Alt",
+let S = { snap: {}, history: [], workflows: [], skills: [], listening: false, transcript: "", status: "", hotkey: "Ctrl+Alt", talkKey: "Ctrl+H",
           context: {}, tab: "home", fixDismissed: null, recording: false, learning: false };
 
 const suggestions = [
@@ -135,6 +135,7 @@ function fixable(s) {
 function placeholder(s) {
   if (s.review) return "Type a change, or click Submit";
   if (s.question) return s.question.sensitive ? "Type it here (kept private)" : "Your answer";
+  if (s.running && s.paused) return "Paused — add something, or press Resume";
   if (s.running) return "Add to this task or change the plan…";
   if (fixable(s)) return "What should I do differently? e.g. “no, click the other one”";
   return s.dry_run ? "What should I show you? (dry run)" : "What should I do?";
@@ -188,7 +189,8 @@ function render() {
   let btns;
   if (s.review) btns = `<button class="ib white" data-act="cancel" title="Stop">${icon("stop.fill")}</button>`;
   else if (s.question) btns = mic + `<button class="ib white" data-act="send" title="Answer">${icon("arrow.up")}</button>`;
-  else if (s.running) btns = `<button class="ib white" data-act="cancel" title="Stop">${icon("stop.fill")}</button>`;
+  else if (s.running) btns = `<button class="ib white" data-act="pause" title="${s.paused ? "Resume" : "Pause (holds before the next step)"}">${icon(s.paused ? "play.fill" : "pause.fill")}</button>`
+    + `<button class="ib white" data-act="cancel" title="Stop now">${icon("stop.fill")}</button>`;
   else btns = mic;
   $("#buttons").innerHTML = btns;
 
@@ -226,6 +228,7 @@ function render() {
       body += `<div class="sugg">${suggestions.map(([ic, t]) => `<button class="srow" data-suggest="${esc(t)}"><span class="ic">${icon(ic)}</span><span class="t" style="text-align:left">${esc(t)}</span><span class="ret">${icon("return")}</span></button>`).join("")}</div>`;
     } else {
       body += `<div class="steps">`;
+      if (s.running && s.paused) body += `<div class="label" style="color:var(--text)">${icon("pause.fill")} Paused — press Resume to carry on, or Stop</div>`;
       if (s.answer) body += `<div class="answer">${esc(s.answer)}</div>`;
       body += (s.steps || []).slice(-7).map((st) => `<div class="step ${st.state}"><span class="m">${st.state === "running" ? `<span class="spin"></span>` : st.state === "ok" ? icon("checkmark") : st.state === "failed" ? icon("xmark") : icon("sparkle", "f")}</span><span class="t">${esc(st.text)}</span></div>`).join("");
       body += `</div>`;
@@ -234,7 +237,7 @@ function render() {
   $("#bodywrap").innerHTML = showBody ? `<div class="hair"></div><div class="content">${body}</div>` : "";
 
   // The footer.
-  $("#foot").innerHTML = `<span class="hint"><span class="keys">${esc(S.hotkey)}</span>open</span><span class="hint">hold <span class="keys">${esc(S.hotkey)}</span>talk</span>
+  $("#foot").innerHTML = `<span class="hint"><span class="keys">${esc(S.hotkey)}</span>open</span><span class="hint">hold <span class="keys">${esc(S.talkKey)}</span>talk</span>
     <span class="spacer"></span>
     <button class="fb ${s.dry_run ? "acc" : ""}" data-act="dry" title="Dry run: Clinqy points at everything it would click and type, without doing it"><span class="ic">${icon(s.dry_run ? "eye.fill" : "eye")}</span>Dry run</button>
     <button class="fb" data-act="circle" title="Circle something on screen to point Clinqy at it"><span class="ic">${icon("lasso")}</span>Circle</button>

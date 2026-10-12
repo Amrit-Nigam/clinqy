@@ -18,7 +18,8 @@ pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding ag
   clinqy page [read|url]                   What's in the browser tab in front (via the extension), read-only.
   clinqy look [read|url]                   What's in front (the app's controls, or the browser tab), read-only.
   clinqy answer \"<text>\"                    Answer the question Clinqy is waiting on.
-  clinqy stop                              Stop the current task.
+  clinqy stop                              Stop the current task now.
+  clinqy pause | resume                    Hold the current task at its next step, then carry on.
   clinqy open                              Open the command bar.
   clinqy stats [days] [--last]             Success rate, time per turn, click outcomes, common failures (default 7 days).
   clinqy memory [\"request\"]                What memory holds (or exactly which facts a request would be sent).
@@ -81,6 +82,8 @@ pub fn main(args: Vec<String>) -> i32 {
         }
         "answer" => simple("answer", json!({"text": rest.join(" ")}), false),
         "stop" | "cancel" => simple("cancel", json!({}), false),
+        "pause" => simple("pause", json!({}), false),
+        "resume" => simple("resume", json!({}), false),
         "open" | "show" => simple("show", json!({}), true),
         "extension" => {
             if rest.first().map(|s| s == "reload").unwrap_or(false) {

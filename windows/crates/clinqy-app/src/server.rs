@@ -97,6 +97,13 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
             shared.send(UserEvent::ShowBar);
             out.end(json!({"event": "ok"})).await
         }
+        "pause" | "resume" => {
+            if !agent.is_running() {
+                return out.end(json!({"event": "error", "error": "nothing is running"})).await;
+            }
+            agent.set_paused(cmd == "pause");
+            out.end(json!({"event": "ok", "text": if cmd == "pause" { "Paused (clinqy resume carries on, clinqy stop ends it)" } else { "Resumed" }})).await
+        }
         "status" => out.end(json!({"event": "ok", "snapshot": agent.snapshot(), "extension": clinqy_core::bridge::bridge().is_connected()})).await,
         "answer" => {
             agent.answer(Some(s("text")));

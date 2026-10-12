@@ -21,7 +21,6 @@ use tray_icon::{TrayIconBuilder, TrayIconEvent};
 pub enum UserEvent {
     Agent(AgentEvent),
     Hot(HotEvent),
-    HoldTimer(u64),
     Bar(String),
     Result(String),
     Menu(String),
@@ -103,12 +102,14 @@ pub fn run() -> anyhow::Result<()> {
     rt.spawn(crate::server::serve(shared.clone()));
     agent.prewarm();
 
-    // The summon chord.
+    // The summon chord (tap to open the bar) and push-to-talk (hold to speak, let go to send).
     let hk = clinqy_core::config::value("HOTKEY").unwrap_or_else(|| "ctrl+alt".into());
     let hotkey_label = hotkey::label(&hk);
+    let talk = clinqy_core::config::value("TALK_HOTKEY").unwrap_or_else(|| "ctrl+h".into());
+    let talk_label = hotkey::talk_label(&talk);
     {
         let p = proxy.clone();
-        hotkey::start(&hk, move |e| {
+        hotkey::start(&hk, &talk, move |e| {
             let _ = p.send_event(UserEvent::Hot(e));
         });
     }
@@ -116,6 +117,7 @@ pub fn run() -> anyhow::Result<()> {
     // Tray.
     let menu = Menu::new();
     let item = |id: &str, text: &str| MenuItem::with_id(id, text, true, None);
+    let pause = MenuItem::with_id("pause", "Pause the current task", true, None);
     let dry = CheckMenuItem::with_id("dry", "Dry run (show, don't do)", true, false, None);
     let login = CheckMenuItem::with_id("login", "Open at login", true, crate::setup::starts_at_login(), None);
     // Voice language: what Whisper listens for (saved as VOICE_LANGUAGE in the settings file).
@@ -130,7 +132,7 @@ pub fn run() -> anyhow::Result<()> {
     }
     let _ = menu.append_items(&[
         &item("open", &format!("Open Clinqy\t{hotkey_label}")),
-        &item("talk", &format!("Talk (hold {hotkey_label})")),
+        &pause,
         &item("stop", "Stop the current task"),
         &PredefinedMenuItem::separator(),
         &item("circle", "Circle something…"),
@@ -237,9 +239,10 @@ pub fn run() -> anyhow::Result<()> {
         login,
         clip,
         hotkey_label,
-        pressed_at: None,
-        hold_id: 0,
-        holding: false,
+        talk_label,
+        talk_key: talk.clone(),
+        talk_started: None,
+        pause,
         voice_run: false,
         tab: "home".into(),
         island_until: None,
@@ -303,9 +306,12 @@ struct UiState {
     login: CheckMenuItem,
     clip: Arc<Mutex<ClipState>>,
     hotkey_label: String,
-    pressed_at: Option<Instant>,
-    hold_id: u64,
-    holding: bool,
+    /// Push-to-talk's key, for hints ("Ctrl+H"); empty when it's off.
+    talk_label: String,
+    talk_key: String,
+    /// When push-to-talk went down (a quick tap is passed on to the app as its own shortcut).
+    talk_started: Option<Instant>,
+    pause: MenuItem,
     voice_run: bool,
     tab: String,
     island_until: Option<Instant>,
@@ -347,7 +353,7 @@ impl UiState {
             "snap": self.agent().snapshot(),
             "history": hist, "workflows": wfs, "skills": skills,
             "listening": self.shared.voice.is_listening(), "transcript": if transcript == "Transcribing…" { String::new() } else { transcript },
-            "hotkey": self.hotkey_label, "model": format!("{} · {}", provider.id(), provider.default_model()),
+            "hotkey": self.hotkey_label, "talkKey": self.talk_label, "model": format!("{} · {}", provider.id(), provider.default_model()),
         })
     }
 
@@ -366,6 +372,7 @@ impl UiState {
         v["followUp"] = json!(self.follow_up);
         v["recording"] = json!(crate::recorder::is_recording());
         v["hotkey"] = json!(self.hotkey_label);
+        v["talkKey"] = json!(self.talk_label);
         if let Some(n) = &self.notice {
             v["notice"] = json!(n);
         }
@@ -485,13 +492,6 @@ impl UiState {
         match e {
             UserEvent::Agent(ev) => self.on_agent(ev),
             UserEvent::Hot(h) => self.on_hotkey(h),
-            UserEvent::HoldTimer(id) => {
-                if id == self.hold_id && self.pressed_at.is_some() && !self.holding {
-                    self.holding = true;
-                    self.bar.hide();
-                    self.start_listening();
-                }
-            }
             UserEvent::ShowBar => self.show_bar(),
             UserEvent::TrayClick => {
                 if self.agent().is_running() {
@@ -563,8 +563,7 @@ impl UiState {
                 if text.is_empty() {
                     if !self.agent().is_running() {
                         self.island_on = false;
-                        self.island_on = false;
-                    self.island.hide();
+                        self.island.hide();
                     }
                     return;
                 }
@@ -587,49 +586,57 @@ impl UiState {
 
     fn on_hotkey(&mut self, h: HotEvent) {
         match h {
-            HotEvent::Pressed => {
-                self.pressed_at = Some(Instant::now());
-                self.holding = false;
-                self.hold_id += 1;
-                let id = self.hold_id;
-                let p = self.shared.proxy.lock().clone();
-                std::thread::spawn(move || {
-                    std::thread::sleep(Duration::from_millis(320));
-                    let _ = p.send_event(UserEvent::HoldTimer(id));
-                });
-            }
+            // The summon chord: a tap opens (or closes) the bar; listening is push-to-talk's job.
+            HotEvent::Pressed | HotEvent::Spoiled => {}
             HotEvent::Released => {
-                let held = self.holding;
-                self.pressed_at = None;
-                self.holding = false;
-                if held {
-                    self.shared.voice.stop();
-                } else if self.bar.visible() {
+                if self.bar.visible() {
                     self.bar.hide();
                 } else {
                     self.capture_context_then_show();
                 }
             }
-            HotEvent::Spoiled => {
-                // Part of another shortcut: undo anything it started.
-                if self.holding {
+            // Push-to-talk: listen only while it's held.
+            HotEvent::TalkDown => {
+                self.talk_started = Some(Instant::now());
+                if self.agent().question().is_none() {
+                    self.bar.hide();
+                }
+                self.start_listening();
+            }
+            HotEvent::TalkUp => {
+                let held = self.talk_started.take().map(|t| t.elapsed()).unwrap_or_default();
+                if held < Duration::from_millis(250) {
+                    // A tap, not speech: undo, and give the app its own shortcut (Ctrl+H is Replace, History…).
                     self.shared.voice.cancel();
                     self.agent().set_listening(false);
+                    self.shared.agent.buddy.set_mood(if self.agent().is_running() { Mood::Acting } else { Mood::Idle });
                     if !self.agent().is_running() {
                         self.island_on = false;
-                        self.island_on = false;
-                    self.island.hide();
+                        self.island.hide();
                     }
+                    let keys = self.talk_key.clone();
+                    std::thread::spawn(move || {
+                        std::thread::sleep(Duration::from_millis(30));
+                        let _ = clinqy_windows::input::press_combo(&keys);
+                    });
+                } else {
+                    self.shared.voice.stop();
                 }
-                self.pressed_at = None;
-                self.holding = false;
             }
         }
+    }
+
+    /// The tray's Pause item: only while a task runs, and it says Resume when paused.
+    fn sync_pause_item(&self) {
+        let running = self.agent().is_running();
+        self.pause.set_enabled(running);
+        self.pause.set_text(if running && self.agent().is_paused() { "Resume the task" } else { "Pause the current task" });
     }
 
     fn on_agent(&mut self, ev: AgentEvent) {
         match ev {
             AgentEvent::Changed(_) => {
+                self.sync_pause_item();
                 self.refresh_island();
                 self.refresh_bar();
             }
@@ -659,6 +666,7 @@ impl UiState {
                 }
             }
             AgentEvent::Finished { answer, ok } => {
+                self.sync_pause_item();
                 self.refresh_island();
                 let has_card = self.agent().snapshot().result.is_some();
                 if !has_card {
@@ -669,7 +677,7 @@ impl UiState {
                     self.show_bar();
                 }
                 let spoken = std::mem::take(&mut self.voice_run);
-                if spoken && ok && clinqy_core::config::on("FOLLOW_UP", true) {
+                if spoken && ok && clinqy_core::config::on("FOLLOW_UP", false) {
                     // Keep the mic open a few seconds for a follow-up ("now email that to Rahul").
                     self.follow_up = true;
                     self.agent().context.lock().continuation = history::history().latest();
@@ -706,6 +714,7 @@ impl UiState {
             "answer" => agent.answer(Some(s("text"))),
             "review" => agent.decide_review(m["submit"] == true, Some(s("note")).filter(|n| !n.is_empty())),
             "cancel" => agent.cancel(),
+            "pause" => agent.set_paused(!agent.is_paused()),
             "dry" => {
                 let on = !agent.dry_run.load(std::sync::atomic::Ordering::Relaxed);
                 agent.dry_run.store(on, std::sync::atomic::Ordering::Relaxed);
@@ -830,7 +839,7 @@ impl UiState {
         };
         match id {
             "open" => self.capture_context_then_show(),
-            "talk" => self.start_listening(),
+            "pause" => agent.set_paused(!agent.is_paused()),
             "stop" => agent.cancel(),
             "watch" => crate::recorder::toggle(self.shared.clone()),
             "circle" => self.start_circling(),

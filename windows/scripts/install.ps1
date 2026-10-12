@@ -91,6 +91,6 @@ if (-not $NoStart) {
     Start-Process (Join-Path $dest 'ClinqyApp.exe')
 }
 Write-Host ''
-Write-Host 'Done. Press Ctrl+Alt to open Clinqy, or hold Ctrl+Alt to talk.' -ForegroundColor Green
+Write-Host 'Done. Press Ctrl+Alt to open Clinqy, or hold Ctrl+H to talk.' -ForegroundColor Green
 Write-Host 'Next: add the browser extension (tray icon -> Browser extension...) and check everything with: clinqy doctor'
 Write-Host ''

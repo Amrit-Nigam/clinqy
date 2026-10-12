@@ -218,8 +218,18 @@ impl Island {
     pub fn update(&self, s: &Value, visible: bool) {
         let hotkey = s["hotkey"].as_str().unwrap_or("Ctrl+Alt");
         let listening = s["listening"] == true;
+        let talk = s["talkKey"].as_str().unwrap_or("");
+        let paused = s["running"] == true && s["paused"] == true;
         let text = if listening {
-            s["transcript"].as_str().filter(|t| !t.is_empty()).map(String::from).unwrap_or_else(|| if s["followUp"] == true { "Anything else? I'm listening…".into() } else { "Listening…".into() })
+            s["transcript"].as_str().filter(|t| !t.is_empty()).map(String::from).unwrap_or_else(|| {
+                if s["followUp"] == true {
+                    "Anything else? I'm listening…".into()
+                } else if !talk.is_empty() {
+                    format!("Listening… let go of {talk} to send")
+                } else {
+                    "Listening…".into()
+                }
+            })
         } else if s["recording"] == true {
             format!("Watching you… do the task, then {hotkey} or ■ to stop")
         } else if s["transcribing"] == true {
@@ -230,12 +240,16 @@ impl Island {
             format!("Needs your input: {q}")
         } else if let Some(t) = s["review"]["title"].as_str() {
             format!("Check before I submit: {t}")
+        } else if paused {
+            format!("Paused · {}", s["narration"].as_str().filter(|t| !t.is_empty()).unwrap_or("between steps"))
         } else if s["running"] == true {
             s["narration"].as_str().filter(|t| !t.is_empty()).unwrap_or("Thinking…").to_string()
         } else {
             s["answer"].as_str().filter(|t| !t.is_empty()).or(s["narration"].as_str().filter(|t| !t.is_empty())).unwrap_or("Thinking…").to_string()
         };
-        let hint = if s["running"] == true {
+        let hint = if paused {
+            format!("{hotkey} to resume or stop")
+        } else if s["running"] == true {
             if s["dry"] == true {
                 "dry run · ■ to stop".to_string()
             } else {
@@ -246,6 +260,8 @@ impl Island {
         };
         let mood = if listening {
             Mood::Listening
+        } else if paused {
+            Mood::Idle
         } else {
             match s["phase"].as_str().unwrap_or("idle") {
                 "thinking" => Mood::Thinking,

@@ -80,6 +80,8 @@ pub struct Snapshot {
     pub dry_run: bool,
     /// The current run only shows what it would do.
     pub dry: bool,
+    /// Held by the user between steps (Pause); Resume carries on.
+    pub paused: bool,
     pub qa: bool,
 }
 
@@ -186,6 +188,8 @@ pub struct Agent {
     /// Whether the current run is a dry run (the toggle, "dry run:" or `--dry`).
     run_dry: AtomicBool,
     last_progress: Arc<Mutex<Instant>>,
+    paused: AtomicBool,
+    pause_wake: tokio::sync::Notify,
     snaps: Mutex<(Vec<Snap>, Option<PathBuf>, Option<Instant>)>,
     auto_continues: AtomicU32,
     /// Bumped by every new run, so a stale watchdog or a finished run's late call can tell it's not current.
@@ -246,6 +250,8 @@ impl Agent {
             dry_run: AtomicBool::new(false),
             run_dry: AtomicBool::new(false),
             last_progress: Arc::new(Mutex::new(Instant::now())),
+            paused: AtomicBool::new(false),
+            pause_wake: tokio::sync::Notify::new(),
             snaps: Mutex::new((vec![], None, None)),
             auto_continues: AtomicU32::new(0),
             generation: AtomicU32::new(0),
@@ -281,6 +287,7 @@ impl Agent {
             request: u.request.clone(),
             dry_run: self.dry_run.load(Ordering::Relaxed),
             dry: self.run_dry.load(Ordering::Relaxed),
+            paused: self.paused.load(Ordering::Relaxed) && matches!(u.phase, Phase::Thinking | Phase::Acting | Phase::Waiting),
             qa: u.qa,
         }
     }
@@ -392,6 +399,44 @@ impl Agent {
         if self.is_running() {
             self.finish(false, "Stopped");
         }
+    }
+
+    /// Pause or resume the running task. It holds at the next step (before an action or the next turn); Stop
+    /// still ends it at once.
+    pub fn set_paused(&self, on: bool) {
+        if on && !self.is_running() {
+            return;
+        }
+        if self.paused.swap(on, Ordering::Relaxed) == on {
+            return;
+        }
+        if !on {
+            self.pause_wake.notify_waiters();
+        }
+        self.changed();
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::Relaxed)
+    }
+
+    /// Waits here while the user has the task paused.
+    pub(crate) async fn hold_if_paused(&self) {
+        if !self.is_paused() {
+            return;
+        }
+        self.log("  ⏸ paused by the user");
+        self.buddy.set_mood(Mood::Idle);
+        self.buddy.go_home();
+        while self.is_paused() {
+            self.progress();
+            tokio::select! {
+                _ = self.pause_wake.notified() => {}
+                _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+            }
+        }
+        self.log("  ▶ resumed");
+        self.buddy.set_mood(Mood::Acting);
     }
 
     pub(crate) fn progress(&self) {
@@ -627,6 +672,7 @@ impl Agent {
                 s.1 = None;
             }
         }
+        self.paused.store(false, Ordering::Relaxed);
         self.platform.begin_run();
         self.buddy.clear_mark();
         self.progress();
@@ -680,6 +726,7 @@ impl Agent {
         if !self.is_running() {
             return;
         }
+        self.paused.store(false, Ordering::Relaxed);
         let info = {
             let mut c = self.current.lock();
             if c.finished {

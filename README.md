@@ -134,12 +134,12 @@ To use agy, Codex, an Anthropic / OpenAI / Gemini / OpenRouter key, or a local m
 | | |
 |---|---|
 | **Tap Ctrl+Alt** | open the command bar, type what you want, press Enter |
-| **Hold Ctrl+Alt** | talk (the voice model downloads the first time), let go to send |
-| **Ctrl+Alt while it works** | add something or change the plan |
-| **Click the tray icon while it works** | stop |
+| **Hold Ctrl+H** | talk: it listens only while you hold it, and sends when you let go (the voice model downloads the first time) |
+| **Ctrl+Alt while it works** | add something or change the plan, **Pause / Resume**, or **Stop** |
+| **Click the tray icon while it works** | stop at once (the tray menu also has Pause) |
 | **Esc** | close the bar |
 
-The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and **History**, the same as on the Mac. Only the left Alt key counts, so typing with AltGr never opens Clinqy. To use another key combination, set `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) in the settings file.
+The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and **History**, the same as on the Mac. Only the left Alt key counts, so typing with AltGr never opens Clinqy. To use other keys, set `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) or `TALK_HOTKEY=ctrl+shift+space` in the settings file. A quick tap of Ctrl+H still reaches the app in front (Replace, History…).
 
 **Use it from coding agents (optional).** `clinqy run`, `clinqy qa` and `clinqy look` work in any terminal, as on the Mac (see [The `clinqy` command](#the-clinqy-command-qa-and-workflows-for-any-coding-agent)). To add Clinqy as an MCP server:
 

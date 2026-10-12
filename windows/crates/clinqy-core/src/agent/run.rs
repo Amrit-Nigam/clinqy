@@ -187,6 +187,7 @@ impl Agent {
         let max_turns = 80usize;
 
         for turn in 0..max_turns {
+            self.hold_if_paused().await;
             if turn == max_turns - 10 {
                 message += &format!("\n({turn} of {max_turns} steps used. If the current approach isn't getting closer, change it now. A long task that is making progress just carries on in a new run when these run out, so don't finish early for that; finish only if it truly can't be done. Before the steps run out, paste any snaps not yet in the doc.)");
             }
@@ -450,6 +451,7 @@ impl Agent {
             last_first = actions.first().map(reply::canonical).unwrap_or_default();
             let mut early = early;
             for (i, action) in actions.iter().enumerate() {
+                self.hold_if_paused().await;
                 if !self.added.lock().is_empty() {
                     results.push(format!("(stopped before step {}: the user added something — see above)", i + 1));
                     break;

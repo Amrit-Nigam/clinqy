@@ -38,9 +38,9 @@ To remove it: `uninstall.ps1` in the install folder (add `-Purge` to delete your
 | | |
 |---|---|
 | **Tap Ctrl+Alt** | Open the command bar. Type, press Enter. |
-| **Hold Ctrl+Alt** | Talk (on-device Whisper, downloaded the first time). Let go to send. |
-| **Ctrl+Alt while it works** | Add to the task or change the plan. |
-| **Click the tray icon while it works** | Stop. |
+| **Hold Ctrl+H** | Talk: it listens only while you hold it and sends when you let go (on-device Whisper, downloaded the first time). A quick tap still reaches the app in front. |
+| **Ctrl+Alt while it works** | Add to the task or change the plan; **Pause** / **Resume** (holds before its next step) or **Stop** (at once). |
+| **Click the tray icon while it works** | Stop. The tray menu also has Pause. `clinqy pause`, `clinqy resume` and `clinqy stop` work from a terminal. |
 | **Esc** | Close the bar. |
 
 The footer of the bar has the same tools as on the Mac: **Dry run** (it points at everything it would click and
