@@ -344,7 +344,7 @@ dependencies = [
 
 [[package]]
 name = "clinqy-app"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -373,7 +373,7 @@ dependencies = [
 
 [[package]]
 name = "clinqy-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -396,7 +396,7 @@ dependencies = [
 
 [[package]]
 name = "clinqy-windows"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "anyhow",
  "async-trait",
