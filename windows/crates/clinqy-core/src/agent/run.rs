@@ -276,10 +276,18 @@ impl Agent {
             if known < 6 || failures >= 2 {
                 wants_look = true;
             }
+            // The first look shows what the user circled; after that it's just in the request text.
+            let circled = if turn == 0 { self.context.lock().circled.clone() } else { None };
+            if let Some(c) = &circled {
+                wants_look = true;
+                let r = super::circle_bounds(c);
+                let inside: Vec<&str> = obs.elements.iter().filter(|e| e.rect.intersects(&r)).map(|e| e.id.as_str()).take(30).collect();
+                message += &format!("\nInside the circled area: {}", if inside.is_empty() { "no listed elements (use the screenshot).".to_string() } else { inside.join(", ") });
+            }
             let mut image: Option<String> = None;
             if wants_look {
                 if let Some(a) = &obs.app {
-                    image = self.platform.look(a, &obs.elements).await;
+                    image = self.platform.look(a, &obs.elements, circled.as_deref()).await;
                 }
             }
             wants_look = false;
@@ -308,7 +316,11 @@ impl Agent {
             }
             let turn_text = format!(
                 "{message}\n\n{screen}{}{}",
-                if image.is_some() { "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)" } else { "" },
+                match (&image, &circled) {
+                    (Some(_), Some(_)) => "\n(Screenshot attached: red boxes are tagged with the same e<N> ids. The yellow loop is what the user circled.)",
+                    (Some(_), None) => "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.)",
+                    _ => "",
+                },
                 crate::prompt::REPLY_JSON_ONLY
             );
 
@@ -333,7 +345,7 @@ impl Agent {
             let shot = image.clone();
             let mut replying = tokio::spawn(async move { s.send(&send_text, shot, if early_on { Some(ptx) } else { None }).await });
             let mut early: Option<(Action, ActionResult, Option<Target>)> = None;
-            let mut reply_result = None;
+            let reply_result;
             loop {
                 tokio::select! {
                     biased;
@@ -500,6 +512,13 @@ impl Agent {
                     break;
                 }
                 failures = 0;
+                // The user's answer can change the plan ("it's saved, just click the field"): what was planned
+                // after the question waits for the next turn.
+                if kind == "ask" && i + 1 < actions.len() && result.summary.starts_with("the user answered") {
+                    results.push(format!("(the rest of this batch waits: plan it again with the answer above)"));
+                    cut_short = true;
+                    break;
+                }
                 // Another app came to the front (a link opening the browser): the rest was planned for the old screen.
                 if ["click", "key", "type"].contains(&kind.as_str()) && !dry && i + 1 < actions.len() {
                     if let Some(current) = &ctx.app {
@@ -615,6 +634,13 @@ impl Agent {
                     s.0.last().map(|x| x.caption.chars().take(80).collect::<String>()).unwrap_or_default()
                 );
             }
+        }
+        if let Some(c) = &ctx.circled {
+            let r = super::circle_bounds(c);
+            text += &format!(
+                "\nThe user circled an area on screen before asking (\"this\", \"here\", \"that\" usually mean it): x {}–{}, y {}–{} in screen pixels. It's the yellow loop on the first screenshot.",
+                r.x as i64, r.max_x() as i64, r.y as i64, r.max_y() as i64
+            );
         }
         if let Some(sel) = ctx.selected_text.as_ref().filter(|s| !s.is_empty()) {
             text += &format!("\nSelected text (the user highlighted this before asking; \"this\", \"it\", \"that\" usually mean it):\n\"\"\"\n{}\n\"\"\"", sel.chars().take(4000).collect::<String>());

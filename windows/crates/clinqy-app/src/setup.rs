@@ -57,6 +57,31 @@ pub fn set_start_at_login(on: bool) {
     }
 }
 
+/// A string value under HKEY_CURRENT_USER (`name` None: the key's default value), creating the key.
+fn set_user_string(key: &str, name: Option<&str>, value: &str) {
+    let k = wide(key);
+    let n = name.map(wide);
+    unsafe {
+        let mut h = HKEY::default();
+        if RegCreateKeyExW(HKEY_CURRENT_USER, PCWSTR(k.as_ptr()), 0, None, REG_OPTION_NON_VOLATILE, KEY_SET_VALUE, None, &mut h, None).is_err() {
+            return;
+        }
+        let v: Vec<u8> = wide(value).iter().flat_map(|u| u.to_le_bytes()).collect();
+        let _ = RegSetValueExW(h, n.as_ref().map(|n| PCWSTR(n.as_ptr())).unwrap_or(PCWSTR::null()), 0, REG_SZ, Some(&v));
+        let _ = RegCloseKey(h);
+    }
+}
+
+/// clinqy:// links (QA runs, workflows, "open Clinqy" from a web page) go to the `clinqy` command next to the app,
+/// as on the Mac. Re-registered at each launch, so it follows the app when it moves.
+pub fn register_links() {
+    let Some(cli) = std::env::current_exe().ok().and_then(|e| e.parent().map(|d| d.join("clinqy.exe"))).filter(|c| c.is_file()) else { return };
+    set_user_string(r"Software\Classes\clinqy", None, "URL:Clinqy");
+    set_user_string(r"Software\Classes\clinqy", Some("URL Protocol"), "");
+    set_user_string(r"Software\Classes\clinqy\DefaultIcon", None, &format!("{},0", cli.with_file_name("ClinqyApp.exe").display()));
+    set_user_string(r"Software\Classes\clinqy\shell\open\command", None, &format!("\"{}\" url \"%1\"", cli.display()));
+}
+
 /// Where the browser extension lives: next to the app when installed, else the repo's extension folder.
 pub fn extension_dir() -> Option<std::path::PathBuf> {
     let exe = std::env::current_exe().ok()?;
@@ -89,7 +114,9 @@ pub fn beep() {
 }
 
 /// What's ready: the model, the browser extension, voice, Outlook (email & calendar), Windows Search.
-pub fn check_card() -> ResultCard {
+/// What's set up. `extension`: whether the browser extension is connected, when someone else (the running app)
+/// knows better than this process.
+pub fn check_card(extension: Option<bool>) -> ResultCard {
     let p = Provider::current();
     let mut items = vec![];
     let ok = |b: bool| if b { "✓ ready" } else { "✗ needs setup" };
@@ -100,7 +127,7 @@ pub fn check_card() -> ResultCard {
         detail: Some(ok(model_ready).into()),
         link: None,
     });
-    let ext = clinqy_core::bridge::bridge().is_connected();
+    let ext = extension.unwrap_or_else(|| clinqy_core::bridge::bridge().is_connected());
     items.push(CardItem {
         title: "Browser extension".into(),
         subtitle: Some(if ext {

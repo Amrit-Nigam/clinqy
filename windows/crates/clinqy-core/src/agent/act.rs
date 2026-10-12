@@ -202,8 +202,6 @@ impl Agent {
             .cloned()
     }
 
-    pub(crate) fn trace_click(&self, _p: Point) {}
-
     pub(crate) async fn perform(self: &Arc<Self>, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
         let kind = action.kind();
         if rs.dry {
@@ -224,11 +222,11 @@ impl Agent {
             "open_app" => self.open_app(action, ctx).await,
             "open_url" => self.open_url(action, ctx, rs).await,
             "click" if web => self.web_click(action, ctx, rs).await,
-            "upload" if ctx.page.is_some() => self.upload(action, ctx).await,
+            "upload" if ctx.page.is_some() => self.upload(action, ctx, rs).await,
             "review" if ctx.page.is_some() => self.review_form(ctx, rs).await,
             "autofill" if ctx.page.is_some() => Box::pin(self.autofill(ctx, rs)).await,
-            "choose" if web => self.choose(action, ctx).await,
-            "type" if web => self.web_type(action, ctx).await,
+            "choose" if web => self.choose(action, ctx, rs).await,
+            "type" if web => self.web_type(action, ctx, rs).await,
             "type" if !has_id && ctx.page.is_some() => self.type_focused_page(action, ctx).await,
             "point" | "mark" if web => self.web_point(action, ctx, rs).await,
             "scroll" if ctx.page.is_some() => self.web_scroll(action, ctx).await,

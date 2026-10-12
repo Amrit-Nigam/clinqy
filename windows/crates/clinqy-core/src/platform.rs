@@ -268,7 +268,8 @@ pub trait Platform: Send + Sync {
     async fn screenshot(&self, app: &AppRef) -> Option<Shot>;
     /// A screenshot for the model: the window as a base64 JPEG, scaled down, with red boxes tagged by e-id. Its
     /// geometry is kept so `screen_point` can map the model's x/y back to the screen.
-    async fn look(&self, app: &AppRef, elements: &[Element]) -> Option<String>;
+    /// `circled`: a loop the user drew on screen before asking, drawn on the screenshot as they drew it.
+    async fn look(&self, app: &AppRef, elements: &[Element], circled: Option<&[Point]>) -> Option<String>;
     /// A point on the last screenshot (image pixels) as a screen point, and the image-to-screen scale.
     fn screen_point(&self, x: f64, y: f64) -> Option<Point>;
     fn shot_scale(&self) -> f64;

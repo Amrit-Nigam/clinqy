@@ -620,8 +620,8 @@ impl Uia {
     }
 
     fn close_menus(&self) {
-        crate::input::press_combo("esc");
-        crate::input::press_combo("esc");
+        let _ = crate::input::press_combo("esc");
+        let _ = crate::input::press_combo("esc");
     }
 
     fn children_named(&self, el: &IUIAutomationElement, ct: UIA_CONTROLTYPE_ID) -> Vec<(String, IUIAutomationElement)> {

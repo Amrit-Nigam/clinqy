@@ -323,7 +323,10 @@ impl CliSession {
         }
         let result: Option<Result<String>> = if event["event"] == "result" {
             let res = &event["result"];
-            let text = res["response"].as_str().unwrap_or("").to_string();
+            let mut text = res["response"].as_str().unwrap_or("").to_string();
+            if text.trim().is_empty() && !st.partial_text.trim().is_empty() {
+                text = st.partial_text.clone();
+            }
             let err = res["error"].as_str().filter(|e| !e.is_empty());
             if res["status"] == "ERROR" || err.is_some() {
                 let msg = err.map(String::from).unwrap_or_else(|| if text.is_empty() { "Agy process error".into() } else { text });
@@ -333,7 +336,11 @@ impl CliSession {
                 Some(Ok(text))
             }
         } else if event["type"] == "result" {
-            let text = event["result"].as_str().unwrap_or("").to_string();
+            let mut text = event["result"].as_str().unwrap_or("").to_string();
+            // The final event can come back empty while the text arrived as deltas: use what streamed.
+            if text.trim().is_empty() && !st.partial_text.trim().is_empty() {
+                text = st.partial_text.clone();
+            }
             if event["is_error"] == true {
                 Some(Err(anyhow!(if text.is_empty() { "the model returned an error".to_string() } else { text })))
             } else {

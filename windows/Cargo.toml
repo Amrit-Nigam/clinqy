@@ -1,7 +1,7 @@
 # Clinqy for Windows. Three crates, split by what they may depend on:
 #   clinqy-core     the agent itself: models, prompt, loop, memory, history, browser bridge, MCP. No OS APIs.
 #   clinqy-windows  the Windows platform layer: UI Automation, input, screen capture, OCR, overlay cursor, hotkey.
-#   clinqy-app      clinqy.exe: tray, command bar, IPC for the `clinqy` command, and the wiring between the two.
+#   clinqy-app      ClinqyApp.exe (tray, command bar, result card) and clinqy.exe (the command), plus the wiring.
 [workspace]
 resolver = "2"
 members = ["crates/clinqy-core", "crates/clinqy-windows", "crates/clinqy-app"]

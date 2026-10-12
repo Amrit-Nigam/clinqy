@@ -10,12 +10,18 @@ use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 static ON: AtomicBool = AtomicBool::new(false);
+static LEARNING: AtomicBool = AtomicBool::new(false);
 static STEPS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 static CLICKS: Mutex<Option<std::sync::mpsc::Sender<(i32, i32)>>> = Mutex::new(None);
 static HOOK_THREAD: Mutex<Option<u32>> = Mutex::new(None);
 
 pub fn is_recording() -> bool {
     ON.load(Ordering::Relaxed)
+}
+
+/// Turning a recording into a skill (the model is writing it).
+pub fn is_learning() -> bool {
+    LEARNING.load(Ordering::Relaxed)
 }
 
 unsafe extern "system" fn mouse(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
@@ -116,8 +122,11 @@ fn stop(shared: Arc<Shared>) {
     }
     let steps = std::mem::take(&mut *STEPS.lock());
     shared.send(UserEvent::Notice(format!("Learning from {} steps…", steps.len())));
+    LEARNING.store(true, Ordering::Relaxed);
     tokio::spawn(async move {
-        match clinqy_core::skills::learn(&steps).await {
+        let learned = clinqy_core::skills::learn(&steps).await;
+        LEARNING.store(false, Ordering::Relaxed);
+        match learned {
             Ok(s) => shared.send(UserEvent::Notice(format!("Learned the skill “{}” — find it under Skills", s.name))),
             Err(e) => shared.send(UserEvent::Notice(e)),
         }

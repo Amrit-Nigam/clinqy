@@ -250,13 +250,12 @@ impl Agent {
 
     /// A dropdown in one step: open it with a real click (typing to filter a search box), find the option by its
     /// text, click it, then check the field shows it.
-    pub(crate) async fn choose(&self, action: &Action, ctx: &mut Ctx) -> ActionResult {
+    pub(crate) async fn choose(&self, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
         let Some(want) = action.str("option").or_else(|| action.str("text")).filter(|w| !w.is_empty()).map(String::from) else {
             return ActionResult::fail("choose needs option");
         };
-        let mut rs_dummy = RunState::default();
         let Some(n) = super::run::web_index(action.get("id")) else { return ActionResult::fail("bad id") };
-        let Some((el, rect)) = self.live_target(n, ctx, &mut rs_dummy).await else { return ActionResult::fail(self.gone(action)) };
+        let Some((el, rect)) = self.live_target(n, ctx, rs).await else { return ActionResult::fail(self.gone(action)) };
         let (Some(page), Some(app), Some(web)) = (ctx.page.clone(), ctx.app.clone(), ctx.web_area) else { return ActionResult::fail(self.gone(action)) };
         let line = self.begin(&format!("Choose “{}”", want.chars().take(40).collect::<String>()));
         self.platform.bring_to_front(&app).await;
@@ -358,11 +357,10 @@ impl Agent {
         None
     }
 
-    pub(crate) async fn web_type(&self, action: &Action, ctx: &mut Ctx) -> ActionResult {
+    pub(crate) async fn web_type(&self, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
         let Some(text) = action.str("text").map(String::from) else { return ActionResult::fail("type needs text") };
-        let mut rs_dummy = RunState::default();
         let Some(n) = super::run::web_index(action.get("id")) else { return ActionResult::fail("bad id") };
-        let Some((el, rect)) = self.live_target(n, ctx, &mut rs_dummy).await else { return ActionResult::fail(self.gone(action)) };
+        let Some((el, rect)) = self.live_target(n, ctx, rs).await else { return ActionResult::fail(self.gone(action)) };
         let (Some(page), Some(app)) = (ctx.page.clone(), ctx.app.clone()) else { return ActionResult::fail(self.gone(action)) };
         let submit = action.flag("submit");
         let line = self.begin(&format!("Type “{}”", text.chars().take(40).collect::<String>()));
@@ -499,9 +497,16 @@ impl Agent {
         let editor = before.as_ref().and_then(|v| v["editorKind"].as_str()).map(String::from);
         self.buddy.set_typing(true);
         self.platform.set_target(Some(&app));
-        // Document editors (Google Docs) take the caret into an iframe: paste the whole text there.
-        if before.as_ref().map(|v| v["frame"] == true).unwrap_or(false) {
+        let code = before.as_ref().map(|v| v["code"] == true).unwrap_or(false);
+        // Document editors (Google Docs) take the caret into an iframe, and long code would take minutes to type
+        // and get re-indented on the way: both get the exact text pasted in one go.
+        if before.as_ref().map(|v| v["frame"] == true).unwrap_or(false) || (code && text.chars().count() > 200) {
+            if code {
+                self.platform.select_all();
+                tokio::time::sleep(Duration::from_millis(60)).await;
+            }
             self.platform.paste(&text);
+            tokio::time::sleep(Duration::from_millis(250)).await;
         } else {
             self.platform.enter_text(&text, before.as_ref().map(|v| v["code"] == true).unwrap_or(false)).await;
         }
@@ -512,7 +517,10 @@ impl Agent {
                 if !similar(value, &text) || value.chars().count() > text.chars().count() + 3 {
                     if let Ok(r) = b.perform("fillActive", &page, json!({"text": text}), 3.0).await {
                         if r["skipped"] == true {
-                            if let Some(shows) = r["value"].as_str().filter(|s| !similar(s, &text)) {
+                            // Editors like Monaco only render the visible lines: a run of what was typed is the whole of it,
+                            // scrolled.
+                            let squash = |s: &str| s.chars().filter(|c| !c.is_whitespace()).collect::<String>();
+                            if let Some(shows) = r["value"].as_str().filter(|s| !similar(s, &text) && !squash(&text).contains(&squash(s))) {
                                 self.buddy.clear_highlight();
                                 return self.end(
                                     line,
@@ -643,17 +651,16 @@ impl Agent {
 
     /// Straight into the page's upload field (no file picker); else through the site's own button; else the
     /// Windows file picker it opens, driven like a person would.
-    pub(crate) async fn upload(&self, action: &Action, ctx: &mut Ctx) -> ActionResult {
+    pub(crate) async fn upload(&self, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
         let Some(path) = action.str("file").or_else(|| action.str("path")) else { return ActionResult::fail("upload needs file") };
         let file = crate::paths::expand(path);
         let Ok(data) = std::fs::read(&file) else { return ActionResult::fail(format!("can't read {}", file.display())) };
         if data.len() >= 15_000_000 {
             return ActionResult::fail(format!("{} is too big to upload this way ({} MB)", file.display(), data.len() / 1_000_000));
         }
-        let mut rs_dummy = RunState::default();
         let mut target = None;
         if let Some(n) = super::run::web_index(action.get("id")) {
-            match self.live_target(n, ctx, &mut rs_dummy).await {
+            match self.live_target(n, ctx, rs).await {
                 Some(t) => target = Some(t),
                 None => return ActionResult::fail(self.gone(action)),
             }

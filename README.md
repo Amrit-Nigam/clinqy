@@ -12,6 +12,8 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 "message mom I'll be late"           "in the background, add a reminder to call Raj"
 ```
 
+> **On Windows?** Clinqy runs there too, with the same extension, settings and workflows: see [windows/README.md](windows/README.md).
+
 ## Setup guide
 
 The quickest way to set up Clinqy is to let your AI coding agent do it (Claude Code, Cursor, Codex, Antigravity CLI / agy, Windsurf…).

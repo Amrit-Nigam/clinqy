@@ -123,13 +123,19 @@ impl WindowsPlatform {
     }
 
     async fn wait_new_front(&self, before: &[isize], want: &str, seconds: f64) -> Option<AppRef> {
-        let deadline = Instant::now() + Duration::from_secs_f64(seconds);
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs_f64(seconds);
         let want = want.to_lowercase();
         while Instant::now() < deadline {
             if let Some((main, _)) = apps::foreground() {
                 if let Some(a) = apps::app_ref(main) {
                     let matches = a.name.to_lowercase().contains(&want) || want.contains(&a.name.to_lowercase()) || apps::window_title(main).to_lowercase().contains(&want);
-                    let fresh = !before.contains(&main) && a.pid != apps::own_pid() && !["searchhost.exe", "startmenuexperiencehost.exe", "shellexperiencehost.exe"].contains(&a.exe.as_str());
+                    // A window that merely appeared counts only after a while (an app whose window title doesn't
+                    // carry its name); early on, something else popping up (an Explorer window) mustn't.
+                    let fresh = !before.contains(&main)
+                        && a.pid != apps::own_pid()
+                        && !["searchhost.exe", "startmenuexperiencehost.exe", "shellexperiencehost.exe", "explorer.exe"].contains(&a.exe.as_str())
+                        && started.elapsed() > Duration::from_millis(2500);
                     if matches || fresh {
                         // Give it a moment to put its window up.
                         sleep(250).await;
@@ -254,7 +260,17 @@ impl Platform for WindowsPlatform {
         }
         // Installed: Start search like a person, falling back to launching it directly.
         let n2 = name.clone();
-        let installed = blocking(move || apps::find_installed(&n2)).await?;
+        let Some(installed) = blocking(move || apps::find_installed(&n2)).await else {
+            // A Mac browser (from a workflow or test recorded on a Mac): the user's own browser does the same job.
+            let mac_only = ["arc", "safari", "orion"];
+            if mac_only.contains(&name.to_lowercase().as_str()) {
+                if let Some(b) = self.default_browser().filter(|b| !mac_only.contains(&b.to_lowercase().as_str())) {
+                    clinqy_core::log::write(&format!("    ({name} is a Mac browser; using {b})"));
+                    return Box::pin(self.open_app(&b)).await;
+                }
+            }
+            return None;
+        };
         let before = apps::top_windows();
         let shown = installed.name.clone();
         let searched = self.start_search(&shown).await;
@@ -374,7 +390,8 @@ impl Platform for WindowsPlatform {
 
     async fn scan(&self, app: &AppRef, limit: usize) -> Scan {
         let (main, dialog) = Self::live_hwnd(app);
-        let browser = self.is_browser(app);
+        // With the extension connected the page comes from it; without, from UI Automation (slower, but it sees).
+        let browser = self.is_browser(app) && clinqy_core::bridge::bridge().is_connected();
         blocking(move || {
             let mut s = uia::uia().scan(main, dialog, browser, screen::virtual_screen(), limit);
             s.dialog = dialog.and_then(|d| uia::dialog_of(d, apps::owner(d)));
@@ -385,7 +402,7 @@ impl Platform for WindowsPlatform {
 
     async fn fingerprint(&self, app: &AppRef) -> u64 {
         let (main, dialog) = Self::live_hwnd(app);
-        let browser = self.is_browser(app);
+        let browser = self.is_browser(app) && clinqy_core::bridge::bridge().is_connected();
         blocking(move || uia::uia().fingerprint(dialog.unwrap_or(main), browser)).await
     }
 
@@ -440,10 +457,11 @@ impl Platform for WindowsPlatform {
         .await
     }
 
-    async fn look(&self, app: &AppRef, elements: &[Element]) -> Option<String> {
+    async fn look(&self, app: &AppRef, elements: &[Element], circled: Option<&[Point]>) -> Option<String> {
         let area = Self::shot_area(app)?;
         let els = elements.to_vec();
-        blocking(move || screen::for_model(area, &els)).await
+        let circled = circled.map(|c| c.to_vec());
+        blocking(move || screen::for_model(area, &els, circled.as_deref())).await
     }
 
     fn screen_point(&self, x: f64, y: f64) -> Option<Point> {

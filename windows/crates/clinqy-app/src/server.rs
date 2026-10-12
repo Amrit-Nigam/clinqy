@@ -94,7 +94,7 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
     match cmd {
         "ping" => out.end(json!({"event": "ok"})).await,
         "show" => {
-            shared.send(UserEvent::TrayClick);
+            shared.send(UserEvent::ShowBar);
             out.end(json!({"event": "ok"})).await
         }
         "status" => out.end(json!({"event": "ok", "snapshot": agent.snapshot(), "extension": clinqy_core::bridge::bridge().is_connected()})).await,

@@ -1,29 +1,35 @@
-//! The two windows: the command bar (Spotlight-like; takes the keyboard) and the status island (top of the screen,
-//! never takes focus, so the app being worked on stays in front). Both are WebView2 pages, rounded, and kept out
-//! of screenshots and screen shares like the Mac app's panels.
+//! The windows, styled exactly like the Mac app's panels: the command bar (Spotlight-like; takes the keyboard),
+//! the result card (top right; clickable but never takes focus), and the status island (top centre; drawn
+//! natively in `clinqy_windows::island` so it can be click-through). The bar and card are WebView2 pages on
+//! transparent windows, so their 22 pt / 18 pt corners are the Mac's; all are kept out of screenshots and shares.
 
 use crate::app::UserEvent;
+use clinqy_core::platform::Mood;
+use clinqy_windows::island::{Island as NativeIsland, IslandState};
 use serde_json::Value;
 use tao::dpi::{LogicalSize, PhysicalPosition};
 use tao::event_loop::{EventLoop, EventLoopProxy};
 use tao::platform::windows::{WindowBuilderExtWindows, WindowExtWindows};
 use tao::window::{Window, WindowBuilder};
-use windows::Win32::Foundation::HWND;
-use windows::Win32::Graphics::Dwm::{DwmSetWindowAttribute, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND};
+use windows::Win32::Foundation::{HWND, POINT};
+use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
 use windows::Win32::UI::WindowsAndMessaging::*;
-use wry::{WebView, WebViewBuilder};
+use wry::{WebContext, WebView, WebViewBuilder};
 
-const BAR_HTML: &str = include_str!("ui/web/bar.html");
-const ISLAND_HTML: &str = include_str!("ui/web/island.html");
-const BAR_WIDTH: f64 = 660.0;
-const ISLAND_WIDTH: f64 = 540.0;
+const SHARED_CSS: &str = include_str!("ui/web/shared.css");
+const ICONS_JS: &str = include_str!("ui/web/icons.js");
+const BAR_WIDTH: f64 = 612.0;
+const RESULT_WIDTH: f64 = 420.0;
 
+fn page(html: &str) -> String {
+    html.replace("/*SHARED_CSS*/", SHARED_CSS).replace("/*ICONS_JS*/", ICONS_JS)
+}
+
+/// Topmost, no taskbar button, out of screen captures; `no_activate` for windows that must never take focus.
 fn style(window: &Window, no_activate: bool) {
     let hwnd = HWND(window.hwnd() as _);
     unsafe {
-        let pref = DWMWCP_ROUND;
-        let _ = DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &pref as *const _ as _, std::mem::size_of_val(&pref) as u32);
-        let _ = SetWindowDisplayAffinity(hwnd, WDA_EXCLUDEFROMCAPTURE);
+        clinqy_windows::screen::hide_from_capture(hwnd.0 as isize);
         let ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
         let mut add = (WS_EX_TOOLWINDOW.0 | WS_EX_TOPMOST.0) as isize;
         if no_activate {
@@ -35,8 +41,6 @@ fn style(window: &Window, no_activate: bool) {
 
 /// The work area of the monitor under the pointer (physical pixels).
 fn work_area() -> (i32, i32, i32, i32) {
-    use windows::Win32::Foundation::POINT;
-    use windows::Win32::Graphics::Gdi::{GetMonitorInfoW, MonitorFromPoint, MONITORINFO, MONITOR_DEFAULTTONEAREST};
     unsafe {
         let mut p = POINT::default();
         let _ = GetCursorPos(&mut p);
@@ -52,32 +56,45 @@ fn js(view: &WebView, call: &str, v: &Value) {
     let _ = view.evaluate_script(&format!("window.clinqy && window.clinqy.{call}({v})"));
 }
 
+/// WebView2's profile lives with Clinqy's local data, not next to the exe (which may not be writable).
+fn web_context() -> WebContext {
+    WebContext::new(Some(clinqy_core::paths::local_dir().join("WebView2")))
+}
+
+fn transparent_window(event_loop: &EventLoop<UserEvent>, title: &str, w: f64, h: f64) -> anyhow::Result<Window> {
+    Ok(WindowBuilder::new()
+        .with_title(title)
+        .with_decorations(false)
+        .with_resizable(false)
+        .with_visible(false)
+        .with_transparent(true)
+        .with_always_on_top(true)
+        .with_skip_taskbar(true)
+        .with_undecorated_shadow(false)
+        .with_inner_size(LogicalSize::new(w, h))
+        .build(event_loop)?)
+}
+
 pub struct Bar {
     pub window: Window,
     view: WebView,
+    _context: WebContext,
 }
 
 impl Bar {
     pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Bar> {
-        let window = WindowBuilder::new()
-            .with_title("Clinqy")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_visible(false)
-            .with_always_on_top(true)
-            .with_skip_taskbar(true)
-            .with_undecorated_shadow(true)
-            .with_inner_size(LogicalSize::new(BAR_WIDTH, 64.0))
-            .build(event_loop)?;
+        let window = transparent_window(event_loop, "Clinqy", BAR_WIDTH, 300.0)?;
         style(&window, false);
-        let view = WebViewBuilder::new()
-            .with_html(BAR_HTML)
-            .with_background_color((23, 23, 26, 255))
+        let mut context = web_context();
+        let view = WebViewBuilder::with_web_context(&mut context)
+            .with_html(page(include_str!("ui/web/bar.html")))
+            .with_transparent(true)
+            .with_background_color((0, 0, 0, 0))
             .with_ipc_handler(move |req| {
                 let _ = proxy.send_event(UserEvent::Bar(req.body().to_string()));
             })
             .build(&window)?;
-        Ok(Bar { window, view })
+        Ok(Bar { window, view, _context: context })
     }
 
     pub fn visible(&self) -> bool {
@@ -87,9 +104,9 @@ impl Bar {
     pub fn show(&self, state: &Value) {
         js(&self.view, "update", state);
         if !self.visible() {
+            // Centred, a sixth of the way down the screen (the Mac's spot).
             let (x, y, w, h) = work_area();
-            let scale = self.window.scale_factor();
-            let bw = (BAR_WIDTH * scale) as i32;
+            let bw = (BAR_WIDTH * self.window.scale_factor()) as i32;
             self.window.set_outer_position(PhysicalPosition::new(x + (w - bw) / 2, y + (h as f64 * 0.16) as i32));
         }
         self.window.set_visible(true);
@@ -97,6 +114,15 @@ impl Bar {
         clinqy_windows::apps::bring_to_front(self.window.hwnd() as isize);
         self.window.set_focus();
         self.focus();
+    }
+
+    /// Whether the foreground window is the bar (or its WebView).
+    pub fn has_focus(&self) -> bool {
+        unsafe {
+            let f = GetForegroundWindow();
+            let root = GetAncestor(f, GA_ROOT);
+            root.0 as isize == self.window.hwnd() as isize
+        }
     }
 
     pub fn focus(&self) {
@@ -123,52 +149,43 @@ impl Bar {
     }
 
     pub fn resize(&self, height: f64) {
-        self.window.set_inner_size(LogicalSize::new(BAR_WIDTH, height.clamp(64.0, 600.0)));
+        self.window.set_inner_size(LogicalSize::new(BAR_WIDTH, height.clamp(64.0, 640.0).ceil()));
     }
 }
 
-pub struct Island {
+/// The result card: top right, 12 pt from the edges.
+pub struct ResultPanel {
     window: Window,
     view: WebView,
+    _context: WebContext,
 }
 
-impl Island {
-    pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Island> {
-        let window = WindowBuilder::new()
-            .with_title("Clinqy status")
-            .with_decorations(false)
-            .with_resizable(false)
-            .with_visible(false)
-            .with_always_on_top(true)
-            .with_skip_taskbar(true)
-            .with_focused(false)
-            .with_undecorated_shadow(true)
-            .with_inner_size(LogicalSize::new(ISLAND_WIDTH, 48.0))
-            .build(event_loop)?;
+impl ResultPanel {
+    pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<ResultPanel> {
+        let window = transparent_window(event_loop, "Clinqy result", RESULT_WIDTH, 200.0)?;
         style(&window, true);
-        let view = WebViewBuilder::new()
-            .with_html(ISLAND_HTML)
-            .with_background_color((23, 23, 26, 255))
+        let mut context = web_context();
+        let view = WebViewBuilder::with_web_context(&mut context)
+            .with_html(page(include_str!("ui/web/result.html")))
+            .with_transparent(true)
+            .with_background_color((0, 0, 0, 0))
             .with_ipc_handler(move |req| {
-                let _ = proxy.send_event(UserEvent::Island(req.body().to_string()));
+                let _ = proxy.send_event(UserEvent::Result(req.body().to_string()));
             })
             .build(&window)?;
-        Ok(Island { window, view })
+        Ok(ResultPanel { window, view, _context: context })
     }
 
     fn hwnd(&self) -> HWND {
         HWND(self.window.hwnd() as _)
     }
 
-    pub fn show(&self) {
-        let visible = unsafe { IsWindowVisible(self.hwnd()).as_bool() };
-        if !visible {
-            let (x, y, w, _) = work_area();
-            let scale = self.window.scale_factor();
-            let iw = (ISLAND_WIDTH * scale) as i32;
-            self.window.set_outer_position(PhysicalPosition::new(x + (w - iw) / 2, y + (8.0 * scale) as i32));
-        }
-        // Shown without taking focus from the app being worked on.
+    pub fn show(&self, card: &Value) {
+        js(&self.view, "update", card);
+        let (x, y, w, _) = work_area();
+        let s = self.window.scale_factor();
+        let pw = (RESULT_WIDTH * s) as i32;
+        self.window.set_outer_position(PhysicalPosition::new(x + w - pw - (12.0 * s) as i32, y + (12.0 * s) as i32));
         unsafe {
             let _ = ShowWindow(self.hwnd(), SW_SHOWNOACTIVATE);
             let _ = SetWindowPos(self.hwnd(), HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
@@ -176,30 +193,90 @@ impl Island {
     }
 
     pub fn hide(&self) {
-        let _ = self.view.evaluate_script("window.clinqy && window.clinqy.card(false)");
         unsafe {
             let _ = ShowWindow(self.hwnd(), SW_HIDE);
         }
     }
 
-    pub fn update(&self, state: &Value) {
-        js(&self.view, "update", state);
-    }
-
-    pub fn card(&self, on: bool) {
-        let _ = self.view.evaluate_script(&format!("window.clinqy && window.clinqy.card({on})"));
-    }
-
-    /// A one-line notice (a reminder, a hint) in the capsule.
-    pub fn notice(&self, text: &str) {
-        let v = serde_json::json!({"phase": "done", "answer": text, "running": false, "steps": []});
-        js(&self.view, "update", &v);
-        self.show();
-    }
-
     pub fn resize(&self, height: f64) {
-        let h = height.clamp(48.0, 480.0);
-        let size = LogicalSize::new(ISLAND_WIDTH, h);
-        self.window.set_inner_size(size);
+        self.window.set_inner_size(LogicalSize::new(RESULT_WIDTH, height.clamp(60.0, 640.0).ceil()));
+    }
+}
+
+/// The status island (native, click-through).
+pub struct Island {
+    native: NativeIsland,
+    last: parking_lot::Mutex<IslandState>,
+}
+
+impl Island {
+    pub fn new() -> Island {
+        Island { native: NativeIsland::start(), last: parking_lot::Mutex::new(IslandState::default()) }
+    }
+
+    /// The capsule's content from the agent's state (IslandView's rules).
+    pub fn update(&self, s: &Value, visible: bool) {
+        let hotkey = s["hotkey"].as_str().unwrap_or("Ctrl+Alt");
+        let listening = s["listening"] == true;
+        let text = if listening {
+            s["transcript"].as_str().filter(|t| !t.is_empty()).map(String::from).unwrap_or_else(|| if s["followUp"] == true { "Anything else? I'm listening…".into() } else { "Listening…".into() })
+        } else if s["recording"] == true {
+            format!("Watching you… do the task, then {hotkey} or ■ to stop")
+        } else if s["transcribing"] == true {
+            "Transcribing…".into()
+        } else if let Some(n) = s["notice"].as_str() {
+            n.to_string()
+        } else if let Some(q) = s["question"]["text"].as_str() {
+            format!("Needs your input: {q}")
+        } else if let Some(t) = s["review"]["title"].as_str() {
+            format!("Check before I submit: {t}")
+        } else if s["running"] == true {
+            s["narration"].as_str().filter(|t| !t.is_empty()).unwrap_or("Thinking…").to_string()
+        } else {
+            s["answer"].as_str().filter(|t| !t.is_empty()).or(s["narration"].as_str().filter(|t| !t.is_empty())).unwrap_or("Thinking…").to_string()
+        };
+        let hint = if s["running"] == true {
+            if s["dry"] == true {
+                "dry run · ■ to stop".to_string()
+            } else {
+                format!("{hotkey} to add · ■ to stop")
+            }
+        } else {
+            String::new()
+        };
+        let mood = if listening {
+            Mood::Listening
+        } else {
+            match s["phase"].as_str().unwrap_or("idle") {
+                "thinking" => Mood::Thinking,
+                "acting" => Mood::Acting,
+                "done" => Mood::Success,
+                "failed" => Mood::Failure,
+                "listening" => Mood::Listening,
+                _ => Mood::Idle,
+            }
+        };
+        let state = IslandState { visible, text, hint, mood, level: s["level"].as_f64().unwrap_or(0.0) as f32, head: listening };
+        let mut last = self.last.lock();
+        if *last != state {
+            *last = state.clone();
+            self.native.set(state);
+        }
+    }
+
+    pub fn hide(&self) {
+        let mut last = self.last.lock();
+        if last.visible {
+            last.visible = false;
+            self.native.set(last.clone());
+        }
+    }
+
+    pub fn level(&self, l: f32) {
+        let mut last = self.last.lock();
+        if last.visible && last.mood == Mood::Listening {
+            last.level = l;
+            self.native.set(last.clone());
+        }
     }
 }

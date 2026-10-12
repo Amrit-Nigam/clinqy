@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.8.6";
+const SCRIPT_VERSION = "1.8.7";
 let socket = null;
 let retry = 1000;
 

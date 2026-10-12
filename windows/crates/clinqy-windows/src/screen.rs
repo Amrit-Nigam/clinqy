@@ -100,7 +100,7 @@ pub fn scale() -> f64 {
 
 /// The window for the model: at most 1400 px wide, red boxes on the listed elements tagged with their e-ids,
 /// as base64 JPEG.
-pub fn for_model(area: Rect, elements: &[Element]) -> Option<String> {
+pub fn for_model(area: Rect, elements: &[Element], circled: Option<&[Point]>) -> Option<String> {
     let img = capture(area)?;
     let max_w = 1400u32;
     let img = if img.width() > max_w {
@@ -133,6 +133,25 @@ pub fn for_model(area: Rect, elements: &[Element]) -> Option<String> {
             crate::text::draw(&mut pix, f, &e.id, tag.x() + 2.0, tag.y() + 10.5, size, Color::WHITE);
         }
     }
+    // What the user circled, drawn the way they drew it (a yellow loop).
+    if let Some(pts) = circled.filter(|p| p.len() > 1) {
+        let mut pb = PathBuilder::new();
+        for (i, p) in pts.iter().enumerate() {
+            let (x, y) = (((p.x - area.x) * s) as f32, ((p.y - area.y) * s) as f32);
+            if i == 0 {
+                pb.move_to(x, y)
+            } else {
+                pb.line_to(x, y)
+            }
+        }
+        if let Some(path) = pb.finish() {
+            let mut yellow = Paint::default();
+            yellow.set_color(Color::from_rgba8(255, 214, 10, 255));
+            yellow.anti_alias = true;
+            let st = Stroke { width: 4.0, line_cap: tiny_skia::LineCap::Round, line_join: tiny_skia::LineJoin::Round, ..Default::default() };
+            pix.stroke_path(&path, &yellow, &st, Transform::identity(), None);
+        }
+    }
     *LAST.lock() = Some(LastShot { area, width: w, height: h });
     let rgba: RgbaImage = ImageBuffer::from_raw(w, h, pix.take())?;
     let rgb = image::DynamicImage::ImageRgba8(rgba).to_rgb8();
@@ -144,3 +163,20 @@ pub fn for_model(area: Rect, elements: &[Element]) -> Option<String> {
 }
 
 pub fn _unused(_: Rgba<u8>) {}
+
+/// The primary monitor's width in pixels.
+pub fn primary_width() -> i32 {
+    unsafe { windows::Win32::UI::WindowsAndMessaging::GetSystemMetrics(windows::Win32::UI::WindowsAndMessaging::SM_CXSCREEN) }
+}
+
+/// Keeps one of Clinqy's own windows out of screenshots and screen shares (so it never sees itself). Set
+/// CLINQY_CAPTURABLE=1 to let them show, e.g. to take screenshots of Clinqy for docs.
+pub fn hide_from_capture(hwnd: isize) {
+    if std::env::var("CLINQY_CAPTURABLE").map(|v| v == "1").unwrap_or(false) {
+        return;
+    }
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowDisplayAffinity, WDA_EXCLUDEFROMCAPTURE};
+    unsafe {
+        let _ = SetWindowDisplayAffinity(windows::Win32::Foundation::HWND(hwnd as _), WDA_EXCLUDEFROMCAPTURE);
+    }
+}

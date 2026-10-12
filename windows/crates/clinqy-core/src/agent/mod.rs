@@ -11,7 +11,7 @@ mod tasks;
 mod web;
 
 use crate::history::{self, Entry, ResultCard};
-use crate::platform::{AppRef, Buddy, Mood, Platform};
+use crate::platform::{AppRef, Buddy, Mood, Platform, Point, Rect};
 use crate::provider::Provider;
 use crate::session::{Brain, Session};
 use crate::workflow::{Target, WorkflowStep};
@@ -78,6 +78,8 @@ pub struct Snapshot {
     pub review: Option<Review>,
     pub request: String,
     pub dry_run: bool,
+    /// The current run only shows what it would do.
+    pub dry: bool,
     pub qa: bool,
 }
 
@@ -108,6 +110,8 @@ pub struct Context {
     pub selected_files: Vec<PathBuf>,
     pub copied: Option<Copied>,
     pub continuation: Option<Entry>,
+    /// A loop the user drew around something on screen ("this", "here"); screen pixels.
+    pub circled: Option<Vec<Point>>,
 }
 
 /// Options for one request.
@@ -179,6 +183,8 @@ pub struct Agent {
     pub context: Mutex<Context>,
     /// The sticky Dry run toggle from the command bar.
     pub dry_run: AtomicBool,
+    /// Whether the current run is a dry run (the toggle, "dry run:" or `--dry`).
+    run_dry: AtomicBool,
     last_progress: Arc<Mutex<Instant>>,
     snaps: Mutex<(Vec<Snap>, Option<PathBuf>, Option<Instant>)>,
     auto_continues: AtomicU32,
@@ -238,6 +244,7 @@ impl Agent {
             task: Mutex::new(None),
             context: Mutex::new(Context::default()),
             dry_run: AtomicBool::new(false),
+            run_dry: AtomicBool::new(false),
             last_progress: Arc::new(Mutex::new(Instant::now())),
             snaps: Mutex::new((vec![], None, None)),
             auto_continues: AtomicU32::new(0),
@@ -273,6 +280,7 @@ impl Agent {
             review: u.review.clone(),
             request: u.request.clone(),
             dry_run: self.dry_run.load(Ordering::Relaxed),
+            dry: self.run_dry.load(Ordering::Relaxed),
             qa: u.qa,
         }
     }
@@ -458,6 +466,7 @@ impl Agent {
             request = request[m.end()..].to_string();
             dry = true;
         }
+        self.run_dry.store(dry, Ordering::Relaxed);
         // "continue", "also make the answers": builds on the last task.
         {
             let mut ctx = self.context.lock();
@@ -494,6 +503,7 @@ impl Agent {
             || ctx.selected_text.is_some()
             || !ctx.selected_files.is_empty()
             || ctx.continuation.is_some()
+            || ctx.circled.is_some()
             || run::is_question(request)
             || crate::workflow::refers_to_context(request)
         {
@@ -625,6 +635,7 @@ impl Agent {
             ctx.selected_text.as_ref().map(|t| format!(" [selection: {} chars]", t.chars().count())),
             (!ctx.selected_files.is_empty())
                 .then(|| format!(" [files: {}]", ctx.selected_files.iter().filter_map(|f| f.file_name()).map(|f| f.to_string_lossy().into_owned()).collect::<Vec<_>>().join(", "))),
+            ctx.circled.as_deref().map(circle_bounds).map(|r| format!(" [circled: {}×{} at {},{}]", r.w as i64, r.h as i64, r.x as i64, r.y as i64)),
         ]
         .into_iter()
         .flatten()
@@ -857,4 +868,19 @@ pub(crate) struct Seen {
     pub facts: HashSet<String>,
     pub hosts: HashSet<String>,
     pub apps: HashSet<String>,
+}
+
+/// The bounding box of a drawn loop.
+pub fn circle_bounds(points: &[Point]) -> Rect {
+    if points.is_empty() {
+        return Rect::default();
+    }
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for p in points {
+        x0 = x0.min(p.x);
+        y0 = y0.min(p.y);
+        x1 = x1.max(p.x);
+        y1 = y1.max(p.y);
+    }
+    Rect::new(x0, y0, x1 - x0, y1 - y0)
 }

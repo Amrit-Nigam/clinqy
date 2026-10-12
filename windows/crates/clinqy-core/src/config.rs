@@ -74,4 +74,49 @@ mod tests {
         assert_eq!(v["C"], "x");
         assert_eq!(v.len(), 3);
     }
+
+    #[test]
+    fn sets_settings_in_place() {
+        let t = "# Clinqy\nPROVIDER=claude-cli\n# VOICE_LANGUAGE=en\nHOTKEY=ctrl+alt\n";
+        let out = super::with_setting(t, "VOICE_LANGUAGE", "hinglish");
+        assert_eq!(out, "# Clinqy\nPROVIDER=claude-cli\nVOICE_LANGUAGE=hinglish\nHOTKEY=ctrl+alt\n");
+        assert_eq!(super::parse(&out)["VOICE_LANGUAGE"], "hinglish");
+        assert!(super::with_setting(&out, "NEW", "1").ends_with("NEW=1\n"));
+        assert!(!super::with_setting(&out, "VOICE_LANGUAGE", "").contains("VOICE_LANGUAGE"));
+    }
+}
+
+/// Saves a setting in the env file (see `with_setting`).
+pub fn set(key: &str, value: &str) -> std::io::Result<()> {
+    let path = crate::paths::env_file();
+    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, with_setting(&text, key, value))?;
+    *CACHE.lock() = None;
+    Ok(())
+}
+
+/// `text` with `key` set: its line (commented-out or not) replaced, or one appended; an empty value removes it.
+pub fn with_setting(text: &str, key: &str, value: &str) -> String {
+    let line = format!("{key}={value}");
+    let mut found = false;
+    let mut out: Vec<String> = vec![];
+    for l in text.lines() {
+        let t = l.trim().trim_start_matches('#').trim();
+        let t = t.strip_prefix("export ").unwrap_or(t);
+        if t.contains('=') && t.split('=').next().map(str::trim) == Some(key) {
+            if !found && !value.is_empty() {
+                out.push(line.clone());
+            }
+            found = true;
+            continue;
+        }
+        out.push(l.to_string());
+    }
+    if !found && !value.is_empty() {
+        out.push(line);
+    }
+    out.join("\n") + "\n"
 }

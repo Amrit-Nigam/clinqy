@@ -115,7 +115,12 @@ pub fn main(args: Vec<String>) -> i32 {
             0
         }
         "doctor" | "check" | "setup" => {
-            let card = crate::setup::check_card();
+            // The extension connects to the app, not to this process: ask the app (when it's running).
+            let ext = rt().block_on(async { ipc::call("status", json!({}), |_| {}).await.ok().and_then(|v| v["extension"].as_bool()) });
+            let card = crate::setup::check_card(Some(ext.unwrap_or(false)));
+            if ext.is_none() {
+                println!("(Clinqy isn't running — start it to connect the browser extension.)");
+            }
             println!("{}", card.plain());
             0
         }
@@ -129,6 +134,20 @@ pub fn main(args: Vec<String>) -> i32 {
             // clinqy:// links (registered by the installer) land here.
             let Some(u) = rest.first() else { return 2 };
             simple("url", json!({"url": u}), true)
+        }
+        "transcribe" => {
+            let Some(f) = rest.first() else { return fail("usage: clinqy transcribe <audio.wav>") };
+            let rt = rt();
+            let _g = rt.enter();
+            let voice = crate::voice::Voice::new(Box::new(|_| {}), Box::new(|t, _| eprintln!("{t}")));
+            let t0 = std::time::Instant::now();
+            match rt.block_on(voice.transcribe_file(Path::new(f))) {
+                Ok(t) => {
+                    println!("{} ms: {t}", t0.elapsed().as_millis());
+                    0
+                }
+                Err(e) => fail(&e.to_string()),
+            }
         }
         "version" => {
             println!("clinqy {}", env!("CARGO_PKG_VERSION"));
@@ -212,6 +231,10 @@ fn run(rest: &[String]) -> i32 {
             "--test" => a["test"] = json!(true),
             "--agy" | "--agy-cli" => a["agy"] = json!(true),
             "--claude" | "--claude-cli" => a["claude"] = json!(true),
+            "--help" | "-h" => {
+                println!("usage: clinqy run [--dry] [--test] [--claude|--agy] <request…>");
+                return 0;
+            }
             other => words.push(other.to_string()),
         }
     }

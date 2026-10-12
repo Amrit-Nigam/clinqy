@@ -1,9 +1,9 @@
 //! ClinqyApp: the tray icon, the command bar, the status island, and everything that wires the agent to them — the
 //! hotkey (tap to open, hold to talk), the IPC pipe for the `clinqy` command, schedules and reminders.
 
-use crate::ui::{Bar, Island};
+use crate::ui::{Bar, Island, ResultPanel};
 use clinqy_core::agent::{Context, Copied, Event as AgentEvent, RunOptions};
-use clinqy_core::platform::{Buddy, Mood, Platform};
+use clinqy_core::platform::{Mood, Platform};
 use clinqy_core::{bridge, history, workflow, Agent};
 use clinqy_windows::hotkey::{self, HotEvent};
 use clinqy_windows::{Overlay, WindowsPlatform};
@@ -14,7 +14,7 @@ use std::time::{Duration, Instant};
 use tao::event::{Event, StartCause, WindowEvent};
 use tao::event_loop::{ControlFlow, EventLoopBuilder, EventLoopProxy};
 use tokio::sync::broadcast;
-use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{TrayIconBuilder, TrayIconEvent};
 
 #[derive(Debug, Clone)]
@@ -23,13 +23,16 @@ pub enum UserEvent {
     Hot(HotEvent),
     HoldTimer(u64),
     Bar(String),
-    Island(String),
+    Result(String),
     Menu(String),
     TrayClick,
     ShowBar,
     Notice(String),
+    BarBlur,
     VoiceLevel(f32),
     VoiceText(String, bool),
+    /// The loop the user drew with "Circle" (None: cancelled).
+    Circled(Option<Vec<clinqy_core::platform::Point>>),
     Quit,
 }
 
@@ -115,11 +118,22 @@ pub fn run() -> anyhow::Result<()> {
     let item = |id: &str, text: &str| MenuItem::with_id(id, text, true, None);
     let dry = CheckMenuItem::with_id("dry", "Dry run (show, don't do)", true, false, None);
     let login = CheckMenuItem::with_id("login", "Open at login", true, crate::setup::starts_at_login(), None);
+    // Voice language: what Whisper listens for (saved as VOICE_LANGUAGE in the settings file).
+    let current = crate::voice::language_setting();
+    let languages: Vec<CheckMenuItem> = crate::voice::LANGUAGES
+        .iter()
+        .map(|(code, label)| CheckMenuItem::with_id(format!("lang:{code}"), *label, true, current == *code, None))
+        .collect();
+    let voice_menu = Submenu::with_id("voice", "Voice language", true);
+    for l in &languages {
+        let _ = voice_menu.append(l);
+    }
     let _ = menu.append_items(&[
         &item("open", &format!("Open Clinqy\t{hotkey_label}")),
         &item("talk", &format!("Talk (hold {hotkey_label})")),
         &item("stop", "Stop the current task"),
         &PredefinedMenuItem::separator(),
+        &item("circle", "Circle something…"),
         &item("watch", "Watch && learn…"),
         &item("history", "History"),
         &item("applications", "Applications…"),
@@ -130,6 +144,7 @@ pub fn run() -> anyhow::Result<()> {
         &item("settings", "Settings (model, keys)…"),
         &item("extension", "Browser extension…"),
         &item("check", "Check setup…"),
+        &voice_menu,
         &dry,
         &login,
         &PredefinedMenuItem::separator(),
@@ -155,7 +170,8 @@ pub fn run() -> anyhow::Result<()> {
     }
 
     let bar = Bar::new(&event_loop, proxy.clone())?;
-    let island = Island::new(&event_loop, proxy.clone())?;
+    let island = Island::new();
+    let result = ResultPanel::new(&event_loop, proxy.clone())?;
 
     // The clipboard's recent history, for "this" when nothing is selected.
     let clip = Arc::new(Mutex::new(ClipState::default()));
@@ -213,7 +229,11 @@ pub fn run() -> anyhow::Result<()> {
         shared: shared.clone(),
         bar,
         island,
+        result,
+        island_on: false,
+        notice: None,
         dry,
+        languages,
         login,
         clip,
         hotkey_label,
@@ -233,6 +253,7 @@ pub fn run() -> anyhow::Result<()> {
         };
         match event {
             Event::NewEvents(StartCause::Init) => {
+                std::thread::spawn(crate::setup::register_links);
                 if crate::setup::first_run() {
                     let _ = proxy_for_loop.send_event(UserEvent::Notice(format!("Clinqy is ready — tap {} to open it", ui.hotkey_label)));
                 }
@@ -240,8 +261,12 @@ pub fn run() -> anyhow::Result<()> {
             Event::NewEvents(StartCause::ResumeTimeReached { .. }) => {
                 if ui.island_until.map(|t| Instant::now() >= t).unwrap_or(false) {
                     ui.island_until = None;
-                    if !ui.shared.agent.is_running() && ui.shared.agent.snapshot().result.is_none() {
+                    ui.notice = None;
+                    if !ui.shared.agent.is_running() && !ui.shared.voice.is_listening() && !crate::recorder::is_recording() {
+                        ui.island_on = false;
                         ui.island.hide();
+                    } else {
+                        ui.refresh_island();
                     }
                 }
             }
@@ -254,10 +279,12 @@ pub fn run() -> anyhow::Result<()> {
             }
             Event::WindowEvent { window_id, event: WindowEvent::Focused(false), .. } if window_id == ui.bar.window.id() => {
                 // Clicking elsewhere puts the bar away, like Spotlight (not while it's asking something).
-                let s = ui.shared.agent.snapshot();
-                if s.question.is_none() && s.review.is_none() && !ui.shared.voice.is_listening() {
-                    ui.bar.hide();
-                }
+                // WebView2's own window taking the keyboard also blurs the bar, so check what's really in front.
+                let p = proxy_for_loop.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(120)).await;
+                    let _ = p.send_event(UserEvent::BarBlur);
+                });
             }
             _ => {}
         }
@@ -268,7 +295,11 @@ struct UiState {
     shared: Arc<Shared>,
     bar: Bar,
     island: Island,
+    result: ResultPanel,
+    island_on: bool,
+    notice: Option<String>,
     dry: CheckMenuItem,
+    languages: Vec<CheckMenuItem>,
     login: CheckMenuItem,
     clip: Arc<Mutex<ClipState>>,
     hotkey_label: String,
@@ -291,15 +322,31 @@ impl UiState {
             .entries()
             .iter()
             .take(40)
-            .map(|h| json!({"id": h.id, "request": h.request, "answer": h.answer, "ok": h.ok, "trace": h.trace.as_ref().map(|t| !t.is_empty()).unwrap_or(false)}))
+            .map(|h| json!({"id": h.id, "date": h.date, "request": h.request, "answer": h.answer, "ok": h.ok, "result": h.result.is_some(), "trace": h.trace.as_ref().map(|t| !t.is_empty()).unwrap_or(false)}))
             .collect();
-        let wfs: Vec<Value> = workflow::workflows().all().iter().map(|w| json!({"id": w.id, "name": w.name, "steps": w.steps.len(), "runs": w.runs, "schedule": w.schedule})).collect();
-        let skills: Vec<Value> = clinqy_core::skills::all().iter().map(|s| json!({"id": s.id, "name": s.name, "summary": s.summary})).collect();
+        let wfs: Vec<Value> = workflow::workflows().all().iter().map(|w| json!({"id": w.id, "name": w.name, "steps": w.steps.len(), "runs": w.runs, "schedule": w.schedule, "params": w.params})).collect();
+        let skills: Vec<Value> = clinqy_core::skills::all().iter().map(|s| json!({"id": s.id, "name": s.name, "summary": s.summary, "parameters": s.parameters, "steps": s.steps})).collect();
         let provider = clinqy_core::provider::Provider::current();
+        let ctx = self.agent().context.lock().clone();
+        let name = |p: &std::path::Path| p.file_name().map(|f| f.to_string_lossy().into_owned()).unwrap_or_else(|| p.display().to_string());
+        let copied = ctx.copied.as_ref().map(|c| {
+            let what = c.text.as_ref().map(|t| format!("“{}”", t.chars().take(60).collect::<String>().replace(char::is_control, " "))).unwrap_or_else(|| c.files.iter().map(|f| name(f)).collect::<Vec<_>>().join(", "));
+            format!("{what} · {}", if c.age_secs < 60 { "just now".to_string() } else { format!("{} min ago", c.age_secs / 60) })
+        });
+        let context = json!({
+            "continuing": ctx.continuation.as_ref().map(|c| c.request.clone()),
+            "selected": ctx.selected_text,
+            "files": ctx.selected_files.iter().map(|f| name(f)).collect::<Vec<_>>(),
+            "copied": copied,
+            "circled": ctx.circled.as_deref().map(clinqy_core::agent::circle_bounds).map(|r| format!("{}×{}", r.w as i64, r.h as i64)),
+        });
+        let transcript = self.shared.voice.transcript();
         json!({
+            "context": context, "recording": crate::recorder::is_recording(), "learning": crate::recorder::is_learning(),
+            "transcribing": transcript == "Transcribing…",
             "snap": self.agent().snapshot(),
             "history": hist, "workflows": wfs, "skills": skills,
-            "listening": self.shared.voice.is_listening(), "transcript": self.shared.voice.transcript(),
+            "listening": self.shared.voice.is_listening(), "transcript": if transcript == "Transcribing…" { String::new() } else { transcript },
             "hotkey": self.hotkey_label, "model": format!("{} · {}", provider.id(), provider.default_model()),
         })
     }
@@ -313,8 +360,16 @@ impl UiState {
     fn refresh_island(&self) {
         let mut v = serde_json::to_value(self.agent().snapshot()).unwrap_or_default();
         v["listening"] = json!(self.shared.voice.is_listening());
-        v["transcript"] = json!(self.shared.voice.transcript());
-        self.island.update(&v);
+        let t = self.shared.voice.transcript();
+        v["transcribing"] = json!(t == "Transcribing…");
+        v["transcript"] = json!(if t == "Transcribing…" { String::new() } else { t });
+        v["followUp"] = json!(self.follow_up);
+        v["recording"] = json!(crate::recorder::is_recording());
+        v["hotkey"] = json!(self.hotkey_label);
+        if let Some(n) = &self.notice {
+            v["notice"] = json!(n);
+        }
+        self.island.update(&v, self.island_on);
     }
 
     /// Notes what the user was looking at (the app, selected text, files, a recent copy) before the bar opens.
@@ -366,6 +421,20 @@ impl UiState {
         });
     }
 
+    /// Hides the bar, lets the user draw a loop around something, then brings the bar back with it attached.
+    fn start_circling(&mut self) {
+        self.bar.hide();
+        let shared = self.shared.clone();
+        let platform = self.shared.platform.clone();
+        tokio::spawn(async move {
+            if shared.agent.context.lock().target.is_none() {
+                shared.agent.context.lock().target = platform.front_app();
+            }
+            let points = tokio::task::spawn_blocking(clinqy_windows::circle::pick).await.ok().flatten();
+            shared.send(UserEvent::Circled(points));
+        });
+    }
+
     fn show_bar(&mut self) {
         self.bar.show(&self.extras());
     }
@@ -397,7 +466,7 @@ impl UiState {
         self.shared.agent.buddy.set_mood(Mood::Listening);
         a.set_listening(true);
         self.island_until = None;
-        self.island.show();
+        self.island_on = true;
         self.refresh_island();
     }
 
@@ -425,22 +494,60 @@ impl UiState {
             }
             UserEvent::ShowBar => self.show_bar(),
             UserEvent::TrayClick => {
-                if self.bar.visible() {
+                if self.agent().is_running() {
+                    self.agent().cancel();
+                } else if self.bar.visible() {
                     self.bar.hide();
                 } else {
                     self.capture_context_then_show();
                 }
             }
             UserEvent::Bar(msg) => self.on_bar(&msg),
-            UserEvent::Island(msg) => self.on_island(&msg),
+            UserEvent::BarBlur => {
+                let s = self.agent().snapshot();
+                if self.bar.visible() && !self.bar.has_focus() && s.question.is_none() && s.review.is_none() && !self.shared.voice.is_listening() {
+                    self.bar.hide();
+                }
+            }
+            UserEvent::Result(msg) => self.on_result(&msg),
+            UserEvent::Circled(points) => {
+                let agent = self.agent().clone();
+                let target = agent.context.lock().target.clone();
+                // The user's app comes back to the front first (keys and clicks go there), then the bar over it.
+                let reopen = !agent.is_running();
+                if let Some(t) = target {
+                    let p = self.shared.platform.clone();
+                    let shared = self.shared.clone();
+                    tokio::spawn(async move {
+                        p.bring_to_front(&t).await;
+                        if reopen {
+                            shared.send(UserEvent::ShowBar);
+                        }
+                    });
+                } else if reopen {
+                    self.shared.send(UserEvent::ShowBar);
+                }
+                match points {
+                    // While a task runs, the circle goes in as added context instead.
+                    Some(pts) if agent.is_running() => {
+                        let r = clinqy_core::agent::circle_bounds(&pts);
+                        agent.add_context(&format!("I circled this area of the screen: x {}–{}, y {}–{} (screen pixels).", r.x as i64, r.max_x() as i64, r.y as i64, r.max_y() as i64));
+                    }
+                    Some(pts) => agent.context.lock().circled = Some(pts),
+                    None => {}
+                }
+            }
             UserEvent::Menu(id) => self.on_menu(&id),
             UserEvent::Notice(text) => {
                 crate::setup::beep();
-                self.island.notice(&text);
+                self.notice = Some(text);
+                self.island_on = true;
+                self.refresh_island();
                 self.island_until = Some(Instant::now() + Duration::from_secs(8));
             }
             UserEvent::VoiceLevel(l) => {
                 self.shared.agent.buddy.set_level(l);
+                self.island.level(l);
                 self.bar.level(l);
             }
             UserEvent::VoiceText(text, done) => {
@@ -455,7 +562,9 @@ impl UiState {
                 let text = text.trim().to_string();
                 if text.is_empty() {
                     if !self.agent().is_running() {
-                        self.island.hide();
+                        self.island_on = false;
+                        self.island_on = false;
+                    self.island.hide();
                     }
                     return;
                 }
@@ -466,6 +575,7 @@ impl UiState {
                     a.add_context(&text);
                 } else if follow && workflow::is_dismissal(&text) {
                     a.context.lock().continuation = None;
+                    self.island_on = false;
                     self.island.hide();
                 } else {
                     self.submit(&text, true);
@@ -506,7 +616,9 @@ impl UiState {
                     self.shared.voice.cancel();
                     self.agent().set_listening(false);
                     if !self.agent().is_running() {
-                        self.island.hide();
+                        self.island_on = false;
+                        self.island_on = false;
+                    self.island.hide();
                     }
                 }
                 self.pressed_at = None;
@@ -524,7 +636,7 @@ impl UiState {
             AgentEvent::Started => {
                 self.island_until = None;
                 self.bar.hide();
-                self.island.show();
+                self.island_on = true;
                 self.refresh_island();
             }
             AgentEvent::Question => {
@@ -542,9 +654,9 @@ impl UiState {
                 }
             }
             AgentEvent::Result => {
-                self.island.show();
-                self.island.card(true);
-                self.island_until = None;
+                if let Some(card) = self.agent().snapshot().result {
+                    self.result.show(&serde_json::to_value(card).unwrap_or_default());
+                }
             }
             AgentEvent::Finished { answer, ok } => {
                 self.refresh_island();
@@ -651,17 +763,48 @@ impl UiState {
                 clinqy_core::skills::remove(&s("id"));
                 self.refresh_bar();
             }
+            "delhist" => {
+                history::history().remove(&s("id"));
+                self.refresh_bar();
+            }
+            "result" => {
+                if let Some(card) = history::history().get(&s("id")).and_then(|h| h.result) {
+                    agent.show_card(card);
+                }
+            }
+            // A correction to the run that just failed: carry on from it with what to do differently.
+            "fix" => {
+                if let Some(h) = history::history().get(&s("id")) {
+                    agent.context.lock().continuation = Some(h);
+                    self.submit(&format!("That didn't work. {}", s("text")), false);
+                }
+            }
+            "unchip" => {
+                let mut c = agent.context.lock();
+                match s("kind").as_str() {
+                    "continuation" => c.continuation = None,
+                    "selection" => c.selected_text = None,
+                    "files" => c.selected_files.clear(),
+                    "copied" => c.copied = None,
+                    "circled" => c.circled = None,
+                    _ => {}
+                }
+                drop(c);
+                self.refresh_bar();
+            }
+            "circle" => self.start_circling(),
+            "watch" => {
+                self.bar.hide();
+                crate::recorder::toggle(self.shared.clone());
+            }
             _ => {}
         }
     }
 
-    fn on_island(&mut self, raw: &str) {
+    fn on_result(&mut self, raw: &str) {
         let Ok(m) = serde_json::from_str::<Value>(raw) else { return };
         match m["type"].as_str().unwrap_or("") {
-            "ready" => self.refresh_island(),
-            "resize" => self.island.resize(m["height"].as_f64().unwrap_or(48.0)),
-            "cancel" => self.agent().cancel(),
-            "open" => self.capture_context_then_show(),
+            "resize" => self.result.resize(m["height"].as_f64().unwrap_or(200.0)),
             "copy" => {
                 if let Some(r) = self.agent().snapshot().result {
                     self.shared.platform.set_clipboard_text(&r.plain());
@@ -669,9 +812,7 @@ impl UiState {
             }
             "dismiss" => {
                 self.agent().dismiss_result();
-                if !self.agent().is_running() {
-                    self.island.hide();
-                }
+                self.result.hide();
             }
             "link" => {
                 if let Some(u) = m["url"].as_str().filter(|u| u.starts_with("http")) {
@@ -692,6 +833,7 @@ impl UiState {
             "talk" => self.start_listening(),
             "stop" => agent.cancel(),
             "watch" => crate::recorder::toggle(self.shared.clone()),
+            "circle" => self.start_circling(),
             "history" => {
                 self.bar.update(&json!({"tab": "history"}));
                 self.show_bar();
@@ -721,7 +863,14 @@ impl UiState {
                 }
             }
             "extension" => crate::setup::show_extension_help(),
-            "check" => agent.show_card(crate::setup::check_card()),
+            "check" => agent.show_card(crate::setup::check_card(None)),
+            lang if lang.starts_with("lang:") => {
+                let code = &lang[5..];
+                let _ = clinqy_core::config::set("VOICE_LANGUAGE", code);
+                for (item, (c, _)) in self.languages.iter().zip(crate::voice::LANGUAGES) {
+                    item.set_checked(c == code);
+                }
+            }
             "dry" => {
                 let on = !agent.dry_run.load(std::sync::atomic::Ordering::Relaxed);
                 agent.dry_run.store(on, std::sync::atomic::Ordering::Relaxed);

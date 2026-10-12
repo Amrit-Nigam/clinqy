@@ -1,7 +1,8 @@
 //! Voice: hold the hotkey and talk, release to send — transcribed on this PC by Whisper (whisper.cpp, the same
 //! model family the Mac app runs). The first use downloads whisper.cpp and the model into
-//! %LOCALAPPDATA%\Clinqy\voice; after that a small local Whisper server keeps the model warm so a request is
-//! transcribed in about a second. Nothing leaves the PC.
+//! %LOCALAPPDATA%\Clinqy\voice. Each request is transcribed with Whisper's audio window sized to what was said (a
+//! 3-second request costs a tenth of the usual 30-second window), so it takes a second or two on a laptop CPU.
+//! Nothing leaves the PC.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
@@ -12,7 +13,6 @@ use std::time::{Duration, Instant};
 
 /// whisper.cpp's Windows build, pinned.
 const WHISPER_ZIP: &str = "https://github.com/ggml-org/whisper.cpp/releases/download/b5130/whisper-bin-x64.zip";
-const PORT: u16 = 47824;
 
 type LevelFn = Box<dyn Fn(f32) + Send + Sync>;
 type TextFn = Box<dyn Fn(String, bool) + Send + Sync>;
@@ -24,9 +24,6 @@ struct Inner {
     transcript: Mutex<String>,
     on_level: LevelFn,
     on_text: TextFn,
-    server: Mutex<Option<std::process::Child>>,
-    last_used: Mutex<Instant>,
-    preparing: AtomicBool,
 }
 
 #[derive(Clone)]
@@ -38,13 +35,13 @@ fn dir() -> PathBuf {
     d
 }
 
+/// The model: `small` by default — on a CPU it's the best accuracy that still answers in a second or two
+/// (large-v3-turbo, the Mac's model, needs Apple's Neural Engine or a GPU to be quick). WHISPER_MODEL picks another
+/// ggml model (base, medium, large-v3-turbo-q5_0…); the Mac's WhisperKit names in a shared env file mean the default.
 fn model_name() -> String {
-    let m = clinqy_core::config::value("WHISPER_MODEL").unwrap_or_else(|| "large-v3-turbo-q5_0".into());
-    // The Mac's WhisperKit names ("large-v3-v20240930_turbo_632MB") mean the same model here.
-    if m.contains("turbo") {
-        "large-v3-turbo-q5_0".into()
-    } else {
-        m.trim_start_matches("ggml-").trim_end_matches(".bin").to_string()
+    match clinqy_core::config::value("WHISPER_MODEL") {
+        Some(m) if !m.contains("_632MB") && !m.contains("v20240930") => m.trim_start_matches("ggml-").trim_end_matches(".bin").to_string(),
+        _ => "small-q5_1".into(),
     }
 }
 
@@ -52,30 +49,44 @@ fn model_path() -> PathBuf {
     dir().join(format!("ggml-{}.bin", model_name()))
 }
 
-fn server_exe() -> PathBuf {
-    dir().join("whisper").join("whisper-server.exe")
+fn cli_exe() -> PathBuf {
+    dir().join("whisper").join("whisper-cli.exe")
 }
 
-/// Whisper's language from VOICE_LANGUAGE: auto, en, hi, hinglish (English letters), or any Whisper code.
+/// The voice language (tray menu; saved in the env file): en (default), hinglish, hi, auto, or any Whisper code.
+pub fn language_setting() -> String {
+    clinqy_core::config::value("VOICE_LANGUAGE").unwrap_or_else(|| "en".into()).to_lowercase()
+}
+
+/// The tray's choices: (setting, label).
+pub const LANGUAGES: [(&str, &str); 6] = [
+    ("en", "English"),
+    ("hinglish", "Hinglish (Hindi + English)"),
+    ("hi", "Hindi"),
+    ("es", "Spanish"),
+    ("fr", "French"),
+    ("auto", "Detect automatically (slower)"),
+];
+
+/// Whisper's language and prompt. "auto" detects it every time, which costs a full extra pass (slower).
 fn language() -> (String, Option<&'static str>) {
-    match clinqy_core::config::value("VOICE_LANGUAGE").unwrap_or_else(|| "auto".into()).to_lowercase().as_str() {
+    match language_setting().as_str() {
         "hinglish" => ("en".into(), Some("Hinglish: Hindi and English mixed, written in English letters.")),
-        "" | "auto" => ("auto".into(), None),
+        "" => ("en".into(), None),
         other => (other.to_string(), None),
     }
 }
 
 async fn download(url: &str, to: &std::path::Path, label: &str, on_progress: &(dyn Fn(String) + Sync)) -> anyhow::Result<()> {
     use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
     let client = reqwest::Client::builder().timeout(Duration::from_secs(3600)).build()?;
     let resp = client.get(url).send().await?.error_for_status()?;
     let total = resp.content_length().unwrap_or(0);
     let tmp = to.with_extension("part");
     let mut file = tokio::fs::File::create(&tmp).await?;
-    let mut got: u64 = 0;
-    let mut last = Instant::now();
+    let (mut got, mut last) = (0u64, Instant::now());
     let mut stream = resp.bytes_stream();
-    use tokio::io::AsyncWriteExt;
     while let Some(chunk) = stream.next().await {
         let chunk = chunk?;
         got += chunk.len() as u64;
@@ -100,9 +111,6 @@ impl Voice {
             transcript: Mutex::new(String::new()),
             on_level,
             on_text,
-            server: Mutex::new(None),
-            last_used: Mutex::new(Instant::now()),
-            preparing: AtomicBool::new(false),
         }))
     }
 
@@ -120,30 +128,27 @@ impl Voice {
     }
 
     pub fn ready(&self) -> bool {
-        server_exe().is_file() && model_path().is_file()
+        cli_exe().is_file() && model_path().is_file()
     }
 
-    /// Gets whisper.cpp and the model (once), then starts the local server.
+    /// Gets whisper.cpp and the model, once.
     async fn prepare(&self) -> anyhow::Result<()> {
         let progress = |m: String| {
             *self.0.transcript.lock() = m.clone();
             (self.0.on_text)(m, false);
         };
-        if !server_exe().is_file() {
+        if !cli_exe().is_file() {
             progress("Setting up voice (once): downloading Whisper…".into());
             let zip = dir().join("whisper.zip");
             download(WHISPER_ZIP, &zip, "Whisper", &progress).await?;
             let out = dir().join("whisper");
             let _ = std::fs::create_dir_all(&out);
-            let file = std::fs::File::open(&zip)?;
-            let mut archive = zip::ZipArchive::new(file)?;
+            let mut archive = zip::ZipArchive::new(std::fs::File::open(&zip)?)?;
             for i in 0..archive.len() {
                 let mut f = archive.by_index(i)?;
                 let name = f.name().rsplit('/').next().unwrap_or("").to_string();
-                let keep = name == "whisper-server.exe" || name == "whisper-cli.exe" || (name.ends_with(".dll") && (name.starts_with("ggml") || name == "whisper.dll"));
-                if keep {
-                    let mut w = std::fs::File::create(out.join(&name))?;
-                    std::io::copy(&mut f, &mut w)?;
+                if name == "whisper-cli.exe" || (name.ends_with(".dll") && (name.starts_with("ggml") || name == "whisper.dll")) {
+                    std::io::copy(&mut f, &mut std::fs::File::create(out.join(&name))?)?;
                 }
             }
             let _ = std::fs::remove_file(zip);
@@ -153,33 +158,7 @@ impl Voice {
             progress(format!("Setting up voice (once): downloading the {} model…", model_name()));
             download(&url, &model_path(), "the voice model", &progress).await?;
         }
-        self.ensure_server().await
-    }
-
-    async fn ensure_server(&self) -> anyhow::Result<()> {
-        *self.0.last_used.lock() = Instant::now();
-        let alive = self.0.server.lock().as_mut().map(|c| c.try_wait().map(|s| s.is_none()).unwrap_or(false)).unwrap_or(false);
-        if alive {
-            return Ok(());
-        }
-        let (lang, prompt) = language();
-        let threads = std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(4).to_string();
-        let mut cmd = std::process::Command::new(server_exe());
-        cmd.args(["-m", &model_path().display().to_string(), "--host", "127.0.0.1", "--port", &PORT.to_string(), "-l", &lang, "-t", &threads, "-nt"]);
-        if let Some(p) = prompt {
-            cmd.args(["--prompt", p]);
-        }
-        use std::os::windows::process::CommandExt;
-        let child = cmd.current_dir(server_exe().parent().unwrap()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).creation_flags(0x0800_0000).spawn()?;
-        *self.0.server.lock() = Some(child);
-        // Loading the model takes a few seconds.
-        for _ in 0..120 {
-            if tokio::net::TcpStream::connect(("127.0.0.1", PORT)).await.is_ok() {
-                return Ok(());
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-        anyhow::bail!("the voice model didn't start")
+        Ok(())
     }
 
     /// Starts listening until stop() (hold-to-talk).
@@ -210,61 +189,57 @@ impl Voice {
         *self.0.transcript.lock() = String::new();
         let me = self.clone();
         let rt = tokio::runtime::Handle::current();
-        // The server warms up while the user is still talking.
-        if !self.0.preparing.swap(true, Ordering::Relaxed) {
+        // The download happens while the user is still talking, the first time.
+        if !self.ready() {
             let m = self.clone();
-            tokio::spawn(async move {
-                if m.ready() {
-                    let _ = m.ensure_server().await;
-                }
-                m.0.preparing.store(false, Ordering::Relaxed);
+            rt.spawn(async move {
+                let _ = m.prepare().await;
             });
         }
         std::thread::spawn(move || {
             let samples = me.record(auto);
             me.0.listening.store(false, Ordering::Relaxed);
-            if me.0.cancel.load(Ordering::Relaxed) || samples.is_none() {
-                me.set_transcript("", true);
-                return;
-            }
-            let samples = samples.unwrap();
-            if samples.len() < 16_000 / 3 {
-                me.set_transcript("", true);
-                return;
-            }
-            let m2 = me.clone();
+            let samples = match samples {
+                Some(s) if !me.0.cancel.load(Ordering::Relaxed) && s.len() >= 16_000 / 3 => s,
+                _ => {
+                    me.set_transcript("", true);
+                    return;
+                }
+            };
             rt.spawn(async move {
-                m2.set_transcript("Transcribing…", false);
-                let text = match m2.transcribe(&samples).await {
+                me.set_transcript("Transcribing…", false);
+                let text = match me.transcribe(&samples).await {
                     Ok(t) => t,
                     Err(e) => {
                         clinqy_core::log::write(&format!("voice: {e}"));
-                        m2.set_transcript(&format!("Voice didn't work: {e}"), false);
+                        me.set_transcript(&format!("Voice didn't work: {e}"), false);
                         String::new()
                     }
                 };
-                m2.set_transcript(&text, true);
+                me.set_transcript(&text, true);
             });
         });
     }
 
     /// Records 16 kHz mono until stopped (or, auto, until a pause after speech).
     fn record(&self, auto: Option<f64>) -> Option<Vec<f32>> {
-        let host = cpal::default_host();
-        let Some(device) = host.default_input_device() else {
-            self.set_transcript("No microphone found", false);
-            return None;
+        let device = match cpal::default_host().default_input_device() {
+            Some(d) => d,
+            None => {
+                self.set_transcript("No microphone found", false);
+                return None;
+            }
         };
         let config = device.default_input_config().ok()?;
         let rate = config.sample_rate().0 as f64;
-        let channels = config.channels() as usize;
+        let channels = (config.channels() as usize).max(1);
         let buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::new()));
         let level: Arc<Mutex<f32>> = Arc::new(Mutex::new(0.0));
         let (b2, l2) = (buf.clone(), level.clone());
         let push = move |data: &[f32]| {
             let mut sum = 0.0f32;
-            let mut mono = Vec::with_capacity(data.len() / channels.max(1));
-            for frame in data.chunks(channels.max(1)) {
+            let mut mono = Vec::with_capacity(data.len() / channels);
+            for frame in data.chunks(channels) {
                 let s = frame.iter().sum::<f32>() / frame.len() as f32;
                 sum += s * s;
                 mono.push(s);
@@ -273,16 +248,11 @@ impl Voice {
             b2.lock().extend(mono);
         };
         let err = |e| clinqy_core::log::write(&format!("voice: microphone error {e}"));
+        let cfg: cpal::StreamConfig = config.clone().into();
         let stream = match config.sample_format() {
-            cpal::SampleFormat::F32 => device.build_input_stream(&config.clone().into(), move |d: &[f32], _: &_| push(d), err, None),
-            cpal::SampleFormat::I16 => {
-                let p = push;
-                device.build_input_stream(&config.clone().into(), move |d: &[i16], _: &_| p(&d.iter().map(|s| *s as f32 / 32768.0).collect::<Vec<_>>()), err, None)
-            }
-            cpal::SampleFormat::U16 => {
-                let p = push;
-                device.build_input_stream(&config.clone().into(), move |d: &[u16], _: &_| p(&d.iter().map(|s| (*s as f32 - 32768.0) / 32768.0).collect::<Vec<_>>()), err, None)
-            }
+            cpal::SampleFormat::F32 => device.build_input_stream(&cfg, move |d: &[f32], _: &_| push(d), err, None),
+            cpal::SampleFormat::I16 => device.build_input_stream(&cfg, move |d: &[i16], _: &_| push(&d.iter().map(|s| *s as f32 / 32768.0).collect::<Vec<_>>()), err, None),
+            cpal::SampleFormat::U16 => device.build_input_stream(&cfg, move |d: &[u16], _: &_| push(&d.iter().map(|s| (*s as f32 - 32768.0) / 32768.0).collect::<Vec<_>>()), err, None),
             _ => return None,
         }
         .ok()?;
@@ -309,50 +279,86 @@ impl Voice {
         drop(stream);
         (self.0.on_level)(0.0);
         let raw = std::mem::take(&mut *buf.lock());
-        // Linear resample to 16 kHz.
-        let ratio = rate / 16_000.0;
-        let n = (raw.len() as f64 / ratio) as usize;
-        Some((0..n).map(|i| {
-            let x = i as f64 * ratio;
-            let j = x as usize;
-            let f = (x - j as f64) as f32;
-            raw.get(j).copied().unwrap_or(0.0) * (1.0 - f) + raw.get(j + 1).copied().unwrap_or(0.0) * f
-        }).collect())
+        Some(resample(&raw, rate))
     }
 
     async fn transcribe(&self, samples: &[f32]) -> anyhow::Result<String> {
         if !self.ready() {
             self.prepare().await?;
-        } else {
-            self.ensure_server().await?;
         }
-        *self.0.last_used.lock() = Instant::now();
-        let wav = wav(samples);
-        let part = reqwest::multipart::Part::bytes(wav).file_name("audio.wav").mime_str("audio/wav")?;
-        let form = reqwest::multipart::Form::new().part("file", part).text("response_format", "json").text("temperature", "0.0");
-        let r: serde_json::Value = reqwest::Client::new().post(format!("http://127.0.0.1:{PORT}/inference")).multipart(form).timeout(Duration::from_secs(60)).send().await?.json().await?;
-        let text = r["text"].as_str().unwrap_or("").trim().to_string();
+        let file = std::env::temp_dir().join(format!("clinqy-voice-{}.wav", std::process::id()));
+        std::fs::write(&file, wav(samples))?;
+        // Whisper's encoder costs the same for 3 seconds as for 30 unless told how much audio there is
+        // (1500 frames = 30 s); a little headroom keeps the last word.
+        let secs = samples.len() as f64 / 16_000.0;
+        let ctx = (((secs + 1.5) / 30.0 * 1500.0) as u32).clamp(160, 1500);
+        let (lang, prompt) = language();
+        let threads = std::thread::available_parallelism().map(|n| (n.get() / 2).clamp(2, 8)).unwrap_or(4).to_string();
+        let mut cmd = tokio::process::Command::new(cli_exe());
+        cmd.args(["-m", &model_path().display().to_string(), "-f", &file.display().to_string(), "-l", &lang, "-t", &threads, "-nt", "-np"]);
+        if ctx < 1500 {
+            cmd.args(["-ac", &ctx.to_string()]);
+        }
+        if let Some(p) = prompt {
+            cmd.args(["--prompt", p]);
+        }
+        let out = cmd.current_dir(dir().join("whisper")).creation_flags(0x0800_0000).kill_on_drop(true).output().await?;
+        let _ = std::fs::remove_file(&file);
+        if !out.status.success() {
+            anyhow::bail!("Whisper failed: {}", String::from_utf8_lossy(&out.stderr).lines().last().unwrap_or(""));
+        }
+        let text = String::from_utf8_lossy(&out.stdout).split_whitespace().collect::<Vec<_>>().join(" ");
         // Whisper's stock hallucinations on silence.
-        let junk = ["[BLANK_AUDIO]", "(silence)", "[ Silence ]", "Thank you.", "Thanks for watching!"];
+        let junk = ["[BLANK_AUDIO]", "(silence)", "[ Silence ]", "Thank you.", "Thanks for watching!", "you"];
         Ok(if junk.iter().any(|j| text.eq_ignore_ascii_case(j)) { String::new() } else { text })
     }
 
-    /// Stops the local server after a while unused (it holds the model in memory).
-    pub fn idle_check(&self) {
-        if self.0.last_used.lock().elapsed() > Duration::from_secs(15 * 60) {
-            if let Some(mut c) = self.0.server.lock().take() {
-                let _ = c.kill();
-            }
-        }
+    /// Transcribes a WAV file (16-bit PCM, any rate, mono or stereo): `clinqy transcribe`.
+    pub async fn transcribe_file(&self, path: &std::path::Path) -> anyhow::Result<String> {
+        let bytes = std::fs::read(path)?;
+        let (rate, channels, data) = parse_wav(&bytes).ok_or_else(|| anyhow::anyhow!("not a 16-bit PCM WAV file"))?;
+        let mono: Vec<f32> = data.chunks(channels).map(|f| f.iter().sum::<f32>() / channels as f32).collect();
+        self.transcribe(&resample(&mono, rate as f64)).await
     }
 }
 
-impl Drop for Inner {
-    fn drop(&mut self) {
-        if let Some(mut c) = self.server.lock().take() {
-            let _ = c.kill();
-        }
+/// Linear resample to 16 kHz.
+fn resample(raw: &[f32], rate: f64) -> Vec<f32> {
+    let ratio = rate / 16_000.0;
+    let n = (raw.len() as f64 / ratio) as usize;
+    (0..n)
+        .map(|i| {
+            let x = i as f64 * ratio;
+            let j = x as usize;
+            let f = (x - j as f64) as f32;
+            raw.get(j).copied().unwrap_or(0.0) * (1.0 - f) + raw.get(j + 1).copied().unwrap_or(0.0) * f
+        })
+        .collect()
+}
+
+fn parse_wav(b: &[u8]) -> Option<(u32, usize, Vec<f32>)> {
+    if b.len() < 44 || &b[0..4] != b"RIFF" || &b[8..12] != b"WAVE" {
+        return None;
     }
+    let (mut i, mut rate, mut channels, mut bits) = (12usize, 0u32, 1usize, 16u16);
+    while i + 8 <= b.len() {
+        let id = &b[i..i + 4];
+        let size = u32::from_le_bytes(b[i + 4..i + 8].try_into().ok()?) as usize;
+        let body = &b[i + 8..(i + 8 + size).min(b.len())];
+        if id == b"fmt " {
+            channels = u16::from_le_bytes(body[2..4].try_into().ok()?) as usize;
+            rate = u32::from_le_bytes(body[4..8].try_into().ok()?);
+            bits = u16::from_le_bytes(body[14..16].try_into().ok()?);
+        } else if id == b"data" {
+            if bits != 16 {
+                return None;
+            }
+            let s = body.chunks_exact(2).map(|c| i16::from_le_bytes([c[0], c[1]]) as f32 / 32768.0).collect();
+            return Some((rate, channels.max(1), s));
+        }
+        i += 8 + size + (size & 1);
+    }
+    None
 }
 
 /// 16-bit PCM WAV, 16 kHz mono.
