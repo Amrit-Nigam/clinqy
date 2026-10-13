@@ -1,6 +1,6 @@
 # Builds Clinqy for Windows and packages it as dist\Clinqy-windows-x64.zip:
-#   ClinqyApp.exe, clinqy.exe, extension\ (the browser extension, shared with the Mac app), install.ps1,
-#   uninstall.ps1, env.example and README.md.
+#   ClinqyApp.exe, clinqy.exe, extension\ (the browser extension, shared with the Mac app), Install Clinqy.bat
+#   (double-click to install), install.ps1, Uninstall Clinqy.bat, uninstall.ps1, env.example and README.md.
 # Usage (from anywhere):  powershell -ExecutionPolicy Bypass -File windows\scripts\build-release.ps1
 
 $ErrorActionPreference = 'Stop'
@@ -24,6 +24,8 @@ Copy-Item (Join-Path $release 'clinqy.exe') $stage
 Copy-Item -Recurse (Join-Path $repo 'extension') (Join-Path $stage 'extension')
 Copy-Item (Join-Path $PSScriptRoot 'install.ps1') $stage
 Copy-Item (Join-Path $PSScriptRoot 'uninstall.ps1') $stage
+Copy-Item (Join-Path $PSScriptRoot 'Install Clinqy.bat') $stage
+Copy-Item (Join-Path $PSScriptRoot 'Uninstall Clinqy.bat') $stage
 Copy-Item (Join-Path $windows 'env.windows.example') (Join-Path $stage 'env.example')
 Copy-Item (Join-Path $windows 'README.md') $stage
 

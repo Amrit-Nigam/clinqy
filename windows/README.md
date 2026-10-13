@@ -16,22 +16,25 @@ replays on Windows.
 
 **Requirements:** Windows 10 (1903+) or 11, x64. WebView2 (built into Windows 11 and current Windows 10).
 
-**One line** (in PowerShell): `irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex`
-does steps 1–2 for you. Or by hand:
+1. Download `Clinqy-windows-x64.zip` from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest),
+   unzip it and double-click **`Install Clinqy.bat`**. No admin rights needed. It installs to
+   `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH, turns on Open at login
+   and starts Clinqy.
+2. Paste the setup prompt from the [main README](../README.md#setup-on-windows) (or the website) into your coding agent.
+   It picks the AI you already have (Claude Code, then Codex, then agy, then Ollama), has Clinqy load its own browser
+   extension, connects the agent and checks everything.
 
-1. Download `Clinqy-windows-x64.zip` from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest)
-   and unzip it.
-2. Right-click `install.ps1` → **Run with PowerShell**. No admin rights needed. It installs to
-   `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH, opens Clinqy at login
-   and starts it.
-3. Pick a model. With nothing set, Clinqy uses **Claude Code** (`winget install Anthropic.ClaudeCode`, then
-   `claude` once to log in). For anything else, tray icon → **Settings (model, keys)…** and uncomment one block.
-4. Add the browser extension (Chrome, Edge, Brave…): tray icon → **Browser extension…** opens the folder and the
-   extensions page. Turn on *Developer mode*, click *Load unpacked* and pick the folder. Without it Clinqy still
-   works in the browser, from screenshots, just less precisely.
-5. Check everything: tray icon → **Check setup…**, or `clinqy doctor` in a terminal.
+Without a coding agent, the same in a new terminal:
 
-To remove it: `uninstall.ps1` in the install folder (add `-Purge` to delete your settings and data too).
+```powershell
+clinqy model              # the AI Clinqy uses (`clinqy model agy`, `claude`, `codex`, `ollama`…; `auto` is the default)
+clinqy extension install  # Clinqy loads its own extension into Chrome, Edge or Brave
+clinqy connect claude     # MCP for coding agents: claude, codex, agy, cursor, gemini, windsurf
+clinqy doctor
+```
+
+The tray icon has **Model**, **Browser extension…** and **Check setup…** too. To uninstall, double-click
+`Uninstall Clinqy.bat` in the install folder (`uninstall.ps1 -Purge` also deletes your settings and data).
 
 ## Using it
 

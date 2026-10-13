@@ -98,38 +98,55 @@ Connect to: cursor
 
 ## Setup on Windows
 
-Clinqy for Windows is a ready-made download: no building, no admin rights. It needs Windows 10 (1903 or later) or Windows 11, on x64.
+Download, paste one prompt into your coding agent, done. It needs Windows 10 (1903 or later) or Windows 11, on x64, and no admin rights.
 
-**1. Install it.** Pick one:
+**1. Download** **`Clinqy-windows-x64.zip`** from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH, opens it at login and starts it. The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. (You can skip this step: the prompt installs Clinqy too.)
 
-- **One line:** open PowerShell and paste:
-  ```powershell
-  irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex
-  ```
-- **By hand:**
-  1. Download **`Clinqy-windows-x64.zip`** from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest) and unzip it.
-  2. Right-click **`install.ps1`** → **Run with PowerShell**.
+**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
-The installer puts Clinqy in `%LOCALAPPDATA%\Programs\Clinqy` and adds it to the Start menu. It puts the `clinqy` command on your PATH and opens Clinqy at login, then starts it. Clinqy's icon appears in the system tray. The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**.
+````text
+Model: auto
+Connect to: this agent
 
-**2. Pick a model.** Clinqy uses **Claude Code** unless you choose something else:
+Set up Clinqy for Windows (https://github.com/Amrit-Nigam/clinqy) on this PC for me, using the two lines above. Run
+the commands yourself in PowerShell. Only stop when you need my answer or a click that only I can do.
+
+1. Install Clinqy, unless it's already installed ($c below exists). It needs no admin rights:
+     powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex"
+   From then on use the full path (PATH only updates in new terminals):
+     $c = "$env:LOCALAPPDATA\Programs\Clinqy\clinqy.exe"
+2. Set up the model with `& $c model <name>`, then read what it prints.
+   - "auto" (or blank): run `& $c model auto`. It uses what this PC has: Claude Code, then Codex, then agy, then Ollama.
+     If it has none of them, install Claude Code (`winget install Anthropic.ClaudeCode`) and run `& $c model claude`.
+   - Otherwise map my choice: claude, codex, agy, ollama <model>, or an API key: anthropic, openai, gemini, openrouter.
+   - It checks that the model really answers. If it says a CLI isn't logged in, ask me to run `claude` (or `codex`,
+     `agy`) once in a new terminal and log in, wait for me, then run `& $c model test`.
+   - API key: don't ask me to paste the key into this chat. Run `& $c settings` (it opens the file), tell me which line
+     to paste the key into, wait until I've saved it, then run `& $c model test`.
+3. Add the browser extension with `& $c extension install`. Clinqy opens the extensions page and loads it by itself
+   (add `edge` or `brave` if I use one of those). If it fails, walk me through it by hand: it prints the folder to pick.
+4. Connect coding agents with `& $c connect <names>` (claude, codex, agy, cursor, gemini, windsurf). "this agent" means
+   you: Claude Code → claude, Codex → codex, Antigravity → agy, Cursor → cursor, Gemini CLI → gemini, Windsurf →
+   windsurf. Skip this if it says none.
+5. Check it: run `& $c doctor`, then `& $c run --dry "open example.com"`, and show me the planned steps. Fix anything
+   that isn't ready (the log is %LOCALAPPDATA%\Clinqy\Logs\agent.log). Finish with a short summary, and tell me: tap
+   Ctrl+Alt to type a request, hold Ctrl+H to say it.
+````
+
+**3. Tap Ctrl+Alt** and ask something.
+
+**No coding agent?** Do the same by hand in a new terminal after installing:
 
 ```powershell
-winget install Anthropic.ClaudeCode
-claude        # log in once, then close it
+clinqy model              # which AI Clinqy uses; `clinqy model agy` (or claude, codex, ollama…) picks one and checks it answers
+clinqy extension install  # Clinqy loads its own extension into your browser (add edge or brave to choose)
+clinqy connect claude     # add Clinqy to coding agents over MCP: claude, codex, agy, cursor, gemini, windsurf
+clinqy doctor             # what's ready
 ```
 
-To use agy, Codex, an Anthropic / OpenAI / Gemini / OpenRouter key, or a local model with Ollama, go to the tray icon → **Settings (model, keys)…**. Uncomment one block and save. It's the same settings file as on the Mac (`%USERPROFILE%\.config\clinqy\env`), and the options are explained in [Choosing the model](#choosing-the-model).
+The tray icon has the same: **Model**, **Browser extension…** and **Check setup…**. API keys go in the settings file (`clinqy settings` opens it), the same file and keys as on the Mac; see [Choosing the model](#choosing-the-model).
 
-**3. Add the browser extension** (Chrome, Edge or Brave). This lets Clinqy read and use web pages exactly:
-
-1. Go to the tray icon → **Browser extension…**. This opens the extension folder and your browser's extensions page, and copies the folder's path.
-2. Turn on **Developer mode**.
-3. Click **Load unpacked** and pick that folder.
-
-**4. Check it.** Go to the tray icon → **Check setup…**, or run `clinqy doctor` in a new terminal. Everything should say ready.
-
-**5. Use it.**
+### Using it
 
 | | |
 |---|---|
@@ -141,15 +158,7 @@ To use agy, Codex, an Anthropic / OpenAI / Gemini / OpenRouter key, or a local m
 
 The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and **History**, the same as on the Mac. Only the left Alt key counts, so typing with AltGr never opens Clinqy. To use other keys, set `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) or `TALK_HOTKEY=ctrl+shift+space` in the settings file. A quick tap of Ctrl+H still reaches the app in front (Replace, History…).
 
-**Use it from coding agents (optional).** `clinqy run`, `clinqy qa` and `clinqy look` work in any terminal, as on the Mac (see [The `clinqy` command](#the-clinqy-command-qa-and-workflows-for-any-coding-agent)). To add Clinqy as an MCP server:
-
-```powershell
-claude mcp add clinqy -- "$env:LOCALAPPDATA\Programs\Clinqy\clinqy.exe" mcp
-```
-
-For other agents, use the same command and the argument `mcp`.
-
-**Updating** means running the installer again; your settings, memory and history are kept. **Uninstalling** means running `uninstall.ps1` in `%LOCALAPPDATA%\Programs\Clinqy`; add `-Purge` to also delete your settings and data. More detail, including building from source, is in [windows/README.md](windows/README.md).
+**Updating** means running the installer again; your settings, memory and history are kept. **Uninstalling** means double-clicking `Uninstall Clinqy.bat` in `%LOCALAPPDATA%\Programs\Clinqy`. More detail, including building from source, is in [windows/README.md](windows/README.md).
 
 ---
 

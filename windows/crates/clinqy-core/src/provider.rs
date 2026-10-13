@@ -78,7 +78,8 @@ impl Provider {
         None
     }
 
-    /// The provider in use: a flag, PROVIDER / USE_AGY, else the logged-in Claude CLI, else agy, else the first key.
+    /// The provider in use: a flag, PROVIDER / USE_AGY, else whatever is on this PC, in this order: Claude Code
+    /// (logged in), Codex, agy, a running Ollama, an API key, then any CLI at all.
     pub fn current() -> Provider {
         if let Some(agy) = Self::flag_says_agy() {
             return if agy { Provider::AgyCli } else { Provider::ClaudeCli };
@@ -89,19 +90,23 @@ impl Provider {
         if let Some(p) = config::value("PROVIDER").and_then(|v| Provider::parse(&v)) {
             return p;
         }
+        Self::detected()
+    }
+
+    /// What `current` picks when nothing is set.
+    pub fn detected() -> Provider {
         if Provider::ClaudeCli.cli().is_some() && claude_logged_in() {
             return Provider::ClaudeCli;
         }
-        if Provider::AgyCli.cli().is_some() {
-            return Provider::AgyCli;
+        if let Some(p) = [Provider::CodexCli, Provider::AgyCli].into_iter().find(|p| p.cli().is_some()) {
+            return p;
         }
-        if Provider::ClaudeCli.cli().is_some() {
-            return Provider::ClaudeCli;
+        if ollama_running() {
+            return Provider::Ollama;
         }
         [Provider::Anthropic, Provider::OpenAi, Provider::Gemini, Provider::OpenRouter]
             .into_iter()
             .find(|p| p.key().is_some())
-            .or_else(|| [Provider::CodexCli, Provider::ClaudeCli, Provider::AgyCli].into_iter().find(|p| p.cli().is_some()))
             .unwrap_or(Provider::ClaudeCli)
     }
 
@@ -199,6 +204,33 @@ impl Provider {
             _ => format!("{} API ({})", self.id(), if self.key().is_none() { "no key" } else { "key set" }),
         }
     }
+}
+
+/// Whether something listens at a URL's host and port (a local server is up).
+pub fn reachable(url: &str) -> bool {
+    use std::net::ToSocketAddrs;
+    let rest = url.split("://").nth(1).unwrap_or(url);
+    let host_port = rest.split('/').next().unwrap_or(rest);
+    let addr = if host_port.contains(':') { host_port.to_string() } else { format!("{host_port}:80") };
+    addr.to_socket_addrs()
+        .ok()
+        .and_then(|mut a| a.next())
+        .map(|a| std::net::TcpStream::connect_timeout(&a, std::time::Duration::from_millis(300)).is_ok())
+        .unwrap_or(false)
+}
+
+/// Ollama answering at its address (checked once a minute at most: it sits on the path of every request).
+fn ollama_running() -> bool {
+    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
+    let mut last = LAST.lock().unwrap();
+    if let Some((at, up)) = *last {
+        if at.elapsed() < std::time::Duration::from_secs(60) {
+            return up;
+        }
+    }
+    let up = reachable(&Provider::Ollama.base_url());
+    *last = Some((std::time::Instant::now(), up));
+    up
 }
 
 fn claude_logged_in() -> bool {

@@ -126,6 +126,22 @@ pub fn run() -> anyhow::Result<()> {
         .iter()
         .map(|(code, label)| CheckMenuItem::with_id(format!("lang:{code}"), *label, true, current == *code, None))
         .collect();
+    // Model: the CLIs people log in with, one click each (checked with a quick question); keys go in Settings.
+    let auto = crate::onboard::is_auto();
+    let now = crate::onboard::short_name(clinqy_core::provider::Provider::current());
+    let mut models: Vec<CheckMenuItem> = vec![CheckMenuItem::with_id("model:auto", "Automatic (what you have)", true, auto, None)];
+    models.extend(
+        crate::onboard::MODELS[..4]
+            .iter()
+            .map(|(name, _, what)| CheckMenuItem::with_id(format!("model:{name}"), *what, true, !auto && now == *name, None)),
+    );
+    let model_menu = Submenu::with_id("model", "Model", true);
+    for m in &models {
+        let _ = model_menu.append(m);
+    }
+    let _ = model_menu.append(&PredefinedMenuItem::separator());
+    let _ = model_menu.append(&MenuItem::with_id("model:keys", "An API key or a local model…", true, None));
+    let _ = model_menu.append(&MenuItem::with_id("model:test", "Check the model works", true, None));
     let voice_menu = Submenu::with_id("voice", "Voice language", true);
     for l in &languages {
         let _ = voice_menu.append(l);
@@ -146,6 +162,7 @@ pub fn run() -> anyhow::Result<()> {
         &item("settings", "Settings (model, keys)…"),
         &item("extension", "Browser extension…"),
         &item("check", "Check setup…"),
+        &model_menu,
         &voice_menu,
         &dry,
         &login,
@@ -236,6 +253,7 @@ pub fn run() -> anyhow::Result<()> {
         notice: None,
         dry,
         languages,
+        models,
         login,
         clip,
         hotkey_label,
@@ -303,6 +321,7 @@ struct UiState {
     notice: Option<String>,
     dry: CheckMenuItem,
     languages: Vec<CheckMenuItem>,
+    models: Vec<CheckMenuItem>,
     login: CheckMenuItem,
     clip: Arc<Mutex<ClipState>>,
     hotkey_label: String,
@@ -873,6 +892,43 @@ impl UiState {
             }
             "extension" => crate::setup::show_extension_help(),
             "check" => agent.show_card(crate::setup::check_card(None)),
+            "model:keys" => {
+                crate::setup::ensure_env_file();
+                let p = clinqy_core::paths::env_file();
+                use std::os::windows::process::CommandExt;
+                let _ = std::process::Command::new("notepad.exe").arg(&p).creation_flags(clinqy_core::session::CREATE_NO_WINDOW).spawn();
+            }
+            m if m.starts_with("model:") => {
+                let name = &m[6..];
+                let p = if name == "test" {
+                    clinqy_core::provider::Provider::current()
+                } else if name == "auto" {
+                    let Ok(p) = crate::onboard::choose_auto() else { return };
+                    p
+                } else {
+                    let Some(p) = crate::onboard::MODELS.iter().find(|x| x.0 == name).map(|x| x.1) else { return };
+                    let _ = crate::onboard::choose(p, None);
+                    p
+                };
+                let now = crate::onboard::short_name(p);
+                let auto = crate::onboard::is_auto();
+                for (i, item) in self.models.iter().enumerate() {
+                    item.set_checked(if i == 0 { auto } else { !auto && crate::onboard::MODELS[i - 1].0 == now });
+                }
+                // Check it answers, and say so either way.
+                let shared = self.shared.clone();
+                shared.send(UserEvent::Notice(format!("Checking that {now} answers…")));
+                tokio::spawn(async move {
+                    let text = match crate::onboard::readiness(p) {
+                        Err(fix) => fix,
+                        Ok(_) => match crate::onboard::test(p).await {
+                            Ok(t) => format!("✓ {now} works ({:.1} s). Press Ctrl+Alt and ask something.", t.as_secs_f64()),
+                            Err(e) => format!("✗ {now} didn't answer: {e}. Run `{now}` once in a terminal to log in."),
+                        },
+                    };
+                    shared.send(UserEvent::Notice(text));
+                });
+            }
             lang if lang.starts_with("lang:") => {
                 let code = &lang[5..];
                 let _ = clinqy_core::config::set("VOICE_LANGUAGE", code);

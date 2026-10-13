@@ -7,7 +7,7 @@ import { ARROW, AsciiFinale } from './AsciiFinale'
 import { Scramble } from './Scramble'
 import { HowArt, SafetyArt, SetupArt } from './IsoArt'
 import { AgentSection, QaSection } from './AgentSections'
-import { SETUP_PROMPT } from './setupPrompt'
+import { SETUP_PROMPT, SETUP_PROMPT_WINDOWS } from './setupPrompt'
 import { Tour, TourOffer } from './Tour'
 import { AgentCycle, BrandIcon } from './BrandIcons'
 
@@ -162,9 +162,12 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
     }
   }
 
-  async function copyPrompt() {
+  // The setup prompt for a platform (the visitor's own, unless they're looking at the other tab).
+  const promptFor = (p: Platform) => (p === 'windows' ? SETUP_PROMPT_WINDOWS : SETUP_PROMPT)
+
+  async function copyPrompt(p: Platform = detected) {
     try {
-      await navigator.clipboard.writeText(SETUP_PROMPT)
+      await navigator.clipboard.writeText(promptFor(p))
       setCopied(true)
       setTimeout(() => setCopied(false), 2200)
     } catch {
@@ -235,7 +238,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
             <div className="hero-ctas">
               {download(detected, true)}
               {download(other(detected), false)}
-              <button type="button" className="btn btn-outline" onClick={copyPrompt} data-buddy>
+              <button type="button" className="btn btn-outline" onClick={() => copyPrompt()} data-buddy>
                 <AgentCycle />
                 {copied ? 'Copied. Paste it into your agent' : 'Copy the one-prompt install'}
               </button>
@@ -405,7 +408,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                     <i />
                     <i />
                     <span>setup prompt</span>
-                    <button type="button" className="btn btn-primary btn-small" onClick={copyPrompt} data-buddy data-tour="copy">
+                    <button type="button" className="btn btn-primary btn-small" onClick={() => copyPrompt('mac')} data-buddy data-tour="copy">
                       {copied ? 'Copied' : 'Copy'}
                     </button>
                   </div>
@@ -418,32 +421,26 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               <div>
                 <ol className="steps">
                   <li>
-                    <h3>Download and install</h3>
+                    <h3>Download</h3>
                     <p>
-                      Unzip <code>Clinqy-windows-x64.zip</code>, right-click <code>install.ps1</code> and choose Run with PowerShell. No admin
-                      rights needed. If SmartScreen warns you, click More info → Run anyway.
+                      Unzip it and double-click <code>Install Clinqy.bat</code>. No admin rights needed. If SmartScreen warns you, click
+                      More info → Run anyway. (You can skip this: the prompt installs Clinqy too.)
                     </p>
                     <div className="step-cta">{download('windows', true)}</div>
                   </li>
                   <li>
-                    <h3>Pick a model</h3>
+                    <h3>Paste one prompt into your coding agent</h3>
                     <p>
-                      With nothing set, Clinqy uses Claude Code: <code>winget install Anthropic.ClaudeCode</code>, then run <code>claude</code>{' '}
-                      once to log in. For anything else, tray icon → Settings (model, keys)…
+                      Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf. Nothing to fill in: it uses the AI you already have (Claude
+                      Code, then Codex, then agy, then Ollama), adds the browser extension and connects your agent. It only stops when it
+                      needs you.
                     </p>
-                  </li>
-                  <li>
-                    <h3>Add the browser extension</h3>
-                    <p>
-                      Tray icon → Browser extension… opens the folder and your extensions page. Turn on Developer mode, click Load unpacked
-                      and pick that folder.
-                    </p>
-                  </li>
-                  <li>
-                    <h3>Check it</h3>
-                    <p>
-                      Tray icon → Check setup…, or run <code>clinqy doctor</code> in a new terminal. Everything should say ready.
-                    </p>
+                    <div className="step-cta">
+                      <button type="button" className="btn btn-primary" onClick={() => copyPrompt('windows')} data-buddy data-tour="copy">
+                        <AgentCycle />
+                        {copied ? 'Copied. Paste it into your agent' : 'Copy the setup prompt'}
+                      </button>
+                    </div>
                   </li>
                   <li>
                     <h3>Tap Ctrl+Alt</h3>
@@ -452,20 +449,30 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                 </ol>
               </div>
               <div className="setup-alt">
-                <h3>Or install from PowerShell</h3>
-                <p>This one line downloads Clinqy and does step 1 for you.</p>
+                <h3>The prompt</h3>
+                <p>
+                  Want a particular AI? Change the first line to <code>claude cli</code>, <code>codex cli</code>, <code>agy cli</code>,{' '}
+                  <code>ollama qwen3-vl</code> or <code>anthropic api key</code>. No coding agent? After installing, use the tray icon’s
+                  Model menu and Browser extension… instead.
+                </p>
                 <div className="term">
                   <div className="term-bar">
                     <i />
                     <i />
                     <i />
-                    <span>PowerShell</span>
-                    <button type="button" className="btn btn-primary btn-small" onClick={copyWinInstall} data-buddy data-tour="copy">
-                      {winCopied ? 'Copied' : 'Copy'}
+                    <span>setup prompt</span>
+                    <button type="button" className="btn btn-primary btn-small" onClick={() => copyPrompt('windows')} data-buddy>
+                      {copied ? 'Copied' : 'Copy'}
                     </button>
                   </div>
-                  <pre tabIndex={0}>{WIN_INSTALL}</pre>
+                  <pre tabIndex={0}>{SETUP_PROMPT_WINDOWS}</pre>
                 </div>
+                <p className="fineprint">
+                  Or install from PowerShell:{' '}
+                  <button type="button" className="linklike" onClick={copyWinInstall} data-buddy>
+                    {winCopied ? 'copied' : 'copy the one-line install'}
+                  </button>
+                </p>
               </div>
             </div>
           )}
@@ -476,7 +483,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
           <p id="finale-title" className="finale-line">Press {detected === 'mac' ? '⌃⌥' : 'Ctrl+Alt'}. Say it. Watch it happen.</p>
           <div className="hero-ctas" data-tour="finale-cta">
             {download(detected, true)}
-            <button type="button" className="btn btn-quiet" onClick={copyPrompt} data-buddy>
+            <button type="button" className="btn btn-quiet" onClick={() => copyPrompt()} data-buddy>
               {copyLabel}
             </button>
           </div>

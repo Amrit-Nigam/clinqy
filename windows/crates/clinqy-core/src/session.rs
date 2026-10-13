@@ -112,8 +112,8 @@ impl CliSession {
         std::fs::create_dir_all(&dir)?;
         let mut args: Vec<String> = prefix;
         if is_agy {
-            // agy picks up its rules from AGENTS.md in the working folder; the first turn repeats them too.
-            std::fs::write(dir.join("AGENTS.md"), system)?;
+            // The rules go in the first turn. (Not in an AGENTS.md in the working folder: agy 1.2.17 answers every turn
+            // with an error_message step when one is there, retrying until it gives up.)
             args.extend(
                 ["--sandbox", "--input-format", "stream-json", "--output-format", "stream-json", "--disable-slash-commands",
                  "--dangerously-skip-permissions"]

@@ -3,7 +3,7 @@
 #   - adds a Start menu shortcut and puts `clinqy` on your PATH (for terminals and coding agents)
 #   - opens Clinqy at login, and starts it
 #
-# From an unzipped release:   right-click install.ps1 -> Run with PowerShell
+# From an unzipped release:   double-click "Install Clinqy.bat" (it runs this with the right PowerShell settings)
 # Or in one line:             irm <release-url>/install.ps1 | iex      (downloads the latest zip itself)
 param(
     [string]$Zip = '',
@@ -43,7 +43,7 @@ Get-Process ClinqyApp -ErrorAction SilentlyContinue | Stop-Process -Force -Error
 Start-Sleep -Milliseconds 400
 
 New-Item -ItemType Directory -Force $dest | Out-Null
-foreach ($item in 'ClinqyApp.exe', 'clinqy.exe', 'extension', 'env.example', 'README.md', 'uninstall.ps1') {
+foreach ($item in 'ClinqyApp.exe', 'clinqy.exe', 'extension', 'env.example', 'README.md', 'uninstall.ps1', 'Uninstall Clinqy.bat') {
     $from = Join-Path $source $item
     if (Test-Path $from) {
         $to = Join-Path $dest $item
@@ -92,5 +92,8 @@ if (-not $NoStart) {
 }
 Write-Host ''
 Write-Host 'Done. Press Ctrl+Alt to open Clinqy, or hold Ctrl+H to talk.' -ForegroundColor Green
-Write-Host 'Next: add the browser extension (tray icon -> Browser extension...) and check everything with: clinqy doctor'
+Write-Host 'Next: paste the setup prompt from clinqy.vercel.app into your coding agent, or run these in a new terminal:'
+Write-Host '  clinqy model           (which AI it uses: Claude Code, then Codex, then agy, then Ollama)'
+Write-Host '  clinqy extension install'
+Write-Host '  clinqy doctor'
 Write-Host ''
