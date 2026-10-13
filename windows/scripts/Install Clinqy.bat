@@ -3,7 +3,9 @@ rem Installs Clinqy for Windows for this user (no admin needed). Double-click it
 rem It runs install.ps1 next to it, or downloads the latest release when it is on its own (e.g. opened from inside the zip).
 title Installing Clinqy
 setlocal
-if exist "%~dp0install.ps1" if exist "%~dp0ClinqyApp.exe" (
+set "LOCAL="
+if exist "%~dp0install.ps1" if exist "%~dp0ClinqyApp.exe" set "LOCAL=1"
+if defined LOCAL (
   powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0install.ps1"
 ) else (
   powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex"
