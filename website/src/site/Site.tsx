@@ -12,7 +12,7 @@ import { Tour, TourOffer } from './Tour'
 import { AgentCycle, BrandIcon } from './BrandIcons'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
-const MAC_DMG = `${GITHUB}/releases/download/mac-v0.2.0/Clinqy.dmg`
+const MAC_DMG = `${GITHUB}/releases/download/mac-v0.2.1/Clinqy.dmg`
 // Windows releases are the repo's "latest", so this link follows each new one.
 const WIN_ZIP = `${GITHUB}/releases/latest/download/Clinqy-windows-x64.zip`
 const WIN_INSTALL = `irm ${GITHUB}/releases/latest/download/install.ps1 | iex`
@@ -94,14 +94,6 @@ const CAN = [
     title: 'Works with your coding agent',
     body: 'Add Clinqy as an MCP server to Claude Code, Cursor, Codex or agy, and they can see how your page really renders, logged in, in your own browser.',
   },
-]
-
-const MODELS: [string, string][] = [
-  ['claude cli', 'your Claude login'],
-  ['codex cli', 'your ChatGPT login'],
-  ['agy cli', 'your Google login'],
-  ['anthropic api key', 'or openai, gemini, openrouter'],
-  ['ollama qwen3-vl', 'any local vision model'],
 ]
 
 function Rule() {
@@ -362,25 +354,26 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               <div>
                 <ol className="steps">
                   <li>
-                    <h3>Download and install</h3>
+                    <h3>Download</h3>
                     <p>
-                      Open <code>Clinqy.dmg</code> and drag Clinqy into Applications.
+                      Open <code>Clinqy.dmg</code> and drag Clinqy into Applications. macOS blocks the first launch (it isn’t notarized
+                      yet): System Settings → Privacy &amp; Security → Open Anyway. (You can skip this: the prompt installs Clinqy too.)
                     </p>
                     <div className="step-cta">{download('mac', true)}</div>
                   </li>
                   <li>
-                    <h3>Open it once from Settings</h3>
+                    <h3>Paste one prompt into your coding agent</h3>
                     <p>
-                      Clinqy isn’t notarized by Apple yet, so macOS blocks the first launch. Open System Settings → Privacy &amp; Security,
-                      scroll down and click Open Anyway.
+                      Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf. Nothing to fill in: it uses the AI you already have (Claude
+                      Code, then Codex, then agy, then an API key), asks for the permissions, adds the browser extension and connects your
+                      agent. It only stops when it needs you.
                     </p>
-                  </li>
-                  <li>
-                    <h3>Follow the setup window</h3>
-                    <p>
-                      It walks you through picking a model (Claude Code, agy, Codex, an API key or Ollama), the permissions, and the
-                      browser extension, which Clinqy can load for you. Then it shows you the keys.
-                    </p>
+                    <div className="step-cta">
+                      <button type="button" className="btn btn-primary" onClick={() => copyPrompt('mac')} data-buddy data-tour="copy">
+                        <AgentCycle />
+                        {copied ? 'Copied. Paste it into your agent' : 'Copy the setup prompt'}
+                      </button>
+                    </div>
                   </li>
                   <li>
                     <h3>Press ⌃⌥</h3>
@@ -389,26 +382,19 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                 </ol>
               </div>
               <div className="setup-alt">
-                <h3>Or let your coding agent do it</h3>
+                <h3>The prompt</h3>
                 <p>
-                  Fill in the first two lines, then paste it into Claude Code, Cursor, Codex, agy or Windsurf. It builds Clinqy from source,
-                  sets up your model and the extension, and only stops when it needs you.
+                  Want a particular AI? Change the first line to <code>claude cli</code>, <code>codex cli</code>, <code>agy cli</code>,{' '}
+                  <code>ollama qwen3-vl</code> or <code>anthropic api key</code>. No coding agent? Open Clinqy and follow its setup window
+                  instead.
                 </p>
-                <dl className="models">
-                  {MODELS.map(([k, v]) => (
-                    <div key={k}>
-                      <dt>{k}</dt>
-                      <dd>{v}</dd>
-                    </div>
-                  ))}
-                </dl>
                 <div className="term">
                   <div className="term-bar">
                     <i />
                     <i />
                     <i />
                     <span>setup prompt</span>
-                    <button type="button" className="btn btn-primary btn-small" onClick={() => copyPrompt('mac')} data-buddy data-tour="copy">
+                    <button type="button" className="btn btn-primary btn-small" onClick={() => copyPrompt('mac')} data-buddy>
                       {copied ? 'Copied' : 'Copy'}
                     </button>
                   </div>

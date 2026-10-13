@@ -1,6 +1,8 @@
 import AppKit
 import CryptoKit
+import AVFoundation
 import Carbon
+import Speech
 import ServiceManagement
 
 @MainActor
@@ -43,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UI.dismiss = { [weak self] in self?.panel.orderOut(nil) }
         enableOpenAtLogin()
         _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
+        linkCommand()
         installEditMenu()
         dismissOnOutsideClick()
         Brain.prewarm()
@@ -204,6 +207,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return true
         }
         for url in urls where url.host == "browser" { Task { await answerBrowserQuery(url) } }
+        for url in urls where url.host == "status" { answerStatus(url) }
+        for url in urls where url.host == "permissions" { askForPermissions() }
+        for url in urls where url.host == "extension-install" {
+            installExtension(browser: URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "browser" }?.value)
+        }
         for url in urls where url.scheme == "clinqy" && url.host == "reload-extension" {
             Task { Agent.writeLog("extension reloaded in \(await BrowserBridge.shared.reloadAll()) browser(s)") }
         }
@@ -278,6 +286,68 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/cli", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try? out.write(to: dir.appendingPathComponent("\(id).txt"), atomically: true, encoding: .utf8)
+    }
+
+    /// Puts the `clinqy` command on the PATH (~/.local/bin/clinqy → the copy inside the app) when it isn't there yet, so
+    /// an app installed from the disk image works from terminals and coding agents too. A repo checkout's link is kept.
+    private func linkCommand() {
+        let fm = FileManager.default
+        let link = fm.homeDirectoryForCurrentUser.appendingPathComponent(".local/bin/clinqy")
+        guard let script = Bundle.main.url(forResource: "clinqy", withExtension: nil),
+              (try? fm.destinationOfSymbolicLink(atPath: link.path)).map({ fm.fileExists(atPath: $0) }) != true,
+              !fm.fileExists(atPath: link.path) || (try? fm.destinationOfSymbolicLink(atPath: link.path)) != nil else { return }
+        try? fm.createDirectory(at: link.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try? fm.removeItem(at: link)
+        try? fm.createSymbolicLink(at: link, withDestinationURL: script)
+    }
+
+    /// `clinqy://status?id=…`: this app's permissions and whether the browser extension is connected, for `Clinqy
+    /// doctor` and the other setup commands (a terminal's own permissions say nothing about Clinqy's). Written to
+    /// Application Support/Clinqy/cli/<id>.json.
+    private func answerStatus(_ url: URL) {
+        guard let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "id" })?.value,
+              id.range(of: #"^[A-Za-z0-9-]{1,40}$"#, options: .regularExpression) != nil else { return }
+        var perms = Permissions.all.map { ["name": $0.name, "granted": $0.granted()] as [String: Any] }
+        perms.append(["name": "Microphone", "granted": AVCaptureDevice.authorizationStatus(for: .audio) == .authorized])
+        perms.append(["name": "Speech Recognition", "granted": SFSpeechRecognizer.authorizationStatus() == .authorized])
+        var status: [String: Any] = [
+            "permissions": perms,
+            "extension": BrowserBridge.shared.isConnected,
+            "extensionFolder": extensionInstaller?.extensionFolder.path
+                ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension").path,
+            "provider": Provider.current.rawValue,
+        ]
+        if extensionInstaller?.autoLoad == .gaveUp { status["extensionInstall"] = "the run ended before the extension connected" }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/cli", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: status) { try? data.write(to: dir.appendingPathComponent("\(id).json")) }
+    }
+
+    /// `clinqy://permissions`: macOS asks for each missing permission, and System Settings opens at the first one.
+    private func askForPermissions() {
+        Permissions.requestMissing()
+        if AVCaptureDevice.authorizationStatus(for: .audio) == .notDetermined { AVCaptureDevice.requestAccess(for: .audio) { _ in } }
+        if SFSpeechRecognizer.authorizationStatus() == .notDetermined { SFSpeechRecognizer.requestAuthorization { _ in } }
+        if let first = Permissions.all.first(where: { !$0.granted() }), let url = URL(string: first.settingsURL) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { NSWorkspace.shared.open(url) }
+        }
+    }
+
+    /// `clinqy://extension-install?browser=…`: Clinqy loads its own extension, as "Let Clinqy do it" does in setup.
+    private var extensionInstaller: OnboardingModel?
+
+    private func installExtension(browser: String?) {
+        let model = OnboardingModel()
+        model.run = { [weak self] task in self?.agent.submit(task, test: true) }
+        model.isRunning = { [weak self] in self?.agent.isRunning ?? false }
+        if let b = browser?.lowercased(), let match = model.browsers.first(where: { $0.name.lowercased().contains(b) || $0.id.lowercased().contains(b) }) {
+            model.browserID = match.id
+        } else if let def = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!),
+                  let id = Bundle(url: def)?.bundleIdentifier, model.browsers.contains(where: { $0.id == id }) {
+            model.browserID = id   // the default browser, when it can load extensions
+        }
+        extensionInstaller = model
+        model.letClinqyLoadExtension()
     }
 
     /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).

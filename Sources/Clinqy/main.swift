@@ -129,6 +129,9 @@ if CommandLine.arguments.count >= 3, ["--click-label", "--type", "--key"].contai
 let command = CommandLine.arguments.count >= 2 && !CommandLine.arguments[1].hasPrefix("-psn")
     ? String(CommandLine.arguments[1].drop { $0 == "-" }) : ""
 
+// `Clinqy model | connect | settings | permissions | extension install | doctor`: set Clinqy up from a terminal.
+if SetupCommands.names.contains(command) { MainActor.assumeIsolated { SetupCommands.run(command, Array(CommandLine.arguments.dropFirst(2))) } }
+
 // `Clinqy mcp`: an MCP server on stdio for other agents (`agy mcp add clinqy -- …/Clinqy mcp`).
 if command == "mcp" { MCPServer.serve() }
 

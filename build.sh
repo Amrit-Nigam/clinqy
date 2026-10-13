@@ -14,6 +14,7 @@ cp .build/release/Clinqy "$APP/Contents/MacOS/Clinqy"
 # the `clinqy` command (setup links it into ~/.local/bin) and the fonts setup is drawn with.
 cp -R extension "$APP/Contents/Resources/extension"
 cp bin/clinqy "$APP/Contents/Resources/clinqy"
+cp env.example "$APP/Contents/Resources/env.example"
 cp website/public/fonts/GeistPixel-Square.woff2 website/public/fonts/GeistMono-Variable.woff2 "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'
@@ -26,7 +27,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Clinqy</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.0</string>
+  <key>CFBundleShortVersionString</key><string>0.2.1</string>
   <key>CFBundleVersion</key><string>1</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>

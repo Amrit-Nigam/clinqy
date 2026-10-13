@@ -16,85 +16,60 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 
 ## Setup guide
 
-The quickest way to set up Clinqy is to let your AI coding agent do it (Claude Code, Cursor, Codex, Antigravity CLI / agy, Windsurf…).
+Download, paste one prompt into your coding agent, done. It needs macOS 14 or later on Apple silicon.
 
-**1. Fill in the two lines at the top of the prompt**, in plain words:
+**1. Download** **[`Clinqy.dmg`](https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.1/Clinqy.dmg)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
 
-| If you want to use… | Write after `Model:` |
-|---|---|
-| Claude Code (your Claude login, the default) | `claude cli` |
-| Antigravity CLI / agy (your Google login) | `agy cli` |
-| Codex CLI (your ChatGPT login) | `codex cli` |
-| An Anthropic / OpenAI / Gemini / OpenRouter key | `anthropic api key`, `openai api key`, `gemini api key` or `openrouter api key` |
-| A local model with Ollama | `ollama qwen3-vl` (any vision model) |
-| Groq, LM Studio, Together… | `openai-compatible https://api.groq.com/openai/v1 <model>` |
-| Not sure | leave it blank, and the agent shows you what's installed and asks |
-
-`Connect to:` lists the coding agents that should be able to use Clinqy: `claude code`, `cursor`, `codex`, `agy cli`, or `none`.
-
-**2. Paste the prompt into your agent:**
+**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
 ````text
-Model: claude cli
-Connect to: claude code, cursor
+Model: auto
+Connect to: this agent
 
-Set up Clinqy (https://github.com/Amrit-Nigam/clinqy) on this Mac for me, using the two lines above. Run the
+Set up Clinqy for Mac (https://github.com/Amrit-Nigam/clinqy) on this Mac for me, using the two lines above. Run the
 commands yourself. Only stop when you need my answer or a click that only I can do.
 
-1. Check that this Mac has macOS 14+ on Apple silicon and Swift 5.9+. If Swift is missing, run
-   `xcode-select --install` and wait for me.
-2. If this folder isn't the Clinqy repo, clone it to ~/clinqy and work there.
-3. Set up the model from my "Model:" line:
-   - Make my settings file from the repo's template:
-     `mkdir -p ~/.config/clinqy && cp -n env.example ~/.config/clinqy/env && chmod 600 ~/.config/clinqy/env`
-     (if the file already exists, edit it, don't replace it).
-   - In it, uncomment the block for my choice in section 1 of env.example. Every option there is listed with
-     its KEY=value lines. Leave the rest commented. For a model name, also set CLAUDE_MODEL / AGY_MODEL (or LOCAL_MODEL for
-     ollama / openai-compatible).
-   - claude/codex/agy cli: check the CLI is installed and logged in. If not, install it with the command in
-     env.example and have me log in.
-   - API key: don't ask me to paste the key into this chat. Open ~/.config/clinqy/env for me
-     (`open -e ~/.config/clinqy/env`), tell me which line to paste the key into, and wait until I've saved it.
-     Then check the line has a value, without printing the key.
-   - Ollama: run `ollama pull <model>` if needed.
-4. Run `./build.sh run`. It builds and installs /Applications/Clinqy.app, adds the `clinqy` command to
-   ~/.local/bin and launches the app. Add ~/.local/bin to my PATH if it isn't there.
-5. Tell me to open the Clinqy menu-bar icon → Check Permissions… and turn on Accessibility, Screen Recording,
-   Microphone and Speech Recognition. Wait for me. If I just turned on Screen Recording, restart Clinqy. The
-   "Model:" line in that window should match my choice.
-6. Help me load the browser extension: in Chrome, Arc, Brave or Edge, open the extensions page, turn on Developer
-   mode, click Load unpacked and choose the repo's `extension/` folder. Give me that folder's full path.
-7. Add Clinqy as an MCP server (command `/Applications/Clinqy.app/Contents/MacOS/Clinqy`, argument `mcp`) to
-   each agent on my "Connect to:" line. Keep their other servers:
-   - claude code: `claude mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp`
-   - agy cli: `agy mcp add clinqy -- /Applications/Clinqy.app/Contents/MacOS/Clinqy mcp`
-   - cursor: ~/.cursor/mcp.json → "mcpServers": {"clinqy": {"command": "/Applications/Clinqy.app/Contents/MacOS/Clinqy", "args": ["mcp"]}}
-   - codex: ~/.codex/config.toml → [mcp_servers.clinqy] command = "/Applications/Clinqy.app/Contents/MacOS/Clinqy", args = ["mcp"]
-8. Test it: run `clinqy run --dry "open example.com"` and show me the planned steps. Then have me press ⌃⌥
-   (Control + Option) and ask "where's the brightness setting?". If something fails, read
-   ~/Library/Logs/Clinqy/agent.log and fix it. End with a short summary of what's set up.
+1. Install Clinqy (this also updates an older copy). It needs macOS 14+ on Apple silicon and no admin rights:
+     curl -fsSL -o /tmp/Clinqy.dmg https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.1/Clinqy.dmg
+     v=$(hdiutil attach -nobrowse /tmp/Clinqy.dmg | grep -o '/Volumes/.*'); pkill -x Clinqy; rm -rf /Applications/Clinqy.app
+     ditto "$v/Clinqy.app" /Applications/Clinqy.app; hdiutil detach -quiet "$v"; open /Applications/Clinqy.app
+   From then on use the full path: c=/Applications/Clinqy.app/Contents/MacOS/Clinqy
+2. Set up the model with `$c model <name>`, then read what it prints.
+   - "auto" (or blank): run `$c model auto`. It uses what this Mac has: Claude Code, then Codex, then agy, then an API
+     key. If it has none of them, install Claude Code (`curl -fsSL https://claude.ai/install.sh | bash`) and run
+     `$c model claude`.
+   - Otherwise map my choice: claude, codex, agy, ollama <model>, or an API key: anthropic, openai, gemini, openrouter.
+   - It checks that the model really answers. If it says a CLI isn't logged in, ask me to run `claude` (or `codex`,
+     `agy`) once in a new terminal and log in, wait for me, then run `$c model test`.
+   - API key: don't ask me to paste the key into this chat. Run `$c settings` (it opens the file), tell me which line
+     to paste the key into, wait until I've saved it, then run `$c model test`.
+3. Run `$c permissions`. Clinqy asks macOS for what it still needs. Tell me to turn each one it lists on for Clinqy in
+   System Settings → Privacy & Security, wait for me, and run it again until it says all are on. (After Screen
+   Recording, macOS asks to quit and reopen Clinqy: tell me to let it.)
+4. Add the browser extension with `$c extension install` (add `chrome`, `arc`, `brave` or `edge` to pick one). Clinqy
+   loads it by itself and moves the mouse for a minute, so tell me before you run it. If it fails, walk me through it
+   by hand: it prints the folder to pick.
+5. Connect coding agents with `$c connect <names>` (claude, codex, agy, cursor, gemini, windsurf). "this agent" means
+   you: Claude Code → claude, Codex → codex, Antigravity → agy, Cursor → cursor, Gemini CLI → gemini, Windsurf →
+   windsurf. Skip this if it says none.
+6. Check it: run `$c doctor`, then `~/.local/bin/clinqy run --dry "open example.com"`, and show me the planned steps.
+   Fix anything that isn't ready (the log is ~/Library/Logs/Clinqy/agent.log). Finish with a short summary, and tell
+   me: tap ⌃⌥ (Control + Option) to type a request, hold it to say it.
 ````
 
-**Examples of the two lines:**
+**3. Tap ⌃⌥** and ask something, like "where's the brightness setting?"
 
-```text
-Model: codex cli
-Connect to: cursor, codex
-```
-```text
-Model: openai api key
-Connect to: claude code
-```
-```text
-Model: agy cli
-Connect to: agy cli, cursor
-```
-```text
-Model: ollama qwen3-vl
-Connect to: cursor
+**No coding agent?** Open Clinqy: the first time, its setup window walks you through the model, the permissions, the browser extension and the keys (menu-bar icon → **Set Up Clinqy…** brings it back). Or do the same in a terminal:
+
+```bash
+clinqy model              # which AI Clinqy uses; `clinqy model agy` (or claude, codex, ollama…) picks one and checks it answers
+clinqy permissions        # which macOS permissions Clinqy still needs (it asks macOS for them)
+clinqy extension install  # Clinqy loads its own extension into your browser (add chrome, arc, brave or edge to choose)
+clinqy connect claude     # add Clinqy to coding agents over MCP: claude, codex, agy, cursor, gemini, windsurf
+clinqy doctor             # what's ready
 ```
 
-**Doing it by hand instead?** Copy [`env.example`](env.example) to `~/.config/clinqy/env`, uncomment your model option, then follow [Build & run](#build--run). All the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration).
+API keys go in the settings file (`clinqy settings` opens it); all the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration). Building from source instead? See [Build & run](#build--run).
 
 ## Setup on Windows
 
@@ -310,7 +285,7 @@ Install it for Claude Code:
 mkdir -p ~/.claude/skills/clinqy && curl -fsSL https://raw.githubusercontent.com/Amrit-Nigam/clinqy/main/skills/clinqy/SKILL.md -o ~/.claude/skills/clinqy/SKILL.md
 ```
 
-Claude Code then uses it on its own when you say things like "check my browser" or "test this in the browser", or when you type `/clinqy`. Other agents (Cursor, Codex, agy, Gemini CLI) can use Clinqy over MCP instead; see step 7 of the [setup guide](#setup-guide).
+Claude Code then uses it on its own when you say things like "check my browser" or "test this in the browser", or when you type `/clinqy`. Other agents (Cursor, Codex, agy, Gemini CLI) can use Clinqy over MCP instead; see step 5 of the [setup guide](#setup-guide).
 
 **Workflows (routines without a model).** Every successful run records exactly what it did. In **History**, hover a run and click **Save workflow**. Typed text becomes named inputs, defaulting to the original values. Saved workflows appear under **Skills → Workflows**:
 - **Run:** replays it with no model.

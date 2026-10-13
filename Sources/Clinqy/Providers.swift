@@ -1,8 +1,8 @@
 import Foundation
 
 /// Which model service answers: a coding CLI you're already logged into (Claude Code, the default; Antigravity CLI / agy;
-/// Codex) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env, or just add a key:
-/// with no CLI installed, the first key found is used, then the first CLI found.
+/// Codex) or a provider's HTTP API with your own key. Set PROVIDER in ~/.config/clinqy/env (`Clinqy model <name>`); with
+/// none set, the first of Claude Code (logged in), Codex, agy, Claude Code, then an API key that this Mac has.
 enum Provider: String, CaseIterable {
     case claudeCLI = "claude-cli", agyCLI = "agy-cli", codexCLI = "codex-cli"
     case anthropic, openai, gemini, openrouter, ollama, compatible = "openai-compatible"
@@ -63,11 +63,12 @@ enum Provider: String, CaseIterable {
             default: if let p = Provider(rawValue: raw) { return p }
             }
         }
+        // Nothing chosen ("auto"): what this Mac has, in the same order as on Windows: Claude Code, Codex, agy, then a key.
         if ClaudeSession.claudePath != nil && isClaudeLoggedIn { return .claudeCLI }
+        if Provider.codexCLI.cliPath != nil { return .codexCLI }
         if AgySession.agyPath != nil { return .agyCLI }
         if ClaudeSession.claudePath != nil { return .claudeCLI }
-        return [.anthropic, .openai, .gemini, .openrouter].first { $0.key != nil }
-            ?? [.codexCLI, .claudeCLI, .agyCLI].first { $0.cliPath != nil } ?? .claudeCLI
+        return [.anthropic, .openai, .gemini, .openrouter].first { $0.key != nil } ?? .claudeCLI
     }
 
     /// The CLI's executable, for the CLI providers (AGY_PATH / CLAUDE_PATH / CODEX_PATH, else the usual install spots).

@@ -24,6 +24,14 @@
 #   clinqy page [read|url]           What's in the focused browser tab, via the extension (read-only):
 #                                    its elements (w-ids, fields, values, errors) and visible text; read = full text.
 #   clinqy extension reload          Reload the browser extension from disk.
+#   clinqy extension install [chrome|arc|brave|edge]   Clinqy loads its own extension (needs its permissions on).
+#   clinqy model [auto|test|claude|codex|agy|ollama|anthropic|openai|gemini|openrouter|compatible] [model-id]
+#                                    Which AI Clinqy uses; pick one (or auto: Claude Code, then Codex, then agy, then an
+#                                    API key) and check that it really answers.
+#   clinqy connect <claude|codex|agy|cursor|gemini|windsurf> ...   Add Clinqy as an MCP server to those agents.
+#   clinqy settings [--path]         Open the settings file (keys, hotkeys, everything else).
+#   clinqy permissions               Which macOS permissions Clinqy still needs; asks for them.
+#   clinqy doctor                    What's set up and what isn't (model, permissions, extension).
 set -u
 LOG=~/Library/Logs/Clinqy/agent.log
 WF=~/Library/Application\ Support/Clinqy/workflows.json
@@ -144,10 +152,12 @@ PY
     out=$(<$f); rm -f $f; print -r -- "$out"
     [[ $out == ERROR:* ]] && exit 1; exit 0 ;;
   extension)
+    if [[ ${1:-} == install ]]; then exec /Applications/Clinqy.app/Contents/MacOS/Clinqy extension "$@"; fi
     ensure_app
     open -g "clinqy://reload-extension?token=$TOKEN"; echo "Asked the browser(s) to reload the Clinqy extension." ;;
-  stats|mcp|watch|replay|memory)
-    # Handled by the app binary itself (no running app needed): stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>, memory.
+  stats|mcp|watch|replay|memory|model|models|connect|settings|permissions|doctor)
+    # Handled by the app binary itself: stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>, memory,
+    # and the setup commands (model, connect, settings, permissions, doctor).
     APP=/Applications/Clinqy.app/Contents/MacOS/Clinqy
     [[ -x $APP ]] || { echo "Clinqy isn't installed. Get it from https://clinqy.vercel.app (or run ./build.sh in the repo)"; exit 2; }
     exec $APP "$cmd" "$@" ;;

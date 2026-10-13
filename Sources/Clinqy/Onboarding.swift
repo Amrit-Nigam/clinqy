@@ -424,8 +424,6 @@ final class OnboardingModel: ObservableObject {
 
     // ── Coding agents ──
 
-    private var exe: String { Bundle.main.executablePath ?? "/Applications/Clinqy.app/Contents/MacOS/Clinqy" }
-
     struct Agent: Identifiable {
         let id: String
         let name: String
@@ -442,66 +440,11 @@ final class OnboardingModel: ObservableObject {
 
     func connect(_ id: String) {
         do {
-            switch id {
-            case "claude":
-                guard let claude = AgySession.claudePath else { throw msg("Claude Code isn't installed") }
-                try runQuiet(claude, ["mcp", "add", "clinqy", "-s", "user", "--", exe, "mcp"], okIfContains: "already exists")
-            case "agy":
-                guard let agy = AgySession.agyPath else { throw msg("agy isn't installed") }
-                try runQuiet(agy, ["mcp", "add", "clinqy", "--", exe, "mcp"], okIfContains: "already exists")
-            case "cursor": try addJSONServer(".cursor/mcp.json")
-            case "gemini": try addJSONServer(".gemini/settings.json")
-            case "codex": try addCodexServer()
-            default: return
-            }
+            _ = try AgentConnect.connect(id)
             agentStatus[id] = "Connected"
         } catch {
             agentStatus[id] = error.localizedDescription
         }
-    }
-
-    private func msg(_ s: String) -> NSError { NSError(domain: "Clinqy", code: 1, userInfo: [NSLocalizedDescriptionKey: s]) }
-
-    private func runQuiet(_ path: String, _ args: [String], okIfContains: String) throws {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: path)
-        p.arguments = args
-        let out = Pipe()
-        p.standardOutput = out
-        p.standardError = out
-        try p.run()
-        p.waitUntilExit()
-        let text = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
-        if p.terminationStatus != 0 && !text.contains(okIfContains) {
-            throw msg(text.split(separator: "\n").first.map(String.init) ?? "Failed")
-        }
-    }
-
-    /// Adds Clinqy under "mcpServers", keeping every other server and setting in the file.
-    private func addJSONServer(_ relative: String) throws {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(relative)
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        var root: [String: Any] = [:]
-        if let data = try? Data(contentsOf: url), !data.isEmpty {
-            guard let obj = try JSONSerialization.jsonObject(with: data) as? [String: Any] else {
-                throw msg("\(relative) isn't a JSON object; left it alone")
-            }
-            root = obj
-        }
-        var servers = root["mcpServers"] as? [String: Any] ?? [:]
-        servers["clinqy"] = ["command": exe, "args": ["mcp"]]
-        root["mcpServers"] = servers
-        let data = try JSONSerialization.data(withJSONObject: root, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes])
-        try data.write(to: url, options: .atomic)
-    }
-
-    private func addCodexServer() throws {
-        let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".codex/config.toml")
-        try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        let old = (try? String(contentsOf: url, encoding: .utf8)) ?? ""
-        if old.contains("[mcp_servers.clinqy]") { return }
-        let block = "\n[mcp_servers.clinqy]\ncommand = \"\(exe)\"\nargs = [\"mcp\"]\n"
-        try (old + block).write(to: url, atomically: true, encoding: .utf8)
     }
 
     /// Puts the `clinqy` command on the PATH (~/.local/bin), pointing at the copy inside the app.
