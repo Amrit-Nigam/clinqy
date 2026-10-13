@@ -77,7 +77,7 @@ const CAN = [
   {
     say: 'mummy ko bolo main late hoon',
     title: 'Talk to it, in your words',
-    body: 'Hold ⌃⌥ and speak. Whisper turns it into text on your Mac. English, Hindi and Hinglish all work, and replies keep your style.',
+    body: 'Hold ⌃⌥ and speak. Your Mac’s own speech model turns it into text as you talk, on the Mac. English, Hindi and Hinglish all work, and replies keep your style.',
   },
   {
     say: 'message mom I’ll be late',
