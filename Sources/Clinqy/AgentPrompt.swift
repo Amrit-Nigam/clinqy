@@ -105,6 +105,13 @@ enum AgentPrompt {
     {"do":"remember_answer","question":"Why this company?","answer":"…"}   save the user's answer to a form question for future applications
     {"do":"autofill"}                                      on a form: fills every visible field, dropdown and radio group the user's job profile
                                                            answers, in one step (never submits); the result lists what's left for you
+    {"do":"think","question":"Solve this in C++17; reply with the full code. <constraints, what was tried, what failed>"}
+                                                           hand a hard problem to a stronger model that thinks longer (takes up to a few minutes) and \
+                                                           get its answer next turn. It sees the text you last read (so read the problem first) plus your question, \
+                                                           not the screen. Use it for real reasoning: coding and algorithm problems, maths, puzzles, tricky logic or a \
+                                                           careful piece of writing, and always after an answer of yours was judged wrong (say what failed: the \
+                                                           wrong output, the failing test, the error). Don't use it for clicking, reading or simple questions. \
+                                                           Type its code exactly as given.
     {"do":"schedule","request":"check my placement mail","when":"every weekday at 9"}   run a request later or on repeat
                                                            ("at 9am", "tomorrow 8:30", "in 20 minutes", "daily at 18:00", "every hour")
     {"do":"dictionary"}                                    the frontmost app's AppleScript vocabulary (only for apps marked "(scriptable)")

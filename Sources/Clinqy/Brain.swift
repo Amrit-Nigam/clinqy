@@ -59,11 +59,12 @@ final class AgySession: @unchecked Sendable {
     private var systemPrompt = ""
     private var isFirstTurn = true
 
-    init(system: String, model: String, provider: Provider = Provider.current) throws {
+    /// `effort` overrides the configured reasoning effort (AGY_EFFORT / CLAUDE_EFFORT) for this session.
+    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil) throws {
         self.systemPrompt = system
         self.sessionProvider = provider
         if provider != .agyCLI && provider != .claudeCLI {
-            api = try APIChat(provider: provider, system: system, model: model)
+            api = try APIChat(provider: provider, system: system, model: model, effort: effort)
             return
         }
         let path = provider == .agyCLI ? Self.agyPath : Self.claudePath
@@ -87,9 +88,9 @@ final class AgySession: @unchecked Sendable {
                 "--disable-slash-commands", "--dangerously-skip-permissions",
             ]
             var m = provider.model(model)
-            let explicitEffort = isAgy
+            let explicitEffort = effort ?? (isAgy
                 ? (Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT"))
-                : (Config.value("CLAUDE_EFFORT") ?? Config.value("AGY_EFFORT"))
+                : (Config.value("CLAUDE_EFFORT") ?? Config.value("AGY_EFFORT")))
             let effortSuffixes = ["-low", "-medium", "-high", "-xhigh", "-max"]
             let matchedSuffix = effortSuffixes.first { m.hasSuffix($0) }
 
@@ -114,7 +115,7 @@ final class AgySession: @unchecked Sendable {
         } else {
             process.arguments = [
                 "-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose",
-                "--model", model, "--effort", Config.value("CLAUDE_EFFORT") ?? "low", "--tools", "", "--system-prompt", system,
+                "--model", model, "--effort", effort ?? Config.value("CLAUDE_EFFORT") ?? "low", "--tools", "", "--system-prompt", system,
                 "--strict-mcp-config", "--setting-sources", "", "--disable-slash-commands", "--no-session-persistence",
                 "--include-partial-messages",
             ]

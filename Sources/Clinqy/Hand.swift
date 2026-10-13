@@ -391,6 +391,15 @@ final class Hand {
     /// Line breaks are Shift+Return (a new line without sending in chat apps). In code editors, which re-indent
     /// typed code, each line is typed without its leading spaces and the exact code is swapped in at the end.
     func enterText(_ text: String, codeEditor: Bool = false) async {
+        // A long program typed key by key takes half a minute (and trips the watchdog), only to be replaced by the
+        // exact paste at the end anyway: paste it straight in.
+        if codeEditor, text.count > 300 {
+            AXEngine.selectAll()
+            try? await Task.sleep(for: .milliseconds(60))
+            AXEngine.paste(text)
+            try? await Task.sleep(for: .milliseconds(250))
+            return
+        }
         guard text.contains("\n") else { return await keystrokes(text) }
         let lines = text.components(separatedBy: "\n")
         for (i, line) in lines.enumerated() {

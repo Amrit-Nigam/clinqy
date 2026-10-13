@@ -161,7 +161,7 @@ final class APIChat: @unchecked Sendable {
     /// Set after the provider rejected the reasoning setting for this model, so later turns leave it out.
     private var plain = false
 
-    init(provider: Provider, system: String, model: String) throws {
+    init(provider: Provider, system: String, model: String, effort: String? = nil) throws {
         let key = provider.key
         if provider.isCLI, provider.cliPath == nil {
             let pathEnv = provider == .codexCLI ? "CODEX_PATH" : provider == .agyCLI ? "AGY_PATH" : "CLAUDE_PATH"
@@ -174,7 +174,7 @@ final class APIChat: @unchecked Sendable {
         self.key = key
         self.system = system
         self.model = provider.model(model)
-        effort = (Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
+        self.effort = (effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
     }
 
     var isAlive: Bool { lock.withLock { !closed } }

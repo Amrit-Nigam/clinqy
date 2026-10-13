@@ -1640,7 +1640,7 @@ final class Agent: ObservableObject {
                !AXEngine.similar(value, text) || value.count > text.count + 3 {
                 let r = try? await BrowserBridge.shared.perform("fillActive", on: page, ["text": text])
                 // A code editor can't be set directly (it would corrupt it): what it shows is the result.
-                if r?["skipped"] as? Bool == true, let shows = r?["value"] as? String, !AXEngine.similar(shows, text) {
+                if r?["skipped"] as? Bool == true, let shows = r?["value"] as? String, !Self.editorShows(shows, text) {
                     buddy.clearHighlight()
                     return end(line, fail("the \(editor ?? "code") editor shows \(shows.prefix(200).debugDescription), not the text typed "
                                           + "(auto-indent or auto-closed brackets?). Fix what differs rather than typing it all again"))
@@ -2048,6 +2048,11 @@ final class Agent: ObservableObject {
 
         case "look":
             return .init(ok: true, summary: "screenshot attached next turn", effect: .look)
+
+        case "think":
+            guard let question = action["question"] as? String, !question.isEmpty else { return fail("think needs a question") }
+            let line = begin("Think it through")
+            return end(line, await think(question))
 
         case "wait" where action["for"] is String:
             return await waitFor(action["for"] as! String, gone: action["gone"] as? Bool == true,
@@ -2564,7 +2569,7 @@ final class Agent: ObservableObject {
     /// Dry run: instead of acting, mark the target and say what would happen. nil = this action is safe to really do
     /// (opening, scrolling, reading, asking, anything that only looks).
     private func rehearse(_ kind: String, _ action: [String: Any], context: inout ActionContext) async -> ActionResult? {
-        let lookOnly: Set<String> = ["open_app", "open_url", "scroll", "look", "read", "wait", "recall", "dictionary", "ask", "show",
+        let lookOnly: Set<String> = ["open_app", "open_url", "scroll", "look", "read", "wait", "recall", "dictionary", "ask", "show", "think",
                                      "point", "mark", "review", "assert", "extract"]
         let readOps: [String: Set<String>] = ["event": ["list", "find", "search", "free", "busy"], "calendar": ["list", "find", "search", "free", "busy"],
                                               "reminder": ["list"], "files": ["find", "search", "list", "reveal", "show"],
@@ -2921,6 +2926,61 @@ final class Agent: ObservableObject {
     // MARK: - Progress
 
     private func fail(_ why: String) -> ActionResult { .init(ok: false, summary: "FAILED: \(why)") }
+
+    /// Whether a code editor's rendered text matches what was typed. Editors draw only the lines on screen, wrap long
+    /// lines (the wrap points read as line breaks) and the read is cut at 400 characters, so the part shown just has to
+    /// be a piece of the typed text, ignoring spacing and line breaks.
+    static func editorShows(_ shows: String, _ typed: String) -> Bool {
+        let squash = { (s: String) in s.filter { !$0.isWhitespace } }
+        var seen = squash(shows), want = squash(typed)
+        if seen.isEmpty { return want.isEmpty }
+        // The read can stop mid-line: drop its last few characters before comparing.
+        if shows.count >= 400 { seen = String(seen.dropLast(min(8, seen.count / 2))) }
+        if want.contains(seen) { return true }
+        // Auto-closed brackets or quotes add a character or two; otherwise it's the old loose check.
+        return AXEngine.similar(shows, typed) && seen.count <= want.count + 3
+    }
+
+    /// Hands a hard problem (an algorithm, maths, tricky logic) to a stronger model with more reasoning effort, in a
+    /// fresh one-off session: THINK_MODEL (default opus) at THINK_EFFORT (default high). It gets the user's request,
+    /// the text last read and the agent's question, but not the screen.
+    private func think(_ question: String) async -> ActionResult {
+        let model = Config.value("THINK_MODEL") ?? "opus"
+        let effort = Config.value("THINK_EFFORT") ?? "high"
+        let system = """
+        You are the expert a computer-use agent consults when a step needs real thinking. Work the problem out \
+        carefully and check your answer (trace the examples and edge cases; for code, mind the limits and overflow). \
+        Reply with the answer the agent can use directly: when code is asked for, the complete program in one block, \
+        compact, with no commentary inside it, then at most two lines on the approach. No tool calls.
+        """
+        var prompt = "The user asked: \(request)\n\n"
+        if let readText { prompt += "What's on screen (last read):\n\(readText.prefix(20_000))\n\n" }
+        prompt += "The agent asks:\n\(question)"
+        log("  think: \(model) at \(effort) effort")
+        // A long think is progress, not a stuck step: keep the watchdog quiet while it runs (up to 10 minutes).
+        let heartbeat = Task { @MainActor [weak self] in
+            for _ in 0..<60 {
+                try? await Task.sleep(for: .seconds(10))
+                if Task.isCancelled { return }
+                self?.lastProgress = Date()
+            }
+        }
+        defer { heartbeat.cancel() }
+        let thinkStarted = Date()
+        do {
+            let session = try AgySession(system: system, model: model, effort: effort)
+            defer { session.close() }
+            let reply = try await withTaskCancellationHandler {
+                try await session.send(prompt)
+            } onCancel: { session.close() }
+            let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !text.isEmpty else { return fail("the stronger model gave no answer") }
+            log("  think: answered in \(Int(Date().timeIntervalSince(thinkStarted))) s (\(text.count) chars)")
+            return .init(ok: true, summary: "the stronger model's answer:\n\(text)")
+        } catch {
+            return fail("couldn't reach the stronger model (\(model)): \(error.localizedDescription)")
+        }
+    }
 
     private func begin(_ text: String) -> Int {
         var text = text
