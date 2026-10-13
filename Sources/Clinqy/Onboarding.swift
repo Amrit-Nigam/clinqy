@@ -14,29 +14,43 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
     static var isDone: Bool { UserDefaults.standard.bool(forKey: doneKey) }
 
     private var onFinish: () -> Void = {}
+    private let model: OnboardingModel
+    private let dashboardModel: DashboardModel
 
     /// `run` hands a task to the agent (for "Let Clinqy do it"); `isRunning` says whether one is still going.
-    init(onFinish: @escaping () -> Void, run: @escaping (String) -> Void, isRunning: @escaping () -> Bool) {
+    init(onFinish: @escaping () -> Void, run: @escaping (String) -> Void, isRunning: @escaping () -> Bool,
+         providerChanged: @escaping () -> Void, shortcutsChanged: @escaping () -> Void,
+         captureChanged: @escaping (Bool) -> Void) {
+        let setup = OnboardingModel()
+        model = setup
+        dashboardModel = DashboardModel(providerChanged: providerChanged, shortcutsChanged: shortcutsChanged,
+                                        captureChanged: captureChanged, providerSetup: { [weak setup] in
+            setup?.refreshConfiguration()
+            setup?.step = .model
+            setup?.showingDashboard = false
+        })
         Brand.registerFonts()
         super.init(contentRect: NSRect(origin: .zero, size: OnboardingView.size),
-                   styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+                   styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         self.onFinish = onFinish
         title = "Set up Clinqy"
         titlebarAppearsTransparent = true
         titleVisibility = .hidden
         isMovableByWindowBackground = true
-        appearance = NSAppearance(named: .darkAqua)
+        minSize = NSSize(width: OnboardingView.size.width, height: OnboardingView.size.height)
         isReleasedWhenClosed = false
         delegate = self
-        backgroundColor = NSColor(red: 0.031, green: 0.035, blue: 0.051, alpha: 1)
-        let model = OnboardingModel()
+        backgroundColor = .windowBackgroundColor
+        model.destinationChanged = { [weak self] showing in
+            self?.title = showing ? "Clinqy Dashboard" : "Set up Clinqy"
+        }
         model.finish = { [weak self] in self?.complete() }
         model.run = run
         model.isRunning = isRunning
         // Out of the way while Clinqy works on screen, back when it's done.
         model.hideWindow = { [weak self] in self?.orderOut(nil) }
         model.showWindow = { [weak self] in self?.present() }
-        let hosting = NSHostingView(rootView: OnboardingView(model: model))
+        let hosting = NSHostingView(rootView: OnboardingView(model: model, dashboardModel: dashboardModel))
         hosting.sizingOptions = []   // don't grow the window by the title bar's height
         contentView = hosting
         // The content runs under the transparent title bar, so the whole window is the view's size.
@@ -44,8 +58,20 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
         center()
     }
 
+    func presentSetup() {
+        model.refreshConfiguration()
+        model.showingDashboard = false
+        present()
+    }
+
+    func presentDashboard() {
+        model.showingDashboard = true
+        dashboardModel.refresh(settings: true)
+        present()
+    }
+
     func present() {
-        // A menu-bar app has no Dock icon; give it one while setup is open so the window can't get lost.
+        // Keep setup reachable from the Dock while it is open.
         NSApp.setActivationPolicy(.regular)
         makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -59,7 +85,7 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        NSApp.setActivationPolicy(.accessory)
+        NSApp.setActivationPolicy(.regular)
     }
 }
 
@@ -189,8 +215,15 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
+    private let persistProgress: Bool
+    @Published var showingDashboard = false {
+        didSet { destinationChanged(showingDashboard) }
+    }
+    var destinationChanged: (Bool) -> Void = { _ in }
     @Published var step: Step {
-        didSet { UserDefaults.standard.set(step.rawValue, forKey: OnboardingWindow.stepKey) }
+        didSet {
+            if persistProgress { UserDefaults.standard.set(step.rawValue, forKey: OnboardingWindow.stepKey) }
+        }
     }
     @Published var choice: ModelChoice { didSet { if oldValue != choice { test = .idle } } }
     @Published var apiKey = ""
@@ -213,14 +246,17 @@ final class OnboardingModel: ObservableObject {
     @Published var browserID = ""
     private var autoStarted: Date?
     private var timer: Timer?
+    private var savedConfiguration: [String] = []
 
-    init() {
+    init(persistProgress: Bool = true) {
+        self.persistProgress = persistProgress
         step = Step(rawValue: UserDefaults.standard.integer(forKey: OnboardingWindow.stepKey)) ?? .welcome
         let current = Provider.current
         choice = ModelChoice.from(current)
         localModel = Config.value("LOCAL_MODEL") ?? "qwen3-vl"
         baseURL = Config.value("OPENAI_BASE_URL") ?? ""
         if let name = ModelChoice.from(current).keyName { apiKey = Config.value(name) ?? "" }
+        savedConfiguration = [choice.rawValue, apiKey, localModel, baseURL]
         browserID = browsers.first?.id ?? ""
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
@@ -262,8 +298,22 @@ final class OnboardingModel: ObservableObject {
         }
     }
 
+    func refreshConfiguration() {
+        guard [choice.rawValue, apiKey, localModel, baseURL] == savedConfiguration else { return }
+        choice = ModelChoice.from(Provider.current)
+        apiKey = choice.keyName.flatMap { Config.value($0) } ?? ""
+        localModel = Config.value("LOCAL_MODEL") ?? "qwen3-vl"
+        baseURL = Config.value("OPENAI_BASE_URL") ?? ""
+        savedConfiguration = [choice.rawValue, apiKey, localModel, baseURL]
+    }
+
     func save() {
-        do { try Config.write(settings) } catch { test = .failed("Couldn't save settings: \(error.localizedDescription)") }
+        do {
+            try Config.write(settings)
+            savedConfiguration = [choice.rawValue, apiKey, localModel, baseURL]
+        } catch {
+            test = .failed("Couldn't save settings: \(error.localizedDescription)")
+        }
     }
 
     /// Saves the choice and sends one real request through it, the same way a task would.
@@ -489,19 +539,19 @@ private struct BrandButton: ButtonStyle {
         .foregroundStyle(primary ? Brand.bg : Brand.text)
         .background(
             RoundedRectangle(cornerRadius: 2)
-                .fill(primary ? Brand.text : Color.white.opacity(configuration.isPressed ? 0.12 : 0.0001))
+                .fill(primary ? Brand.text : Brand.text.opacity(configuration.isPressed ? 0.12 : 0.0001))
         )
-        .overlay(RoundedRectangle(cornerRadius: 2).stroke(primary ? Color.clear : Color.white.opacity(0.28)))
+        .overlay(RoundedRectangle(cornerRadius: 2).stroke(primary ? Color.clear : Brand.text.opacity(0.28)))
         .opacity(enabled ? (configuration.isPressed ? 0.85 : 1) : 0.4)
         .contentShape(Rectangle())
     }
 }
 
-private extension View {
+extension View {
     func brand(primary: Bool = false) -> some View { buttonStyle(BrandButton(primary: primary)) }
 
     func card(_ highlight: Bool = false) -> some View {
-        background(RoundedRectangle(cornerRadius: 8).fill(highlight ? blue.opacity(0.12) : Color.white.opacity(0.035)))
+        background(RoundedRectangle(cornerRadius: 8).fill(highlight ? blue.opacity(0.12) : Brand.text.opacity(0.035)))
             .overlay(RoundedRectangle(cornerRadius: 8).stroke(highlight ? blue.opacity(0.55) : Brand.line))
     }
 }
@@ -509,6 +559,7 @@ private extension View {
 struct OnboardingView: View {
     static let size = CGSize(width: 900, height: 640)
     @ObservedObject var model: OnboardingModel
+    @ObservedObject var dashboardModel: DashboardModel
 
     var body: some View {
         HStack(spacing: 0) {
@@ -523,32 +574,39 @@ struct OnboardingView: View {
                         .padding(.top, 44)
                         .padding(.bottom, 24)
                 }
-                Rectangle().fill(Brand.line).frame(height: 1)
-                Footer(model: model)
+                .id(model.showingDashboard)
+                if !model.showingDashboard {
+                    Rectangle().fill(Brand.line).frame(height: 1)
+                    Footer(model: model)
+                }
             }
         }
-        .frame(width: Self.size.width, height: Self.size.height)
+        .frame(minWidth: Self.size.width, maxWidth: .infinity, minHeight: Self.size.height, maxHeight: .infinity)
         .background(Brand.bg)
         .ignoresSafeArea()   // the title bar is transparent; without this it pushes the footer off the bottom
         .foregroundStyle(Brand.text)
-        .environment(\.colorScheme, .dark)
     }
 
     @ViewBuilder private var page: some View {
-        switch model.step {
-        case .welcome: WelcomePage()
-        case .model: ModelPage(model: model)
-        case .permissions: PermissionsPage(model: model)
-        case .browser: BrowserPage(model: model)
-        case .keys: KeysPage()
-        case .agents: AgentsPage(model: model)
-        case .done: DonePage(model: model)
+        if model.showingDashboard {
+            DashboardContentView(model: dashboardModel)
+        } else {
+            switch model.step {
+            case .welcome: WelcomePage()
+            case .model: ModelPage(model: model)
+            case .permissions: PermissionsPage(model: model)
+            case .browser: BrowserPage(model: model)
+            case .keys: KeysPage()
+            case .agents: AgentsPage(model: model)
+            case .done: DonePage(model: model)
+            }
         }
     }
 }
 
 private struct Sidebar: View {
     @ObservedObject var model: OnboardingModel
+    @Environment(\.accessibilityReduceMotion) private var reduceMotion
 
     var body: some View {
         VStack(alignment: .leading, spacing: 2) {
@@ -558,23 +616,48 @@ private struct Sidebar: View {
             }
             .padding(.bottom, 26)
             ForEach(OnboardingModel.Step.allCases, id: \.rawValue) { s in
-                StepRow(index: s.rawValue + 1, title: s.title, state: rowState(s))
-                    .contentShape(Rectangle())
-                    .onTapGesture { if s.rawValue <= model.step.rawValue { model.step = s } }
+                Button {
+                    model.refreshConfiguration()
+                    model.step = s
+                    model.showingDashboard = false
+                } label: {
+                    StepRow(index: s.rawValue + 1, title: s.title, state: rowState(s))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .disabled(s.rawValue > model.step.rawValue)
             }
+            Rectangle().fill(Brand.line).frame(height: 1).padding(.vertical, 12)
+            Button { model.showingDashboard = true } label: {
+                HStack(spacing: 10) {
+                    Image(systemName: "chart.bar")
+                        .frame(width: 22, height: 22)
+                        .foregroundStyle(model.showingDashboard ? Brand.blue : Brand.soft)
+                    Text("Dashboard")
+                        .font(Brand.mono(12.5, model.showingDashboard ? .semibold : .regular))
+                    Spacer()
+                }
+                .foregroundStyle(model.showingDashboard ? Brand.text : Brand.soft)
+                .padding(.vertical, 6)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityAddTraits(model.showingDashboard ? .isSelected : [])
             Spacer()
-            Text("Come back any time from the menu bar: Set Up Clinqy…")
+            Text("Setup and Dashboard are always available from the menu bar.")
                 .font(Brand.mono(10.5)).foregroundStyle(Brand.soft).fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 20)
         .padding(.top, 48)
         .padding(.bottom, 26)
         .frame(maxHeight: .infinity, alignment: .top)
-        .background(Color.black.opacity(0.25))
+        .background(Brand.text.opacity(0.025))
+        .animation(reduceMotion ? nil : .easeOut(duration: 0.15), value: model.showingDashboard)
     }
 
     private func rowState(_ s: OnboardingModel.Step) -> StepRow.RowState {
-        s == model.step ? .current : (s.rawValue < model.step.rawValue ? .done : .todo)
+        s == model.step && !model.showingDashboard ? .current : (s.rawValue < model.step.rawValue ? .done : .todo)
     }
 }
 
@@ -588,7 +671,7 @@ private struct StepRow: View {
         HStack(spacing: 10) {
             ZStack {
                 Circle().fill(state == .current ? blue : Color.clear)
-                Circle().stroke(state == .current ? Color.clear : Color.white.opacity(state == .done ? 0.5 : 0.18))
+                Circle().stroke(state == .current ? Color.clear : Brand.text.opacity(state == .done ? 0.5 : 0.18))
                 if state == .done {
                     Image(systemName: "checkmark").font(.system(size: 9, weight: .bold)).foregroundStyle(Brand.green)
                 } else {
@@ -631,13 +714,14 @@ private struct Footer: View {
         .padding(.horizontal, 36)
         .padding(.top, 16)
         .padding(.bottom, 20)
-        .background(Color.black.opacity(0.15))
+        .background(Brand.text.opacity(0.02))
     }
 }
 
-private struct PageTitle: View {
+struct PageTitle: View {
     let title: String
     let text: String
+    var bottomPadding: CGFloat = 24
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -645,7 +729,7 @@ private struct PageTitle: View {
             Text(text).font(.system(size: 13.5)).foregroundStyle(Brand.soft).lineSpacing(2)
                 .fixedSize(horizontal: false, vertical: true)
         }
-        .padding(.bottom, 24)
+        .padding(.bottom, bottomPadding)
     }
 }
 
@@ -740,7 +824,7 @@ private struct CLIBadge: View {
         Text(found ? "installed" : "not found")
             .font(Brand.mono(10.5, .medium))
             .padding(.horizontal, 8).padding(.vertical, 3)
-            .background(Capsule().fill(found ? Brand.green.opacity(0.14) : Color.white.opacity(0.06)))
+            .background(Capsule().fill(found ? Brand.green.opacity(0.14) : Brand.text.opacity(0.06)))
             .foregroundStyle(found ? Brand.green : Brand.soft)
     }
 }
@@ -1002,7 +1086,7 @@ private struct NumberedStep<Content: View>: View {
     var body: some View {
         HStack(alignment: .top, spacing: 12) {
             Text("\(n)").font(Brand.mono(11, .bold))
-                .frame(width: 22, height: 22).overlay(Circle().stroke(Color.white.opacity(0.3)))
+                .frame(width: 22, height: 22).overlay(Circle().stroke(Brand.text.opacity(0.3)))
             VStack(alignment: .leading, spacing: 8) {
                 Text(text).font(.system(size: 12.5)).fixedSize(horizontal: false, vertical: true)
                 content
@@ -1061,7 +1145,7 @@ private struct Hint: View {
         HStack(spacing: 12) {
             Text(key).font(Brand.mono(11.5, .semibold))
                 .padding(.horizontal, 7).padding(.vertical, 3)
-                .background(RoundedRectangle(cornerRadius: 4).fill(Color.white.opacity(0.08)))
+                .background(RoundedRectangle(cornerRadius: 4).fill(Brand.text.opacity(0.08)))
                 .frame(minWidth: 110, alignment: .leading)
             Text(text).font(.system(size: 12.5)).foregroundStyle(Brand.soft)
         }

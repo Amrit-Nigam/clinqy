@@ -1,7 +1,7 @@
 //! ClinqyApp: the tray icon, the command bar, the status island, and everything that wires the agent to them — the
 //! hotkey (tap to open, hold to talk), the IPC pipe for the `clinqy` command, schedules and reminders.
 
-use crate::ui::{Bar, Island, ResultPanel};
+use crate::ui::{Bar, Dashboard, Island, ResultPanel};
 use clinqy_core::agent::{Context, Copied, Event as AgentEvent, RunOptions};
 use clinqy_core::platform::{Mood, Platform};
 use clinqy_core::{bridge, history, workflow, Agent};
@@ -23,6 +23,7 @@ pub enum UserEvent {
     Hot(HotEvent),
     Bar(String),
     Result(String),
+    Dashboard(String),
     Menu(String),
     TrayClick,
     ShowBar,
@@ -118,6 +119,7 @@ pub fn run() -> anyhow::Result<()> {
     let menu = Menu::new();
     let item = |id: &str, text: &str| MenuItem::with_id(id, text, true, None);
     let pause = MenuItem::with_id("pause", "Pause the current task", true, None);
+    let open_item = item("open", &format!("Open Clinqy\t{hotkey_label}"));
     let dry = CheckMenuItem::with_id("dry", "Dry run (show, don't do)", true, false, None);
     let login = CheckMenuItem::with_id("login", "Open at login", true, crate::setup::starts_at_login(), None);
     // Voice language: what Whisper listens for (saved as VOICE_LANGUAGE in the settings file).
@@ -147,7 +149,8 @@ pub fn run() -> anyhow::Result<()> {
         let _ = voice_menu.append(l);
     }
     let _ = menu.append_items(&[
-        &item("open", &format!("Open Clinqy\t{hotkey_label}")),
+        &open_item,
+        &item("dashboard", "Dashboard…"),
         &pause,
         &item("stop", "Stop the current task"),
         &PredefinedMenuItem::separator(),
@@ -191,6 +194,7 @@ pub fn run() -> anyhow::Result<()> {
     let bar = Bar::new(&event_loop, proxy.clone())?;
     let island = Island::new();
     let result = ResultPanel::new(&event_loop, proxy.clone())?;
+    let dashboard = Dashboard::new(&event_loop, proxy.clone())?;
 
     // The clipboard's recent history, for "this" when nothing is selected.
     let clip = Arc::new(Mutex::new(ClipState::default()));
@@ -249,6 +253,8 @@ pub fn run() -> anyhow::Result<()> {
         bar,
         island,
         result,
+        dashboard,
+        open_item,
         island_on: false,
         notice: None,
         dry,
@@ -265,6 +271,8 @@ pub fn run() -> anyhow::Result<()> {
         tab: "home".into(),
         island_until: None,
         follow_up: false,
+        dashboard_range: "month".into(),
+        dashboard_status: String::new(),
     };
     let proxy_for_loop = proxy.clone();
     event_loop.run(move |event, _target, control_flow| {
@@ -307,6 +315,10 @@ pub fn run() -> anyhow::Result<()> {
                     let _ = p.send_event(UserEvent::BarBlur);
                 });
             }
+            Event::WindowEvent { window_id, event: WindowEvent::CloseRequested, .. } if window_id == ui.dashboard.window.id() => {
+                hotkey::set_enabled(true);
+                ui.dashboard.hide();
+            }
             _ => {}
         }
     });
@@ -317,6 +329,8 @@ struct UiState {
     bar: Bar,
     island: Island,
     result: ResultPanel,
+    dashboard: Dashboard,
+    open_item: MenuItem,
     island_on: bool,
     notice: Option<String>,
     dry: CheckMenuItem,
@@ -335,6 +349,8 @@ struct UiState {
     tab: String,
     island_until: Option<Instant>,
     follow_up: bool,
+    dashboard_range: String,
+    dashboard_status: String,
 }
 
 impl UiState {
@@ -522,6 +538,7 @@ impl UiState {
                 }
             }
             UserEvent::Bar(msg) => self.on_bar(&msg),
+            UserEvent::Dashboard(msg) => self.on_dashboard(&msg),
             UserEvent::BarBlur => {
                 let s = self.agent().snapshot();
                 if self.bar.visible() && !self.bar.has_focus() && s.question.is_none() && s.review.is_none() && !self.shared.voice.is_listening() {
@@ -603,6 +620,174 @@ impl UiState {
         }
     }
 
+    fn dashboard_state(&self) -> Value {
+        use clinqy_core::provider::Provider;
+        let current = Provider::current();
+        let model_name = current.model(&current.default_model());
+        let model_name = if model_name.is_empty() { "Provider default".to_string() } else { model_name };
+        let range = match self.dashboard_range.as_str() {
+            "thirtyDays" => "thirtyDays",
+            "all" => "all",
+            _ => "month",
+        };
+        let summary = clinqy_core::usage::summary(range);
+        let monthly = clinqy_core::usage::summary("month");
+        let providers = summary.providers.iter().map(|p| {
+            let display = Provider::parse(&p.provider).map(Provider::display_name).unwrap_or("Unknown provider");
+            json!({
+                "provider": p.provider,
+                "providerName": display,
+                "requests": p.requests,
+                "inputTokens": p.input_tokens,
+                "outputTokens": p.output_tokens,
+                "meteredRequests": p.metered_requests,
+            })
+        }).collect::<Vec<_>>();
+        let summary = json!({
+            "requests": summary.requests,
+            "inputTokens": summary.input_tokens,
+            "outputTokens": summary.output_tokens,
+            "meteredRequests": summary.metered_requests,
+            "providers": providers,
+            "days": summary.days,
+        });
+        let provider_options = Provider::ALL.into_iter().map(|provider| {
+            let model = provider.model(&provider.default_model());
+            json!({
+                "id": provider.id(),
+                "name": provider.display_name(),
+                "configured": provider.is_configured(),
+                "subtitle": if provider.is_configured() {
+                    if model.is_empty() { "Ready · provider chooses its model".to_string() } else { format!("Ready · {model}") }
+                } else { "Set up credentials or install this provider first".to_string() },
+            })
+        }).collect::<Vec<_>>();
+        let summon = clinqy_core::config::value("HOTKEY").unwrap_or_else(|| "ctrl+alt".into());
+        let talk = clinqy_core::config::value("TALK_HOTKEY").unwrap_or_else(|| "ctrl+h".into());
+        let talk_label = if ["off", "none", "disabled"].contains(&talk.to_lowercase().as_str()) {
+            "Off".to_string()
+        } else {
+            hotkey::talk_label(&talk)
+        };
+        json!({
+            "range": range,
+            "rangeLabel": match range { "month" => "This month", "thirtyDays" => "Last 30 days", _ => "All time" },
+            "summary": summary,
+            "monthlySummary": { "requests": monthly.requests, "inputTokens": monthly.input_tokens, "outputTokens": monthly.output_tokens, "meteredRequests": monthly.metered_requests },
+            "currentProvider": current.id(),
+            "currentProviderName": current.display_name(),
+            "model": model_name,
+            "providerManaged": Provider::managed_by_environment(),
+            "providers": provider_options,
+            "tokenLimit": clinqy_core::config::value("MONTHLY_TOKEN_LIMIT").unwrap_or_default(),
+            "requestLimit": clinqy_core::config::value("MONTHLY_REQUEST_LIMIT").unwrap_or_default(),
+            "summonSpec": summon,
+            "summonLabel": hotkey::label(&summon),
+            "talkSpec": if talk_label == "Off" { "off" } else { talk.as_str() },
+            "talkLabel": talk_label,
+            "hotkeysManaged": std::env::var_os("HOTKEY").is_some() || std::env::var_os("TALK_HOTKEY").is_some(),
+            "status": self.dashboard_status,
+        })
+    }
+
+    fn show_dashboard(&mut self) {
+        self.dashboard_range = "month".into();
+        self.dashboard_status.clear();
+        self.dashboard.present(&self.dashboard_state());
+    }
+
+    fn refresh_dashboard(&self) {
+        if self.dashboard.visible() {
+            self.dashboard.update(&self.dashboard_state());
+        }
+    }
+
+    fn on_dashboard(&mut self, raw: &str) {
+        let Ok(message) = serde_json::from_str::<Value>(raw) else { return; };
+        let string = |key: &str| message[key].as_str().unwrap_or("").trim().to_string();
+        match message["type"].as_str().unwrap_or("") {
+            "ready" | "refresh" => self.refresh_dashboard(),
+            "close" => self.dashboard.hide(),
+            "range" => {
+                let range = string("range");
+                if ["month", "thirtyDays", "all"].contains(&range.as_str()) {
+                    self.dashboard_range = range;
+                    self.refresh_dashboard();
+                }
+            }
+            "capture" => hotkey::set_enabled(!message["enabled"].as_bool().unwrap_or(false)),
+            "provider" => {
+                use clinqy_core::provider::Provider;
+                if Provider::managed_by_environment() {
+                    self.dashboard_status = "The provider is managed by the environment or launch options.".into();
+                } else if let Some(provider) = Provider::parse(&string("provider")) {
+                    if !provider.is_configured() {
+                        self.dashboard_status = format!("Set up {} before switching to it.", provider.display_name());
+                    } else {
+                        let saved = clinqy_core::config::set("PROVIDER", provider.id())
+                            .and_then(|_| clinqy_core::config::set("USE_AGY", ""));
+                        match saved {
+                            Ok(()) => {
+                                self.dashboard_status = format!("Using {}.", provider.display_name());
+                                self.agent().prewarm();
+                            }
+                            Err(error) => self.dashboard_status = format!("Couldn't save provider: {error}"),
+                        }
+                    }
+                }
+                self.refresh_dashboard();
+            }
+            "limits" => {
+                let tokens = string("tokens");
+                let requests = string("requests");
+                if (!tokens.is_empty() && tokens.parse::<u64>().is_err()) || (!requests.is_empty() && requests.parse::<u64>().is_err()) {
+                    self.dashboard_status = "Enter a whole number of zero or greater, or leave a limit empty.".into();
+                } else {
+                    let saved = clinqy_core::config::set("MONTHLY_TOKEN_LIMIT", &tokens)
+                        .and_then(|_| clinqy_core::config::set("MONTHLY_REQUEST_LIMIT", &requests));
+                    self.dashboard_status = match saved {
+                        Ok(()) => "Monthly warning limits saved.".into(),
+                        Err(error) => format!("Couldn't save limits: {error}"),
+                    };
+                }
+                self.refresh_dashboard();
+            }
+            "shortcuts" => {
+                if std::env::var_os("HOTKEY").is_some() || std::env::var_os("TALK_HOTKEY").is_some() {
+                    self.dashboard_status = "Shortcuts are managed by environment variables.".into();
+                } else {
+                    let summon = string("summon");
+                    let talk = string("talk");
+                    let talk = if talk.is_empty() { "off".to_string() } else { talk };
+                    if !hotkey::valid_summon(&summon) || !(talk == "off" || hotkey::valid_talk(&talk)) {
+                        self.dashboard_status = "Summon needs modifier keys. Push-to-talk needs modifiers and one key.".into();
+                    } else {
+                        let saved = clinqy_core::config::set("HOTKEY", &summon)
+                            .and_then(|_| clinqy_core::config::set("TALK_HOTKEY", &talk));
+                        match saved {
+                            Ok(()) => {
+                                hotkey::configure(&summon, &talk);
+                                self.hotkey_label = hotkey::label(&summon);
+                                self.talk_label = hotkey::talk_label(&talk);
+                                self.talk_key = if talk == "off" { String::new() } else { talk };
+                                self.open_item.set_text(&format!("Open Clinqy\t{}", self.hotkey_label));
+                                self.dashboard_status = "Shortcuts saved.".into();
+                            }
+                            Err(error) => self.dashboard_status = format!("Couldn't save shortcuts: {error}"),
+                        }
+                    }
+                }
+                self.refresh_dashboard();
+            }
+            "setup" => {
+                self.open_settings();
+                self.dashboard_status = "Opened settings. Add provider credentials, then return here.".into();
+                self.refresh_dashboard();
+            }
+            _ => {}
+        }
+    }
+
     fn on_hotkey(&mut self, h: HotEvent) {
         match h {
             // The summon chord: a tap opens (or closes) the bar; listening is push-to-talk's job.
@@ -658,6 +843,7 @@ impl UiState {
                 self.sync_pause_item();
                 self.refresh_island();
                 self.refresh_bar();
+                self.refresh_dashboard();
             }
             AgentEvent::Started => {
                 self.island_until = None;
@@ -687,6 +873,7 @@ impl UiState {
             AgentEvent::Finished { answer, ok } => {
                 self.sync_pause_item();
                 self.refresh_island();
+                self.refresh_dashboard();
                 let has_card = self.agent().snapshot().result.is_some();
                 if !has_card {
                     self.island_until = Some(Instant::now() + Duration::from_millis(4500));
@@ -858,6 +1045,7 @@ impl UiState {
         };
         match id {
             "open" => self.capture_context_then_show(),
+            "dashboard" => self.show_dashboard(),
             "pause" => agent.set_paused(!agent.is_paused()),
             "stop" => agent.cancel(),
             "watch" => crate::recorder::toggle(self.shared.clone()),
@@ -882,13 +1070,7 @@ impl UiState {
                 open(&clinqy_core::profile::path());
             }
             "settings" => {
-                crate::setup::ensure_env_file();
-                let p = clinqy_core::paths::env_file();
-                let w = clinqy_core::session::CREATE_NO_WINDOW;
-                use std::os::windows::process::CommandExt;
-                if std::process::Command::new("notepad.exe").arg(&p).creation_flags(w).spawn().is_err() {
-                    open(&p);
-                }
+                self.open_settings();
             }
             "extension" => crate::setup::show_extension_help(),
             "check" => agent.show_card(crate::setup::check_card(None)),
@@ -951,6 +1133,16 @@ impl UiState {
                 self.shared.send(UserEvent::Quit);
             }
             _ => {}
+        }
+    }
+
+    fn open_settings(&self) {
+        crate::setup::ensure_env_file();
+        let path = clinqy_core::paths::env_file();
+        let flags = clinqy_core::session::CREATE_NO_WINDOW;
+        use std::os::windows::process::CommandExt;
+        if std::process::Command::new("notepad.exe").arg(&path).creation_flags(flags).spawn().is_err() {
+            clinqy_windows::system::shell_open(&path.display().to_string());
         }
     }
 }

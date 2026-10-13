@@ -19,6 +19,7 @@ pub const CREATE_NO_WINDOW: u32 = 0x0800_0000;
 
 pub struct Session {
     pub provider: Provider,
+    model: String,
     kind: Kind,
 }
 
@@ -33,7 +34,7 @@ impl Session {
             Provider::ClaudeCli | Provider::AgyCli => Kind::Cli(CliSession::start(system, model, provider)?),
             _ => Kind::Api(Arc::new(ApiChat::new(provider, system, model)?)),
         };
-        Ok(Session { provider, kind })
+        Ok(Session { provider, model: provider.model(model), kind })
     }
 
     pub fn is_alive(&self) -> bool {
@@ -47,7 +48,11 @@ impl Session {
     /// far each time it grows (streaming CLIs only).
     pub async fn send(&self, text: &str, image: Option<String>, partial: Option<mpsc::UnboundedSender<String>>) -> Result<String> {
         match &self.kind {
-            Kind::Cli(c) => c.send(text, image, partial).await,
+            Kind::Cli(c) => {
+                let reply = c.send(text, image, partial).await?;
+                crate::usage::record(self.provider.id(), &self.model, None, None);
+                Ok(reply)
+            }
             Kind::Api(a) => a.clone().send(text, image).await,
         }
     }
@@ -100,6 +105,16 @@ fn not_installed(p: Provider) -> anyhow::Error {
         anyhow!("Agy CLI not found. Install Antigravity (or set AGY_PATH), or add an API key to ~/.config/clinqy/env")
     } else {
         anyhow!("Claude CLI not found. Install Claude Code (winget install Anthropic.ClaudeCode, or set CLAUDE_PATH), or add an API key to ~/.config/clinqy/env")
+    }
+}
+
+fn reported_usage(provider: Provider, json: &Value) -> (Option<u64>, Option<u64>) {
+    let usage = &json["usage"];
+    let metadata = &json["usageMetadata"];
+    match provider {
+        Provider::Anthropic => (usage["input_tokens"].as_u64(), usage["output_tokens"].as_u64()),
+        Provider::Gemini => (metadata["promptTokenCount"].as_u64(), metadata["candidatesTokenCount"].as_u64()),
+        _ => (usage["prompt_tokens"].as_u64(), usage["completion_tokens"].as_u64()),
     }
 }
 
@@ -605,6 +620,8 @@ impl ApiChat {
         if reply.is_empty() {
             bail!("Empty reply from {} ({})", p.id(), self.model);
         }
+        let (input, output) = reported_usage(p, &json);
+        crate::usage::record(p.id(), &self.model, input, output);
         Ok(reply)
     }
 
@@ -664,6 +681,7 @@ impl ApiChat {
         if reply.is_empty() {
             bail!("Empty reply from codex-cli");
         }
+        crate::usage::record(self.provider.id(), &self.model, None, None);
         Ok(reply)
     }
 }

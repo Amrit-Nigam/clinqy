@@ -51,6 +51,34 @@ impl Provider {
         }
     }
 
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Provider::ClaudeCli => "Claude Code",
+            Provider::AgyCli => "Antigravity CLI",
+            Provider::CodexCli => "Codex CLI",
+            Provider::Anthropic => "Anthropic API",
+            Provider::OpenAi => "OpenAI API",
+            Provider::Gemini => "Google Gemini",
+            Provider::OpenRouter => "OpenRouter",
+            Provider::Ollama => "Ollama",
+            Provider::Compatible => "OpenAI-compatible API",
+        }
+    }
+
+    pub fn is_configured(self) -> bool {
+        match self {
+            Provider::ClaudeCli => self.cli().is_some() && claude_logged_in(),
+            Provider::AgyCli | Provider::CodexCli => self.cli().is_some(),
+            Provider::Anthropic | Provider::OpenAi | Provider::Gemini | Provider::OpenRouter => self.key().is_some(),
+            Provider::Ollama | Provider::Compatible => true,
+        }
+    }
+
+    pub fn managed_by_environment() -> bool {
+        ["PROVIDER", "USE_AGY"].iter().any(|key| std::env::var_os(key).is_some())
+            || std::env::args().any(|arg| ["--agy", "--agy-cli", "--claude", "--claude-cli"].contains(&arg.as_str()))
+    }
+
     /// Parses a PROVIDER value (and the aliases the Mac app accepts).
     pub fn parse(raw: &str) -> Option<Provider> {
         Some(match raw.trim().to_lowercase().as_str() {

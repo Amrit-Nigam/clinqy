@@ -16,6 +16,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var island: IslandPanel!
     private var resultPanel: ResultPanel!
     private var hotKey: HotKey?
+    private var talkHotKey: PushToTalkHotKey?
+    private var openMenuItem: NSMenuItem?
+    private var talkMenuItem: NSMenuItem?
     private var pressedAt: Date?
     private var holdTimer: Timer?
     private var holdToTalk = false
@@ -27,6 +30,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         Persist.flush()
+    }
+
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows: Bool) -> Bool {
+        if OnboardingWindow.isDone { showDashboard() } else { showOnboarding() }
+        return true
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -134,8 +142,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Clinqy")
         let menu = NSMenu()
-        menu.addItem(withTitle: "Open Clinqy  (⌃⌥)", action: #selector(togglePanel), keyEquivalent: "")
-        menu.addItem(withTitle: "Talk  (hold ⌃⌥)", action: #selector(toggleMic), keyEquivalent: "")
+        openMenuItem = menu.addItem(withTitle: "Open Clinqy", action: #selector(togglePanel), keyEquivalent: "")
+        talkMenuItem = menu.addItem(withTitle: "Talk", action: #selector(toggleMic), keyEquivalent: "")
+        menu.addItem(withTitle: "Dashboard…", action: #selector(showDashboard), keyEquivalent: "")
         menu.addItem(withTitle: "Circle Something…", action: #selector(startCircling), keyEquivalent: "")
         menu.addItem(withTitle: "Set Up Clinqy…", action: #selector(showOnboarding), keyEquivalent: "")
         menu.addItem(withTitle: "Check Permissions…", action: #selector(checkPermissions), keyEquivalent: "")
@@ -171,14 +180,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         statusItem.menu = menu
         self.menu = menu
 
-        // ⌃⌥ (Control + Option on their own): tap opens the bar, hold talks.
-        hotKey = HotKey(onPress: { [weak self] in self?.hotKeyDown() },
-                        onRelease: { [weak self] in self?.hotKeyUp() },
-                        onOtherKey: { [weak self] in self?.hotKeyAbandoned() })
+        configureHotKeys()
 
         if !Permissions.allGranted {
             Permissions.requestMissing()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.checkPermissions() }
+        }
+
+        if OnboardingWindow.isDone {
+            DispatchQueue.main.async { [weak self] in self?.showDashboard() }
         }
     }
 
@@ -499,6 +509,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // While working, ⌃⌥ no longer stops (⏹ does): tap opens the bar to add context, hold talks.
         guard pressedAt == nil else { return }   // key repeat
         pressedAt = Date()
+        // A dedicated push-to-talk shortcut is configured: the summon chord is tap-only.
+        if Config.value("TALK_HOTKEY") != nil { return }
         holdTimer = Timer.scheduledTimer(withTimeInterval: 0.3, repeats: false) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.pressedAt != nil else { return }
@@ -533,6 +545,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         } else {
             togglePanel()
         }
+    }
+
+    private func configureHotKeys() {
+        let summon = Config.value("HOTKEY") ?? "ctrl+alt"
+        hotKey = HotKey(spec: summon, onPress: { [weak self] in self?.hotKeyDown() },
+                        onRelease: { [weak self] in self?.hotKeyUp() },
+                        onOtherKey: { [weak self] in self?.hotKeyAbandoned() })
+        talkHotKey = Config.value("TALK_HOTKEY").flatMap { spec in
+            PushToTalkHotKey(spec: spec, onPress: { [weak self] in self?.dedicatedTalkDown() },
+                             onRelease: { [weak self] in self?.dedicatedTalkUp() })
+        }
+        openMenuItem?.title = "Open Clinqy  (\(menuShortcutLabel(summon)))"
+        let talkLabel = talkHotKey == nil ? menuShortcutLabel(summon) + " · hold" : menuShortcutLabel(Config.value("TALK_HOTKEY") ?? "")
+        talkMenuItem?.title = "Talk  (hold \(talkLabel))"
+    }
+
+    private func menuShortcutLabel(_ value: String) -> String {
+        value.lowercased().replacingOccurrences(of: "control", with: "⌃")
+            .replacingOccurrences(of: "ctrl", with: "⌃")
+            .replacingOccurrences(of: "option", with: "⌥")
+            .replacingOccurrences(of: "alt", with: "⌥")
+            .replacingOccurrences(of: "shift", with: "⇧")
+            .replacingOccurrences(of: "command", with: "⌘")
+            .replacingOccurrences(of: "cmd", with: "⌘")
+            .replacingOccurrences(of: "space", with: "Space")
+            .replacingOccurrences(of: "+", with: "")
+    }
+
+    private func setHotKeysEnabled(_ enabled: Bool) {
+        if !enabled {
+            holdTimer?.invalidate()
+            if holdToTalk {
+                voice.cancel()
+                island.hide()
+                buddy.mood = agent.isRunning ? .acting : .idle
+            }
+            pressedAt = nil
+            holdToTalk = false
+        }
+        hotKey?.enabled = enabled
+        talkHotKey?.enabled = enabled
+    }
+
+    private func dedicatedTalkDown() {
+        guard pressedAt == nil else { return }
+        pressedAt = Date()
+        holdToTalk = true
+        rememberTarget()
+        panel.orderOut(nil)
+        startListening(autoStop: false)
+        island.show()
+    }
+
+    private func dedicatedTalkUp() {
+        guard holdToTalk else { return }
+        voice.stop()
+        if voice.transcript.isEmpty { island.hide(); buddy.mood = .idle }
+        pressedAt = nil
+        holdToTalk = false
     }
 
     private func startListening(autoStop: Bool) {
@@ -758,20 +829,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSWorkspace.shared.open(url)
     }
 
-    @objc func showOnboarding() {
-        if onboarding == nil {
-            onboarding = OnboardingWindow(onFinish: { [weak self] in
-                Brain.prewarm()
-                // Show where Clinqy lives now that it's ready.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.panel.showCentered() }
-            }, run: { [weak self] task in
-                self?.agent.submit(task, test: true)
-            }, isRunning: { [weak self] in
-                self?.agent.isRunning ?? false
-            })
-        }
-        onboarding?.present()
+    private func sharedWindow() -> OnboardingWindow {
+        if let onboarding { return onboarding }
+        let window = OnboardingWindow(onFinish: { [weak self] in
+            Brain.prewarm()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { self?.panel.showCentered() }
+        }, run: { [weak self] task in
+            self?.agent.submit(task, test: true)
+        }, isRunning: { [weak self] in
+            self?.agent.isRunning ?? false
+        }, providerChanged: { Brain.reloadModel() }, shortcutsChanged: { [weak self] in
+            self?.configureHotKeys()
+        }, captureChanged: { [weak self] capturing in
+            self?.setHotKeysEnabled(!capturing)
+        })
+        onboarding = window
+        return window
     }
+
+    @objc func showOnboarding() { sharedWindow().presentSetup() }
+
+    @objc func showDashboard() { sharedWindow().presentDashboard() }
 
     @objc func checkPermissions() {
         let lines = Permissions.all.map { "\($0.granted() ? "✅" : "❌")  \($0.name): \($0.why)" }

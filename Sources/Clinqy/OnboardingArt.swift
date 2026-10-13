@@ -7,13 +7,19 @@ import SwiftUI
 // MARK: - Brand
 
 enum Brand {
-    static let bg = Color(red: 0.031, green: 0.035, blue: 0.051)
-    static let raised = Color(red: 0.063, green: 0.071, blue: 0.102)
-    static let line = Color(red: 0.122, green: 0.137, blue: 0.188)
-    static let text = Color(red: 0.914, green: 0.925, blue: 0.953)
-    static let soft = Color(red: 0.553, green: 0.580, blue: 0.647)
-    static let blue = Color(red: 0.29, green: 0.55, blue: 1.0)
-    static let green = Color(red: 0.553, green: 1.0, blue: 0.690)
+    private static func adaptive(_ dark: NSColor, _ light: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        })
+    }
+
+    static let bg = adaptive(NSColor(red: 0.031, green: 0.035, blue: 0.051, alpha: 1), NSColor(white: 0.97, alpha: 1))
+    static let raised = adaptive(NSColor(red: 0.063, green: 0.071, blue: 0.102, alpha: 1), .white)
+    static let line = adaptive(NSColor(red: 0.122, green: 0.137, blue: 0.188, alpha: 1), NSColor(white: 0.82, alpha: 1))
+    static let text = adaptive(NSColor(red: 0.914, green: 0.925, blue: 0.953, alpha: 1), NSColor(white: 0.12, alpha: 1))
+    static let soft = adaptive(NSColor(red: 0.553, green: 0.580, blue: 0.647, alpha: 1), NSColor(white: 0.42, alpha: 1))
+    static let blue = adaptive(NSColor(red: 0.29, green: 0.55, blue: 1.0, alpha: 1), NSColor(red: 0.12, green: 0.36, blue: 0.80, alpha: 1))
+    static let green = adaptive(NSColor(red: 0.553, green: 1.0, blue: 0.690, alpha: 1), NSColor(red: 0.12, green: 0.45, blue: 0.23, alpha: 1))
 
     /// Geist Pixel (headings) and Geist Mono (labels), bundled in the app's Resources by build.sh.
     static func registerFonts() {

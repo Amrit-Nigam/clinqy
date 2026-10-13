@@ -29,6 +29,7 @@ pub mod skills;
 pub mod stats;
 pub mod when;
 pub mod workflow;
+pub mod usage;
 
 pub use agent::{Agent, Event, RunOptions, Snapshot};
 pub use platform::{Buddy, Platform};

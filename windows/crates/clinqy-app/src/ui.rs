@@ -81,6 +81,59 @@ pub struct Bar {
     _context: WebContext,
 }
 
+/// The settings and usage dashboard: a regular, resizable window rather than a transient overlay.
+pub struct Dashboard {
+    pub window: Window,
+    view: WebView,
+    _context: WebContext,
+}
+
+impl Dashboard {
+    pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Dashboard> {
+        let window = WindowBuilder::new()
+            .with_title("Clinqy Dashboard")
+            .with_visible(false)
+            .with_resizable(true)
+            .with_inner_size(LogicalSize::new(1080.0, 740.0))
+            .build(event_loop)?;
+        let mut context = web_context();
+        let view = WebViewBuilder::with_web_context(&mut context)
+            .with_html(include_str!("ui/web/dashboard.html"))
+            .with_background_color((17, 20, 23, 255))
+            .with_ipc_handler(move |req| {
+                let _ = proxy.send_event(UserEvent::Dashboard(req.body().to_string()));
+            })
+            .build(&window)?;
+        Ok(Dashboard { window, view, _context: context })
+    }
+
+    pub fn visible(&self) -> bool {
+        unsafe { IsWindowVisible(HWND(self.window.hwnd() as _)).as_bool() }
+    }
+
+    pub fn present(&self, state: &Value) {
+        self.update(state);
+        if !self.visible() {
+            let (x, y, w, h) = work_area();
+            let scale = self.window.scale_factor();
+            let width = (1080.0 * scale) as i32;
+            let height = (740.0 * scale) as i32;
+            self.window.set_outer_position(PhysicalPosition::new(x + (w - width) / 2, y + (h - height) / 2));
+        }
+        self.window.set_visible(true);
+        clinqy_windows::apps::bring_to_front(self.window.hwnd() as isize);
+        self.window.set_focus();
+    }
+
+    pub fn hide(&self) {
+        self.window.set_visible(false);
+    }
+
+    pub fn update(&self, state: &Value) {
+        js(&self.view, "update", state);
+    }
+}
+
 impl Bar {
     pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Bar> {
         let window = transparent_window(event_loop, "Clinqy", BAR_WIDTH, 300.0)?;

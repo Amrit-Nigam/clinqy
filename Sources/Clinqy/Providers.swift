@@ -7,6 +7,35 @@ enum Provider: String, CaseIterable {
     case claudeCLI = "claude-cli", agyCLI = "agy-cli", codexCLI = "codex-cli"
     case anthropic, openai, gemini, openrouter, ollama, compatible = "openai-compatible"
 
+    var displayName: String {
+        switch self {
+        case .claudeCLI: return "Claude Code"
+        case .agyCLI: return "Antigravity CLI"
+        case .codexCLI: return "Codex CLI"
+        case .anthropic: return "Anthropic API"
+        case .openai: return "OpenAI API"
+        case .gemini: return "Google Gemini"
+        case .openrouter: return "OpenRouter"
+        case .ollama: return "Ollama"
+        case .compatible: return "OpenAI-compatible API"
+        }
+    }
+
+    var isConfigured: Bool {
+        switch self {
+        case .claudeCLI: return AgySession.claudePath != nil && Self.isClaudeLoggedIn
+        case .agyCLI, .codexCLI: return cliPath != nil
+        case .anthropic, .openai, .gemini, .openrouter: return key != nil
+        case .ollama, .compatible: return true
+        }
+    }
+
+    static var isManagedByEnvironment: Bool {
+        let env = ProcessInfo.processInfo.environment
+        return env["PROVIDER"] != nil || env["USE_AGY"] != nil ||
+            CommandLine.arguments.contains(where: { ["--agy", "--agy-cli", "--claude", "--claude-cli"].contains($0) })
+    }
+
     /// Flag switch: set via --agy command line flag, USE_AGY=1/true, or PROVIDER=agy-cli.
     static var useAgy: Bool {
         if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return true }
@@ -315,7 +344,24 @@ final class APIChat: @unchecked Sendable {
         guard let text, !text.isEmpty else {
             throw ClaudeSession.BrainError.failed("Empty reply from \(provider.rawValue) (\(model))")
         }
+        let usage = Self.reportedUsage(json, provider: provider)
+        UsageStore.record(provider: provider, model: model, inputTokens: usage.input, outputTokens: usage.output)
         return text
+    }
+
+    private static func reportedUsage(_ json: [String: Any]?, provider: Provider) -> (input: Int?, output: Int?) {
+        guard let json else { return (nil, nil) }
+        let usage = json["usage"] as? [String: Any]
+        let metadata = json["usageMetadata"] as? [String: Any]
+        func int(_ value: Any?) -> Int? { (value as? NSNumber)?.intValue }
+        switch provider {
+        case .anthropic:
+            return (int(usage?["input_tokens"]), int(usage?["output_tokens"]))
+        case .gemini:
+            return (int(metadata?["promptTokenCount"]), int(metadata?["candidatesTokenCount"]))
+        default:
+            return (int(usage?["prompt_tokens"]), int(usage?["completion_tokens"]))
+        }
     }
 
     /// Codex CLI has no long-lived chat mode to talk to, so each turn runs the CLI once with the
@@ -377,6 +423,7 @@ final class APIChat: @unchecked Sendable {
         let reply = (try? String(contentsOf: lastURL, encoding: .utf8)) ?? String(decoding: stdout, as: UTF8.self)
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw ClaudeSession.BrainError.failed("Empty reply from \(provider.rawValue)") }
+        UsageStore.record(provider: provider, model: model)
         return text
     }
 }
