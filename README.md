@@ -203,6 +203,8 @@ On first launch, grant the permissions Clinqy asks for (menu bar icon → **Chec
 | Automation | AppleScript fallback for scriptable apps |
 | Calendars & Reminders | Adding and finding events and reminders (asked the first time you schedule something) |
 
+The first `./build.sh` on a Mac creates a self-signed "CursorBoy Local Signing" certificate in your login keychain and signs every build with it. macOS ties Accessibility and Screen Recording to the app's signature, so this keeps them granted across rebuilds. Without it each rebuild would quietly lose them while System Settings still showed Clinqy switched on.
+
 The first voice use downloads the Whisper model (~630 MB) into `~/Library/Application Support/Clinqy/models`.
 
 ### Browser extension
