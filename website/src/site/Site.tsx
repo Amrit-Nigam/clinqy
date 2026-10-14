@@ -12,7 +12,7 @@ import { Tour, TourOffer } from './Tour'
 import { AgentCycle, BrandIcon } from './BrandIcons'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
-const MAC_DMG = `${GITHUB}/releases/download/mac-v0.2.1/Clinqy.dmg`
+const MAC_DMG = `${GITHUB}/releases/download/mac-v0.2.2/Clinqy.dmg`
 // Windows releases are the repo's "latest", so this link follows each new one.
 const WIN_ZIP = `${GITHUB}/releases/latest/download/Clinqy-windows-x64.zip`
 const WIN_INSTALL = `irm ${GITHUB}/releases/latest/download/install.ps1 | iex`

@@ -89,7 +89,7 @@ enum AgentConnect {
 /// the same steps as the setup window. This is what the one-prompt install has a coding agent run.
 @MainActor
 enum SetupCommands {
-    nonisolated static let names: Set<String> = ["model", "models", "connect", "settings", "config", "permissions", "doctor", "check", "extension"]
+    nonisolated static let names: Set<String> = ["model", "models", "connect", "settings", "config", "permissions", "doctor", "check", "extension", "update"]
 
     static func run(_ command: String, _ args: [String]) -> Never {
         let code: Int32
@@ -98,6 +98,7 @@ enum SetupCommands {
         case "connect": code = connect(args)
         case "settings", "config": code = settings(args)
         case "permissions": code = permissions()
+        case "update": code = update(args)
         case "extension": code = args.first == "install" ? extensionInstall(args.dropFirst().first) : extensionOther(args)
         default: code = doctor()
         }
@@ -355,6 +356,46 @@ enum SetupCommands {
         print("✗ Couldn't add the extension by itself (\(why)). By hand: open your browser's extensions page (chrome://extensions),")
         print("  turn on Developer mode, click Load unpacked and pick this folder: \(folder)")
         return 1
+    }
+
+    // ── Updates ──
+
+    /// `Clinqy update [--check]`: is a newer Clinqy for Mac out? Without --check, installs it and reopens Clinqy.
+    private static func update(_ args: [String]) -> Int32 {
+        let sem = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var found: Result<Updater.Release?, Error> = .success(nil)
+        Task.detached { do { found = .success(try await Updater.newestRelease()) } catch { found = .failure(error) }; sem.signal() }
+        sem.wait()
+        let release: Updater.Release
+        switch found {
+        case .failure(let e): return failed("couldn't check for updates: \(e.localizedDescription)")
+        case .success(let r?) where Updater.isNewer(r.version, than: Updater.current): release = r
+        case .success(let r): print("✓ Clinqy \(Updater.current) is the newest\(r.map { " (latest release: \($0.version))" } ?? "")."); return 0
+        }
+        print("Clinqy \(release.version) is out (this is \(Updater.current)): \(release.page.absoluteString)")
+        if args.contains("--check") { return 0 }
+        let target = URL(fileURLWithPath: args.firstIndex(of: "--to").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
+                         ?? "/Applications/Clinqy.app")
+        print("Downloading…")
+        nonisolated(unsafe) var staged: Result<URL, Error> = .failure(NSError(domain: "Clinqy", code: 1))
+        Task.detached { do { staged = .success(try await Updater.download(release)) } catch { staged = .failure(error) }; sem.signal() }
+        sem.wait()
+        switch staged {
+        case .failure(let e): return failed("the update failed: \(e.localizedDescription)")
+        case .success(let app):
+            let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.amritnigam.clinqy").first { $0.processIdentifier != getpid() && $0.bundleURL == target }
+            do { try Updater.swapInAndReopen(app, replacing: target, waitingFor: running?.processIdentifier, reopen: running != nil) } catch {
+                return failed("couldn't install it: \(error.localizedDescription)")
+            }
+            running?.terminate()
+            // The swap runs once the old app has quit; wait for it so this command ends with the new version in place.
+            for _ in 0..<150 {
+                usleep(200_000)
+                let v = NSDictionary(contentsOf: target.appendingPathComponent("Contents/Info.plist"))?["CFBundleShortVersionString"] as? String
+                if v == release.version { print("✓ Installed Clinqy \(release.version) at \(target.path)\(running != nil ? " and reopened it" : "").") ; return 0 }
+            }
+            return failed("the new version didn't land at \(target.path) within 30 s")
+        }
     }
 
     // ── Doctor ──

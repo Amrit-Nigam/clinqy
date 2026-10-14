@@ -18,7 +18,7 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 
 Download, paste one prompt into your coding agent, done. It needs macOS 14 or later on Apple silicon.
 
-**1. Download** **[`Clinqy.dmg`](https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.1/Clinqy.dmg)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
+**1. Download** **[`Clinqy.dmg`](https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.2/Clinqy.dmg)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
 
 **2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
@@ -30,7 +30,7 @@ Set up Clinqy for Mac (https://github.com/Amrit-Nigam/clinqy) on this Mac for me
 commands yourself. Only stop when you need my answer or a click that only I can do.
 
 1. Install Clinqy (this also updates an older copy). It needs macOS 14+ on Apple silicon and no admin rights:
-     curl -fsSL -o /tmp/Clinqy.dmg https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.1/Clinqy.dmg
+     curl -fsSL -o /tmp/Clinqy.dmg https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.2/Clinqy.dmg
      v=$(hdiutil attach -nobrowse /tmp/Clinqy.dmg | grep -o '/Volumes/.*'); pkill -x Clinqy; rm -rf /Applications/Clinqy.app
      ditto "$v/Clinqy.app" /Applications/Clinqy.app; hdiutil detach -quiet "$v"; open /Applications/Clinqy.app
    From then on use the full path: c=/Applications/Clinqy.app/Contents/MacOS/Clinqy
@@ -68,6 +68,8 @@ clinqy extension install  # Clinqy loads its own extension into your browser (ad
 clinqy connect claude     # add Clinqy to coding agents over MCP: claude, codex, agy, cursor, gemini, windsurf
 clinqy doctor             # what's ready
 ```
+
+**Updates.** Clinqy for Mac checks GitHub for a new version once a day. When there is one, it asks once, and the menu-bar menu shows **Update to Clinqy x.y.z…**: it installs it and reopens, keeping your settings, memory, history and permissions. You can also run **Check for Updates…** from the menu, or `clinqy update` in a terminal.
 
 API keys go in the settings file (`clinqy settings` opens it); all the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration). Building from source instead? See [Build & run](#build--run).
 
@@ -384,6 +386,7 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `WHISPER_MODEL` | `small-q5_1` | Windows only: the whisper.cpp model |
 | `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
 | `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
+| `UPDATE_CHECK` | on | Mac: `off` stops the daily check for a new version on GitHub |
 | `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |
 | `FAST_AUTO` | on | `off`: the fast model only takes over when the main model plans routine steps |
 | `REPLAY_RECORD` | off | `on`: record each run as an offline replay fixture |

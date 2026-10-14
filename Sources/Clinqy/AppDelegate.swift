@@ -70,6 +70,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         SpeechModel.shared.prepare()
         BrowserBridge.shared.start()
+        Updater.shared.onChange = { [weak self] in
+            guard let item = self?.updateMenuItem else { return }
+            item.title = Updater.shared.available.map { "Update to Clinqy \($0.version)…" } ?? "Check for Updates…"
+        }
+        Updater.shared.start()
         // First launch of a downloaded copy: walk through setup. A Mac that already has settings skips it.
         if !OnboardingWindow.isDone {
             if FileManager.default.fileExists(atPath: Config.fileURL.path) {
@@ -175,6 +180,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(language)
         let login = menu.addItem(withTitle: "Open at Login", action: #selector(toggleOpenAtLogin(_:)), keyEquivalent: "")
         login.state = SMAppService.mainApp.status == .enabled ? .on : .off
+        updateMenuItem = menu.addItem(withTitle: "Check for Updates…", action: #selector(checkForUpdates), keyEquivalent: "")
         menu.addItem(withTitle: "Quit", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         for item in menu.items where item.action != #selector(NSApplication.terminate(_:)) { item.target = self }
         statusItem.menu = menu
@@ -849,6 +855,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showOnboarding() { sharedWindow().presentSetup() }
+
+    private var updateMenuItem: NSMenuItem?
+
+    /// Installs the update the background check found, or checks now.
+    @objc func checkForUpdates() {
+        if let release = Updater.shared.available { Updater.shared.offer(release) }
+        else { Task { await Updater.shared.check(userAsked: true) } }
+    }
 
     @objc func showDashboard() { sharedWindow().presentDashboard() }
 

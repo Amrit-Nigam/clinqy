@@ -32,6 +32,7 @@
 #   clinqy settings [--path]         Open the settings file (keys, hotkeys, everything else).
 #   clinqy permissions               Which macOS permissions Clinqy still needs; asks for them.
 #   clinqy doctor                    What's set up and what isn't (model, permissions, extension).
+#   clinqy update [--check]          Install the newest Clinqy for Mac from GitHub (--check: only say if there is one).
 set -u
 LOG=~/Library/Logs/Clinqy/agent.log
 WF=~/Library/Application\ Support/Clinqy/workflows.json
@@ -155,7 +156,7 @@ PY
     if [[ ${1:-} == install ]]; then exec /Applications/Clinqy.app/Contents/MacOS/Clinqy extension "$@"; fi
     ensure_app
     open -g "clinqy://reload-extension?token=$TOKEN"; echo "Asked the browser(s) to reload the Clinqy extension." ;;
-  stats|mcp|watch|replay|memory|model|models|connect|settings|permissions|doctor)
+  stats|mcp|watch|replay|memory|model|models|connect|settings|permissions|doctor|update)
     # Handled by the app binary itself: stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>, memory,
     # and the setup commands (model, connect, settings, permissions, doctor).
     APP=/Applications/Clinqy.app/Contents/MacOS/Clinqy
