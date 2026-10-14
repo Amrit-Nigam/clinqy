@@ -154,7 +154,7 @@ The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and 
   - Web pages through a **browser extension**: exact elements, verified typing that survives autofill, dropdowns, reading.
   - Documents through PDFKit, and scans or images through on-device OCR.
   - Scriptable apps through their **AppleScript dictionaries**, used as a fallback or when you ask for "in the background".
-- **Voice.** Hold ⌃⌥ and talk. Apple dictation shows a live preview, and **local Whisper** (large-v3 turbo via WhisperKit) writes the final text on-device.
+- **Voice.** Hold ⌃⌥ and talk. On macOS 26 the **Mac's own speech model** (SpeechAnalyzer, the one behind Dictation, Notes and Voice Memos) writes the text on-device as you speak, so it's ready a moment after you stop. Nothing to download into Clinqy. Before macOS 26, Apple dictation does it.
 - **Asks when it needs you.** It asks for details, choices and passwords (hidden input), with quick-choice buttons or a voice answer.
 - **Safety enforced in code:**
   - Clicks on Pay, Buy, Book, Send, Submit, Delete and similar need your OK, unless you asked for exactly that.
@@ -205,7 +205,7 @@ On first launch, grant the permissions Clinqy asks for (menu bar icon → **Chec
 
 The first `./build.sh` on a Mac creates a self-signed "CursorBoy Local Signing" certificate in your login keychain and signs every build with it. macOS ties Accessibility and Screen Recording to the app's signature, so this keeps them granted across rebuilds. Without it each rebuild would quietly lose them while System Settings still showed Clinqy switched on.
 
-The first voice use downloads the Whisper model (~630 MB) into `~/Library/Application Support/Clinqy/models`.
+Voice uses the speech model macOS already keeps for Dictation. If this Mac doesn't have the one for your voice language yet, macOS fetches it once (it's shared with the rest of the system).
 
 ### Browser extension
 
@@ -378,9 +378,9 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `CLAUDE_PATH` · `AGY_PATH` · `CODEX_PATH` | auto-detected | Path to each CLI |
 | `CLAUDE_MODEL` / `AGY_MODEL` | `sonnet` | Model for the agent (any provider) |
 | `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step |
-| `WHISPER_MODEL` | `large-v3-v20240930_turbo_632MB` | Any WhisperKit variant |
-| `VOICE_ENGINE` | whisper | Set `apple` to use only Apple dictation |
-| `VOICE_LANGUAGE` | `auto` | `auto`, `en`, `hinglish`, `hi`, or any Whisper code (the menu setting wins) |
+| `VOICE_LANGUAGE` | `auto` | `auto` (the Mac's language), `en`, `hinglish`, `hi`, or a locale like `en-GB` (the menu setting wins) |
+| `VOICE_MODEL` | `speech` | Mac: which of Apple's models hears languages both cover, `speech` (SpeechTranscriber) or `dictation` (DictationTranscriber, the system Dictation's). Hindi always uses `dictation` |
+| `WHISPER_MODEL` | `small-q5_1` | Windows only: the whisper.cpp model |
 | `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
 | `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
 | `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |
@@ -449,7 +449,7 @@ Sources/Clinqy/
   Reader.swift       documents (PDFKit/AppKit) and OCR (Vision)
   Scripting.swift    AppleScript dictionaries for scriptable apps
   Safety.swift       risky-click confirmation, call detection
-  Voice.swift, Whisper.swift         push-to-talk, on-device Whisper
+  Voice.swift, SpeechModel.swift, Transcription.swift   push-to-talk with the Mac's own speech model (SpeechAnalyzer)
   Recorder.swift, Skills.swift       watch & learn
   History.swift      run history and result cards
   Workflow.swift     deterministic workflows (steps + targets), store; replay/heal/QA live in Agent.swift
@@ -475,4 +475,4 @@ tests/qa/            example plain-English QA tests (compiled scripts in tests/q
 
 ## Privacy
 
-Everything except the model calls stays on your Mac. That covers screen reading, voice (Whisper runs locally), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), or Codex CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
+Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), or Codex CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.

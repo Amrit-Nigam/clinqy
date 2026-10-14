@@ -247,7 +247,7 @@ struct CommandView: View {
     /// Lets the user circle something on screen (set by the app delegate).
     var onCircle: () -> Void = {}
     @StateObject private var historyTab = Hover()
-    @ObservedObject private var whisper = Whisper.shared
+    @ObservedObject private var speech = SpeechModel.shared
     @ObservedObject private var review = ReviewCenter.shared
     @ObservedObject private var undo = StepUndo.shared
     @ObservedObject private var history = History.shared
@@ -392,7 +392,7 @@ struct CommandView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in focused = true }
     }
 
-    private var showBody: Bool { historyTab.on || skillsTab.on || skills.isLearning || skills.lastError != nil || voice.isTranscribing || whisper.statusText != nil || !agent.steps.isEmpty || !agent.answer.isEmpty || voice.isListening || voice.error != nil || agent.input.isEmpty }
+    private var showBody: Bool { historyTab.on || skillsTab.on || skills.isLearning || skills.lastError != nil || voice.isTranscribing || speech.statusText != nil || !agent.steps.isEmpty || !agent.answer.isEmpty || voice.isListening || voice.error != nil || agent.input.isEmpty }
 
     private var bar: some View {
         HStack(spacing: 14) {
@@ -479,7 +479,7 @@ struct CommandView: View {
         } else if let error = skills.lastError {
             Label(error, systemImage: "exclamationmark.circle").font(.system(size: 13)).foregroundStyle(DS.secondary)
         }
-        if let status = whisper.statusText, agent.steps.isEmpty {
+        if let status = speech.statusText, agent.steps.isEmpty {
             Label(status, systemImage: "waveform.badge.plus").font(.system(size: 12)).foregroundStyle(DS.tertiary)
                 .padding(.bottom, 4)
         }
