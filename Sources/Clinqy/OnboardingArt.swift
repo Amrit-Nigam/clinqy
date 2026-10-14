@@ -181,16 +181,17 @@ private func keys(_ ctx: inout GraphicsContext, _ iso: Iso, press: CGFloat) {
 struct TapKeysArt: View {
     var body: some View {
         Looping(period: 3.6) { ctx, size, t in
-            let iso = Iso.fit([(-10, 52, -6), (102, -10, -6), (102, 52, -6), (-40, -70, 39), (110, -70, 39), (-40, -42, 34)], in: size)
+            let iso = Iso.fit([(-10, 52, -6), (102, -10, -6), (102, 52, -6), (-40, -70, 39), (150, -70, 39), (-40, -42, 34)], in: size)
             let press = span(t, 0.12, 0.17) * (1 - span(t, 0.24, 0.29))
             let bar = ease(span(t, 0.28, 0.4)) * (1 - span(t, 0.88, 0.98))
             if bar > 0 {
                 let lift = 26 + 8 * bar
-                box(&ctx, iso, -40, -70, lift, 150, 28, 5, .plain, opacity: Double(bar))
+                // Wide enough for the whole request and the caret (Geist Mono at 8.5 is about 5.1 per character).
+                box(&ctx, iso, -40, -70, lift, 190, 28, 5, .plain, opacity: Double(bar))
                 let request = "where’s the brightness setting?"
                 let n = Int((CGFloat(request.count) * span(t, 0.42, 0.78)).rounded())
                 flatText(&ctx, iso, String(request.prefix(n)) + (t < 0.82 ? "▍" : ""), -34, -62, lift + 5,
-                         size: 9.5, color: Brand.text, opacity: Double(bar))
+                         size: 8.5, color: Brand.text, opacity: Double(bar))
             }
             keys(&ctx, iso, press: ease(press))
         }
