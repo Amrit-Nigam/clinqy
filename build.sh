@@ -45,10 +45,43 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
-# Stable local identity keeps macOS permissions across rebuilds; falls back to ad-hoc.
-if security find-identity | grep -q "CursorBoy Local Signing"; then
-  codesign --force --deep --sign "CursorBoy Local Signing" "$APP"
+# Stable local identity keeps macOS permissions across rebuilds. macOS keys Accessibility and Screen Recording
+# grants to the signature: an ad-hoc one changes every build, so a rebuilt app silently loses them while
+# System Settings still shows the switch on. Signing with the same certificate every time keeps them.
+IDENTITY="CursorBoy Local Signing"
+if ! security find-identity | grep -q "$IDENTITY"; then
+  echo "Creating the self-signed \"$IDENTITY\" certificate in your login keychain (once per Mac)…"
+  TMP=$(mktemp -d)
+  cat > "$TMP/cfg" <<EOF
+[req]
+distinguished_name=dn
+prompt=no
+x509_extensions=ext
+[dn]
+CN=$IDENTITY
+[ext]
+basicConstraints=critical,CA:false
+keyUsage=critical,digitalSignature
+extendedKeyUsage=critical,codeSigning
+EOF
+  if /usr/bin/openssl req -x509 -newkey rsa:2048 -nodes -days 3650 -config "$TMP/cfg" \
+       -keyout "$TMP/key.pem" -out "$TMP/cert.pem" 2>/dev/null \
+     && /usr/bin/openssl pkcs12 -export -inkey "$TMP/key.pem" -in "$TMP/cert.pem" \
+       -out "$TMP/id.p12" -passout pass:clinqy \
+     && security import "$TMP/id.p12" -k "$HOME/Library/Keychains/login.keychain-db" -P clinqy -T /usr/bin/codesign >/dev/null; then
+    # Grants made to earlier ad-hoc builds point at a signature that no longer exists; clear them so the
+    # switches in System Settings match reality and Clinqy can ask again.
+    for service in Accessibility ScreenCapture PostEvent ListenEvent; do
+      tccutil reset "$service" com.amritnigam.clinqy >/dev/null 2>&1 || true
+    done
+    echo "Signing identity created. Turn Clinqy on again under Accessibility and Screen Recording; from now on rebuilds keep it."
+  fi
+  rm -rf "$TMP"
+fi
+if security find-identity | grep -q "$IDENTITY"; then
+  codesign --force --deep --sign "$IDENTITY" "$APP"
 else
+  echo "warning: couldn't create \"$IDENTITY\"; signing ad-hoc, so macOS permissions reset on every rebuild." >&2
   codesign --force --deep --sign - "$APP"
 fi
 echo "Built $APP"

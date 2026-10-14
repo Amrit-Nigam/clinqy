@@ -68,7 +68,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if await TextEncoder.fetch() { Embedder.shared.activate(warming: texts) }
             }
         }
-        Whisper.shared.prepare()
+        SpeechModel.shared.prepare()
         BrowserBridge.shared.start()
         // First launch of a downloaded copy: walk through setup. A Mac that already has settings skips it.
         if !OnboardingWindow.isDone {
@@ -165,11 +165,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         follow.state = buddy.followsMouse ? .on : .off
         let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
         let languages = NSMenu()
-        for (code, name) in Whisper.languages {
+        for (code, name) in SpeechModel.languages {
             let item = languages.addItem(withTitle: name, action: #selector(setVoiceLanguage(_:)), keyEquivalent: "")
             item.representedObject = code
             item.target = self
-            item.state = Whisper.language == code ? .on : .off
+            item.state = SpeechModel.language == code ? .on : .off
         }
         language.submenu = languages
         menu.addItem(language)
@@ -808,6 +808,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         guard let code = item.representedObject as? String else { return }
         UserDefaults.standard.set(code, forKey: "voiceLanguage")
         for other in item.menu?.items ?? [] { other.state = (other.representedObject as? String) == code ? .on : .off }
+        SpeechModel.shared.prepare()   // the new language's model, fetched if this Mac doesn't have it yet
     }
 
     @objc func tidyMemory() {

@@ -50,33 +50,27 @@ if CommandLine.arguments.count >= 4, CommandLine.arguments[1] == "--run" {
     app.run()
 }
 
-// Voice check: `Clinqy --transcribe <audio file>` runs a file through the Whisper model.
+// Voice check: `Clinqy --transcribe <audio file>` runs a file through the Mac's speech model, the way a spoken
+// request goes (same model, language and vocabulary), and prints how long the text took after the audio ended.
 if CommandLine.arguments.count >= 3, CommandLine.arguments[1] == "--transcribe" {
     let path = CommandLine.arguments[2]
     Task { @MainActor in
-        Whisper.shared.prepare()
-        while !Whisper.shared.isReady {
-            if case .failed(let why) = Whisper.shared.state { print("failed: \(why)"); exit(1) }
-            try? await Task.sleep(for: .milliseconds(200))
+        guard #available(macOS 26.0, *) else { print("needs macOS 26 (the Mac's speech model)"); exit(1) }
+        let model = SpeechModel.shared
+        model.prepare()
+        while !model.isReady {
+            if case .failed(let why) = model.state { print("failed: \(why)"); exit(1) }
+            try? await Task.sleep(for: .milliseconds(100))
         }
         guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)),
-              let format = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 16_000, channels: 1, interleaved: false),
-              let converter = AVAudioConverter(from: file.processingFormat, to: format),
-              let input = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
-              (try? file.read(into: input)) != nil,
-              let output = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(Double(file.length) * 16_000 / file.processingFormat.sampleRate) + 64)
+              let audio = AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)),
+              (try? file.read(into: audio)) != nil
         else { print("can't read audio"); exit(1) }
-        var fed = false
-        converter.convert(to: output, error: nil) { _, status in
-            if fed { status.pointee = .endOfStream; return nil }
-            fed = true
-            status.pointee = .haveData
-            return input
-        }
-        let samples = Array(UnsafeBufferPointer(start: output.floatChannelData![0], count: Int(output.frameLength)))
+        guard let session = await model.start(onText: { _ in }) else { print("the speech model didn't start"); exit(1) }
+        session.feed(audio)
         let started = Date()
-        let text = await Whisper.shared.transcribe(samples) ?? "(nothing)"
-        print("\(Int(Date().timeIntervalSince(started) * 1000)) ms: \(text)")
+        let text = await session.finish()
+        print("\(Int(Date().timeIntervalSince(started) * 1000)) ms (\(session.model.rawValue), \(session.locale.identifier)): \(text.isEmpty ? "(nothing)" : text)")
         exit(0)
     }
     RunLoop.main.run()
