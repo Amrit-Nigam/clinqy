@@ -40,6 +40,7 @@ final class AgySession: @unchecked Sendable {
     }
 
     let sessionProvider: Provider
+    let sessionModel: String
     private let process = Process()
     private let input = Pipe()
     private let output = Pipe()
@@ -63,6 +64,7 @@ final class AgySession: @unchecked Sendable {
     init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil) throws {
         self.systemPrompt = system
         self.sessionProvider = provider
+        self.sessionModel = provider.model(model)
         if provider != .agyCLI && provider != .claudeCLI {
             api = try APIChat(provider: provider, system: system, model: model, effort: effort)
             return
@@ -188,7 +190,7 @@ final class AgySession: @unchecked Sendable {
         }
         line.append(0x0A)
 
-        return try await withCheckedThrowingContinuation { continuation in
+        let reply: String = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             lock.lock()
             if dead {
                 let err = lastErrorMessage.map { BrainError.failed($0) } ?? BrainError.died
@@ -203,6 +205,8 @@ final class AgySession: @unchecked Sendable {
             lock.unlock()
             input.fileHandleForWriting.write(line)
         }
+        UsageStore.record(provider: sessionProvider, model: sessionModel)
+        return reply
     }
 
     func close() {
@@ -296,6 +300,8 @@ enum Brain {
         switch provider {
         case .agyCLI:
             return Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet"
+        case .codexCLI:
+            return Config.value("CODEX_MODEL") ?? ""
         case .claudeCLI:
             return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
         default:
@@ -304,6 +310,12 @@ enum Brain {
     }
     static var model: String { defaultModel(for: Provider.current) }
     private static var warm: AgySession?
+
+    static func reloadModel() {
+        warm?.close()
+        warm = nil
+        prewarm()
+    }
 
     static func prewarm() {
         if warm?.isAlive == true { return }

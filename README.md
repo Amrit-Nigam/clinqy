@@ -59,7 +59,7 @@ commands yourself. Only stop when you need my answer or a click that only I can 
 
 **3. Tap ⌃⌥** and ask something, like "where's the brightness setting?"
 
-**No coding agent?** Open Clinqy: the first time, its setup window walks you through the model, the permissions, the browser extension and the keys (menu-bar icon → **Set Up Clinqy…** brings it back). Or do the same in a terminal:
+**No coding agent?** Open Clinqy: the first time, its setup window walks you through the model, the permissions, the browser extension and the keys (menu-bar icon → **Set Up Clinqy…** brings it back). The Dashboard tab shows usage and lets you change the active provider, model and shortcuts. Or do the same in a terminal:
 
 ```bash
 clinqy model              # which AI Clinqy uses; `clinqy model agy` (or claude, codex, ollama…) picks one and checks it answers
@@ -346,7 +346,7 @@ Put each `KEY=value` on its own line, with no comment after the value. `chmod 60
 
 If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `agy` when `--agy` or `USE_AGY=1` is set). Without it, Clinqy uses the first API key it finds, then `agy` or Codex CLI.
 
-`CLAUDE_MODEL` / `AGY_MODEL` (the agent) and `FAST_MODEL` (the helper for routine steps) work with every provider. Leave them as `sonnet` / `haiku` / `opus` to get each provider's matching tier, or set any model id the provider accepts:
+`CLAUDE_MODEL` / `AGY_MODEL` (the agent) and `FAST_MODEL` (the helper for routine steps) work with every provider. Leave them as `sonnet` / `haiku` / `opus` to get each provider's matching tier, or set any model id the provider accepts. On macOS, optional `CODEX_MODEL` selects an explicit Codex CLI model ID; leave it unset to use Codex's configured default:
 
 | Provider | `haiku` (fast) | `sonnet` (agent, default) | `opus` |
 |---|---|---|---|
@@ -377,6 +377,7 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `LOCAL_MODEL` | `qwen3-vl` | Model for `ollama` / `openai-compatible` |
 | `CLAUDE_PATH` · `AGY_PATH` · `CODEX_PATH` | auto-detected | Path to each CLI |
 | `CLAUDE_MODEL` / `AGY_MODEL` | `sonnet` | Model for the agent (any provider) |
+| `CODEX_MODEL` (macOS) | Codex default | Optional explicit model ID for Codex CLI |
 | `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step |
 | `VOICE_LANGUAGE` | `auto` | `auto` (the Mac's language), `en`, `hinglish`, `hi`, or a locale like `en-GB` (the menu setting wins) |
 | `VOICE_MODEL` | `speech` | Mac: which of Apple's models hears languages both cover, `speech` (SpeechTranscriber) or `dictation` (DictationTranscriber, the system Dictation's). Hindi always uses `dictation` |

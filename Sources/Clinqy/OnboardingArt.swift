@@ -7,13 +7,19 @@ import SwiftUI
 // MARK: - Brand
 
 enum Brand {
-    static let bg = Color(red: 0.031, green: 0.035, blue: 0.051)
-    static let raised = Color(red: 0.063, green: 0.071, blue: 0.102)
-    static let line = Color(red: 0.122, green: 0.137, blue: 0.188)
-    static let text = Color(red: 0.914, green: 0.925, blue: 0.953)
-    static let soft = Color(red: 0.553, green: 0.580, blue: 0.647)
-    static let blue = Color(red: 0.29, green: 0.55, blue: 1.0)
-    static let green = Color(red: 0.553, green: 1.0, blue: 0.690)
+    private static func adaptive(_ dark: NSColor, _ light: NSColor) -> Color {
+        Color(nsColor: NSColor(name: nil) { appearance in
+            appearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua ? dark : light
+        })
+    }
+
+    static let bg = adaptive(NSColor(red: 0.031, green: 0.035, blue: 0.051, alpha: 1), NSColor(white: 0.97, alpha: 1))
+    static let raised = adaptive(NSColor(red: 0.063, green: 0.071, blue: 0.102, alpha: 1), .white)
+    static let line = adaptive(NSColor(red: 0.122, green: 0.137, blue: 0.188, alpha: 1), NSColor(white: 0.82, alpha: 1))
+    static let text = adaptive(NSColor(red: 0.914, green: 0.925, blue: 0.953, alpha: 1), NSColor(white: 0.12, alpha: 1))
+    static let soft = adaptive(NSColor(red: 0.553, green: 0.580, blue: 0.647, alpha: 1), NSColor(white: 0.42, alpha: 1))
+    static let blue = adaptive(NSColor(red: 0.29, green: 0.55, blue: 1.0, alpha: 1), NSColor(red: 0.12, green: 0.36, blue: 0.80, alpha: 1))
+    static let green = adaptive(NSColor(red: 0.553, green: 1.0, blue: 0.690, alpha: 1), NSColor(red: 0.12, green: 0.45, blue: 0.23, alpha: 1))
 
     /// Geist Pixel (headings) and Geist Mono (labels), bundled in the app's Resources by build.sh.
     static func registerFonts() {
@@ -175,16 +181,17 @@ private func keys(_ ctx: inout GraphicsContext, _ iso: Iso, press: CGFloat) {
 struct TapKeysArt: View {
     var body: some View {
         Looping(period: 3.6) { ctx, size, t in
-            let iso = Iso.fit([(-10, 52, -6), (102, -10, -6), (102, 52, -6), (-40, -70, 39), (110, -70, 39), (-40, -42, 34)], in: size)
+            let iso = Iso.fit([(-10, 52, -6), (102, -10, -6), (102, 52, -6), (-40, -70, 39), (150, -70, 39), (-40, -42, 34)], in: size)
             let press = span(t, 0.12, 0.17) * (1 - span(t, 0.24, 0.29))
             let bar = ease(span(t, 0.28, 0.4)) * (1 - span(t, 0.88, 0.98))
             if bar > 0 {
                 let lift = 26 + 8 * bar
-                box(&ctx, iso, -40, -70, lift, 150, 28, 5, .plain, opacity: Double(bar))
+                // Wide enough for the whole request and the caret (Geist Mono at 8.5 is about 5.1 per character).
+                box(&ctx, iso, -40, -70, lift, 190, 28, 5, .plain, opacity: Double(bar))
                 let request = "where’s the brightness setting?"
                 let n = Int((CGFloat(request.count) * span(t, 0.42, 0.78)).rounded())
                 flatText(&ctx, iso, String(request.prefix(n)) + (t < 0.82 ? "▍" : ""), -34, -62, lift + 5,
-                         size: 9.5, color: Brand.text, opacity: Double(bar))
+                         size: 8.5, color: Brand.text, opacity: Double(bar))
             }
             keys(&ctx, iso, press: ease(press))
         }

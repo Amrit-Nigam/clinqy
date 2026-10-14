@@ -6,7 +6,7 @@
 //!   while held, so the app in front doesn't also get it.
 //! Clinqy's own injected keys are ignored.
 
-use std::sync::OnceLock;
+use std::sync::{OnceLock, RwLock};
 use windows::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Input::KeyboardAndMouse::*;
@@ -31,14 +31,20 @@ struct Mods {
     win: bool,
 }
 
-struct Hook {
+#[derive(Clone, Copy)]
+struct HookConfig {
     want: Mods,
     talk: Option<(Mods, u16)>,
+}
+
+struct Hook {
+    config: RwLock<HookConfig>,
     on: Box<dyn Fn(HotEvent) + Send + Sync>,
 }
 
 /// Push-to-talk is held (its key's events are swallowed until it comes up).
 static TALKING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 static HOOK: OnceLock<Hook> = OnceLock::new();
 static ACCEPT_SYNTHETIC: OnceLock<bool> = OnceLock::new();
@@ -65,23 +71,47 @@ fn parse(spec: &str) -> Mods {
     m
 }
 
+/// Whether a shortcut contains only supported modifier keys with no duplicates.
+pub fn valid_summon(spec: &str) -> bool {
+    let mut seen = Mods::default();
+    let parts: Vec<_> = spec.to_lowercase().split('+').map(|p| p.trim().to_string()).collect();
+    if parts.is_empty() { return false; }
+    for part in parts {
+        let slot = match part.as_str() {
+            "ctrl" | "control" => &mut seen.ctrl,
+            "alt" | "option" | "opt" => &mut seen.alt,
+            "shift" => &mut seen.shift,
+            "win" | "windows" | "super" => &mut seen.win,
+            _ => return false,
+        };
+        if *slot { return false; }
+        *slot = true;
+    }
+    seen != Mods::default()
+}
+
 /// Parses "ctrl+h", "ctrl+shift+space"…: modifiers plus one key (a letter, digit, space or F1–F12).
 fn parse_talk(spec: &str) -> Option<(Mods, u16)> {
     let mut m = Mods::default();
     let mut key = None;
     for p in spec.to_lowercase().split('+') {
         match p.trim() {
-            "ctrl" | "control" => m.ctrl = true,
-            "alt" | "option" | "opt" => m.alt = true,
-            "shift" => m.shift = true,
-            "win" | "windows" | "super" => m.win = true,
-            "space" => key = Some(0x20),
-            k if k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => key = Some(k.to_ascii_uppercase().as_bytes()[0] as u16),
-            k if k.starts_with('f') && k[1..].parse::<u16>().map(|n| (1..=12).contains(&n)).unwrap_or(false) => key = Some(0x6F + k[1..].parse::<u16>().unwrap()),
-            _ => {}
+            "ctrl" | "control" if !m.ctrl => m.ctrl = true,
+            "alt" | "option" | "opt" if !m.alt => m.alt = true,
+            "shift" if !m.shift => m.shift = true,
+            "win" | "windows" | "super" if !m.win => m.win = true,
+            "space" if key.is_none() => key = Some(0x20),
+            k if key.is_none() && k.len() == 1 && k.chars().all(|c| c.is_ascii_alphanumeric()) => key = Some(k.to_ascii_uppercase().as_bytes()[0] as u16),
+            k if key.is_none() && k.starts_with('f') && k[1..].parse::<u16>().map(|n| (1..=12).contains(&n)).unwrap_or(false) => key = Some(0x6F + k[1..].parse::<u16>().unwrap()),
+            _ => return None,
         }
     }
     key.filter(|_| m != Mods::default()).map(|k| (m, k))
+}
+
+/// Whether a push-to-talk shortcut has supported modifiers and one supported key.
+pub fn valid_talk(spec: &str) -> bool {
+    parse_talk(spec).is_some()
 }
 
 /// The push-to-talk key's label: "Ctrl+H".
@@ -107,8 +137,9 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
         // Keys other programs inject count only in tests (CLINQY_ACCEPT_SYNTHETIC_KEYS=1); Clinqy's own never do.
         let synthetic = k.flags.0 & LLKHF_INJECTED.0 != 0 && !*ACCEPT_SYNTHETIC.get_or_init(|| std::env::var("CLINQY_ACCEPT_SYNTHETIC_KEYS").map(|v| v == "1").unwrap_or(false));
         let injected = synthetic || k.dwExtraInfo == crate::input::INJECTED_TAG;
-        if !injected {
+        if !injected && ENABLED.load(std::sync::atomic::Ordering::Relaxed) {
             if let Some(h) = HOOK.get() {
+                let config = *h.config.read().unwrap_or_else(|e| e.into_inner());
                 let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
                 let vk = VIRTUAL_KEY(k.vkCode as u16);
                 let mut st = STATE.lock();
@@ -139,7 +170,7 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 };
                 let mut event = None;
                 // Push-to-talk: its key with exactly its modifiers. Held, its key is swallowed (repeats too).
-                if let Some((tm, tk)) = h.talk {
+                if let Some((tm, tk)) = config.talk {
                     let talking = TALKING.load(std::sync::atomic::Ordering::Relaxed);
                     if vk.0 == tk {
                         if down && (talking || *mods == tm) {
@@ -173,7 +204,7 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         *spoiled = true;
                         event = Some(HotEvent::Spoiled);
                     }
-                } else if !*held && *mods == h.want {
+                } else if !*held && *mods == config.want {
                     *held = true;
                     *spoiled = false;
                     event = Some(HotEvent::Pressed);
@@ -186,7 +217,7 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                         },
                     };
                     SendInput(&[k2(false), k2(true)], std::mem::size_of::<INPUT>() as i32);
-                } else if *held && *mods != h.want {
+                } else if *held && *mods != config.want {
                     *held = false;
                     if !*spoiled {
                         event = Some(HotEvent::Released);
@@ -205,7 +236,7 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
 /// Starts watching for the summon chord and push-to-talk (once; `talk` empty or "off" turns push-to-talk off).
 /// `on` runs on the hook's thread: keep it quick.
 pub fn start(spec: &str, talk: &str, on: impl Fn(HotEvent) + Send + Sync + 'static) {
-    if HOOK.set(Hook { want: parse(spec), talk: parse_talk(talk), on: Box::new(on) }).is_err() {
+    if HOOK.set(Hook { config: RwLock::new(HookConfig { want: parse(spec), talk: parse_talk(talk) }), on: Box::new(on) }).is_err() {
         return;
     }
     std::thread::Builder::new()
@@ -224,6 +255,32 @@ pub fn start(spec: &str, talk: &str, on: impl Fn(HotEvent) + Send + Sync + 'stat
             let _ = UnhookWindowsHookEx(hook);
         })
         .ok();
+}
+
+/// Updates the active hotkeys without restarting the low-level keyboard hook.
+pub fn configure(spec: &str, talk: &str) {
+    let Some(hook) = HOOK.get() else { return; };
+    let was_talking = TALKING.swap(false, std::sync::atomic::Ordering::Relaxed);
+    SWALLOW_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+    if let Ok(mut config) = hook.config.write() {
+        *config = HookConfig { want: parse(spec), talk: parse_talk(talk) };
+    }
+    *STATE.lock() = (Mods::default(), false, false);
+    if was_talking {
+        (hook.on)(HotEvent::TalkUp);
+    }
+}
+
+/// Temporarily suspends global shortcut recognition while the dashboard records a new binding.
+pub fn set_enabled(enabled: bool) {
+    ENABLED.store(enabled, std::sync::atomic::Ordering::Relaxed);
+    if enabled { return; }
+    let was_talking = TALKING.swap(false, std::sync::atomic::Ordering::Relaxed);
+    SWALLOW_UP.store(false, std::sync::atomic::Ordering::Relaxed);
+    *STATE.lock() = (Mods::default(), false, false);
+    if was_talking {
+        if let Some(hook) = HOOK.get() { (hook.on)(HotEvent::TalkUp); }
+    }
 }
 
 #[cfg(test)]

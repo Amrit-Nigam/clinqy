@@ -261,25 +261,30 @@ if command == "onboarding-snapshot" {
         let app = NSApplication.shared
         app.setActivationPolicy(.prohibited)
         Brand.registerFonts()
-        let model = OnboardingModel()
-        // An optional step name renders just that page.
+        let model = OnboardingModel(persistProgress: false)
+        let dashboard = DashboardModel(providerChanged: {}, shortcutsChanged: {}, captureChanged: { _ in }, providerSetup: {})
+        // An optional step name or "dashboard" renders just that page.
         let only = CommandLine.arguments.dropFirst(3).first
-        for step in OnboardingModel.Step.allCases where only == nil || only == "\(step)" {
+        model.showingDashboard = only == "dashboard"
+        if let index = CommandLine.arguments.firstIndex(of: "--section"), index + 1 < CommandLine.arguments.count {
+            dashboard.page = CommandLine.arguments[index + 1]
+        }
+        for step in OnboardingModel.Step.allCases where only == nil || only == "\(step)" || (only == "dashboard" && step == .welcome) {
             model.step = step
-            let view = NSHostingView(rootView: OnboardingView(model: model))
+            let view = NSHostingView(rootView: OnboardingView(model: model, dashboardModel: dashboard))
             let window = NSWindow(contentRect: NSRect(origin: CGPoint(x: -4000, y: 0), size: OnboardingView.size), styleMask: [.borderless], backing: .buffered, defer: false)
-            window.appearance = NSAppearance(named: .darkAqua)
+            window.appearance = NSAppearance(named: CommandLine.arguments.contains("--light") ? .aqua : .darkAqua)
             window.contentView = view
             view.layoutSubtreeIfNeeded()
-            RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            RunLoop.current.run(until: Date().addingTimeInterval(0.5))
             guard let rep = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { continue }
             view.cacheDisplay(in: view.bounds, to: rep)
-            let url = dir.appendingPathComponent("onboarding-\(step.rawValue)-\(step).png")
+            let name = model.showingDashboard ? "dashboard.png" : "onboarding-\(step.rawValue)-\(step).png"
+            let url = dir.appendingPathComponent(name)
             try? rep.representation(using: .png, properties: [:])?.write(to: url)
             print(url.path)
             window.contentView = nil   // stop its animations before the next page
         }
-        UserDefaults.standard.removeObject(forKey: OnboardingWindow.stepKey)
     }
     exit(0)
 }
@@ -640,5 +645,5 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--reload-exten
 let app = NSApplication.shared
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
-app.setActivationPolicy(.accessory)
+app.setActivationPolicy(.regular)
 app.run()
