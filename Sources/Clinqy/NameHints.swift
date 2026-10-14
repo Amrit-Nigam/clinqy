@@ -25,11 +25,8 @@ enum NameHints {
         return built
     }
 
-    /// For SFSpeechRecognitionRequest.contextualStrings (Apple recommends ≤ 100).
+    /// For the speech models' contextual strings (Apple recommends ≤ 100).
     static var vocabulary: [String] { terms.map(\.name) }
-
-    /// A short list for Whisper's prompt; the most important names go last (Whisper keeps the prompt's tail).
-    static func promptNames(limit: Int = 30) -> [String] { Array(vocabulary.prefix(limit).reversed()) }
 
     /// Fixes misheard names in a finished transcript.
     static func correct(_ text: String) -> String { correct(text, terms: terms) }
