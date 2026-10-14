@@ -203,6 +203,8 @@ On first launch, grant the permissions Clinqy asks for (menu bar icon → **Chec
 | Automation | AppleScript fallback for scriptable apps |
 | Calendars & Reminders | Adding and finding events and reminders (asked the first time you schedule something) |
 
+The first `./build.sh` on a Mac creates a self-signed "CursorBoy Local Signing" certificate in your login keychain and signs every build with it. macOS ties Accessibility and Screen Recording to the app's signature, so this keeps them granted across rebuilds. Without it each rebuild would quietly lose them while System Settings still showed Clinqy switched on.
+
 Voice uses the speech model macOS already keeps for Dictation. If this Mac doesn't have the one for your voice language yet, macOS fetches it once (it's shared with the rest of the system).
 
 ### Browser extension
