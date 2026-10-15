@@ -71,7 +71,7 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
     }
 
     func present() {
-        // Keep setup reachable from the Dock while it is open.
+        // A menu-bar app has no Dock icon; give it one while the window is open so it can't get lost.
         NSApp.setActivationPolicy(.regular)
         makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -85,7 +85,7 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
-        NSApp.setActivationPolicy(.regular)
+        NSApp.setActivationPolicy(.accessory)
     }
 }
 

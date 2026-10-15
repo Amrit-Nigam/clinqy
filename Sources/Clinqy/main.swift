@@ -645,5 +645,5 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--reload-exten
 let app = NSApplication.shared
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(.accessory)
 app.run()
