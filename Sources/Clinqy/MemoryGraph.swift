@@ -37,7 +37,7 @@ struct MemoryGraph {
 
     /// How much sharing one entity of this kind says two facts belong together.
     private static func strength(of entity: String) -> Double {
-        switch entity.prefix { $0 != ":" } {
+        switch entity.prefix(while: { $0 != ":" }) {
         case "detail", "who": return 1
         case "name": return 0.8
         default: return 0.6   // site, app: a place is broader than a person or a detail
