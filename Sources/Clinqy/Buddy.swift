@@ -27,6 +27,12 @@ final class Buddy {
 
     /// QA mode: the companion becomes an amber targeting reticle with a "QA" tag.
     var qaMode = false
+    /// A background run nobody is watching: the buddy doesn't fly to clicks in windows the user can't see.
+    var quiet = false
+    /// A background run on Clinqy's hidden screen: the buddy only goes, points and frames things there.
+    var confine: CGRect?
+    /// Parked at the screen's edge, off doing a background run (see `goAway`).
+    private(set) var away = false
 
     /// A check result: green flash + pop when it held, red flash + shake when it didn't.
     func signal(_ ok: Bool) {
@@ -112,6 +118,8 @@ final class Buddy {
 
     /// Flies along an arc so the tip lands just below-right of `point`, pointing at it. Frames `rect` if given.
     func travel(to point: CGPoint, framing rect: CGRect? = nil) async {
+        if quiet { return }
+        if let confine, !confine.contains(point) { return }
         highlight = rect.map { $0.insetBy(dx: -5, dy: -5) }
         typing = false
         let end = CGPoint(x: point.x + 3, y: point.y + 3)
@@ -133,6 +141,7 @@ final class Buddy {
 
     /// Press-in squash with a ripple at the tip.
     func click() {
+        if quiet { return }
         pressStart = CACurrentMediaTime()
         ripples.append((pos, pressStart))
         if ripples.count > 4 { ripples.removeFirst() }
@@ -141,8 +150,29 @@ final class Buddy {
     /// Gentle bob while text goes in.
     func setTyping(_ on: Bool) { typing = on }
 
+    /// Off to work somewhere else, until the run is done or needs the user (`goHome` brings it back): onto Clinqy's
+    /// hidden screen when there is one (`to`; it leaves through the corner that screen touches), else to the right
+    /// edge of the user's screen, half out of view.
+    func goAway(to elsewhere: CGRect? = nil) {
+        highlight = nil
+        typing = false
+        let m = Self.mouse()
+        let screen = NSScreen.screens.map { AXEngine.flipped($0.frame) }.first { $0.contains(m) }
+            ?? AXEngine.flipped(NSScreen.main?.frame ?? .zero)
+        let end = elsewhere.map { CGPoint(x: $0.midX, y: $0.midY) } ?? CGPoint(x: screen.maxX - 10, y: screen.minY + screen.height * 0.22)
+        away = true
+        let start = pos
+        let distance = hypot(end.x - start.x, end.y - start.y)
+        let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
+        finishFlight()
+        mode = .flying
+        flight = Flight(start: start, control: CGPoint(x: mid.x, y: mid.y - min(distance * 0.25, 120)), end: end,
+                        began: CACurrentMediaTime(), duration: min(1.1, max(0.5, 0.3 + Double(distance) / 1600)), done: nil)
+    }
+
     /// Clears the target frame, then flies back to the mouse and resumes following.
     func goHome() {
+        away = false
         highlight = nil
         typing = false
         guard mode != .following else { return }
@@ -183,6 +213,8 @@ final class Buddy {
     /// Marks something on screen: flies beside it, draws a circle around it and an arrow to it, shows `label`.
     /// Stays until `clearMark()` or the next mark; the buddy stays parked next to it meanwhile.
     func mark(_ rect: CGRect, label: String?) async {
+        if quiet { return }
+        if let confine, !confine.contains(CGPoint(x: rect.midX, y: rect.midY)) { return }
         highlight = nil
         let screen = NSScreen.screens.map { AXEngine.flipped($0.frame) }.first { $0.contains(CGPoint(x: rect.midX, y: rect.midY)) }
             ?? AXEngine.flipped(NSScreen.main?.frame ?? .zero)

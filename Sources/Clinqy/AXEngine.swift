@@ -446,10 +446,12 @@ enum AXEngine {
 
     /// Keyboard events go to `pid` when set (so they can't land in whatever window happens to be focused).
     static var targetPid: pid_t?
+    /// A background run's app: its keys never go through the system stream, which belongs to the user.
+    static var backgroundPid: pid_t?
 
     private static func post(_ event: CGEvent?, to pid: pid_t? = nil) {
         guard let event else { return }
-        if let pid = pid ?? targetPid { event.postToPid(pid) } else { event.post(tap: .cghidEventTap) }
+        if let pid = pid ?? targetPid ?? backgroundPid { event.postToPid(pid) } else { event.post(tap: .cghidEventTap) }
     }
 
     /// One key press. Down and up are both built before anything is posted and the up is deferred, so a key is
@@ -775,6 +777,13 @@ enum AXEngine {
         if let w = mainWindow(root, orFirst: false), let f = frame(of: w) {
             point = CGPoint(x: f.midX, y: f.midY)
         }
+        // In a background run the wheel goes to the app at its window's middle; the pointer stays with the user.
+        if backgroundPid == app.processIdentifier {
+            let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)
+            event?.location = point
+            event?.postToPid(app.processIdentifier)
+            return
+        }
         CGEvent(mouseEventSource: nil, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?
             .post(tap: .cghidEventTap)
         let event = CGEvent(scrollWheelEvent2Source: nil, units: .line, wheelCount: 1, wheel1: lines, wheel2: 0, wheel3: 0)
@@ -973,6 +982,29 @@ extension AXEngine {
     }
 
     nonisolated(unsafe) private static var minimizedWindows: [pid_t: AXUIElement] = [:]
+
+    static func attribute<T>(_ element: AXUIElement, _ name: String) -> T? { attr(element, name) }
+
+    /// The app's windows, as Accessibility lists them.
+    static func windows(of app: NSRunningApplication) -> [AXUIElement] {
+        attr(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) ?? []
+    }
+
+    /// The window server's number for an Accessibility window (private, long-stable _AXUIElementGetWindow).
+    static func windowID(of window: AXUIElement) -> CGWindowID? {
+        typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else { return nil }
+        var id: CGWindowID = 0
+        return unsafeBitCast(sym, to: GetWindow.self)(window, &id) == .success && id != 0 ? id : nil
+    }
+
+    /// Moves a window into `rect` (global top-left), shrinking it to fit.
+    static func place(_ window: AXUIElement, in rect: CGRect) {
+        if let f = frame(of: window), f.width > rect.width || f.height > rect.height {
+            setSize(window, CGSize(width: min(f.width, rect.width), height: min(f.height, rect.height)))
+        }
+        setPoint(window, kAXPositionAttribute, rect.origin)
+    }
 
     private static func setPoint(_ element: AXUIElement, _ name: String, _ point: CGPoint) {
         var p = point

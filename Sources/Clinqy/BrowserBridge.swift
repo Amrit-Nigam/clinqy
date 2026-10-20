@@ -126,6 +126,7 @@ final class BrowserBridge {
                 guard let self else { return }
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any], msg["type"] as? String == "hello" {
                     self.checkVersion(msg["version"] as? String ?? "", on: conn)
+                    if msg["version"] as? String == Self.extensionVersion { self.tidyAfterRestart(conn) }
                 }
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let id = msg["id"] as? String, let cont = self.pending.removeValue(forKey: id) {
@@ -159,7 +160,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.8.7"
+    static let extensionVersion = "1.9.5"
     /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
     /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
     private var reloadAsked: [String: Int] = [:]
@@ -167,8 +168,53 @@ final class BrowserBridge {
     private func checkVersion(_ version: String, on conn: NWConnection) {
         guard version != Self.extensionVersion, reloadAsked[version, default: 0] < 3 else { return }
         reloadAsked[version, default: 0] += 1
-        Agent.writeLog("browser extension v\(version) connected, app expects v\(Self.extensionVersion): reloading it")
+        let key = ObjectIdentifier(conn)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            let browser = self?.owners[key].map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "a browser"
+            Agent.writeLog("browser extension v\(version) connected in \(browser), app expects v\(Self.extensionVersion): reloading it")
+        }
+        Self.refreshInstalledCopy()
         Task { _ = try? await request(conn, ["cmd": "reload"], timeout: 5) }
+    }
+
+    /// As each browser connects in the first minute after Clinqy starts: a background window an earlier Clinqy left
+    /// open (it crashed, or was killed before it could close it) is closed, so it never sits on the user's screen.
+    /// Not once this Clinqy has a hidden screen or a background run: then that window is in use.
+    private let started = Date()
+
+    private func tidyAfterRestart(_ conn: NWConnection) {
+        guard Date().timeIntervalSince(started) < 60, AgentScreen.bounds == nil, !Background.active else { return }
+        Task {
+            do {
+                let r = try await request(conn, ["cmd": "closeAgentWindow"], timeout: 3)
+                if let id = r["closed"] as? Int { Agent.writeLog("closed a background window an earlier Clinqy left open (window \(id))") }
+            } catch {
+                Agent.writeLog("couldn't check for a background window an earlier Clinqy left open: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// The user took over Clinqy's background window: it's theirs now, never closed by Clinqy.
+    func releaseBackgroundWindows() async {
+        for conn in connections.values { _ = try? await request(conn, ["cmd": "releaseAgentWindow"], timeout: 2) }
+    }
+
+    /// The browser loads the extension from a copy in Application Support (setup made it): after an app update that
+    /// copy is still the old one, so a reload would only bring the old version back. Puts this app's copy there first.
+    private static func refreshInstalledCopy() {
+        let fm = FileManager.default
+        let installed = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension")
+        guard let bundled = Bundle.main.url(forResource: "extension", withExtension: nil), fm.fileExists(atPath: installed.path) else { return }
+        let version = { (dir: URL) in
+            (try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("manifest.json")))) .flatMap { ($0 as? [String: Any])?["version"] as? String }
+        }
+        guard version(installed) != version(bundled) else { return }
+        for name in (try? fm.contentsOfDirectory(atPath: bundled.path)) ?? [] {
+            let target = installed.appendingPathComponent(name)
+            try? fm.removeItem(at: target)
+            try? fm.copyItem(at: bundled.appendingPathComponent(name), to: target)
+        }
+        Agent.writeLog("updated the browser extension's files to v\(version(bundled) ?? "?")")
     }
 
     /// Asks every connected browser to reload the extension (after it's been updated on disk).
@@ -211,6 +257,41 @@ final class BrowserBridge {
             return TabInfo(id: id, url: r["url"] as? String ?? "", connection: key)
         }
         return nil
+    }
+
+    /// Whether `app` (a browser) has the extension connected.
+    func isConnected(_ app: NSRunningApplication) -> Bool {
+        guard let bundle = app.bundleURL?.resolvingSymlinksInPath().path else { return false }
+        return owners.contains { connections[$0.key] != nil && $0.value == bundle }
+    }
+
+    /// Opens `url` in Clinqy's own browser window, made without focus behind the user's (one window per browser, reused),
+    /// in `app` if it has the extension, else any connected browser. Returns the tab and the browser it's in.
+    /// `at`: where its window goes (Clinqy's hidden screen), in global top-left points.
+    func backgroundTab(_ url: String, in app: NSRunningApplication? = nil, at: CGRect? = nil) async -> (tab: TabInfo, browser: NSRunningApplication?, window: CGRect?)? {
+        let pool = app.map { candidates(for: $0) } ?? []
+        var body: [String: Any] = ["cmd": "backgroundTab", "url": url]
+        if let at { body["at"] = ["left": Int(at.minX), "top": Int(at.minY), "width": Int(at.width), "height": Int(at.height)] }
+        for (key, conn) in pool.isEmpty ? connections.map({ ($0.key, $0.value) }) : pool {
+            guard let r = try? await request(conn, body, timeout: 5), let id = r["id"] as? Int else { continue }
+            let browser = owners[key].flatMap { path in
+                NSWorkspace.shared.runningApplications.first { $0.bundleURL?.resolvingSymlinksInPath().path == path }
+            }
+            let b = r["bounds"] as? [String: Any]
+            let n = { (k: String) in (b?[k] as? NSNumber)?.doubleValue }
+            let window = n("x").flatMap { x in n("y").flatMap { y in n("w").flatMap { w in n("h").map { CGRect(x: x, y: y, width: w, height: $0) } } } }
+            return (TabInfo(id: id, url: url, connection: key), browser ?? app, window)
+        }
+        return nil
+    }
+
+    /// Reads `tab` by id, wherever it is (Clinqy's background window included). The page is pinned to it.
+    func snapshot(of tab: TabInfo) async -> Page? {
+        guard let conn = connections[tab.connection],
+              let r = try? await request(conn, ["cmd": "snapshot", "tabId": tab.id], timeout: 5) else { return nil }
+        var page = parse(r, connection: tab.connection)
+        page.pinned = true
+        return page
     }
 
     /// Runs a tab-level command (newTab, goBack, navigate) in the browser that owns `tab`.

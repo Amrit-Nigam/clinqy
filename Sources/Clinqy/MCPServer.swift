@@ -27,9 +27,11 @@ enum MCPServer {
         tool("clinqy_run", "Do a task on the Mac",
              "Carry out a natural-language task on the user's Mac with Clinqy: it clicks, types and reads in the frontmost app or "
              + "browser tab, and returns its steps and final answer. Not saved to the user's history or memory. dry=true only points "
-             + "at what it would click or type.",
+             + "at what it would click or type. background=true works out of the user's way: web pages in Clinqy's own browser "
+             + "window behind theirs, apps without coming to the front, so they can keep using the Mac.",
              ["task": ["type": "string", "description": "What to do, in plain words."],
               "dry": ["type": "boolean", "description": "Rehearse: point at each click and keystroke without doing it."],
+              "background": ["type": "boolean", "description": "Work behind the user's windows without taking their screen, mouse or keyboard."],
               "timeout": ["type": "integer", "description": "Seconds to wait for the task to finish (default 300)."]],
              required: ["task"], readOnly: false),
         tool("clinqy_look", "Look at the screen",
@@ -128,7 +130,8 @@ enum MCPServer {
                 let key = "\(id)"
                 lock.withLock { _ = running.insert(key) }
                 defer { lock.withLock { _ = running.remove(key) } }
-                result = await run(task, dry: args["dry"] as? Bool == true, timeout: (args["timeout"] as? NSNumber)?.doubleValue ?? 300)
+                result = await run(task, dry: args["dry"] as? Bool == true, background: args["background"] as? Bool == true,
+                                   timeout: (args["timeout"] as? NSNumber)?.doubleValue ?? 300)
             case "clinqy_look": result = await look(mode: args["mode"] as? String ?? "page")
             case "clinqy_stats": result = text(Stats.report(days: (args["days"] as? NSNumber)?.doubleValue ?? 7, last: args["last"] as? Bool == true))
             case let other: return error(id, -32602, "unknown tool: \(other)")
@@ -196,10 +199,10 @@ enum MCPServer {
         return String(decoding: data, as: UTF8.self)
     }
 
-    static func run(_ task: String, dry: Bool, timeout: Double) async -> [String: Any] {
+    static func run(_ task: String, dry: Bool, background: Bool = false, timeout: Double) async -> [String: Any] {
         guard await ensureApp() else { return text("Clinqy isn't installed or wouldn't start (build it with ./build.sh).", isError: true) }
         var offset = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? UInt64) ?? 0
-        guard openLink("run", ["task": task, "test": "1"].merging(dry ? ["dry": "1"] : [:]) { a, _ in a }) else {
+        guard openLink("run", ["task": (background ? "in the background: " : "") + task, "test": "1"].merging(dry ? ["dry": "1"] : [:]) { a, _ in a }) else {
             return text("Couldn't open the clinqy:// link.", isError: true)
         }
         // The app ignores a task while another runs, so first see this one start ("=== <task>").

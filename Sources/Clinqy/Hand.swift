@@ -48,6 +48,13 @@ final class Hand {
     /// Releases any button left down, puts the pointer back if Clinqy moved it and the user hasn't since, and
     /// brings back the app the user was in (unless `keepFrontApp`). Safe to call on cancel and failure.
     func endRun() {
+        // A background run never touched the user's pointer, buttons or front app: nothing to put back.
+        if Background.active {
+            runCursor = nil
+            runFrontApp = nil
+            cursorLeftAt = nil
+            return
+        }
         Self.releaseButtons()
         if let start = runCursor, let left = cursorLeftAt, Self.near(Buddy.mouse(), left, 2) {
             CGWarpMouseCursorPosition(start)
@@ -71,8 +78,8 @@ final class Hand {
         case real
         /// Posted straight to the app (postToPid): the pointer never moves, and the window needn't be frontmost.
         case pid
-        /// Private SkyLight path for Chromium/Electron windows in the background. Only with BACKGROUND_CLICKS=1;
-        /// never picked automatically.
+        /// Private SkyLight path for Chromium/Electron windows in the background. Every click of a background run
+        /// goes this way; other runs only with BACKGROUND_CLICKS=1.
         case background
     }
 
@@ -98,6 +105,10 @@ final class Hand {
         }
         if !pressed {
             if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: element) { return refuse(why) }
+            if Background.active {
+                lastMethod = "background"
+                return backgroundClick(at: el.center, pid: app.processIdentifier)
+            }
             lastMethod = "real"
             realClick(at: el.center)
         }
@@ -109,6 +120,7 @@ final class Hand {
     /// popup that slid in isn't clicked by mistake. Returns why it didn't click (re-scan and retry), or nil.
     @discardableResult
     func click(at point: CGPoint, pid: pid_t? = nil, window: WindowSnapshot? = nil, mode: ClickMode = .real) async -> String? {
+        let mode = Background.active ? .background : mode
         if let why = window?.staleness() { return refuse(why) }
         if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
@@ -121,10 +133,39 @@ final class Hand {
             guard let pid else { return refuse("a click sent to an app needs its pid") }
             Self.postClick(at: point, pid: pid)
         case .background:
-            guard let pid, let (id, frame) = Self.windowInfo(pid: pid, containing: point) else {
-                return refuse("no window of the target app at that point for a background click")
-            }
-            if let why = SkyLight.click(at: point, pid: pid, window: id, frame: frame) { return refuse(why) }
+            guard let pid else { return refuse("a background click needs the app's pid") }
+            if !Background.active, !SkyLight.isEnabled { return refuse("background clicks are off (BACKGROUND_CLICKS=1 enables them)") }
+            return backgroundClick(at: point, pid: pid)
+        }
+        return nil
+    }
+
+    /// A click on `pid`'s window at `point` that leaves the pointer and the front app alone: SkyLight where this macOS
+    /// has it (Chromium and Electron windows take nothing else), else posted to the app.
+    private func backgroundClick(at point: CGPoint, pid: pid_t) -> String? {
+        guard SkyLight.isAvailable else {
+            Self.postClick(at: point, pid: pid)
+            return nil
+        }
+        // On Clinqy's hidden screen whatever window is at the spot is the run's, even one a helper process owns
+        // (the file picker panel belongs to a macOS service, not the app).
+        let target = Self.windowInfo(pid: pid, containing: point).map { (pid, $0.id, $0.frame) }
+            ?? (AgentScreen.bounds?.contains(point) == true ? Self.topWindow(at: point) : nil)
+        guard let (owner, id, frame) = target else {
+            return refuse("no window of the target app at that point for a background click")
+        }
+        if let why = SkyLight.click(at: point, pid: owner, window: id, frame: frame) { return refuse(why) }
+        return nil
+    }
+
+    /// The frontmost normal-level window at `point`, whoever owns it.
+    nonisolated static func topWindow(at point: CGPoint) -> (pid: pid_t, id: CGWindowID, frame: CGRect)? {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in list where info[kCGWindowLayer as String] as? Int == 0 {
+            guard let pid = (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init), pid != getpid(),
+                  let id = info[kCGWindowNumber as String] as? Int, let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds), frame.contains(point) else { continue }
+            return (pid, CGWindowID(id), frame)
         }
         return nil
     }
@@ -139,6 +180,13 @@ final class Hand {
             // Something covers the field: focusing through Accessibility alone is still safe.
             _ = AXEngine.focus(el.element)
             return Self.isTextRole(AXEngine.focusedRole(of: app)) ? nil : refuse(why)
+        }
+        if Background.active {
+            // Accessibility focus first; a click (to the app, not through the user's pointer) only if that didn't take.
+            _ = AXEngine.focus(el.element)
+            try? await Task.sleep(for: .milliseconds(120))
+            if Self.isTextRole(AXEngine.focusedRole(of: app)) { return nil }
+            return backgroundClick(at: el.center, pid: app.processIdentifier)
         }
         realClick(at: el.center)
         _ = AXEngine.focus(el.element)
@@ -218,7 +266,16 @@ final class Hand {
     }
 
     private func hitCheck(_ point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
-        Self.hitMismatch(at: point, pid: pid, window: window)
+        Background.active ? Self.hitMismatchInApp(at: point, pid: pid, window: window) : Self.hitMismatch(at: point, pid: pid, window: window)
+    }
+
+    /// hitMismatch for a background run, whose window is expected to sit under the user's: only the app's own
+    /// windows are hit-tested, so another of its windows (a popup that slid in, a moved window) still stops the click.
+    static func hitMismatchInApp(at point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
+        var hit: AXUIElement?
+        guard let window, AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &hit) == .success,
+              let hit, let hitWindow: AXUIElement = axAttr(hit, kAXWindowAttribute), !CFEqual(hitWindow, window) else { return nil }
+        return "a different \(NSRunningApplication(processIdentifier: pid)?.cleanName ?? "app") window is at that spot now; look again"
     }
 
     /// Why the element at `point` isn't the target app's (or target window's), or nil. Inconclusive answers
@@ -271,6 +328,16 @@ final class Hand {
         }
     }
 
+    /// Numbers of `pid`'s normal-level windows, wherever they are.
+    nonisolated static func windowIDs(pid: pid_t) -> Set<CGWindowID> {
+        let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return Set(list.compactMap { info in
+            guard (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid, info[kCGWindowLayer as String] as? Int == 0,
+                  let id = info[kCGWindowNumber as String] as? Int else { return nil }
+            return CGWindowID(id)
+        })
+    }
+
     /// The on-screen normal-level window of `pid` containing `point`: its number and bounds.
     nonisolated static func windowInfo(pid: pid_t, containing point: CGPoint) -> (id: CGWindowID, frame: CGRect)? {
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
@@ -312,7 +379,7 @@ final class Hand {
             try? await Task.sleep(for: .milliseconds(70))
         }
         // Scrolling moves the real pointer to the window's middle; the run's end puts it back if the user doesn't.
-        cursorLeftAt = Buddy.mouse()
+        if !Background.active { cursorLeftAt = Buddy.mouse() }
         try? await Task.sleep(for: .milliseconds(200))
     }
 
@@ -332,6 +399,12 @@ final class Hand {
             AXEngine.targetPid = app.processIdentifier
             defer { AXEngine.targetPid = nil }
             AXEngine.paste(text)
+            return true
+        }
+        // In a background run, long or multi-line text goes straight into the field: pasting would borrow the
+        // user's clipboard. Fields that don't take a set value (or don't show it) fall through to the usual ways.
+        if Background.active, text.count > 80 || text.contains("\n"), !Self.codeEditorIDs.contains(app.bundleIdentifier ?? ""),
+           AXEngine.setFocusedValue(text, in: app), await landed(text, in: app) {
             return true
         }
         // Long text (an answer list, a write-up) is pasted: typing 2,000 characters takes minutes and trips the
@@ -457,6 +530,8 @@ final class Hand {
            AXEngine.windowFrame(of: running) != nil {
             return running
         }
+        // In a background run the app opens behind the user's (no Dock click, no Spotlight).
+        if Background.active { return await Launcher.launch(url) }
 
         trace("openApp \(appName) dock=\(AXEngine.dockItem(named: appName) != nil)")
         if let dock = AXEngine.dockItem(named: appName) {
@@ -511,6 +586,13 @@ final class Hand {
 
     /// Goes to a website like a person: bring up the browser, open a tab, type the address, press Return.
     func openURL(_ url: URL, current: NSRunningApplication?, newTab: Bool = true) async -> NSRunningApplication? {
+        // A background run without the extension: hand the address to the browser, which opens it without coming
+        // forward. Typing it would send ⌘T and the address to whichever of its windows the user has.
+        if Background.active {
+            await Launcher.openURL(url)
+            let id = NSWorkspace.shared.urlForApplication(toOpen: url).flatMap { Bundle(url: $0)?.bundleIdentifier }
+            return NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id && id != nil }
+        }
         var browser: NSRunningApplication?
         if let current, Launcher.isBrowser(current) {
             await Launcher.bringToFront(current)

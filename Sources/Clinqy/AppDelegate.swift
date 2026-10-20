@@ -29,6 +29,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var followUpOpen = false
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
+        AgentScreen.quit()
         Persist.flush()
     }
 
@@ -51,6 +53,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         UI.agent = agent
         UI.present = { [weak self] in self?.panel.showCentered(); self?.island.show() }
         UI.dismiss = { [weak self] in self?.panel.orderOut(nil) }
+        // A plain kill (an update, a rebuild, logging out) quits like ⌘Q, so the hidden screen is emptied first.
+        signal(SIGTERM, SIG_IGN)
+        terminateSignal.setEventHandler { NSApp.terminate(nil) }
+        terminateSignal.resume()
+        // A background run's notifications: answered there, or tapped to come here.
+        Notifier.start()
+        AgentScreenView.shared.agent = agent
+        Notifier.onAnswer = { [weak self] text in self?.agent.answer(text) }
+        // "Done": show the window it worked in. "Needs you": the bar, to answer.
+        Notifier.onOpen = { [weak self] question in
+            guard let self else { return }
+            if question || self.agent.question != nil { self.panel.showCentered(); self.island.show() }
+            else { AgentScreenView.shared.show() }
+        }
         enableOpenAtLogin()
         _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
         linkCommand()
@@ -88,7 +104,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         agent.onStart = { [weak self] in
             guard let self else { return }
-            self.setStatusIcon(running: true)
+            self.setStatusIcon(running: true, background: self.agent.runBackground)
             StepUndo.shared.clear()
             // Keystrokes must reach the target app, and clicks must not land on our windows.
             self.panel.orderOut(nil)
@@ -113,6 +129,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Paused for the user's input: bring the bar up with the question; hide it again once answered.
         agent.onQuestion = { [weak self] in
             guard let self else { return }
+            // A background run asks through a notification instead: the bar would take the user's focus.
+            if self.agent.runBackground { self.island.show(); return }
             self.panel.showCentered()
             self.island.show()
         }
@@ -166,6 +184,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let dry = menu.addItem(withTitle: "Dry Run (show, don't act)", action: #selector(toggleDryRun(_:)), keyEquivalent: "")
         dry.state = agent.dryRun ? .on : .off
+        let background = menu.addItem(withTitle: "Work in the Background", action: #selector(toggleBackground(_:)), keyEquivalent: "")
+        background.state = Background.always ? .on : .off
+        // The Dashboard has the same switch.
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak background] _ in
+            MainActor.assumeIsolated { background?.state = Background.always ? .on : .off }
+        }
+        background.toolTip = "Tasks run on a hidden screen of Clinqy's own; you get a notification when one is done or needs you."
+        menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
         follow.state = buddy.followsMouse ? .on : .off
         let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
@@ -366,14 +392,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.letClinqyLoadExtension()
     }
 
+    private let terminateSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
+
     /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
     private var menu: NSMenu?
 
-    private func setStatusIcon(running: Bool) {
+    private func setStatusIcon(running: Bool, background: Bool = false) {
         guard let button = statusItem.button else { return }
+        // A background run: blue, as the corner badge, and saying so (it's working out of sight).
+        button.toolTip = running ? (background ? "Clinqy is working in the background — click to stop" : "Click to stop Clinqy") : nil
         if running {
             button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop Clinqy")
-            button.contentTintColor = .systemRed
+            button.contentTintColor = background ? .systemBlue : .systemRed
             statusItem.menu = nil
             button.target = self
             button.action = #selector(stopFromMenuBar)
@@ -803,6 +833,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleDryRun(_ item: NSMenuItem) {
         agent.dryRun.toggle()
         item.state = agent.dryRun ? .on : .off
+    }
+
+    @objc func showBackgroundWork() { AgentScreenView.shared.show() }
+
+    @objc func toggleBackground(_ item: NSMenuItem) {
+        Background.always.toggle()
+        item.state = Background.always ? .on : .off
     }
 
     @objc func toggleFollowCursor(_ item: NSMenuItem) {

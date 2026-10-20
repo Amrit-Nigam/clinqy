@@ -328,7 +328,10 @@ struct DashboardContentView: View {
     @State private var appeared = false
     @State private var chartVisible = false
 
-    private let pages = ["Overview", "Usage", "AI & Model", "Shortcuts"]
+    private let pages = ["Overview", "Usage", "AI & Model", "Background", "Shortcuts"]
+    @AppStorage("backgroundMode") private var backgroundMode = false
+    @AppStorage("backgroundBrowser") private var backgroundBrowser = "Google Chrome"
+    @AppStorage("backgroundIdleMinutes") private var backgroundIdleMinutes = 10
     private let surface = Brand.text.opacity(0.035)
     private let text = Brand.text
     private let muted = Brand.soft
@@ -373,7 +376,60 @@ struct DashboardContentView: View {
         case "Usage": usagePage
         case "AI & Model": providerPage
         case "Shortcuts": shortcutsPage
+        case "Background": backgroundPage
         default: overviewPage
+        }
+    }
+
+    /// Browsers on this Mac that background runs can use (they need Clinqy's extension too).
+    private var installedBrowsers: [String] {
+        Launcher.browserIDs.compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)?.deletingPathExtension().lastPathComponent }
+            .filter { $0 != "Safari" && $0 != "Firefox" }.sorted()
+    }
+
+    private var backgroundPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            card {
+                Toggle(isOn: $backgroundMode) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Work in the background").font(.system(size: 15, weight: .semibold))
+                        Text("Every task runs on a hidden screen of Clinqy's own, so your screen, mouse and keyboard stay yours. "
+                             + "Without this, start a request with “in the background:”.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
+                    }
+                }
+                .toggleStyle(.switch)
+            }
+            card {
+                Text("Browser for background work").font(.system(size: 14, weight: .semibold))
+                Picker("Browser", selection: $backgroundBrowser) {
+                    ForEach(installedBrowsers, id: \.self) { Text($0).tag($0) }
+                }
+                .labelsHidden().pickerStyle(.menu).frame(width: 220)
+                Text("Clinqy opens its own window there, with its extension. A browser you don't use yourself works best.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                if Config.value("BACKGROUND_BROWSER") != nil {
+                    Text("BACKGROUND_BROWSER in your env file overrides this.").font(.system(size: 11)).foregroundStyle(muted)
+                }
+            }
+            card {
+                Text("Clean up after").font(.system(size: 14, weight: .semibold))
+                Picker("Clean up after", selection: $backgroundIdleMinutes) {
+                    Text("5 minutes").tag(5)
+                    Text("10 minutes").tag(10)
+                    Text("30 minutes").tag(30)
+                    Text("1 hour").tag(60)
+                    Text("Never (until Clinqy quits)").tag(0)
+                }
+                .labelsHidden().pickerStyle(.menu).frame(width: 220)
+                Text("How long the hidden screen and what's on it stay after the last background task. Then Clinqy's browser "
+                     + "window closes, any other window goes to the Dock, and the hidden screen is removed.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                HStack {
+                    Spacer()
+                    Button("Show background work") { AgentScreenView.shared.show() }.brand()
+                }
+            }
         }
     }
 
