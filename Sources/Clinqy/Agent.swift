@@ -316,7 +316,7 @@ final class Agent: ObservableObject {
         }
         // "in the background: book a cab" works out of the user's way (with BACKGROUND_TASKS=1, every request does).
         var background = Background.always || (auto && runBackground)
-        if Background.strip(&request) { background = true }
+        if Background.strip(&request) { background = true } else if Background.wantsForeground(&request) { background = false }
         // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
         if continuation == nil, !test, let last = History.shared.entries.first,
            Date().timeIntervalSince(last.date) < 20 * 60, Router.isFollowUp(request) {
@@ -387,7 +387,9 @@ final class Agent: ObservableObject {
         turnCount = 0; fastTurnCount = 0; lookCount = 0
         reviewedForm = false
         userAnswers = []
-        if continuation == nil, Date().timeIntervalSince(lastSnapAt) > 3 * 3600 || !snaps.contains(where: { !$0.pasted }) {
+        // Kept for a follow-up about them ("where are the screenshots?", "paste them"), not for an unrelated task.
+        let aboutSnaps = request.range(of: #"(?i)\b(screenshots?|snaps?|write-?up|paste|doc|lab|steps?)\b"#, options: .regularExpression) != nil
+        if continuation == nil, !aboutSnaps || Date().timeIntervalSince(lastSnapAt) > 3 * 3600 || !snaps.contains(where: { !$0.pasted }) {
             snaps = []
             snapFolder = nil
         }
@@ -1891,15 +1893,38 @@ final class Agent: ObservableObject {
         case "applescript":
             guard let script = action["script"] as? String else { return fail("applescript needs script") }
             let line = begin("Run a script")
-            let r = await Shell.run("/usr/bin/osascript", ["-e", script])
-            return end(line, .init(ok: r.status == 0, summary: r.status == 0 ? "AppleScript ok\(r.output.isEmpty ? "" : ": \(r.output.prefix(1500))")" : "AppleScript failed: \(r.output.prefix(400))"))
+            // Closing a document without saving throws away the user's unsaved work: only on their word.
+            if script.range(of: #"(?i)\bsaving\s+no\b"#, options: .regularExpression) != nil, !userConfirmed {
+                let reply = await askUser("This closes a document without saving — any unsaved changes in it would be lost. Go ahead?",
+                                          options: ["Yes, discard them", "No, keep the document"])
+                guard reply.map(Safety.isYes) ?? false || reply?.lowercased().hasPrefix("yes") == true else {
+                    return end(line, fail("the user said not to close it without saving. To undo a script's changes, press cmd+z "
+                                          + "(once per change) in the document instead; never close it unsaved"))
+                }
+            }
+            // Before a script deletes or replaces content in a document, its file (as last saved) is copied aside.
+            let backup = Self.destructive(script) ? await DocBackup.save(forScript: script) : nil
+            if let backup { log("    backed up \(backup.lastPathComponent) before the script") }
+            // In a background run nothing comes forward: `activate` would put the app in front of the user.
+            let quiet = Background.active ? script
+                .replacingOccurrences(of: #"(?im)^(\s*)activate\s*$"#, with: "$1launch", options: .regularExpression)
+                .replacingOccurrences(of: #"(?i)\bto activate\b"#, with: "to launch", options: .regularExpression) : script
+            let r = await Shell.run("/usr/bin/osascript", ["-e", quiet], timeout: 280)
+            Background.sweep()
+            log("    script result (\(r.status)): \(r.output.prefix(600))")
+            let saved = backup.map { "\n(The document as last saved was copied to \($0.path) first.)" } ?? ""
+            return end(line, .init(ok: r.status == 0, summary: (r.status == 0 ? "AppleScript ok\(r.output.isEmpty ? "" : ": \(r.output.prefix(1500))")" : "AppleScript failed: \(r.output.prefix(400))") + saved))
 
         case "shell":
             guard let cmd = action["cmd"] as? String else { return fail("shell needs cmd") }
             let line = begin("Look something up")
             // A glob that matches nothing stays as typed (so `ls a/*.pem b/*.pem` still lists what exists) instead of
             // zsh aborting the whole line with "no matches found".
-            let r = await Shell.run("/bin/zsh", ["-lc", "setopt no_nomatch 2>/dev/null\n" + cmd], timeout: 20)
+            // No pager: git log/diff would otherwise wait on `less` until the timeout. In a background run, `open` opens
+            // things without bringing their app forward (the run's sweep then moves the window to the hidden screen).
+            let run = Background.active ? Self.openQuietly(cmd) : cmd
+            let r = await Shell.run("/bin/zsh", ["-lc", "setopt no_nomatch 2>/dev/null\nexport GIT_PAGER=cat PAGER=cat\n" + run], timeout: 20)
+            Background.sweep()
             let hint = r.status == 0 ? "" : Self.shellHint(r.output)
             return end(line, .init(ok: r.status == 0, summary: "exit \(r.status)\(r.output.isEmpty ? "" : ": \(r.output.prefix(2000))")\(hint)"))
 
@@ -2806,7 +2831,11 @@ final class Agent: ObservableObject {
             let at = AgentScreen.ensure().map { $0.insetBy(dx: 40, dy: 30) }
             // A screen made just now takes a moment to reach other apps (Chrome would place the window on the main one).
             if fresh, at != nil { try? await Task.sleep(for: .milliseconds(1500)) }
-            let had = browser.map { Hand.windowIDs(pid: $0.processIdentifier) } ?? []
+            // Every browser's windows as they were, and who was in front: whichever browser opens the window (a
+            // fallback like Arc may bring it forward, ignoring "unfocused"), it's found, moved, and the user's app put back.
+            let hadAll = Dictionary(NSWorkspace.shared.runningApplications.filter(Launcher.isBrowser)
+                .map { ($0.processIdentifier, Hand.windowIDs(pid: $0.processIdentifier)) }, uniquingKeysWith: { a, _ in a })
+            let front = NSWorkspace.shared.frontmostApplication
             guard let opened = await bridge.backgroundTab(url.absoluteString, in: browser, at: at) else {
                 return fail("couldn't open a tab in the background (is the browser extension up to date?)")
             }
@@ -2814,10 +2843,20 @@ final class Agent: ObservableObject {
             ownedTab = opened.tab.id
             context.app = opened.browser ?? NSWorkspace.shared.runningApplications.first(where: Launcher.isBrowser)
             Background.app = context.app
-            if let browser = context.app, at != nil {
+            if let browser = context.app {
                 try? await Task.sleep(for: .milliseconds(400))
-                AgentScreen.adoptBrowserWindow(browser, had: opened.browser == browser ? had : Hand.windowIDs(pid: browser.processIdentifier),
-                                               frame: opened.window)
+                if at != nil {
+                    AgentScreen.adoptBrowserWindow(browser, had: hadAll[browser.processIdentifier] ?? [], frame: opened.window)
+                }
+                if let front, front.processIdentifier != browser.processIdentifier,
+                   NSWorkspace.shared.frontmostApplication?.processIdentifier == browser.processIdentifier {
+                    log("    \(browser.cleanName ?? "the browser") came forward with its window: giving \(front.cleanName ?? "the user's app") the front back")
+                    if let url = front.bundleURL {
+                        let config = NSWorkspace.OpenConfiguration()
+                        config.activates = true
+                        _ = try? await NSWorkspace.shared.openApplication(at: url, configuration: config)
+                    }
+                }
             }
         }
         log("    background tab #\(Background.tab?.id ?? 0) in \(context.app?.cleanName ?? "?")")
@@ -2840,17 +2879,69 @@ final class Agent: ObservableObject {
         let name = Background.browserName.lowercased()
         let named = { NSWorkspace.shared.runningApplications.first { $0.cleanName?.lowercased() == name && Launcher.isBrowser($0) } }
         if let app = named(), BrowserBridge.shared.isConnected(app) { return app }
-        if named() == nil, let url = Launcher.find(named: name) {
-            // With no window of its own: the run's window is the only one it opens, where the run puts it.
-            writeLog("    starting \(Background.browserName) (no window) for the background run")
-            _ = await Shell.run("/usr/bin/open", ["-g", "-a", url.path, "--args", "--no-startup-window"])
+        // The browser's windows now: any it shows from here on (a profile picker, its startup or profile window) are
+        // the run's doing and go to the hidden screen.
+        let had = named().map { Hand.windowIDs(pid: $0.processIdentifier) } ?? []
+        if let url = named()?.bundleURL ?? Launcher.find(named: name) {
+            // Straight into the profile that has Clinqy's extension: with several profiles Chrome otherwise stops at its
+            // "Who's using Chrome?" picker (on the user's screen) and loads none. No window of its own either: the
+            // run's window is the only one it opens, where the run puts it.
+            var args = ["--no-startup-window"]
+            if let profile = BrowserProfiles.withExtension(url) { args.insert("--profile-directory=\(profile)", at: 0) }
+            if named() == nil {
+                writeLog("    starting \(Background.browserName) (\(args.joined(separator: " "))) for the background run")
+                _ = await Shell.run("/usr/bin/open", ["-g", "-a", url.path, "--args"] + args)
+            } else if args.count > 1, let binary = Bundle(url: url)?.executableURL {
+                // Running without the extension's profile (stuck at the picker): the browser takes the profile over
+                // from a second launch of itself.
+                writeLog("    loading the profile with Clinqy's extension in \(Background.browserName)")
+                let p = Process()
+                p.executableURL = binary
+                p.arguments = args
+                try? p.run()
+            }
         }
-        for _ in 0..<80 {
+        var picked = false
+        for i in 0..<80 {
             if let app = named(), BrowserBridge.shared.isConnected(app) { return app }
+            if let app = named(), AgentScreen.ensure() != nil {
+                AgentScreen.adopt(app, keep: had.union(AgentScreen.windows().map(\.id)))
+                // Stopped at "Who's using Chrome?" (no profile, so no extension): open the user's own profile.
+                if !picked, i >= 6, Self.pickOwnProfile(app) { picked = true }
+            }
             try? await Task.sleep(for: .milliseconds(250))
         }
         writeLog("    \(Background.browserName)'s Clinqy extension isn't connected: using another browser")
         return nil
+    }
+
+    /// In a Chromium profile picker, presses the profile card with the user's name (full or first). False if there's
+    /// no picker or no card that's clearly theirs.
+    private static func pickOwnProfile(_ app: NSRunningApplication) -> Bool {
+        let full = NSFullUserName().lowercased(), first = full.split(separator: " ").first.map(String.init) ?? full
+        // The picker is a web page: Chromium lists its buttons ("Open Amrit profile") once enhanced UI is on.
+        AXUIElementSetAttributeValue(AXUIElementCreateApplication(app.processIdentifier), "AXEnhancedUserInterface" as CFString, kCFBooleanTrue)
+        let buttons = AXEngine.elements(of: app, limit: 400).filter { $0.role == "AXButton" }
+        guard buttons.contains(where: { $0.label.lowercased().contains("guest mode") }) else { return false }
+        let profile = { (e: UIElementInfo) -> String? in
+            guard let r = e.label.range(of: #"(?i)^open (.+) profile"#, options: .regularExpression) else { return nil }
+            return String(e.label[r]).lowercased().replacingOccurrences(of: "open ", with: "").replacingOccurrences(of: " profile", with: "")
+        }
+        guard let mine = buttons.first(where: { profile($0) == full }) ?? buttons.first(where: { profile($0) == first })
+                ?? buttons.first(where: { profile($0).map { $0.hasPrefix(first) } ?? false }) else { return false }
+        writeLog("    profile picker in \(app.cleanName ?? "the browser"): opening \(mine.label.prefix(40).debugDescription)")
+        return AXEngine.axPress(mine.element)
+    }
+
+    /// `open x` → `open -g x` (unless it says otherwise): opens without bringing the app forward.
+    nonisolated static func openQuietly(_ cmd: String) -> String {
+        cmd.replacingOccurrences(of: #"(^|[;&|(]\s*|\n\s*)open\s+(?!-g\b)"#, with: "$1open -g ", options: .regularExpression)
+    }
+
+    /// A script that removes or replaces a document's content (worth a backup of the document first).
+    nonisolated static func destructive(_ script: String) -> Bool {
+        script.range(of: #"(?i)\b(delete|clear|remove|replace|set (the )?content|set text of)\b"#, options: .regularExpression) != nil
+            && script.range(of: #"(?i)\b(document|paragraph|range|selection|text of)\b"#, options: .regularExpression) != nil
     }
 
     /// Clicks a spot on the page: a real click, or in a background run a trusted click sent to the run's tab.
@@ -3282,7 +3373,7 @@ final class Agent: ObservableObject {
     }()
 
     static func writeLog(_ line: String) {
-        guard let data = (line + "\n").data(using: .utf8) else { return }
+        guard let data = (Secrets.mask(line) + "\n").data(using: .utf8) else { return }
         // Keep one old log (agent.log.1) once this one passes 5 MB.
         if let size = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size]) as? Int, size > 5_000_000 {
             let old = logURL.appendingPathExtension("1")

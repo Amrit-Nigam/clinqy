@@ -395,15 +395,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private let terminateSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 
     /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
+    /// A background run gets a small menu instead (watch it or stop it): clicking the icon is how the user looks in on it.
     private var menu: NSMenu?
+    private var runMenu: NSMenu?
 
     private func setStatusIcon(running: Bool, background: Bool = false) {
         guard let button = statusItem.button else { return }
         // A background run: blue, as the corner badge, and saying so (it's working out of sight).
-        button.toolTip = running ? (background ? "Clinqy is working in the background — click to stop" : "Click to stop Clinqy") : nil
-        if running {
+        button.toolTip = running ? (background ? "Clinqy is working in the background" : "Click to stop Clinqy") : nil
+        if running && background {
+            button.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Clinqy (working in the background)")
+            button.contentTintColor = .systemBlue
+            button.action = nil
+            if runMenu == nil {
+                let m = NSMenu()
+                m.delegate = self
+                runMenu = m
+            }
+            statusItem.menu = runMenu
+        } else if running {
             button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop Clinqy")
-            button.contentTintColor = background ? .systemBlue : .systemRed
+            button.contentTintColor = .systemRed
             statusItem.menu = nil
             button.target = self
             button.action = #selector(stopFromMenuBar)
@@ -765,6 +777,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        if menu === runMenu { return fillRunMenu(menu) }
         let items = Scheduler.all
         if items.isEmpty {
             let none = menu.addItem(withTitle: "Nothing scheduled", action: nil, keyEquivalent: "")
@@ -786,6 +799,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let add = menu.addItem(withTitle: "New Schedule…", action: #selector(newSchedule), keyEquivalent: "")
         add.target = self
+    }
+
+    /// The background run's menu: what it's on now, watch it, stop it.
+    private func fillRunMenu(_ menu: NSMenu) {
+        let now = agent.question.map { "Asks: " + $0.text } ?? agent.steps.last?.text ?? "Working…"
+        let status = menu.addItem(withTitle: String(now.prefix(60)) + (now.count > 60 ? "…" : ""), action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Stop", action: #selector(stopFromMenuBar), keyEquivalent: "").target = self
     }
 
     @objc func removeSchedule(_ item: NSMenuItem) {

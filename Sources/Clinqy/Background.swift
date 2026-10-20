@@ -19,6 +19,10 @@ enum Background {
     /// of that app (one the run opened: ⌘N, a dialog) goes to Clinqy's hidden screen.
     private static var userWindows: [pid_t: Set<CGWindowID>] = [:]
 
+    /// Every window on the Mac when the run started: a window that appears later in an app the user isn't in (one a
+    /// script or shell `open` brought up) is the run's.
+    private static var windowsAtStart: Set<CGWindowID> = []
+
     /// Notes the windows `app` has before the run first touches it (`had`: as they were before a launch).
     static func track(_ app: NSRunningApplication, had: Set<CGWindowID>? = nil) {
         guard active, userWindows[app.processIdentifier] == nil else { return }
@@ -28,6 +32,15 @@ enum Background {
     /// Moves the windows the run's apps opened since onto Clinqy's hidden screen (browsers place their own).
     static func sweep() {
         guard active, AgentScreen.bounds != nil else { return }
+        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in list where info[kCGWindowLayer as String] as? Int == 0 {
+            guard let id = (info[kCGWindowNumber as String] as? Int).map(CGWindowID.init), !windowsAtStart.contains(id),
+                  let pid = (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init), pid != front, pid != getpid(),
+                  userWindows[pid] == nil, let app = NSRunningApplication(processIdentifier: pid),
+                  app.activationPolicy == .regular, !Launcher.isBrowser(app) else { continue }
+            track(app, had: Hand.windowIDs(pid: pid).intersection(windowsAtStart))
+        }
         for (pid, had) in userWindows {
             guard let app = NSRunningApplication(processIdentifier: pid), !app.isTerminated, !Launcher.isBrowser(app) else { continue }
             let onIt = Set(AgentScreen.windows().map(\.id))
@@ -57,6 +70,8 @@ enum Background {
         app = nil
         tab = nil
         userWindows = [:]
+        let list = on ? CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [] : []
+        windowsAtStart = Set(list.compactMap { ($0[kCGWindowNumber as String] as? Int).map(CGWindowID.init) })
     }
 
     static func end() {
@@ -81,6 +96,18 @@ enum Background {
             await BrowserBridge.shared.tabCommand("switchTab", on: tab, ["tabId": tab.id])
         }
         if let app = last.app, !app.isTerminated { await Launcher.bringToFront(app) }
+    }
+
+    /// The request wants to be done where the user can see it, even with background mode on: "foreground: …" (taken
+    /// off), or "… in front of me", "… on my screen", "… in the foreground" anywhere in it (left in: they're part of
+    /// what was asked).
+    static func wantsForeground(_ request: inout String) -> Bool {
+        if let r = request.range(of: #"(?i)^\(?(foreground|in front)\)?\s*[:,-]\s*"#, options: .regularExpression) {
+            request.removeSubrange(r)
+            return true
+        }
+        return request.range(of: #"(?i)\b(in front of me|on my screen|in the foreground|where i can see( it)?|let me watch)\b"#,
+                             options: .regularExpression) != nil
     }
 
     /// Takes "in the background: …", "background: …", "bg: …" or a trailing "… in the background" off a request.
