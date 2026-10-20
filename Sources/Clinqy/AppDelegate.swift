@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var resultPanel: ResultPanel!
     private var hotKey: HotKey?
     private var talkHotKey: PushToTalkHotKey?
+    /// fn+⌃: plain dictation. Hold and speak (or tap to start, tap to stop); the words are typed where the cursor is.
+    private var dictateHotKey: HotKey?
+    private var dictating = false
+    private var dictateStarted: Date?
     private var openMenuItem: NSMenuItem?
     private var talkMenuItem: NSMenuItem?
     private var pressedAt: Date?
@@ -139,6 +143,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voice.onFinal = { [weak self] text in
             guard let self else { return }
             self.buddy.mood = .idle
+            if self.dictating {
+                self.dictating = false
+                self.island.hide()
+                self.typeDictation(text)
+                return
+            }
             let followUp = self.followUpOpen
             self.followUpOpen = false
             // A spoken reply to a question answers it; while working it steers; otherwise it's a new request.
@@ -157,6 +167,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voice.onGaveUp = { [weak self] in
             guard let self else { return }
             self.followUpOpen = false
+            self.dictating = false
             if !self.agent.isRunning { self.agent.continuation = nil }
             self.buddy.mood = .idle
             self.island.hide()
@@ -604,6 +615,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             PushToTalkHotKey(spec: spec, onPress: { [weak self] in self?.dedicatedTalkDown() },
                              onRelease: { [weak self] in self?.dedicatedTalkUp() })
         }
+        let dictate = Config.value("DICTATE_HOTKEY") ?? "fn+ctrl"
+        dictateHotKey = dictate.lowercased() == "off" ? nil
+            : HotKey(spec: dictate, onPress: { [weak self] in self?.dictateDown() },
+                     onRelease: { [weak self] in self?.dictateUp() },
+                     onOtherKey: { [weak self] in self?.dictateAbandoned() })
         openMenuItem?.title = "Open Clinqy  (\(menuShortcutLabel(summon)))"
         let talkLabel = talkHotKey == nil ? menuShortcutLabel(summon) + " · hold" : menuShortcutLabel(Config.value("TALK_HOTKEY") ?? "")
         talkMenuItem?.title = "Talk  (hold \(talkLabel))"
@@ -634,6 +650,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         hotKey?.enabled = enabled
         talkHotKey?.enabled = enabled
+        dictateHotKey?.enabled = enabled
+    }
+
+    // MARK: - Dictation
+
+    private func dictateDown() {
+        if dictating {   // tapped on earlier: this press ends it
+            dictateStarted = nil
+            endDictation()
+            return
+        }
+        guard !holdToTalk, !voice.isListening else { return }
+        dictating = true
+        dictateStarted = Date()
+        island.show()
+        startListening(autoStop: false)
+    }
+
+    /// Held: done speaking. A quick tap: keep listening hands-free until the next press.
+    private func dictateUp() {
+        guard dictating, let started = dictateStarted else { return }
+        dictateStarted = nil
+        if Date().timeIntervalSince(started) < 0.35 { return }
+        endDictation()
+    }
+
+    /// Stops listening; nothing heard means nothing typed, so tidy up if no words arrive.
+    private func endDictation() {
+        voice.stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.dictating, !self.voice.isListening else { return }
+            self.dictating = false
+            self.island.hide()
+            self.buddy.mood = self.agent.isRunning ? .acting : .idle
+        }
+    }
+
+    /// fn+⌃ was part of another shortcut (fn+⌃+arrow…): drop the dictation.
+    private func dictateAbandoned() {
+        guard dictating, dictateStarted != nil else { return }
+        dictating = false
+        dictateStarted = nil
+        voice.cancel()
+        island.hide()
+        buddy.mood = agent.isRunning ? .acting : .idle
+    }
+
+    /// Types what was said into whatever has the keyboard focus, like the keyboard would.
+    private func typeDictation(_ text: String) {
+        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return }
+        Agent.writeLog("dictation: typed \(words.count) characters")
+        AXEngine.enter(words)
     }
 
     private func dedicatedTalkDown() {
