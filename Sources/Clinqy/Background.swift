@@ -98,29 +98,37 @@ enum Background {
         if let app = last.app, !app.isTerminated { await Launcher.bringToFront(app) }
     }
 
-    /// The request wants to be done where the user can see it, even with background mode on: "foreground: …" (taken
-    /// off), or "… in front of me", "… on my screen", "… in the foreground" anywhere in it (left in: they're part of
-    /// what was asked).
-    static func wantsForeground(_ request: inout String) -> Bool {
-        if let r = request.range(of: #"(?i)^\(?(foreground|in front)\)?\s*[:,-]\s*"#, options: .regularExpression) {
-            request.removeSubrange(r)
-            return true
+    /// What the request itself says about where to work, typed or spoken, whatever the toggle is: true for "in the
+    /// background: …", "do it in the background, …", "… in background please"; false for "don't do it in the
+    /// background", "not in background: …", "foreground: …", "… in front of me". nil when it says nothing. Phrases that
+    /// only choose the mode are taken off; ones that are part of the task ("… on my screen") are left in.
+    static func choice(_ request: inout String) -> Bool? {
+        let bg = #"(?:in (?:the )?background|background(?: mode)?|bg)"#
+        let doIt = #"(?:(?:please |just )?(?:do|run|work on|handle) (?:this|it|that)(?: one)? )?"#
+        let no = #"(?:don'?t|do not|not|no|never|without)"#
+        let cut: [(String, Bool)] = [
+            // Negatives first: "don't do it in the background" also contains "in the background".
+            (#"(?i)^\(?(?:please )?\#(no) (?:do (?:this|it|that) |run (?:this|it) )?(?:\#(bg)|using (?:the )?background)\)?[\s,:.;!-]+"#, false),
+            (#"(?i)[\s,.;:-]+(?:and |but |please )*\#(no) (?:do (?:this|it|that) |run (?:this|it) )?(?:\#(bg)|using (?:the )?background)(?: please)?[\s.!]*$"#, false),
+            (#"(?i)^\(?(?:please )?\#(doIt)(?:in (?:the )?foreground|foreground(?: mode)?|in front(?: of me)?)\)?[\s,:.;!-]+"#, false),
+            (#"(?i)[\s,.;:-]+(?:and |but |please )*\#(doIt)in (?:the )?foreground(?: please)?[\s.!]*$"#, false),
+            // "in the background open gmail" (spoken, no comma); a bare "background"/"bg" needs a colon or comma, so
+            // "background check on …" stays a request.
+            (#"(?i)^\(?(?:please )?\#(doIt)in (?:the )?background(?: mode)?\)?[\s,:.;!-]+"#, true),
+            (#"(?i)^\(?(?:background(?: mode)?|bg)\)?\s*[,:;-]\s*"#, true),
+            (#"(?i)[\s,.;:-]+(?:and |please )*\#(doIt)in (?:the )?background(?: mode)?(?: please)?[\s.!]*$"#, true),
+            // "open gmail, do it in the background, and reply to …": only with "do/run it", since a bare mid-sentence
+            // "in the background" can be the task ("blur the people in the background").
+            (#"(?i)[\s,.;:-]+(?:and )?(?:please |just )?(?:do|run) (?:this|it|that) in (?:the )?background\b[\s,.;:-]*"#, true),
+        ]
+        for (pattern, wants) in cut {
+            guard let r = request.range(of: pattern, options: .regularExpression) else { continue }
+            request.replaceSubrange(r, with: r.lowerBound == request.startIndex || r.upperBound == request.endIndex ? "" : " ")
+            request = request.trimmingCharacters(in: .whitespacesAndNewlines)
+            return wants
         }
-        return request.range(of: #"(?i)\b(in front of me|on my screen|in the foreground|where i can see( it)?|let me watch)\b"#,
-                             options: .regularExpression) != nil
-    }
-
-    /// Takes "in the background: …", "background: …", "bg: …" or a trailing "… in the background" off a request.
-    static func strip(_ request: inout String) -> Bool {
-        let lead = #"(?i)^\(?(in the background|in background|background|bg)\)?\s*[:,-]\s*"#
-        let trail = #"(?i)[,\s]+(in the background|in background)\s*[.!]?\s*$"#
-        for pattern in [lead, trail] {
-            if let r = request.range(of: pattern, options: .regularExpression) {
-                request.removeSubrange(r)
-                request = request.trimmingCharacters(in: .whitespacesAndNewlines)
-                return true
-            }
-        }
-        return false
+        if request.range(of: #"(?i)\b(in front of me|on my screen|in the foreground|where i can see( it)?|let me (watch|see))\b"#,
+                         options: .regularExpression) != nil { return false }
+        return nil
     }
 }

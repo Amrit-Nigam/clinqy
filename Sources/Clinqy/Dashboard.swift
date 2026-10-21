@@ -394,7 +394,7 @@ struct DashboardContentView: View {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Work in the background").font(.system(size: 15, weight: .semibold))
                         Text("Every task runs on a hidden screen of Clinqy's own, so your screen, mouse and keyboard stay yours. "
-                             + "Without this, start a request with “in the background:”.")
+                             + "Either way, a request can choose: say or type “in the background” or “not in the background”.")
                             .font(.system(size: 11)).foregroundStyle(muted)
                     }
                 }

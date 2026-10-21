@@ -314,9 +314,9 @@ final class Agent: ObservableObject {
             request.removeSubrange(r)
             dry = true
         }
-        // "in the background: book a cab" works out of the user's way (with BACKGROUND_TASKS=1, every request does).
-        var background = Background.always || (auto && runBackground)
-        if Background.strip(&request) { background = true } else if Background.wantsForeground(&request) { background = false }
+        // "in the background: book a cab" works out of the user's way, "not in the background: …" in front of them;
+        // saying nothing follows the toggle (or BACKGROUND_TASKS=1).
+        let background = Background.choice(&request) ?? (Background.always || (auto && runBackground))
         // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
         if continuation == nil, !test, let last = History.shared.entries.first,
            Date().timeIntervalSince(last.date) < 20 * 60, Router.isFollowUp(request) {
