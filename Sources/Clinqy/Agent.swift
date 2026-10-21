@@ -146,6 +146,7 @@ final class Agent: ObservableObject {
         question = Question(text: text, options: options, sensitive: sensitive)
         onQuestion()
         if runBackground { Notifier.ask(text, options: options, sensitive: sensitive) }
+        Telegram.shared.ask(text, options: options, sensitive: sensitive)
         let reply = await withCheckedContinuation { answerWaiter = $0 }
         buddy.bubble(nil)
         if runBackground, !Task.isCancelled { buddy.goAway(to: AgentScreen.bounds) }
@@ -304,7 +305,10 @@ final class Agent: ObservableObject {
         hand = Hand(buddy: buddy)
     }
 
-    func submit(_ raw: String, test: Bool = false, auto: Bool = false, model: String? = nil, provider: Provider? = nil) {
+    /// `preferBackground`: with nothing said either way, work in the background even with the toggle off (the user
+    /// asked from somewhere else, like Telegram, and isn't at the screen).
+    func submit(_ raw: String, test: Bool = false, auto: Bool = false, model: String? = nil, provider: Provider? = nil,
+                preferBackground: Bool = false) {
         if !auto { autoContinues = 0 }
         var request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
@@ -316,7 +320,7 @@ final class Agent: ObservableObject {
         }
         // "in the background: book a cab" works out of the user's way, "not in the background: …" in front of them;
         // saying nothing follows the toggle (or BACKGROUND_TASKS=1).
-        let background = Background.choice(&request) ?? (Background.always || (auto && runBackground))
+        let background = Background.choice(&request) ?? (preferBackground || Background.always || (auto && runBackground))
         // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
         if continuation == nil, !test, let last = History.shared.entries.first,
            Date().timeIntervalSince(last.date) < 20 * 60, Router.isFollowUp(request) {
@@ -3324,6 +3328,7 @@ final class Agent: ObservableObject {
             && (text.hasPrefix("Ran out of steps") || text.hasPrefix("I got stuck on"))
         // A background run tells the user when it's through (not at a pause it carries on from by itself).
         if wasBackground, !isTest, !continues { Notifier.finished(request: request, answer: text, ok: ok, result: runResult) }
+        if !continues { Telegram.shared.finished(answer: text, ok: ok, result: runResult) }
         if continues {
             autoContinues += 1
             log("auto-continue \(autoContinues)/\(limit) after: \(text.prefix(60))")

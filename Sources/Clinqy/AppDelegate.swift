@@ -63,6 +63,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         terminateSignal.resume()
         // A background run's notifications: answered there, or tapped to come here.
         Notifier.start()
+        Telegram.shared.agent = agent
+        Telegram.shared.start()
         AgentScreenView.shared.agent = agent
         Notifier.onAnswer = { [weak self] text in self?.agent.answer(text) }
         // "Done": show the window it worked in. "Needs you": the bar, to answer.
@@ -203,6 +205,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         background.toolTip = "Tasks run on a hidden screen of Clinqy's own; you get a notification when one is done or needs you."
         menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
+        menu.addItem(withTitle: "Telegram…", action: #selector(setUpTelegram), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
         follow.state = buddy.followsMouse ? .on : .off
         let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
@@ -928,6 +931,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func showBackgroundWork() { AgentScreenView.shared.show() }
+
+    /// Connects a Telegram bot (its token from @BotFather), then pairs the user's chat with a one-time link.
+    @objc func setUpTelegram() {
+        let bot = Telegram.shared
+        NSApp.activate(ignoringOtherApps: true)
+        if bot.token != nil {
+            let alert = NSAlert()
+            alert.messageText = "Telegram"
+            alert.informativeText = bot.chatID == nil ? "The bot is set up but no chat is paired yet."
+                : "Paired: tasks you message the bot run on this Mac, in the background unless you say otherwise."
+            alert.addButton(withTitle: "Pair a Chat")
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Disconnect")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: return pairTelegram()
+            case .alertThirdButtonReturn:
+                try? Config.write(["TELEGRAM_BOT_TOKEN": nil, "TELEGRAM_CHAT_ID": nil])
+                bot.start()
+                return
+            default: return
+            }
+        }
+        let alert = NSAlert()
+        alert.messageText = "Message Clinqy from Telegram"
+        alert.informativeText = "In Telegram, message @BotFather, send /newbot and follow its steps. Paste the token it gives you here. "
+            + "Only the chat you pair next can give Clinqy tasks."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "123456789:AA…"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        try? Config.write(["TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": nil])
+        pairTelegram()
+    }
+
+    private func pairTelegram() {
+        Task { @MainActor in
+            let bot = Telegram.shared
+            guard await bot.checkToken() != nil else {
+                let alert = NSAlert()
+                alert.messageText = "Telegram didn't accept that token"
+                alert.informativeText = "Check it in @BotFather (/mybots → API Token) and try again."
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+                return
+            }
+            bot.start()
+            let (code, link) = bot.pairLink()
+            let alert = NSAlert()
+            alert.messageText = "Pair your Telegram chat"
+            alert.informativeText = "Open the bot and press Start, or send it:\n/pair \(code)\n\nThe code works for 10 minutes."
+            alert.addButton(withTitle: "Open in Telegram")
+            alert.addButton(withTitle: "Done")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn, let link { NSWorkspace.shared.open(link) }
+        }
+    }
 
     @objc func toggleBackground(_ item: NSMenuItem) {
         Background.always.toggle()

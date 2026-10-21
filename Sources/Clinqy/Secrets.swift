@@ -10,6 +10,7 @@ enum Secrets {
         #"\b(AIza)[A-Za-z0-9_\-]{30,}"#,                 // Google API keys
         #"\b(xox[abprs]-)[A-Za-z0-9\-]{10,}"#,           // Slack tokens
         #"\b(AKIA)[0-9A-Z]{16}\b"#,                      // AWS access key ids
+        #"\b(\d{8,10}:)[A-Za-z0-9_\-]{35}\b"#,           // Telegram bot tokens
         #"(?i)\b((?:aws_secret_access_key|secret|password|passwd|api[_-]?key|token)\s*[=:]\s*)[^\s"',;]{8,}"#,
         #"(?i)\b(bearer\s+)[A-Za-z0-9._\-]{20,}"#,
     ].compactMap { try? NSRegularExpression(pattern: $0) }

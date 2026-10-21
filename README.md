@@ -73,6 +73,16 @@ clinqy doctor             # what's ready
 
 API keys go in the settings file (`clinqy settings` opens it); all the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration). Building from source instead? See [Build & run](#build--run).
 
+## Telegram tasks and attachments (Mac)
+
+Open **Telegram…** from Clinqy's menu to connect your bot and pair your private chat. Send a photo or file with a caption such as “send this image to Onik on WhatsApp” or “summarize this PDF”. Clinqy downloads the attachment to your Mac and gives the task its exact local path.
+
+You can also send files first, then send your instruction, or reply to an earlier attachment. Photos and documents in an album are collected together. Files sent with a caption during a running Telegram task add context to that task; tasks received while the Mac is doing other work keep their files in the queue.
+
+Each file must fit Telegram's hosted Bot API download limit of 20 MB. A failed download reports an error and prevents that message's task from starting. `/status` shows activity or pending files; `/stop` cancels the task, pending downloads, pending files and queued tasks. Downloaded files stay in `~/Library/Application Support/Clinqy/Telegram/` so follow-up tasks can still use them.
+
+Run `tests/telegram.sh` to check attachment handling with mocked API responses, without contacting Telegram.
+
 ## Setup on Windows
 
 Download, paste one prompt into your coding agent, done. It needs Windows 10 (1903 or later) or Windows 11, on x64, and no admin rights.
