@@ -214,7 +214,11 @@ final class Telegram {
         ownsRun = true
         agent.continuation = nil
         agent.selectedFiles = request.files
-        agent.submit(request.prompt, preferBackground: true)
+        // Decided on the user's own words: the file list appended to the prompt would hide a trailing "not in the
+        // background". Said nothing: background, since they're not at the screen.
+        var request = request
+        let background = Background.choice(&request.text) ?? true
+        agent.submit(request.prompt, background: background)
         if agent.isRunning {
             send(request.files.isEmpty ? "On it." : "On it — using \(request.files.count) attached file(s).")
         } else { ownsRun = false }

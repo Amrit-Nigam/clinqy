@@ -770,6 +770,12 @@ enum AXEngine {
 
     static func pressReturn() { press(0x24) }
 
+    /// Return carrying its character, as typed text does: a Catalyst app (WhatsApp) posted to in the background
+    /// takes the typed letters but ignores a bare Return key.
+    static func typeReturn() {
+        keystroke(0x24, text: [13], source: CGEventSource(stateID: .combinedSessionState))
+    }
+
     /// Scrolls the app's focused window; positive is up.
     static func scroll(_ lines: Int32, in app: NSRunningApplication) {
         let root = AXUIElementCreateApplication(app.processIdentifier)

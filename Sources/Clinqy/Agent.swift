@@ -305,10 +305,10 @@ final class Agent: ObservableObject {
         hand = Hand(buddy: buddy)
     }
 
-    /// `preferBackground`: with nothing said either way, work in the background even with the toggle off (the user
-    /// asked from somewhere else, like Telegram, and isn't at the screen).
+    /// `background`: where to work when the request itself says nothing (nil: the toggle decides). Telegram passes
+    /// what the user's own words said, or true, since they're not at the screen.
     func submit(_ raw: String, test: Bool = false, auto: Bool = false, model: String? = nil, provider: Provider? = nil,
-                preferBackground: Bool = false) {
+                background preferred: Bool? = nil) {
         if !auto { autoContinues = 0 }
         var request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !request.isEmpty, !isRunning else { return }
@@ -320,7 +320,7 @@ final class Agent: ObservableObject {
         }
         // "in the background: book a cab" works out of the user's way, "not in the background: …" in front of them;
         // saying nothing follows the toggle (or BACKGROUND_TASKS=1).
-        let background = Background.choice(&request) ?? (preferBackground || Background.always || (auto && runBackground))
+        let background = Background.choice(&request) ?? preferred ?? (Background.always || (auto && runBackground))
         // "continue", "also make the answers": builds on the last task, even when typed or said after the follow-up mic closed.
         if continuation == nil, !test, let last = History.shared.entries.first,
            Date().timeIntervalSince(last.date) < 20 * 60, Router.isFollowUp(request) {
@@ -1865,13 +1865,33 @@ final class Agent: ObservableObject {
                     AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, old as CFString) == .success
                 }
             }
+            var unsent = false
             if submit {
                 try? await Task.sleep(for: .milliseconds(120))
                 hand.press("return")
                 _ = await changed(app, from: context.fingerprint, ms: 500)
+                // A chat box empties once its message goes. Still holding it, in a window with a Send button: Return
+                // didn't send. Try Return with its character, then the Send button, before calling it done.
+                if let field, Self.stillHolds(field, text), let send = Self.sendButton(in: app) {
+                    log("    Return didn't send (the text is still in the box): retrying")
+                    AXEngine.targetPid = app.processIdentifier
+                    AXEngine.typeReturn()
+                    AXEngine.targetPid = nil
+                    try? await Task.sleep(for: .milliseconds(500))
+                    if Self.stillHolds(field, text) {
+                        log("    pressing \(send.label.debugDescription)")
+                        _ = await Task.detached { AXEngine.axPress(send.element) }.value
+                        try? await Task.sleep(for: .milliseconds(600))
+                    }
+                    unsent = Self.stillHolds(field, text)
+                }
             }
             context.fingerprint = await AXEngine.fingerprintAsync(of: app)
             buddy.clearHighlight()
+            if unsent {
+                return end(line, fail("typed \(text.prefix(60).debugDescription) into \(target), but it was NOT sent: Return and the Send "
+                                      + "button both left it in the box. Look at the window before saying it's sent"))
+            }
             return end(line, .init(ok: true, summary: "typed \(text.prefix(60).debugDescription) into \(target)\(submit ? " and pressed Return" : "")"))
 
         case "key":
@@ -2881,7 +2901,7 @@ final class Agent: ObservableObject {
     /// it isn't installed or its extension never connects.
     static func backgroundBrowser() async -> NSRunningApplication? {
         let name = Background.browserName.lowercased()
-        let named = { NSWorkspace.shared.runningApplications.first { $0.cleanName?.lowercased() == name && Launcher.isBrowser($0) } }
+        let named = { Launcher.running(named: name).flatMap { Launcher.isBrowser($0) ? $0 : nil } }
         if let app = named(), BrowserBridge.shared.isConnected(app) { return app }
         // The browser's windows now: any it shows from here on (a profile picker, its startup or profile window) are
         // the run's doing and go to the hidden screen.
@@ -3166,6 +3186,19 @@ final class Agent: ObservableObject {
         var role: CFTypeRef?
         AXUIElementCopyAttributeValue(element, kAXRoleAttribute as CFString, &role)
         return (element, role as? String ?? "", pid)
+    }
+
+    /// The field still shows what was just typed into it (so a Return meant to send it didn't).
+    private static func stillHolds(_ field: AXUIElement, _ text: String) -> Bool {
+        guard let value = axValue(field)?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else { return false }
+        return AXEngine.similar(value, text)
+    }
+
+    /// A chat window's Send button (WhatsApp, Messages, Slack…): only there does a box that kept its text mean unsent.
+    private static func sendButton(in app: NSRunningApplication) -> UIElementInfo? {
+        AXEngine.elements(of: app).first {
+            $0.role == "AXButton" && $0.label.range(of: #"(?i)^\s*send(\s+message)?\s*$"#, options: .regularExpression) != nil
+        }
     }
 
     private static func axValue(_ element: AXUIElement) -> String? {

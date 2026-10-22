@@ -21,11 +21,36 @@ enum Launcher {
 
     static func isBrowser(_ app: NSRunningApplication) -> Bool { browserIDs.contains(app.bundleIdentifier ?? "") }
 
+    /// A copy of a browser another tool drives (Playwright, Puppeteer, a test runner): a throwaway profile with no
+    /// extensions, under a debugging pipe or port. Not the user's browser, so Clinqy neither works in it nor moves it.
+    static func isAutomated(_ app: NSRunningApplication) -> Bool {
+        let pid = app.processIdentifier
+        if let known = automated[pid] { return known }
+        var size = 0
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid]
+        var args = ""
+        if sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 {
+            var buffer = [CChar](repeating: 0, count: size)
+            if sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 {
+                args = String(decoding: buffer.prefix(size).map { UInt8(bitPattern: $0 == 0 ? 32 : $0) }, as: UTF8.self)
+            }
+        }
+        let found = args.contains("--remote-debugging-pipe") || args.contains("--remote-debugging-port")
+            || args.contains("playwright_") || args.contains("puppeteer_") || args.contains("--enable-automation")
+        automated[pid] = found
+        return found
+    }
+    private static var automated: [pid_t: Bool] = [:]
+
+    /// The running app called `name` (lowercased), leaving out browsers another tool drives.
+    static func running(named name: String) -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { $0.cleanName?.lowercased() == name && !isAutomated($0) }
+    }
+
     /// Brings a running app (or finds and launches one by name) to the front with its window loaded.
     static func open(appNamed name: String) async -> NSRunningApplication? {
         let wanted = name.lowercased().replacingOccurrences(of: ".app", with: "")
-        let url = NSWorkspace.shared.runningApplications
-            .first { $0.cleanName?.lowercased() == wanted }?.bundleURL ?? find(named: wanted)
+        let url = running(named: wanted)?.bundleURL ?? find(named: wanted)
         guard let url else { return nil }
         return await launch(url)
     }

@@ -521,7 +521,7 @@ final class Hand {
     /// Opens an app like a person: click its Dock icon, or use Spotlight if it isn't in the Dock.
     func openApp(named name: String) async -> NSRunningApplication? {
         let wanted = name.lowercased().replacingOccurrences(of: ".app", with: "")
-        let running = NSWorkspace.shared.runningApplications.first { $0.cleanName?.lowercased() == wanted }
+        let running = Launcher.running(named: wanted)
         let url = running?.bundleURL ?? Launcher.find(named: wanted)
         guard let url else { return nil }
         let appName = url.deletingPathExtension().lastPathComponent
