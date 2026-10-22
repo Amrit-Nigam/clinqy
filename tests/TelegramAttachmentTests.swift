@@ -8,31 +8,47 @@ enum Config {
     static func write(_ values: [String: String]) throws {}
 }
 enum Secrets { static func mask(_ text: String) -> String { text } }
-struct ResultCard {
-    struct Item { var title: String; var subtitle: String?; var link: String? }
+struct ResultCard: Equatable {
+    struct Item: Equatable { var title: String; var subtitle: String?; var detail: String? = nil; var link: String? }
+    var title = "Result"
+    var text: String? = nil
     var items: [Item] = []
+    var plain: String { ([title] + [text].compactMap { $0 } + items.map { [$0.title, $0.subtitle, $0.detail, $0.link].compactMap { $0 }.joined(separator: " — ") }).joined(separator: "\n") }
+}
+enum Background {
+    static func choice(_ text: inout String) -> Bool? { nil }
 }
 @MainActor final class Agent {
     struct Question { var text: String; var sensitive = false }
-    struct Step { var text: String }
+    struct Step {
+        enum State { case running, ok, failed, info }
+        var text: String
+        var state: State = .ok
+    }
     var isRunning = false
     var question: Question?
     var steps: [Step] = []
+    var narration = ""
+    var telegramPageURL: String? = nil
+    var screenshot: Data? = nil
+    var captures = 0
     var continuation: String?
     var selectedFiles: [URL] = []
     var submitted: [String] = []
     var notes: [String] = []
     var answers: [String] = []
-    func submit(_ text: String, preferBackground: Bool) { submitted.append(text); isRunning = true }
+    func submit(_ text: String, background: Bool) { submitted.append(text); isRunning = true }
     func addContext(_ text: String) { notes.append(text) }
-    func answer(_ text: String) { answers.append(text) }
+    func answer(_ text: String) { answers.append(text); question = nil }
     func cancel() { isRunning = false }
+    func telegramScreenshot() async -> Data? { captures += 1; return screenshot }
     static func writeLog(_ text: String) {}
 }
 
 final class TelegramAPI: URLProtocol {
     static let lock = NSLock()
     static var requests: [(String, [String: Any])] = []
+    static var rawRequests: [(String, Data)] = []
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -50,7 +66,10 @@ final class TelegramAPI: URLProtocol {
             data = result
         }
         let body = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
-        Self.lock.withLock { Self.requests.append((method, body)) }
+        Self.lock.withLock {
+            Self.requests.append((method, body))
+            Self.rawRequests.append((method, data ?? Data()))
+        }
         let payload: Data
         var status = 200
         if method == "getFile" {
@@ -60,7 +79,7 @@ final class TelegramAPI: URLProtocol {
             payload = Data("file".utf8)
             if method == "broken.jpg" { status = 500 }
         } else {
-            payload = Data(#"{"ok":true,"result":true}"#.utf8)
+            payload = Data(#"{"ok":true,"result":{"message_id":123}}"#.utf8)
         }
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: payload)
@@ -163,6 +182,88 @@ final class TelegramAPI: URLProtocol {
         stopped.handle(message(["text": "/stop"]))
         try await Task.sleep(for: .milliseconds(1000))
         check(stoppedAgent.submitted.isEmpty && !TelegramAPI.fileIDs().contains("stop-album"), "stop cancels pending album ingestion")
-        print("All Telegram attachment tests passed.")
+        // Conversational commands remain separate from the worker's answers/context.
+        check(Telegram.formKey(url: "test/form", answers: [("City", "Delhi")]) != Telegram.formKey(url: "test/form", answers: [("City", "Pune")]), "form changes invalidate an earlier submission approval")
+        check(Telegram.formKey(url: "test/form", answers: [("City", "Delhi")]) != Telegram.formKey(url: "test/other-form", answers: [("City", "Delhi")]), "submission approval cannot transfer to another form")
+        check(Telegram.intent("Can you send me an image of what you're doing right now?") == .screenshot, "conversational screenshot phrasing")
+        check(Telegram.intent("How much work is done?") == .status, "natural-language progress intent")
+        check(Telegram.intent("show me a screenshot") == .screenshot, "natural-language screenshot intent")
+        check(Telegram.intent("set the status to available") == nil, "task text is not mistaken for a command")
+        check(Telegram.intent("what did you fill?") == .result, "natural-language form review intent")
+        let (conversation, worker) = bridge()
+        conversation.handle(message(["text": "fill the sample form"]))
+        try await wait { worker.submitted.count == 1 }
+        worker.steps = [.init(text: "Opened form"), .init(text: "Filled name"), .init(text: "Waiting", state: .running)]
+        worker.narration = "Filling the contact details"
+        worker.question = .init(text: "Which location?")
+        conversation.ask("Which location?", options: ["Delhi", "Mumbai"], sensitive: false)
+        try await wait { TelegramAPI.replies().contains { $0.contains("I need your input: Which location?") } }
+        conversation.handle(message(["text": "how far along?"]))
+        try await wait { TelegramAPI.replies().contains { $0.contains("Waiting on you: Which location?") && $0.contains("2 steps completed") } }
+        check(worker.answers.isEmpty && worker.notes.isEmpty, "progress does not answer or steer the pending question")
+
+        let option = TelegramAPI.lock.withLock {
+            TelegramAPI.requests.reversed().compactMap { _, body -> String? in
+                guard let markup = body["reply_markup"] as? [String: Any], let rows = markup["inline_keyboard"] as? [[[String: String]]] else { return nil }
+                return rows.flatMap { $0 }.first { $0["text"] == "Delhi" }?["callback_data"]
+            }.first!
+        }
+        func tap(_ data: String, chat: Int = 42) -> [String: Any] {
+            ["id": UUID().uuidString, "message": message(["message_id": 123], chat: chat), "data": data]
+        }
+        conversation.handleTap(tap(option))
+        check(worker.answers == ["Delhi"], "current question option answers the worker")
+        worker.question = .init(text: "Which role?")
+        conversation.ask("Which role?", options: ["Engineer"], sensitive: false)
+        conversation.handleTap(tap(option))
+        check(worker.answers == ["Delhi"], "old question button cannot answer the next question")
+        conversation.handleTap(tap(option, chat: 99))
+        check(worker.answers == ["Delhi"], "unpaired callback cannot answer questions")
+
+        // Screenshot commands upload only the worker's supplied image, without consuming the answer.
+        worker.screenshot = Data("test-image".utf8)
+        conversation.handle(message(["text": "/screenshot"]))
+        try await wait { TelegramAPI.lock.withLock { TelegramAPI.rawRequests.contains { $0.0 == "sendPhoto" } } }
+        check(worker.captures == 1 && worker.answers.count == 1, "screenshot request does not consume a pending answer")
+        let photoBody = TelegramAPI.lock.withLock { TelegramAPI.rawRequests.first { $0.0 == "sendPhoto" }!.1 }
+        check(String(data: photoBody, encoding: .utf8)?.contains("test-image") == true, "screenshot delivered as multipart photo upload")
+        worker.question = .init(text: "Secret internal password prompt", sensitive: true)
+        conversation.ask(worker.question!.text, options: ["secret"], sensitive: true)
+        conversation.handle(message(["text": "/screenshot"]))
+        conversation.handle(message(["text": "/status"]))
+        try await wait { TelegramAPI.replies().contains { $0.contains("screenshots are paused") } }
+        check(worker.captures == 1, "screenshots blocked while waiting for private input")
+        check(!TelegramAPI.replies().contains { $0.contains("Secret internal password prompt") }, "sensitive question text stays off Telegram")
+        conversation.handle(message(["text": "secret answer"]))
+        try await wait { TelegramAPI.replies().contains { $0.contains("That one's private") } }
+        check(worker.answers == ["Delhi"], "private answers cannot arrive through Telegram")
+        worker.question = nil
+
+        let largeReview = ResultCard(title: "Form review", text: "All required fields filled", items: (0..<25).map {
+            .init(title: "Field \($0)", subtitle: String(repeating: "value ", count: 60), detail: "detail \($0)", link: nil)
+        })
+        conversation.present(largeReview)
+        try await wait { TelegramAPI.replies().contains { $0.contains("Field 24") } }
+        check(TelegramAPI.replies().contains { $0.contains("detail 24") }, "full review includes every field and detail across message chunks")
+        let unicode = String(repeating: "👩🏽‍💻", count: 1000)
+        let chunks = Telegram.chunks(unicode)
+        check(chunks.joined() == unicode && chunks.allSatisfy { $0.utf16.count <= 3800 }, "long messages split within Telegram limits without losing Unicode")
+        worker.isRunning = false
+        conversation.finished(answer: "Filled, not submitted", ok: true, result: largeReview)
+        try await wait { TelegramAPI.lock.withLock { TelegramAPI.rawRequests.filter { $0.0 == "sendPhoto" }.count >= 2 } }
+        conversation.handle(message(["text": "/screenshot"]))
+        try await wait { TelegramAPI.lock.withLock { TelegramAPI.rawRequests.filter { $0.0 == "sendPhoto" }.count >= 3 } }
+        check(worker.captures == 2, "completed screenshot is saved and reused without recapturing another window")
+        let resultStart = TelegramAPI.replies().count
+        conversation.handle(message(["text": "/result"]))
+        try await wait { TelegramAPI.replies().dropFirst(resultStart).contains { $0.contains("Filled, not submitted") } }
+        check(TelegramAPI.replies().dropFirst(resultStart).contains { $0.contains("Filled, not submitted") }, "result command includes the completion status alongside form fields")
+        conversation.handle(message(["text": "change the location to Pune"]))
+        try await wait { worker.submitted.count == 2 }
+        check(worker.submitted.last!.contains("Previous Telegram task") && worker.submitted.last!.contains("Filled, not submitted"), "follow-ups retain the previous task and result")
+        conversation.handleTap(tap(option))
+        check(worker.answers.count == 1, "old question buttons remain invalid after a new task")
+        conversation.handle(message(["text": "/stop"]))
+        print("All Telegram attachment and conversation tests passed.")
     }
 }

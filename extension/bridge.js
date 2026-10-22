@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.5";
+const SCRIPT_VERSION = "1.9.6";
 let socket = null;
 let retry = 1000;
 
@@ -382,6 +382,14 @@ async function handle(msg) {
     if (!/^(https?|file):/.test(tab.url || "")) return { focused: !!win.focused, text: "" };
     const found = (await callAll(tab.id, "selection")).sort((a, b) => a.frameId - b.frameId).map((r) => r.result).find((t) => t && t.trim());
     return { focused: !!win.focused, text: found || "" };
+  }
+  if (msg.cmd === "captureTask") {
+    // The debugger helper only accepts tabs opened by Clinqy. Never activate a tab or capture the user's display.
+    if (msg.tabId == null) throw new Error("task screenshot requires an explicit tab");
+    const captured = await cdp(tab.id, "Page.captureScreenshot", {
+      format: "png", fromSurface: true, captureBeyondViewport: false
+    });
+    return { image: captured.data, tabId: tab.id };
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);

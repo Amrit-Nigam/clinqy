@@ -58,11 +58,11 @@ enum Screenshot {
     }
 
     /// A clean, full-resolution PNG of the app's main window (what ⌃⌘⇧4 on that window would copy).
-    static func windowPNG(app: NSRunningApplication) async -> Data? {
+    static func windowPNG(app: NSRunningApplication, windowID: CGWindowID? = nil) async -> Data? {
         guard CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
               let window = content.windows
-                .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 })
+                .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 && (windowID == nil || $0.windowID == windowID) })
                 .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
         else { return nil }
         let config = SCStreamConfiguration()

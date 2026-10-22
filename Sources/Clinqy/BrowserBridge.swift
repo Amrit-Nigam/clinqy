@@ -160,7 +160,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.9.5"
+    static let extensionVersion = "1.9.6"
     /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
     /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
     private var reloadAsked: [String: Int] = [:]
@@ -292,6 +292,26 @@ final class BrowserBridge {
         var page = parse(r, connection: tab.connection)
         page.pinned = true
         return page
+    }
+
+    /// Captures one owned task tab through the extension. Capturing a hidden tab can take longer than a normal command.
+    func taskScreenshot(of tab: TabInfo) async -> Data? {
+        guard let conn = connections[tab.connection] else {
+            Agent.writeLog("telegram screenshot: task browser disconnected")
+            return nil
+        }
+        do {
+            let reply = try await request(conn, ["cmd": "captureTask", "tabId": tab.id], timeout: 12)
+            guard let base64 = reply["image"] as? String, let image = Data(base64Encoded: base64) else {
+                Agent.writeLog("telegram screenshot: browser returned no image")
+                return nil
+            }
+            Agent.writeLog("telegram screenshot: captured \(image.count) bytes from task tab")
+            return image
+        } catch {
+            Agent.writeLog("telegram screenshot: \(error.localizedDescription)")
+            return nil
+        }
     }
 
     /// Runs a tab-level command (newTab, goBack, navigate) in the browser that owns `tab`.

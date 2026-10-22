@@ -81,7 +81,13 @@ You can also send files first, then send your instruction, or reply to an earlie
 
 Each file must fit Telegram's hosted Bot API download limit of 20 MB. A failed download reports an error and prevents that message's task from starting. `/status` shows activity or pending files; `/stop` cancels the task, pending downloads, pending files and queued tasks. Downloaded files stay in `~/Library/Application Support/Clinqy/Telegram/` so follow-up tasks can still use them.
 
-Run `tests/telegram.sh` to check attachment handling with mocked API responses, without contacting Telegram.
+Telegram is also the conversation for tasks started there. Clinqy asks for missing information in the chat; reply in words or use the question's buttons. Passwords and codes stay on the Mac. Question buttons expire after an answer, so an old button cannot approve a later request.
+
+Ask “how much work is done?” or `/status` for the current stage, completed step count, elapsed time and anything waiting on you. Changed stages get a quiet update about every 45 seconds. “Show me a screenshot” or `/screenshot` sends the task's own tab/window without switching away from your work. The browser extension captures only Clinqy's tabs; screenshots pause during private-input questions. The final task image is saved in the conversation and can be requested again.
+
+Use `/result` or “what did you fill?” for the full result card, including every form field, warnings and links. Long results span multiple messages. Before a Telegram task submits a form, it sends the actual answers and asks for **Submit** or **Edit**. Editing the answers or moving to another form requires a new review. Completion distinguishes filling from submission and includes the result card and a final screenshot when available. Follow-ups such as “change the location to Pune” keep the previous Telegram task and output as context for 30 minutes.
+
+Run `tests/telegram.sh` and `node tests/telegram-screenshot.mjs` to check conversation routing, attachment handling and screenshot targeting with mocked APIs. `tests/site/telegram-review.html` is a local-only demo form for background conversation checks; it never sends an application anywhere.
 
 ## Setup on Windows
 

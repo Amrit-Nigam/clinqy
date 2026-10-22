@@ -52,7 +52,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              onCircle: { [weak self] in self?.startCircling() })
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
-        agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
+        agent.onResult = { [weak self] in
+            guard let self, let result = self.agent.result else { return }
+            Telegram.shared.present(result)
+            if !self.agent.runBackground { self.resultPanel.show() }
+        }
         // Review before submit: the form's answers come up in the bar; it goes away once the user decides.
         UI.agent = agent
         UI.present = { [weak self] in self?.panel.showCentered(); self?.island.show() }
@@ -122,7 +126,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.setStatusIcon(running: false)
             self.island.show(for: 4.5)
             // Stopped by the user: bring the bar back so they can say what to do differently ("no, the other one").
-            if !ok, answer == "Stopped", !self.agent.isTest, !self.voiceRun {
+            if !ok, answer == "Stopped", !self.agent.isTest, !self.agent.runBackground, !self.voiceRun {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     guard let self, !self.agent.isRunning, !self.panel.isVisible, !Recorder.shared.isRecording else { return }
                     self.panel.showCentered()

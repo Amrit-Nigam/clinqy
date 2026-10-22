@@ -29,6 +29,36 @@ final class Agent: ObservableObject {
     /// Set while the run is paused waiting for the user's answer.
     @Published var question: Question?
     private var answerWaiter: CheckedContinuation<String?, Never>?
+    private var telegramTab: BrowserBridge.TabInfo?
+    private var telegramWindow: (app: NSRunningApplication, id: CGWindowID)?
+    private var telegramApprovedForm: String?
+    var telegramPageURL: String? { telegramTab?.url }
+
+    /// Captures the exact worker tab/window without selecting it or reading the user's foreground desktop.
+    func telegramScreenshot() async -> Data? {
+        guard question?.sensitive != true else { return nil }
+        // finish() has already released Background.tab; Background.last is the exact tab it just released.
+        if let tab = telegramTab ?? (Telegram.shared.ownsRun ? Background.tab : Background.last.tab) {
+            return await BrowserBridge.shared.taskScreenshot(of: tab)
+        }
+        guard let window = telegramWindow, !window.app.isTerminated else {
+            Self.writeLog("telegram screenshot: no task tab or owned native window available")
+            return nil
+        }
+        return await Screenshot.windowPNG(app: window.app, windowID: window.id)
+    }
+
+    private func rememberTelegramTarget(app: NSRunningApplication?, page: BrowserBridge.Page?) {
+        guard Telegram.shared.ownsRun else { return }
+        if let page, let id = page.tabId {
+            telegramTab = .init(id: id, url: page.url, connection: page.connection)
+            telegramWindow = nil
+        } else if let app, !Launcher.isBrowser(app),
+                  let window = AgentScreen.windows().first(where: { $0.pid == app.processIdentifier }) {
+            telegramTab = nil
+            telegramWindow = (app, window.id)
+        }
+    }
     /// Answers the user marked private; masked in the log.
     private var secrets: [String] = []
     var onQuestion: () -> Void = {}
@@ -170,11 +200,24 @@ final class Agent: ObservableObject {
         // Picking an option or ticking a box sends nothing, whatever its label says ("Send a notification to the
         // following SNS topic" is a choice in a form); only a control that acts needs the user's OK.
         guard Self.acts(role) else { return nil }
-        if !userConfirmed, let page, Self.isFormSubmit(label), let ok = await reviewBeforeSubmit(page) {
-            return ok ? nil : Self.editedReview
+        if let page, Self.isFormSubmit(label) {
+            if Telegram.shared.ownsRun {
+                guard let ok = await reviewBeforeSubmit(page) else {
+                    return "Couldn't read the form for your Telegram review. Do not submit; report this and ask the user to check it on the Mac."
+                }
+                return ok ? nil : Self.editedReview
+            }
+            if !userConfirmed, let ok = await reviewBeforeSubmit(page) { return ok ? nil : Self.editedReview }
         }
         return await confirmRisky(label) ? nil
             : "the user said not to click \(label.prefix(40).debugDescription); stop and tell them where things stand"
+    }
+
+    /// Return can submit a web form just like clicking its final button. It needs the same review.
+    private func approveReturn(_ page: BrowserBridge.Page?) async -> String? {
+        guard Telegram.shared.ownsRun, let page,
+              let submit = page.elements.first(where: { Self.acts($0.role) && Self.isFormSubmit($0.text) }) else { return nil }
+        return await approve(submit.text, role: submit.role, page: page)
     }
 
     /// A final summary that itself lists work still to do ("Steps 1–6 partly done … Still to do: …"), unless what's
@@ -246,7 +289,9 @@ final class Agent: ObservableObject {
     /// ("apply to the Headout role, message someone, or something else?"), which the user has to answer in words.
     private static func asksToSubmit(_ action: [String: Any]) -> Bool {
         let q = action["question"] as? String ?? ""
-        guard (action["options"] as? [Any] ?? []).count <= 2, !q.contains(" or ") else { return false }
+        let options = (action["options"] as? [String] ?? []).map { $0.lowercased() }
+        if options.contains("submit"), options.contains("edit") { return true }
+        guard options.count <= 2, !q.contains(" or ") else { return false }
         return q.range(of: #"(?i)(\b(ready to|shall i|should i|ok(ay)? to|go ahead( and)?|can i|want me to|confirm|good to)\b[^?]{0,40}\b(submit|apply|send)\b|^\s*(submit|apply|send)\b[^?]{0,40}\?)"#,
                        options: .regularExpression) != nil
     }
@@ -271,8 +316,37 @@ final class Agent: ObservableObject {
             guard let q = i["q"] as? String, !q.isEmpty else { return nil }
             return (q, i["answer"] as? String ?? "")
         }
-        guard pairs.count >= 2 else { return nil }
+        guard pairs.count >= (Telegram.shared.ownsRun ? 1 : 2) else { return nil }
         reviewedForm = true
+        if Telegram.shared.ownsRun {
+            let formKey = Telegram.formKey(url: page.url, answers: pairs)
+            if telegramApprovedForm == formKey { return true }
+            let cards = items.compactMap { item -> ResultCard.Item? in
+                guard let label = item["q"] as? String else { return nil }
+                let value = item["answer"] as? String ?? ""
+                return .init(title: label, subtitle: value.isEmpty ? "(empty)" : value,
+                             detail: value.isEmpty && item["required"] as? Bool == true ? "⚠️ required — empty" : nil, link: nil)
+            }
+            let missing = r["missing"] as? [String] ?? []
+            let card = ResultCard(title: "Review before submitting: " + String(page.title.prefix(70)),
+                                  text: missing.isEmpty ? "Check these answers before submitting." : "Required answers missing: " + missing.joined(separator: "; "), items: cards)
+            runResult = card; result = card; onResult()
+            Telegram.shared.present(card)
+            let reply = await askUser("Please review the answers above. Submit this form, or tell me what to change?", options: ["Submit", "Edit"])
+            guard let reply, !Task.isCancelled else { return false }
+            let approve = reply.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "submit" || Safety.isYes(reply)
+            // A required field known to be empty cannot be approved by an old or generic yes.
+            telegramApprovedForm = approve && missing.isEmpty ? formKey : nil
+            if telegramApprovedForm != nil { userConfirmed = true; return true }
+            userConfirmed = false
+            reviewedForm = false
+            if approve && !missing.isEmpty {
+                UI.lastReviewNote = "Fill the required fields: " + missing.joined(separator: "; ")
+            } else if reply.lowercased() == "edit" {
+                UI.lastReviewNote = await askUser("What should I change in the form?")
+            } else { UI.lastReviewNote = reply }
+            return false
+        }
         let ok = await UI.reviewBeforeSubmit(items: pairs, title: String((r["title"] as? String ?? page.title).prefix(70)))
         lastProgress = Date()
         if ok { userConfirmed = true }
@@ -291,6 +365,7 @@ final class Agent: ObservableObject {
         }
         guard let waiter = answerWaiter else { return }
         answerWaiter = nil
+        Telegram.shared.dismissQuestion()
         Notifier.clearQuestion()
         lastProgress = Date()   // time spent answering isn't "stuck"
         question = nil
@@ -403,6 +478,9 @@ final class Agent: ObservableObject {
         userConfirmed = false
         secrets = []
         runID = UUID().uuidString
+        telegramTab = nil
+        telegramWindow = nil
+        telegramApprovedForm = nil
         clickCount = 0
         startPlace = (nil, nil, nil)
         openedLast = false
@@ -489,6 +567,7 @@ final class Agent: ObservableObject {
             }
             let observeStart = Date()
             let obs = await Observation.capture(app)
+            rememberTelegramTarget(app: obs.app, page: obs.page)
             let observeMs = Int(Date().timeIntervalSince(observeStart) * 1000)
             if observeMs > 400 { log("  observe: \(observeMs) ms") }
             if turn == 0, continuation == nil, qa == nil {
@@ -969,7 +1048,7 @@ final class Agent: ObservableObject {
         // "What/Who should I put for …?" asks for a detail, not for a go-ahead.
         if question.range(of: #"(?i)\b(what|which|who|whom|where|when|how much|how many)\b.*\bshould i (put|enter|use|write|fill|type|say|give|choose|select|answer|add|list|mention)\b"#,
                           options: .regularExpression) != nil { return false }
-        return question.range(of: #"(?i)\b(submit|send it|should i|shall i|go ahead|ready to|confirm|okay to|ok to)\b"#, options: .regularExpression) != nil
+        return question.range(of: #"(?i)\b(submit(?:ting)?|approv(?:e|al)|proceed|send it|should i|shall i|go ahead|ready to|confirm|okay to|ok to)\b"#, options: .regularExpression) != nil
     }
 
     /// The profile's answer to an ask that's a single form question it covers, as (question, answer).
@@ -1127,6 +1206,13 @@ final class Agent: ObservableObject {
         Running apps: \(running.joined(separator: ", "))
         Default browser: \(Launcher.defaultBrowserName ?? "unknown")
         """
+        if Telegram.shared.ownsRun {
+            text += "\nThe user is talking to you through Telegram. Ask for missing input with ask; they can answer remotely. "
+                + "Use short, concrete say messages describing the current stage. For forms and applications, use review after filling each page "
+                + "and before finishing, so the user gets the actual field labels and answers. Use show for structured output. "
+                + "Distinguish filled, waiting for approval, submitted and confirmed in the final answer. Include what changed, what remains, "
+                + "and any confirmation number or result link that you actually saw. Never claim submission from filling alone."
+        }
         if runBackground {
             text += "\nWorking in the background: the user keeps using their Mac meanwhile, so what they have in front isn't "
                 + "yours to use. Start by opening the site (open_url, in your own browser window behind theirs) or the app you "
@@ -1596,7 +1682,11 @@ final class Agent: ObservableObject {
                 guard let r = try? await BrowserBridge.shared.perform("fill", on: page, ["index": el.index, "text": text]) else {
                     return end(line, fail("\(el.text.prefix(30)) isn't a text box"))
                 }
-                if action["submit"] as? Bool == true { await pagePress("return", page); try? await Task.sleep(for: .milliseconds(500)) }
+                if action["submit"] as? Bool == true {
+                    if let why = await approveReturn(page) { return end(line, fail(why)) }
+                    await pagePress("return", page)
+                    try? await Task.sleep(for: .milliseconds(500))
+                }
                 buddy.clearHighlight()
                 return end(line, .init(ok: true, summary: "set \((r["value"] as? String ?? text).prefix(60).debugDescription) in \(el.role) \(el.text.prefix(40).debugDescription)\(action["submit"] as? Bool == true ? " and pressed Return" : "")"))
             }
@@ -1636,6 +1726,7 @@ final class Agent: ObservableObject {
                 }
             }
             if action["submit"] as? Bool == true {
+                if let why = await approveReturn(page) { return end(line, fail(why)) }
                 try? await Task.sleep(for: .milliseconds(120))
                 await pagePress("return", page)
                 try? await Task.sleep(for: .milliseconds(500))
@@ -1694,6 +1785,7 @@ final class Agent: ObservableObject {
                 }
             }
             if action["submit"] as? Bool == true {
+                if let why = await approveReturn(page) { return end(line, fail(why)) }
                 try? await Task.sleep(for: .milliseconds(120))
                 await pagePress("return", page)
                 try? await Task.sleep(for: .milliseconds(500))
@@ -1897,6 +1989,8 @@ final class Agent: ObservableObject {
         case "key":
             guard let keys = action["keys"] as? String else { return fail("key needs keys") }
             let line = begin("Press \(keys)")
+            if keys.lowercased().range(of: #"(?:^|[+ ])(return|enter)(?:$|[+ ])"#, options: .regularExpression) != nil,
+               let why = await approveReturn(context.page) { return end(line, fail(why)) }
             if let app = context.app { await Launcher.bringToFront(app) }
             guard await pagePress(keys, context.page) else { return end(line, fail(hand.refusal ?? "couldn't press \(keys)")) }
             var didChange = false
@@ -2028,9 +2122,9 @@ final class Agent: ObservableObject {
             hand.lingerBeforeHome = 3.5
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
 
-        case "ask" where !reviewedForm && !userConfirmed && context.page != nil && Self.asksToSubmit(action):
+        case "ask" where (Telegram.shared.ownsRun || (!reviewedForm && !userConfirmed)) && context.page != nil && Self.asksToSubmit(action):
             // "Ready to submit?" is answered by the review: every answer on the form, with Submit or Edit.
-            reviewedForm = true   // once per run, whatever happens
+            reviewedForm = true   // local review shown once; Telegram edits can require another review
             let line = begin("Review before submitting")
             guard let ok = await reviewBeforeSubmit(context.page!) else { return await perform(action, context: &context) }   // no form: just ask
             return end(line, ok ? .init(ok: true, summary: "the user checked every answer on the form and approved submitting: submit now, without asking again")
@@ -2044,7 +2138,7 @@ final class Agent: ObservableObject {
             log("  profile answers “\(q.prefix(60))”")
             return .init(ok: false, summary: "NOT ASKED — the job-application profile already answers this: \(q) → \(a). Use it.")
 
-        case "ask" where !memoryCheckedAsks.contains(action["question"] as? String ?? ""):
+        case "ask" where !Self.isConfirmation(action["question"] as? String ?? "") && !memoryCheckedAsks.contains(action["question"] as? String ?? ""):
             // Before bothering the user, look in memory (once per question): each part of the question is matched like
             // a form field ("your 10th and 12th details: board, percentage" → the school marks fact), and a question
             // for their own details also gets a full search. Facts already shown don't stop it: the model saw them.
@@ -2079,12 +2173,7 @@ final class Agent: ObservableObject {
             let options = (action["options"] as? [String]) ?? []
             let sensitive = action["sensitive"] as? Bool ?? false
             let line = begin("Ask: \(text.prefix(60))")
-            phase = .waiting
-            buddy.mood = .idle
-            buddy.bubble("need your input", for: 4)
-            question = Question(text: text, options: options, sensitive: sensitive)
-            onQuestion()
-            let reply = await withCheckedContinuation { answerWaiter = $0 }
+            let reply = await askUser(text, options: options, sensitive: sensitive)
             guard let reply, !reply.isEmpty, !Task.isCancelled else {
                 return end(line, fail("the user didn't answer; stop here and say what's still needed"))
             }
@@ -2098,8 +2187,8 @@ final class Agent: ObservableObject {
             }
             phase = .acting
             buddy.mood = .acting
-            if let app = context.app { await Launcher.bringToFront(app) }
-            return end(line, .init(ok: true, summary: "the user answered: \(reply)"))
+            if !runBackground, let app = context.app { await Launcher.bringToFront(app) }
+            return end(line, .init(ok: true, summary: sensitive ? "the user supplied the private input" : "the user answered: \(reply)"))
 
         case "show":
             guard let card = ResultCard(action: action) else { return fail("show needs text or items") }
@@ -3002,6 +3091,7 @@ final class Agent: ObservableObject {
     }
 
     private func refresh(_ context: inout ActionContext) async {
+        defer { rememberTelegramTarget(app: context.app, page: context.page) }
         guard let app = context.app else { return }
         let scan = await AXEngine.scan(app)
         context.elements = scan.elements
