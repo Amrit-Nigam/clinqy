@@ -39,6 +39,11 @@ final class History: ObservableObject {
     }
 
     func add(_ entry: Entry) {
+        var entry = entry
+        // A token a command printed mustn't be kept in History (it's shown, and sent back to the model on "continue").
+        entry = Entry(id: entry.id, date: entry.date, request: entry.request, answer: Secrets.mask(entry.answer), ok: entry.ok,
+                      steps: entry.steps.map(Secrets.mask), app: entry.app, result: entry.result, trace: entry.trace,
+                      readText: entry.readText.map(Secrets.mask), task: entry.task)
         entries.insert(entry, at: 0)
         if entries.count > 200 { entries.removeLast(entries.count - 200) }
         save()

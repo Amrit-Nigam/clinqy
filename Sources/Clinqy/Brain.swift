@@ -342,11 +342,18 @@ enum Brain {
 
     /// Pulls the JSON object out of a reply, tolerating code fences or stray prose around it.
     static func json(from reply: String) -> [String: Any]? {
+        let envelope = { (obj: [String: Any]) -> [String: Any] in
+            // A bare action ({"do":"ask",…}) instead of the reply envelope: run it as the turn's only action.
+            obj["do"] != nil && obj["actions"] == nil ? ["say": "", "actions": [obj], "done": false] : obj
+        }
         if let start = reply.firstIndex(of: "{"), let end = reply.lastIndex(of: "}"), start < end,
            let obj = try? JSONSerialization.jsonObject(with: Data(reply[start...end].utf8)) as? [String: Any] {
-            // A bare action ({"do":"ask",…}) instead of the reply envelope: run it as the turn's only action.
-            if obj["do"] != nil, obj["actions"] == nil { return ["say": "", "actions": [obj], "done": false] }
-            return obj
+            return envelope(obj)
+        }
+        // A reply that "corrects" itself ("Wait — correcting format: {…}") or wraps the JSON in stray tool tags holds
+        // more than one object: the last complete reply object is the one meant.
+        for obj in objects(in: reply).reversed() where obj["actions"] != nil || obj["say"] != nil || obj["do"] != nil {
+            return envelope(obj)
         }
         // Sometimes the model writes tool-call tags instead (`<invoke name="scroll"><parameter name="dir">up</parameter>…`):
         // read every one, with its parameters, as an action.
@@ -381,6 +388,33 @@ enum Brain {
             i = text.index(after: i)
         }
         return nil
+    }
+
+    /// Every complete top-level {…} in `text` that parses as a JSON object, in order.
+    static func objects(in text: String) -> [[String: Any]] {
+        var found: [[String: Any]] = []
+        var depth = 0, inString = false, escaped = false
+        var start: String.Index?
+        var i = text.startIndex
+        while i < text.endIndex {
+            let c = text[i]
+            if inString {
+                if escaped { escaped = false } else if c == "\\" { escaped = true } else if c == "\"" { inString = false }
+            } else if c == "\"" {
+                inString = depth > 0
+            } else if c == "{" {
+                if depth == 0 { start = i }
+                depth += 1
+            } else if c == "}", depth > 0 {
+                depth -= 1
+                if depth == 0, let s = start,
+                   let obj = try? JSONSerialization.jsonObject(with: Data(text[s...i].utf8)) as? [String: Any] {
+                    found.append(obj)
+                }
+            }
+            i = text.index(after: i)
+        }
+        return found
     }
 
     static func invokes(in reply: String) -> [String: Any]? {

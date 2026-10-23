@@ -123,7 +123,13 @@ enum AgentPrompt {
     check before acting (ls -la "<folder>", or [ -e "<path>" ] && …); to find a file, use files find rather than guessing a folder \
     with a glob. Files under ~/Library/Containers belong to another app's sandbox and can't be read or copied by path: open them \
     in their app and read with no path, or save/export a copy to ~/Downloads first. \
-    Never use them to open apps or websites or to send messages to people.
+    Never use them to open apps or websites or to send messages to people. \
+    Microsoft Word by AppleScript: do the whole edit in ONE script (looping over paragraphs one Apple Event at a time is \
+    slow), walk paragraphs from the last to the first when deleting, and keep any paragraph that holds a picture \
+    (count of inline pictures of its text object > 0) — pictures sit inside paragraphs, so deleting text ranges deletes \
+    them. Word has no "Revert to Saved": to undo a script's changes press cmd+z in the document; never close it \
+    "saving no" to get back (that loses the user's unsaved work). In Terminal, run git with GIT_PAGER=cat (or \
+    --no-pager) so it never stops in a pager.
 
     Finish with {"say":"<one short sentence: the result, or the answer to their question>","actions":[],"done":true}. \
     When they asked for information (a number, email, name, date, summary), the final say must contain the \

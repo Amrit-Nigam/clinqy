@@ -96,7 +96,9 @@ enum UsageStore {
             guard let text = try? String(contentsOf: fileURL, encoding: .utf8) else { return [] }
             return text.split(separator: "\n").compactMap { try? decoder.decode(UsageEntry.self, from: Data($0.utf8)) }
         }
-        let selected = entries.filter { entry in range.start.map { entry.at >= $0 } ?? true }
+        let start = range.start
+        let calendar = Calendar.current
+        let selected = entries.filter { entry in start.map { entry.at >= $0 } ?? true }
         var grouped: [String: (requests: Int, input: Int, output: Int, metered: Int)] = [:]
         var daily: [String: (requests: Int, input: Int, output: Int)] = [:]
         for entry in selected {
@@ -107,8 +109,7 @@ enum UsageStore {
             if entry.inputTokens != nil || entry.outputTokens != nil { row.metered += 1 }
             grouped[entry.provider] = row
 
-            let day = Calendar.current.startOfDay(for: entry.at)
-            let parts = Calendar.current.dateComponents([.year, .month, .day], from: day)
+            let parts = calendar.dateComponents([.year, .month, .day], from: entry.at)
             let key = String(format: "%04d-%02d-%02d", parts.year ?? 0, parts.month ?? 0, parts.day ?? 0)
             var dayRow = daily[key, default: (0, 0, 0)]
             dayRow.requests += 1

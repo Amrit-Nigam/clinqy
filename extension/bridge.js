@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.8.7";
+const SCRIPT_VERSION = "1.9.6";
 let socket = null;
 let retry = 1000;
 
@@ -230,7 +230,104 @@ async function setOpened(set) {
   try { await chrome.storage.session.set({ opened: [...set] }); } catch {}
 }
 
+// ---- background runs ----
+
+// A background run works in Clinqy's own window, opened without focus behind the user's, and its input goes to the
+// tab through the debugger protocol: trusted clicks and keys that need neither the mouse, the keyboard nor a focused
+// window. Chrome shows its "is debugging this browser" bar while attached; only Clinqy's own tabs are ever attached.
+// Clinqy's window is remembered in local storage: session storage goes with every reload of the extension (each
+// app update), which would orphan the window. Window ids only hold within one run of the browser, so it's
+// forgotten when the browser starts.
+chrome.runtime.onStartup.addListener(() => chrome.storage.local.remove("agentWin"));
+
+async function agentWindow() {
+  try {
+    const { agentWin } = await chrome.storage.local.get("agentWin");
+    if (agentWin != null) return await chrome.windows.get(agentWin);
+  } catch {}
+  return null;
+}
+
+// `at` is where the window goes: Clinqy's hidden screen (left, top, width, height in screen points), when it has one.
+async function backgroundTab(url, at) {
+  const win = await agentWindow();
+  let t;
+  if (win) {
+    t = await chrome.tabs.create({ windowId: win.id, url, active: true });
+    if (at) { try { await chrome.windows.update(win.id, { ...at, state: "normal" }); } catch {} }
+  } else {
+    const w = await chrome.windows.create({ url, focused: false, ...(at || { width: 1280, height: 900 }) });
+    t = w.tabs[0];
+    try { await chrome.storage.local.set({ agentWin: w.id }); } catch {}
+  }
+  const mine = await openedTabs();
+  mine.add(t.id);
+  await setOpened(mine);
+  // Where the window really is (a browser may not place it where asked): the app moves it there itself.
+  const w = await chrome.windows.get(t.windowId);
+  return { id: t.id, windowId: t.windowId, bounds: { x: w.left, y: w.top, w: w.width, h: w.height } };
+}
+
+const attached = new Set();
+
+chrome.debugger.onDetach.addListener((source) => attached.delete(source.tabId));
+
+async function cdp(tabId, method, params = {}) {
+  if (!attached.has(tabId)) {
+    const mine = await openedTabs();
+    if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
+    try { await chrome.debugger.attach({ tabId }, "1.3"); }
+    catch (e) { if (!/already attached/i.test(String(e && e.message || e))) throw e; }
+    attached.add(tabId);
+  }
+  return await chrome.debugger.sendCommand({ tabId }, method, params);
+}
+
+// Named keys as the protocol wants them (key, code, Windows key code, and the text a key types).
+const KEYS = {
+  enter: ["Enter", "Enter", 13, "\r"], return: ["Enter", "Enter", 13, "\r"], tab: ["Tab", "Tab", 9],
+  esc: ["Escape", "Escape", 27], escape: ["Escape", "Escape", 27], space: ["Space", " ", 32, " "],
+  delete: ["Backspace", "Backspace", 8], backspace: ["Backspace", "Backspace", 8], forwarddelete: ["Delete", "Delete", 46],
+  up: ["ArrowUp", "ArrowUp", 38], down: ["ArrowDown", "ArrowDown", 40], left: ["ArrowLeft", "ArrowLeft", 37],
+  right: ["ArrowRight", "ArrowRight", 39], home: ["Home", "Home", 36], end: ["End", "End", 35],
+  pageup: ["PageUp", "PageUp", 33], pagedown: ["PageDown", "PageDown", 34],
+};
+// ⌘-shortcuts that are editing commands on a Mac (the renderer doesn't map synthetic ⌘ keys to them itself).
+const COMMANDS = { a: "selectAll", c: "copy", x: "cut", v: "paste", z: "undo" };
+
+async function cdpKey(tabId, combo) {
+  const parts = String(combo).toLowerCase().split("+").map((s) => s.trim()).filter(Boolean);
+  const name = parts.pop() || "";
+  const mods = { alt: 1, option: 1, opt: 1, ctrl: 2, control: 2, cmd: 4, command: 4, meta: 4, shift: 8 };
+  const modifiers = parts.reduce((m, p) => m | (mods[p] || 0), 0);
+  let [key, code, vk, text] = KEYS[name] || [];
+  if (!key) {
+    if (name.length !== 1) throw new Error("unknown key " + combo);
+    key = modifiers & 8 ? name.toUpperCase() : name;
+    code = /[a-z]/.test(name) ? "Key" + name.toUpperCase() : /[0-9]/.test(name) ? "Digit" + name : "";
+    vk = name.toUpperCase().charCodeAt(0);
+    text = modifiers & ~8 ? undefined : key;
+  }
+  const commands = modifiers === 4 && COMMANDS[name] ? [COMMANDS[name]]
+    : modifiers === 12 && name === "z" ? ["redo"] : undefined;
+  const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers };
+  await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: text ? "keyDown" : "rawKeyDown", text, unmodifiedText: text, commands });
+  await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+  return { pressed: combo };
+}
+
+async function cdpClick(tabId, x, y, count = 1) {
+  const at = { x: Number(x), y: Number(y) };
+  await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...at });
+  for (let i = 1; i <= count; i++) {
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: i });
+    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: i });
+  }
+  return { clicked: at };
+}
+
 chrome.tabs.onRemoved.addListener(async (tabId) => {
+  attached.delete(tabId);
   maps.delete(tabId);
   focusFrames.delete(tabId);
   try { await chrome.storage.session.remove("map" + tabId); } catch {}
@@ -268,6 +365,14 @@ async function tabCommand(msg) {
 
 async function handle(msg) {
   if (/^(tabs|switchTab|closeTab)$/.test(msg.cmd)) return await tabCommand(msg);
+  if (msg.cmd === "backgroundTab") return await backgroundTab(msg.url, msg.at);
+  // A window Clinqy left behind (it quit without closing it) goes; one the user took over is only forgotten.
+  if (msg.cmd === "closeAgentWindow" || msg.cmd === "releaseAgentWindow") {
+    const win = await agentWindow();
+    try { await chrome.storage.local.remove("agentWin"); } catch {}
+    if (win && msg.cmd === "closeAgentWindow") { await chrome.windows.remove(win.id); return { closed: win.id }; }
+    return { closed: null };
+  }
   // A command may name its tab (a snapshot of a background tab, acting on a tab the app pinned); else the one in front.
   const tab = msg.tabId != null && msg.cmd !== "goBack" ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
@@ -277,6 +382,14 @@ async function handle(msg) {
     if (!/^(https?|file):/.test(tab.url || "")) return { focused: !!win.focused, text: "" };
     const found = (await callAll(tab.id, "selection")).sort((a, b) => a.frameId - b.frameId).map((r) => r.result).find((t) => t && t.trim());
     return { focused: !!win.focused, text: found || "" };
+  }
+  if (msg.cmd === "captureTask") {
+    // The debugger helper only accepts tabs opened by Clinqy. Never activate a tab or capture the user's display.
+    if (msg.tabId == null) throw new Error("task screenshot requires an explicit tab");
+    const captured = await cdp(tab.id, "Page.captureScreenshot", {
+      format: "png", fromSurface: true, captureBeyondViewport: false
+    });
+    return { image: captured.data, tabId: tab.id };
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
@@ -288,6 +401,13 @@ async function handle(msg) {
     mine.add(t.id);
     await setOpened(mine);
     return { id: t.id };
+  }
+  if (msg.cmd === "cdpClick") return await cdpClick(tab.id, msg.x, msg.y, Number(msg.count) || 1);
+  if (msg.cmd === "cdpKey") return await cdpKey(tab.id, msg.keys);
+  if (msg.cmd === "cdpType") { await cdp(tab.id, "Input.insertText", { text: String(msg.text) }); return { typed: true }; }
+  if (msg.cmd === "cdpScroll") {
+    await cdp(tab.id, "Input.dispatchMouseEvent", { type: "mouseWheel", x: Number(msg.x) || 200, y: Number(msg.y) || 200, deltaX: 0, deltaY: Number(msg.dy) });
+    return { scrolled: msg.dy };
   }
   if (msg.cmd === "goBack") {
     try { await chrome.tabs.goBack(msg.tabId); } catch {}

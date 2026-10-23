@@ -21,21 +21,57 @@ enum Launcher {
 
     static func isBrowser(_ app: NSRunningApplication) -> Bool { browserIDs.contains(app.bundleIdentifier ?? "") }
 
+    /// A copy of a browser another tool drives (Playwright, Puppeteer, a test runner): a throwaway profile with no
+    /// extensions, under a debugging pipe or port. Not the user's browser, so Clinqy neither works in it nor moves it.
+    static func isAutomated(_ app: NSRunningApplication) -> Bool {
+        let pid = app.processIdentifier
+        if let known = automated[pid] { return known }
+        var size = 0
+        var mib = [CTL_KERN, KERN_PROCARGS2, pid]
+        var args = ""
+        if sysctl(&mib, 3, nil, &size, nil, 0) == 0, size > 0 {
+            var buffer = [CChar](repeating: 0, count: size)
+            if sysctl(&mib, 3, &buffer, &size, nil, 0) == 0 {
+                args = String(decoding: buffer.prefix(size).map { UInt8(bitPattern: $0 == 0 ? 32 : $0) }, as: UTF8.self)
+            }
+        }
+        let found = args.contains("--remote-debugging-pipe") || args.contains("--remote-debugging-port")
+            || args.contains("playwright_") || args.contains("puppeteer_") || args.contains("--enable-automation")
+        automated[pid] = found
+        return found
+    }
+    private static var automated: [pid_t: Bool] = [:]
+
+    /// The running app called `name` (lowercased), leaving out browsers another tool drives.
+    static func running(named name: String) -> NSRunningApplication? {
+        NSWorkspace.shared.runningApplications.first { $0.cleanName?.lowercased() == name && !isAutomated($0) }
+    }
+
     /// Brings a running app (or finds and launches one by name) to the front with its window loaded.
     static func open(appNamed name: String) async -> NSRunningApplication? {
         let wanted = name.lowercased().replacingOccurrences(of: ".app", with: "")
-        let url = NSWorkspace.shared.runningApplications
-            .first { $0.cleanName?.lowercased() == wanted }?.bundleURL ?? find(named: wanted)
+        let url = running(named: wanted)?.bundleURL ?? find(named: wanted)
         guard let url else { return nil }
         return await launch(url)
     }
 
     static func launch(_ url: URL) async -> NSRunningApplication? {
+        // The windows the user already has: a background run moves only the ones it opens to Clinqy's hidden screen.
+        let had = NSWorkspace.shared.runningApplications.first { $0.bundleURL == url }.map { Hand.windowIDs(pid: $0.processIdentifier) } ?? []
         let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
+        config.activates = !Background.active
         guard let app = try? await NSWorkspace.shared.openApplication(at: url, configuration: config) else { return nil }
-        // `open` on a running app whose windows are closed brings a window back.
-        _ = await Shell.run("/usr/bin/open", [url.path])
+        // `open` on a running app whose windows are closed brings a window back (-g: without coming to the front).
+        _ = await Shell.run("/usr/bin/open", Background.active ? ["-g", url.path] : [url.path])
+        if Background.active {
+            for _ in 0..<40 where AXEngine.elements(of: app, limit: 5, menuBar: true).count <= 1 {
+                try? await Task.sleep(for: .milliseconds(100))
+            }
+            Background.track(app, had: had)
+            AgentScreen.adopt(app, keep: had)
+            await bringToFront(app)
+            return app
+        }
         for _ in 0..<40 {
             if app.isActive, AXEngine.elements(of: app, limit: 5, menuBar: true).count > 1 { break }
             app.activate()
@@ -45,6 +81,7 @@ enum Launcher {
     }
 
     static func bringToFront(_ app: NSRunningApplication) async {
+        if Background.active { return focusBehind(app) }
         guard NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier else { return }
         // Plain activate() is ignored while we aren't frontmost; opening the app always works.
         if let url = app.bundleURL {
@@ -58,15 +95,32 @@ enum Launcher {
         }
     }
 
+    /// A background run's stand-in for bringing `app` forward: it becomes the run's app (keys go to it) and its window
+    /// takes synthetic focus without being raised, so the user's app stays in front. A browser working in Clinqy's own
+    /// window needs none of that (its page input goes through the extension), and the user's own windows of the
+    /// same browser mustn't be disturbed.
+    private static func focusBehind(_ app: NSRunningApplication) {
+        Background.app = app
+        Background.track(app)
+        if app.isHidden { app.unhide() }
+        guard !(isBrowser(app) && Background.tab != nil), app.processIdentifier != getpid() else { return }
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        if let info = list.first(where: { ($0[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == app.processIdentifier
+                                         && $0[kCGWindowLayer as String] as? Int == 0 }),
+           let id = info[kCGWindowNumber as String] as? Int {
+            SkyLight.focus(pid: app.processIdentifier, window: CGWindowID(id))
+        }
+    }
+
     /// Opens a URL as a real tab (Arc would otherwise show external links in its "Little Arc" popup).
     static func openURL(_ url: URL) async {
         let browser = NSWorkspace.shared.urlForApplication(toOpen: URL(string: "https://example.com")!)
-        if browser?.lastPathComponent == "Arc.app" {
+        if !Background.active, browser?.lastPathComponent == "Arc.app" {
             let script = "tell application \"Arc\" to tell front window to make new tab with properties {URL:\"\(url.absoluteString)\"}\ntell application \"Arc\" to activate"
             if await Shell.run("/usr/bin/osascript", ["-e", script]).status == 0 { return }
         }
         let config = NSWorkspace.OpenConfiguration()
-        config.activates = true
+        config.activates = !Background.active
         if let browser {
             _ = try? await NSWorkspace.shared.open([url], withApplicationAt: browser, configuration: config)
         } else {

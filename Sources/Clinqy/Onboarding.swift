@@ -50,6 +50,8 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
         // Out of the way while Clinqy works on screen, back when it's done.
         model.hideWindow = { [weak self] in self?.orderOut(nil) }
         model.showWindow = { [weak self] in self?.present() }
+        model.windowVisible = { [weak self] in self?.isVisible == true }
+        dashboardModel.windowVisible = model.windowVisible
         let hosting = NSHostingView(rootView: OnboardingView(model: model, dashboardModel: dashboardModel))
         hosting.sizingOptions = []   // don't grow the window by the title bar's height
         contentView = hosting
@@ -240,6 +242,8 @@ final class OnboardingModel: ObservableObject {
     var isRunning: () -> Bool = { false }
     var hideWindow: () -> Void = {}
     var showWindow: () -> Void = {}
+    /// The setup window is on screen (it's kept around closed); the once-a-second redraw only matters then.
+    var windowVisible: () -> Bool = { true }
     /// "Let Clinqy do it" for the extension: idle, working (window hidden), or how it ended.
     enum AutoLoad: Equatable { case idle, working, done, gaveUp }
     @Published var autoLoad: AutoLoad = .idle
@@ -260,8 +264,9 @@ final class OnboardingModel: ObservableObject {
         browserID = browsers.first?.id ?? ""
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.tick += 1
-                self?.watchAutoLoad()
+                guard let self else { return }
+                if self.windowVisible() { self.tick += 1 }
+                self.watchAutoLoad()
             }
         }
     }
