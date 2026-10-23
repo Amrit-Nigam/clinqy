@@ -83,11 +83,23 @@ Each file must fit Telegram's hosted Bot API download limit of 20 MB. A failed d
 
 Telegram is also the conversation for tasks started there. Clinqy asks for missing information in the chat; reply in words or use the question's buttons. Passwords and codes stay on the Mac. Question buttons expire after an answer, so an old button cannot approve a later request.
 
-Ask “how much work is done?” or `/status` for the current stage, completed step count, elapsed time and anything waiting on you. Changed stages get a quiet update about every 45 seconds. “Show me a screenshot” or `/screenshot` sends the task's own tab/window without switching away from your work. The browser extension captures only Clinqy's tabs; screenshots pause during private-input questions. The final task image is saved in the conversation and can be requested again.
+Ask “how much work is done?” or `/status` for the current stage, completed step count, last confirmed action and anything waiting on you. Changed stages get a quiet update about every 45 seconds. “Show me a screenshot” or `/screenshot` sends the task's own tab/window without switching away from your work. Background Chrome screenshots come directly from the worker; foreground extension captures target only Clinqy's tabs; screenshots pause during private-input questions. The final task image is saved in the conversation and can be requested again.
 
 Use `/result` or “what did you fill?” for the full result card, including every form field, warnings and links. Long results span multiple messages. Before a Telegram task submits a form, it sends the actual answers and asks for **Submit** or **Edit**. Editing the answers or moving to another form requires a new review. Completion distinguishes filling from submission and includes the result card and a final screenshot when available. Follow-ups such as “change the location to Pune” keep the previous Telegram task and output as context for 30 minutes.
 
 Run `tests/telegram.sh` and `node tests/telegram-screenshot.mjs` to check conversation routing, attachment handling and screenshot targeting with mocked APIs. `tests/site/telegram-review.html` is a local-only demo form for background conversation checks; it never sends an application anywhere.
+
+## Isolated background work (Mac)
+
+Background web tasks use **Google Chrome in a separate headless process and data directory**, controlled directly through CDP. Your normal Chrome tabs, browser profile and extension are not used. The worker profile lives in `~/Library/Application Support/Clinqy/ChromeWorker/`.
+
+Sign in once through **Clinqy menu → Sign In to Worker Chrome…**, then select **Finish Worker Chrome Sign-in**. This explicit sign-in opens a visible Chrome window; ordinary task execution stays headless. Worker sign-ins are independent of your usual Chrome profile. Do not run tasks during sign-in. Some sites may reject headless browsers; Clinqy must ask for a different approach instead of taking over your browser.
+
+Use **Show Background Work** for a screenshot view of the owned worker page. Files, PDFs, media and supported services use direct tools. Finder reveal, native app input, clipboard shortcuts, arbitrary shell/AppleScript and conversions that open iWork require an explicit switch to foreground mode. An unavailable worker or tab never falls back to a user window. This provides browser-process isolation; it is not a separate macOS desktop or sandbox for native apps.
+
+**Tasks & Recovery…** and Telegram **`/tasks`** read the same persisted task state: current stage, completed steps, last confirmed action and results. Requests, attachment paths and checkpoints are saved in owner-only `~/Library/Application Support/Clinqy/tasks.json`. After a restart, active tasks become **Interrupted**, retaining any in-flight action marker. They never resume or repeat sends/submissions automatically. Check the real outcome and send fresh instructions. Restored queued requests require review: start them in the Mac panel or use **`/run <id>`** in the paired Telegram chat. Missing files and unreadable task storage prevent execution. Downloading/staged attachments and unanswered questions are not resumed; resend any message that did not receive an acceptance reply.
+
+Validation: `zsh tests/background-tasks.sh` checks persistence, interruption, queue review and capability routing. `zsh tests/chrome-worker.sh` uses two temporary headless Chrome profiles and local dummy pages to check form input, upload bytes and intercepted choosers, screenshots, targeting, orphan cleanup, disconnect handling and unchanged host clipboard/foreground application. It never uses your signed-in browser or submits to an external site.
 
 ## Setup on Windows
 
@@ -171,7 +183,7 @@ The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and 
   - Native apps through the Accessibility tree (Electron apps too).
   - Web pages through a **browser extension**: exact elements, verified typing that survives autofill, dropdowns, reading.
   - Documents through PDFKit, and scans or images through on-device OCR.
-  - Scriptable apps through their **AppleScript dictionaries**, used as a fallback or when you ask for "in the background".
+  - Scriptable apps through their **AppleScript dictionaries** in foreground mode; background mode uses supported direct tools and an isolated Chrome worker.
 - **Voice.** Hold ⌃⌥ and talk. On macOS 26 the **Mac's own speech model** (SpeechAnalyzer, the one behind Dictation, Notes and Voice Memos) writes the text on-device as you speak, so it's ready a moment after you stop. Nothing to download into Clinqy. Before macOS 26, Apple dictation does it.
 - **Asks when it needs you.** It asks for details, choices and passwords (hidden input), with quick-choice buttons or a voice answer.
 - **Safety enforced in code:**

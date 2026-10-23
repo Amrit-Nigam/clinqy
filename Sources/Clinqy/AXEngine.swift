@@ -776,6 +776,11 @@ enum AXEngine {
         keystroke(0x24, text: [13], source: CGEventSource(stateID: .combinedSessionState))
     }
 
+    /// ⌘N to one app only (a new Finder or browser window for the user), leaving `targetPid` to the run's typing.
+    static func pressNewWindow(in pid: pid_t) {
+        keystroke(shortcutKey("n"), flags: .maskCommand, source: CGEventSource(stateID: .hidSystemState), to: pid)
+    }
+
     /// Scrolls the app's focused window; positive is up.
     static func scroll(_ lines: Int32, in app: NSRunningApplication) {
         let root = AXUIElementCreateApplication(app.processIdentifier)

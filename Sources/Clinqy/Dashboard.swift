@@ -330,8 +330,6 @@ struct DashboardContentView: View {
 
     private let pages = ["Overview", "Usage", "AI & Model", "Background", "Shortcuts"]
     @AppStorage("backgroundMode") private var backgroundMode = false
-    @AppStorage("backgroundBrowser") private var backgroundBrowser = "Google Chrome"
-    @AppStorage("backgroundIdleMinutes") private var backgroundIdleMinutes = 10
     private let surface = Brand.text.opacity(0.035)
     private let text = Brand.text
     private let muted = Brand.soft
@@ -381,19 +379,13 @@ struct DashboardContentView: View {
         }
     }
 
-    /// Browsers on this Mac that background runs can use (they need Clinqy's extension too).
-    private var installedBrowsers: [String] {
-        Launcher.browserIDs.compactMap { NSWorkspace.shared.urlForApplication(withBundleIdentifier: $0)?.deletingPathExtension().lastPathComponent }
-            .filter { $0 != "Safari" && $0 != "Firefox" }.sorted()
-    }
-
     private var backgroundPage: some View {
         VStack(alignment: .leading, spacing: 14) {
             card {
                 Toggle(isOn: $backgroundMode) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Work in the background").font(.system(size: 15, weight: .semibold))
-                        Text("Every task runs on a hidden screen of Clinqy's own, so your screen, mouse and keyboard stay yours. "
+                        Text("Web tasks run in a separate Chrome profile. File and supported service tasks run directly; native app work asks before switching to foreground. "
                              + "Either way, a request can choose: say or type “in the background” or “not in the background”.")
                             .font(.system(size: 11)).foregroundStyle(muted)
                     }
@@ -401,32 +393,20 @@ struct DashboardContentView: View {
                 .toggleStyle(.switch)
             }
             card {
-                Text("Browser for background work").font(.system(size: 14, weight: .semibold))
-                Picker("Browser", selection: $backgroundBrowser) {
-                    ForEach(installedBrowsers, id: \.self) { Text($0).tag($0) }
-                }
-                .labelsHidden().pickerStyle(.menu).frame(width: 220)
-                Text("Clinqy opens its own window there, with its extension. A browser you don't use yourself works best.")
+                Text("Worker Chrome").font(.system(size: 14, weight: .semibold))
+                Text("Background web tasks use their own Chrome session. Sign in here once, then finish sign-in to return to background work. Your usual browser stays separate.")
                     .font(.system(size: 11)).foregroundStyle(muted)
-                if Config.value("BACKGROUND_BROWSER") != nil {
-                    Text("BACKGROUND_BROWSER in your env file overrides this.").font(.system(size: 11)).foregroundStyle(muted)
+                HStack {
+                    Button("Sign in…") { (NSApp.delegate as? AppDelegate)?.workerLogin() }.brand()
+                    Button("Finish sign-in") { (NSApp.delegate as? AppDelegate)?.finishWorkerLogin() }.brand()
                 }
             }
             card {
-                Text("Clean up after").font(.system(size: 14, weight: .semibold))
-                Picker("Clean up after", selection: $backgroundIdleMinutes) {
-                    Text("5 minutes").tag(5)
-                    Text("10 minutes").tag(10)
-                    Text("30 minutes").tag(30)
-                    Text("1 hour").tag(60)
-                    Text("Never (until Clinqy quits)").tag(0)
-                }
-                .labelsHidden().pickerStyle(.menu).frame(width: 220)
-                Text("How long the hidden screen and what's on it stay after the last background task. Then Clinqy's browser "
-                     + "window closes, any other window goes to the Dock, and the hidden screen is removed.")
+                Text("Tasks and recovery").font(.system(size: 14, weight: .semibold))
+                Text("Check the current stage and saved results here or in Telegram. Interrupted tasks stay stopped; queued tasks restored after a restart need review before starting.")
                     .font(.system(size: 11)).foregroundStyle(muted)
                 HStack {
-                    Spacer()
+                    Button("Tasks & Recovery") { TasksPanel.shared.show() }.brand()
                     Button("Show background work") { AgentScreenView.shared.show() }.brand()
                 }
             }

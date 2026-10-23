@@ -11,8 +11,13 @@ enum Background {
     private(set) static var active = false
     /// The app the run works in now (its window may well sit behind the user's).
     static var app: NSRunningApplication? {
-        didSet { AXEngine.backgroundPid = active ? app?.processIdentifier : nil }
+        didSet {
+            AXEngine.backgroundPid = active ? app?.processIdentifier : nil
+            if app != nil { appSince = Date() }
+        }
     }
+    /// When the run last moved into an app: launching one can bring it forward for a moment, which isn't the user.
+    private static var appSince = Date.distantPast
     /// Clinqy's tab in its own browser window: every page read and page action of the run is pinned to it.
     static var tab: BrowserBridge.TabInfo?
     /// Per app the run worked in: the windows it already had then (the user's), which never move. Any other window
@@ -83,6 +88,62 @@ enum Background {
         tab = nil
     }
 
+    /// Something the user should hear about an app they switched to that the run is using (no window of its own to give).
+    static var onBusyApp: (String) -> Void = { _ in }
+
+    /// Watches the user switching apps (Dock, ⌘Tab, a click) for ones whose windows are on Clinqy's hidden screen.
+    static func watchSwitches() {
+        NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                          object: nil, queue: .main) { note in
+            guard let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else { return }
+            Task { @MainActor in await userSwitched(to: app) }
+        }
+    }
+
+    /// The user came to an app that has windows on the hidden screen, where they'd see none of it. The run is done
+    /// with it: its windows come to them. The run is in it now: Finder or a browser opens a fresh window for them on
+    /// their screen while the run keeps its own; other apps (a new window there is a new chat or document) stay with
+    /// the run, and the user is told it's theirs when the task is done.
+    private static func userSwitched(to app: NSRunningApplication) async {
+        let pid = app.processIdentifier
+        guard pid != getpid(), AgentScreen.windows().contains(where: { $0.pid == pid }) else { return }
+        // The user's doing: a click, or ⌘Tab's modifier, a moment ago. Clinqy's own input goes to apps directly, not
+        // through the system's stream; and an app the run just moved into can come forward by itself as it launches.
+        let since = [CGEventType.leftMouseDown, .rightMouseDown, .flagsChanged]
+            .map { CGEventSource.secondsSinceLastEventType(.hidSystemState, eventType: $0) }.min() ?? .infinity
+        guard since < 1.5, !(active && self.app?.processIdentifier == pid && Date().timeIntervalSince(appSince) < 2) else { return }
+
+        guard active, self.app?.processIdentifier == pid else {
+            AgentScreen.giveBack(app)
+            // Mid-run in another app: these are the user's now, so the run's sweep mustn't take them back.
+            if active { userWindows[pid, default: []].formUnion(Hand.windowIDs(pid: pid)) }
+            return
+        }
+        guard app.bundleIdentifier == "com.apple.finder" || Launcher.isBrowser(app) else {
+            Agent.writeLog("the user switched to \(app.cleanName ?? "an app") while the run is using it")
+            onBusyApp("Clinqy is using \(app.cleanName ?? "this app") in the background — it's yours when the task is done")
+            return
+        }
+        let before = Hand.windowIDs(pid: pid)
+        AXEngine.pressNewWindow(in: pid)
+        var new: Set<CGWindowID> = []
+        for _ in 0..<20 {
+            try? await Task.sleep(for: .milliseconds(100))
+            new = Hand.windowIDs(pid: pid).subtracting(before)
+            if !new.isEmpty { break }
+        }
+        guard !new.isEmpty else { return Agent.writeLog("the user switched to \(app.cleanName ?? "?"), but no new window opened for them") }
+        // Theirs: the run's sweep leaves it be.
+        userWindows[pid, default: []].formUnion(new)
+        let main = CGDisplayBounds(CGMainDisplayID()).insetBy(dx: 60, dy: 60)
+        for window in AXEngine.windows(of: app) {
+            guard let id = AXEngine.windowID(of: window), new.contains(id) else { continue }
+            if AgentScreen.contains(AXEngine.liveFrame(of: window) ?? .zero) { AXEngine.place(window, in: main) }
+            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
+        }
+        Agent.writeLog("the user switched to \(app.cleanName ?? "?") while the run is using it: opened a window of their own")
+    }
+
     /// Whether the user has come to watch: the run's window is the one in front. The buddy then works there as usual.
     static func isWatched() async -> Bool {
         guard let app, NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else { return false }
@@ -92,6 +153,7 @@ enum Background {
 
     /// Brings the last background run's window to the front: its tab in Clinqy's browser window, or its app.
     static func showLast() async {
+        if last.tab?.connection == ChromeWorker.shared.identity { AgentScreenView.shared.show(); return }
         if let tab = last.tab {
             await BrowserBridge.shared.tabCommand("switchTab", on: tab, ["tabId": tab.id])
         }

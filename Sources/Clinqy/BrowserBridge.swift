@@ -52,7 +52,7 @@ final class BrowserBridge {
         /// Why the page couldn't be read, when it couldn't (never just "0 elements").
         var problem: String?
         /// Viewport's on-screen rect estimated from window geometry (fallback when Accessibility can't say).
-        let estimatedArea: CGRect?
+        var estimatedArea: CGRect?
         /// Scrolling boxes (modals) with more fields out of view; their counts are included in above/below.
         var panes: [Pane] = []
         /// The browser tab this was read from; `pinned` = read by id (snapshot(tab:)), so commands go to that tab
@@ -66,7 +66,7 @@ final class BrowserBridge {
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var counter = 0
 
-    var isConnected: Bool { !connections.isEmpty }
+    var isConnected: Bool { ChromeWorker.shared.connected || !connections.isEmpty }
 
     enum BridgeError: LocalizedError {
         case notConnected, timeout, failed(String)
@@ -269,24 +269,22 @@ final class BrowserBridge {
     /// in `app` if it has the extension, else any connected browser. Returns the tab and the browser it's in.
     /// `at`: where its window goes (Clinqy's hidden screen), in global top-left points.
     func backgroundTab(_ url: String, in app: NSRunningApplication? = nil, at: CGRect? = nil) async -> (tab: TabInfo, browser: NSRunningApplication?, window: CGRect?)? {
-        let pool = app.map { candidates(for: $0) } ?? []
-        var body: [String: Any] = ["cmd": "backgroundTab", "url": url]
-        if let at { body["at"] = ["left": Int(at.minX), "top": Int(at.minY), "width": Int(at.width), "height": Int(at.height)] }
-        for (key, conn) in pool.isEmpty ? connections.map({ ($0.key, $0.value) }) : pool {
-            guard let r = try? await request(conn, body, timeout: 5), let id = r["id"] as? Int else { continue }
-            let browser = owners[key].flatMap { path in
-                NSWorkspace.shared.runningApplications.first { $0.bundleURL?.resolvingSymlinksInPath().path == path }
-            }
-            let b = r["bounds"] as? [String: Any]
-            let n = { (k: String) in (b?[k] as? NSNumber)?.doubleValue }
-            let window = n("x").flatMap { x in n("y").flatMap { y in n("w").flatMap { w in n("h").map { CGRect(x: x, y: y, width: w, height: $0) } } } }
-            return (TabInfo(id: id, url: url, connection: key), browser ?? app, window)
-        }
-        return nil
+        do {
+            let worker = ChromeWorker.shared
+            let id = try await worker.newTab(url)
+            return (TabInfo(id: id, url: url, connection: worker.identity), worker.app, CGRect(x: 0, y: 0, width: 1440, height: 900))
+        } catch { Agent.writeLog("worker: " + error.localizedDescription); return nil }
     }
 
     /// Reads `tab` by id, wherever it is (Clinqy's background window included). The page is pinned to it.
     func snapshot(of tab: TabInfo) async -> Page? {
+        if tab.connection == ChromeWorker.shared.identity {
+            guard let raw = try? await ChromeWorker.shared.command("snapshot", tabID: tab.id) else { return nil }
+            var page = parse(raw, connection: tab.connection)
+            page.pinned = true
+            page.estimatedArea = CGRect(origin: .zero, size: page.viewport)
+            return page
+        }
         guard let conn = connections[tab.connection],
               let r = try? await request(conn, ["cmd": "snapshot", "tabId": tab.id], timeout: 5) else { return nil }
         var page = parse(r, connection: tab.connection)
@@ -296,6 +294,10 @@ final class BrowserBridge {
 
     /// Captures one owned task tab through the extension. Capturing a hidden tab can take longer than a normal command.
     func taskScreenshot(of tab: TabInfo) async -> Data? {
+        if tab.connection == ChromeWorker.shared.identity {
+            guard let raw = try? await ChromeWorker.shared.command("captureTask", tabID: tab.id), let png = raw["image"] as? String else { return nil }
+            return Data(base64Encoded: png)
+        }
         guard let conn = connections[tab.connection] else {
             Agent.writeLog("telegram screenshot: task browser disconnected")
             return nil
@@ -317,6 +319,7 @@ final class BrowserBridge {
     /// Runs a tab-level command (newTab, goBack, navigate) in the browser that owns `tab`.
     @discardableResult
     func tabCommand(_ cmd: String, on tab: TabInfo, _ args: [String: Any] = [:]) async -> [String: Any]? {
+        if tab.connection == ChromeWorker.shared.identity { return try? await ChromeWorker.shared.command(cmd, tabID: tab.id, args: args) }
         guard let conn = connections[tab.connection] else { return nil }
         var body = args
         body["cmd"] = cmd
@@ -373,6 +376,7 @@ final class BrowserBridge {
     }
 
     func perform(_ cmd: String, on page: Page, _ args: [String: Any] = [:], timeout: Double = 4) async throws -> [String: Any] {
+        if page.connection == ChromeWorker.shared.identity { return try await ChromeWorker.shared.command(cmd, tabID: page.tabId, args: args) }
         guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
         var body = args
         body["cmd"] = cmd
@@ -395,6 +399,13 @@ final class BrowserBridge {
 
     /// Tabs of the front browser window, in strip order. `opened` = Clinqy opened it (only those can be closed).
     func tabs(in app: NSRunningApplication? = nil) async throws -> [BrowserTab] {
+        if Background.active {
+            let raw = try await ChromeWorker.shared.command("tabs", tabID: nil)
+            return (raw["tabs"] as? [[String: Any]] ?? []).compactMap { t in
+                guard let id = t["id"] as? Int else { return nil }
+                return BrowserTab(id: id, title: t["title"] as? String ?? "", url: t["url"] as? String ?? "", active: t["active"] as? Bool == true, opened: true)
+            }
+        }
         guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         let r = try await request(conn, ["cmd": "tabs"], timeout: 3)
         return (r["tabs"] as? [[String: Any]] ?? []).compactMap { t in
@@ -406,18 +417,21 @@ final class BrowserBridge {
 
     /// Brings tab `id` to the front of its window.
     func switchTab(_ id: Int, in app: NSRunningApplication? = nil) async throws {
+        if Background.active { _ = try await ChromeWorker.shared.command("switchTab", tabID: id); return }
         guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         _ = try await request(conn, ["cmd": "switchTab", "tabId": id], timeout: 3)
     }
 
     /// Closes tab `id` — only a tab Clinqy opened (the extension refuses others, with a reason).
     func closeTab(_ id: Int, in app: NSRunningApplication? = nil) async throws {
+        if Background.active { _ = try await ChromeWorker.shared.command("closeTab", tabID: id); return }
         guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         _ = try await request(conn, ["cmd": "closeTab", "tabId": id], timeout: 3)
     }
 
     /// Reads tab `id` without bringing it to the front. The page is pinned: perform() on it acts on that tab.
     func snapshot(tab id: Int, in app: NSRunningApplication? = nil) async -> Page? {
+        if Background.active { return await snapshot(of: TabInfo(id: id, url: "", connection: ChromeWorker.shared.identity)) }
         guard let (key, conn) = await frontConnection(for: app),
               let r = try? await request(conn, ["cmd": "snapshot", "tabId": id], timeout: 5) else { return nil }
         var page = parse(r, connection: key)

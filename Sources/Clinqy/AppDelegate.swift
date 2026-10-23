@@ -34,6 +34,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
+        ChromeWorker.shared.shutdown()
         AgentScreen.quit()
         Persist.flush()
     }
@@ -69,6 +70,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Notifier.start()
         Telegram.shared.agent = agent
         Telegram.shared.start()
+        // Switching to an app whose windows are on the hidden screen gets the user a window they can see.
+        Background.onBusyApp = { [weak self] text in self?.buddy.bubble(text, for: 4) }
+        Background.watchSwitches()
         AgentScreenView.shared.agent = agent
         Notifier.onAnswer = { [weak self] text in self?.agent.answer(text) }
         // "Done": show the window it worked in. "Needs you": the bar, to answer.
@@ -112,6 +116,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Clipboard.start()
         startScheduler()
 
+        TaskStore.shared.onReady = { [weak self] id in
+            guard let self, !self.agent.isRunning, let item = TaskStore.shared.record(id) else { return }
+            if item.source == .telegram { Telegram.shared.startQueued(id, reviewed: true) }
+            else if TaskStore.shared.start(id, explicitlyReviewed: true) {
+                self.agent.selectedFiles = item.files.map { URL(fileURLWithPath: $0) }
+                self.agent.submit(item.request, background: item.background, taskID: id)
+            }
+        }
         agent.onStart = { [weak self] in
             guard let self else { return }
             self.setStatusIcon(running: true, background: self.agent.runBackground)
@@ -191,6 +203,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
         menu.addItem(withTitle: "Job Profile…", action: #selector(openProfile), keyEquivalent: "")
+        menu.addItem(withTitle: "Tasks & Recovery…", action: #selector(showTasks), keyEquivalent: "")
+        menu.addItem(withTitle: "Sign In to Worker Chrome…", action: #selector(workerLogin), keyEquivalent: "")
+        menu.addItem(withTitle: "Finish Worker Chrome Sign-in", action: #selector(finishWorkerLogin), keyEquivalent: "")
         menu.addItem(withTitle: "Stats…", action: #selector(showStats), keyEquivalent: "")
         let schedules = NSMenuItem(title: "Schedules", action: nil, keyEquivalent: "")
         let schedulesMenu = NSMenu()
@@ -207,7 +222,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak background] _ in
             MainActor.assumeIsolated { background?.state = Background.always ? .on : .off }
         }
-        background.toolTip = "Tasks run on a hidden screen of Clinqy's own; you get a notification when one is done or needs you."
+        background.toolTip = "Web tasks use a separate Chrome profile. File and supported service tasks run directly; native app tasks ask for foreground access."
         menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
         menu.addItem(withTitle: "Telegram…", action: #selector(setUpTelegram), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
@@ -232,12 +247,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         configureHotKeys()
 
-        if !Permissions.allGranted {
+        if !CommandLine.arguments.contains("--background-launch"), !Permissions.allGranted {
             Permissions.requestMissing()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.checkPermissions() }
         }
 
-        if OnboardingWindow.isDone {
+        if OnboardingWindow.isDone, !CommandLine.arguments.contains("--background-launch") {
             DispatchQueue.main.async { [weak self] in self?.showDashboard() }
         }
     }
@@ -843,6 +858,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func showApplications() { agent.showApplications() }
 
     @objc func openProfile() { Profile.open() }
+
+    @objc func showTasks() { TasksPanel.shared.show() }
+
+    @objc func workerLogin() {
+        guard !agent.isRunning else { buddy.bubble("Finish or stop the current task before signing in to Worker Chrome", for: 5); return }
+        Task {
+            do { try await ChromeWorker.shared.openLogin() }
+            catch { buddy.bubble(error.localizedDescription, for: 8) }
+        }
+    }
+    @objc func finishWorkerLogin() {
+        guard !agent.isRunning else { return }
+        Task { await ChromeWorker.shared.finishLogin() }
+    }
 
     @objc func showStats() {
         agent.result = StatsCard.card

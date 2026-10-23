@@ -14,6 +14,7 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
     private let status = NSTextField(labelWithString: "")
     private let steer = NSTextField()
     private let stop = NSButton()
+    private let bring = NSButton()
     private var timer: Timer?
     private var display: SCDisplay?
     private var capturing = false
@@ -22,12 +23,13 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
 
     /// Opens the view; with no hidden screen (this Mac couldn't make one) it shows the run's window itself instead.
     func show() {
-        guard AgentScreen.bounds != nil else {
+        guard workerTab != nil || AgentScreen.bounds != nil else {
             Task { await Background.showLast() }
             return
         }
         if panel == nil { build() }
         display = nil
+        bring.title = workerTab == nil ? "Bring it here" : "Tasks & Recovery"
         panel?.center()
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
@@ -52,7 +54,9 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
         status.font = .systemFont(ofSize: 12)
         status.textColor = .secondaryLabelColor
         status.lineBreakMode = .byTruncatingTail
-        let bring = NSButton(title: "Bring it here", target: self, action: #selector(bringHere))
+        bring.title = "Bring it here"
+        bring.target = self
+        bring.action = #selector(bringHere)
         bring.bezelStyle = .rounded
         stop.title = "Stop"
         stop.bezelStyle = .rounded
@@ -75,8 +79,24 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
         self.panel = panel
     }
 
+    private var workerTab: BrowserBridge.TabInfo? {
+        let tab = Background.active ? Background.tab : Background.last.tab
+        return tab?.connection == ChromeWorker.shared.identity ? tab : nil
+    }
+
     private func refresh() async {
-        guard !capturing, panel?.isVisible == true, let id = AgentScreen.id else { return }
+        guard !capturing, panel?.isVisible == true else { return }
+        if let tab = workerTab {
+            capturing = true
+            defer { capturing = false }
+            if agent?.question?.sensitive == true { picture.image = nil; status.stringValue = "Waiting for private input on your Mac"; return }
+            if let png = await BrowserBridge.shared.taskScreenshot(of: tab) { picture.image = NSImage(data: png) }
+            status.stringValue = TaskStore.shared.active?.stage ?? "Worker Chrome — final task view"
+            let running = agent?.isRunning == true && agent?.runBackground == true
+            stop.isHidden = !running; steer.isEnabled = running
+            return
+        }
+        guard let id = AgentScreen.id else { return }
         capturing = true
         defer { capturing = false }
         if display == nil {
@@ -115,6 +135,7 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
     @objc private func stopRun() { agent?.cancel() }
 
     @objc private func bringHere() {
+        if workerTab != nil { TasksPanel.shared.show(); return }
         AgentScreen.bringHere()
         panel?.close()
     }

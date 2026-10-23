@@ -25,7 +25,10 @@ enum Background {
         var text: String
         var state: State = .ok
     }
-    var isRunning = false
+    var store: TaskStore?
+    var isRunning = false {
+        didSet { if oldValue && !isRunning, let id = store?.active?.id { store?.finish(id, ok: true, answer: "Finished") } }
+    }
     var question: Question?
     var steps: [Step] = []
     var narration = ""
@@ -37,7 +40,7 @@ enum Background {
     var submitted: [String] = []
     var notes: [String] = []
     var answers: [String] = []
-    func submit(_ text: String, background: Bool) { submitted.append(text); isRunning = true }
+    func submit(_ text: String, background: Bool, taskID: UUID? = nil) { submitted.append(text); isRunning = true }
     func addContext(_ text: String) { notes.append(text) }
     func answer(_ text: String) { answers.append(text); question = nil }
     func cancel() { isRunning = false }
@@ -96,6 +99,7 @@ final class TelegramAPI: URLProtocol {
 
 @main struct TelegramTests {
     @MainActor static func main() async throws {
+        setbuf(stdout, nil)
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-telegram-tests-\(UUID())")
         defer { try? FileManager.default.removeItem(at: root) }
         let config = URLSessionConfiguration.ephemeral
@@ -103,8 +107,9 @@ final class TelegramAPI: URLProtocol {
         let session = URLSession(configuration: config)
         defer { session.invalidateAndCancel() }
         func bridge() -> (Telegram, Agent) {
-            let bot = Telegram(session: session, downloadDirectory: root)
-            let agent = Agent(); bot.agent = agent
+            let store = TaskStore(file: root.appendingPathComponent(UUID().uuidString + ".json"))
+            let bot = Telegram(session: session, downloadDirectory: root, store: store)
+            let agent = Agent(); agent.store = store; bot.agent = agent
             return (bot, agent)
         }
         func message(_ extra: [String: Any], chat: Int = 42) -> [String: Any] {
@@ -196,11 +201,17 @@ final class TelegramAPI: URLProtocol {
         worker.steps = [.init(text: "Opened form"), .init(text: "Filled name"), .init(text: "Waiting", state: .running)]
         worker.narration = "Filling the contact details"
         worker.question = .init(text: "Which location?")
+        worker.store?.update(worker.store?.active?.id, state: .waiting, stage: "Which location?", completedSteps: 2)
         conversation.ask("Which location?", options: ["Delhi", "Mumbai"], sensitive: false)
         try await wait { TelegramAPI.replies().contains { $0.contains("I need your input: Which location?") } }
         conversation.handle(message(["text": "how far along?"]))
-        try await wait { TelegramAPI.replies().contains { $0.contains("Waiting on you: Which location?") && $0.contains("2 steps completed") } }
+        try await wait { TelegramAPI.replies().contains { $0.contains("Now: Which location?") && $0.contains("2 steps completed") } }
         check(worker.answers.isEmpty && worker.notes.isEmpty, "progress does not answer or steer the pending question")
+        check(TelegramAPI.replies().contains { $0.contains(worker.store!.active!.status) }, "Telegram and Mac task store report identical task state")
+        let prior = worker.answers.count
+        conversation.handle(message(["text":"/tasks"]))
+        try await wait { TelegramAPI.replies().contains { $0.contains("/run <id>") } }
+        check(worker.answers.count == prior, "recovery commands do not answer a pending question")
 
         let option = TelegramAPI.lock.withLock {
             TelegramAPI.requests.reversed().compactMap { _, body -> String? in

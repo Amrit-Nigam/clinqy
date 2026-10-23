@@ -134,6 +134,28 @@ enum AgentScreen {
         return moved
     }
 
+    /// Moves `app`'s windows on it to the user's main screen, the first raised: they switched to the app and would
+    /// otherwise get nothing. A browser forgets the window as Clinqy's, so the next run opens its own again.
+    @discardableResult
+    static func giveBack(_ app: NSRunningApplication) -> Int {
+        let ids = Set(windows().filter { $0.pid == app.processIdentifier }.map(\.id))
+        guard !ids.isEmpty else { return 0 }
+        let main = CGDisplayBounds(CGMainDisplayID()).insetBy(dx: 60, dy: 60)
+        var moved = 0
+        for window in AXEngine.windows(of: app) {
+            guard let id = AXEngine.windowID(of: window), ids.contains(id) else { continue }
+            AXEngine.place(window, in: main)
+            if moved == 0 { AXUIElementPerformAction(window, kAXRaiseAction as CFString) }
+            moved += 1
+        }
+        if let mine = browserWindow, mine.pid == app.processIdentifier, ids.contains(mine.id) {
+            browserWindow = nil
+            Task { await BrowserBridge.shared.releaseBackgroundWindows() }
+        }
+        Agent.writeLog("gave \(moved) window\(moved == 1 ? "" : "s") of \(app.cleanName ?? "?") back to the user's screen (they switched to it)")
+        return moved
+    }
+
     /// Brings every window on it to the user's main screen (they asked to take over), centred.
     static func bringHere() {
         Task { await BrowserBridge.shared.releaseBackgroundWindows() }

@@ -29,9 +29,11 @@ final class Telegram {
     private var polling: Task<Void, Never>?
     private(set) var username: String?
     private let session: URLSession
+    private let store: TaskStore
     private let downloadDirectory: URL
     init(session: URLSession = .shared, downloadDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-         .appendingPathComponent("Library/Application Support/Clinqy/Telegram", isDirectory: true)) {
+         .appendingPathComponent("Library/Application Support/Clinqy/Telegram", isDirectory: true), store: TaskStore? = nil) {
+        self.store = store ?? .shared
         self.session = session
         self.downloadDirectory = downloadDirectory
     }
@@ -67,6 +69,7 @@ final class Telegram {
         polling?.cancel()
         polling = nil
         guard token != nil else { return }
+        if store.recovery.contains(where: { $0.source == .mac || $0.conversationID == chatID }) { send("Clinqy restarted. Some tasks need review; none were replayed. Use /tasks to check their last confirmed stage.") }
         polling = Task { [weak self] in await self?.poll() }
     }
 
@@ -121,12 +124,20 @@ final class Telegram {
             return Agent.writeLog("telegram: ignored a message from chat \(id) (not the paired chat)")
         }
         guard let agent else { return }
+        if text == "/tasks" || text == "/recovery" {
+            let items = store.records.filter { $0.source == .mac || $0.conversationID == id }.suffix(12)
+            return send(items.isEmpty ? "No saved tasks." : items.map { "[" + $0.shortID + "] " + $0.status }.joined(separator: "\n\n") + "\n\n/run <id> starts a reviewed queued request. Interrupted tasks stay stopped; send fresh instructions after checking their outcome.")
+        }
+        if text.hasPrefix("/run ") {
+            guard !agent.isRunning, let item = store.find(String(text.dropFirst(5)).trimmingCharacters(in: .whitespaces)), item.source == .telegram, item.conversationID == id, item.state == .queued else { return send("Only a queued task from this chat can be started, while Clinqy is idle. Use /tasks.") }
+            return startQueued(item.id, reviewed: true)
+        }
         // Commands never become an answer to a pending question or context for the worker.
         // A caption is part of its attachment task, even when it contains the word "status".
         if Self.attachment(message) == nil, let intent = Self.intent(text) {
             switch intent {
             case .help:
-                return send("Tell me what to do on your Mac, or send files with a caption. I work in the background and ask here when I need you.\n\n“how far along?” or /status — current stage\n“show me a screenshot” or /screenshot — my task window\n“what did you fill?” or /result — full results / form review\n/stop — cancel this task and clear the queue\n\nReply to a question or tap its options. You can still check progress or request a screenshot while I wait. For a form, review the answers here, then choose Submit or tell me what to change.", extra: controls)
+                return send("Tell me what to do on your Mac, or send files with a caption. I work in the background and ask here when I need you.\n\n“how far along?” or /status — current stage\n“show me a screenshot” or /screenshot — my task window\n“what did you fill?” or /result — full results / form review\n/tasks — saved tasks and recovery\n/run <id> — start a reviewed queued task\n/stop — cancel this task and clear the queue\n\nReply to a question or tap its options. You can still check progress or request a screenshot while I wait. For a form, review the answers here, then choose Submit or tell me what to change.", extra: controls)
             case .status: return sendStatus()
             case .screenshot: return requestScreenshot()
             case .result: return sendResult()
@@ -198,7 +209,7 @@ final class Telegram {
         guard let agent else { return }
         if let question = agent.question {
             guard ownsRun else {
-                queued.append(request)
+                guard enqueueTask(request) else { return }
                 return send("Your Mac is busy; this task and its files are queued.")
             }
             if question.sensitive { return send("That one's private — answer it on your Mac.") }
@@ -207,7 +218,7 @@ final class Telegram {
             send("Got it — continuing.", extra: controls)
         } else if agent.isRunning {
             guard ownsRun else {
-                queued.append(request)
+                guard enqueueTask(request) else { return }
                 return send("Your Mac is busy with something else; I'll start this with its files when it's done (/stop clears the queue).")
             }
             agent.addContext(request.prompt)
@@ -218,9 +229,25 @@ final class Telegram {
     }
 
     /// Tasks keep their attachments while waiting for another run.
-    private var queued: [Request] = []
+    private var queued: [TaskStore.Record] { store.queued.filter { $0.source == .telegram && $0.conversationID == chatID } }
 
-    private func begin(_ request: Request) {
+    private func enqueueTask(_ request: Request) -> Bool {
+        var text = request.text
+        let background = Background.choice(&text) ?? true
+        if store.enqueue(Request(text: text, files: request.files, context: request.context).prompt, files: request.files, source: .telegram, background: background, conversationID: chatID) == nil {
+            send(store.storageError ?? "Couldn't save this task; it wasn't queued.")
+            return false
+        }
+        return true
+    }
+
+    func startQueued(_ id: UUID, reviewed: Bool = false) {
+        guard let item = store.record(id), item.source == .telegram, item.conversationID == chatID, agent?.isRunning == false,
+              store.start(id, explicitlyReviewed: reviewed) else { return send("This task couldn't start. Check /tasks and attached files.") }
+        begin(Request(text: item.request, files: item.files.map { URL(fileURLWithPath: $0) }), savedID: id)
+    }
+
+    private func begin(_ request: Request, savedID: UUID? = nil) {
         guard let agent else { return }
         var request = request
         if request.files.isEmpty, let completedAt, Date().timeIntervalSince(completedAt) < 1800,
@@ -242,12 +269,18 @@ final class Telegram {
         // Decided on the user's own words: the file list appended to the prompt would hide a trailing "not in the
         // background". Said nothing: background, since they're not at the screen.
         let background = Background.choice(&request.text) ?? true
-        agent.submit(request.prompt, background: background)
+        guard let id = savedID ?? store.enqueue(request.prompt, files: request.files, source: .telegram, background: background, conversationID: chatID) else {
+            ownsRun = false; return send(store.storageError ?? "Couldn't save this task. It wasn't started.")
+        }
+        guard store.record(id)?.state == .running || store.start(id) else {
+            ownsRun = false; return send(store.storageError ?? "The task needs review in /tasks before starting.")
+        }
+        agent.submit(savedID == nil ? request.prompt : request.text, background: savedID.flatMap { store.record($0)?.background } ?? background, taskID: id)
         if agent.isRunning {
             send((request.files.isEmpty ? "On it." : "On it — using \(request.files.count) attached file(s).")
                  + " I'll ask here if I need you. You can ask for progress or a screenshot anytime.", extra: controls)
             startReporting()
-        } else { ownsRun = false }
+        } else { ownsRun = false; send(store.storageError ?? "The task needs review in /tasks before it can start.") }
     }
 
     /// A photo contains several resolutions of the same image, not separate attachments.
@@ -363,6 +396,7 @@ final class Telegram {
 
     private func statusText() -> String {
         guard let agent else { return "Clinqy isn't available." }
+        if let item = store.active { return item.status + (queued.isEmpty ? "" : "\n\(queued.count) task(s) queued.") }
         let queueNote = queued.isEmpty ? "" : "\n\(queued.count) task(s) queued."
         guard ownsRun, agent.isRunning else {
             if agent.isRunning {
@@ -411,7 +445,7 @@ final class Telegram {
         receiving?.cancel(); receiving = nil
         reporting?.cancel(); reporting = nil
         pendingFiles.removeAll()
-        queued.removeAll()
+        for item in queued { store.cancelQueued(item.id) }
         dismissQuestion()
         guard let agent, agent.isRunning else { return send("Stopped. Pending files and queued tasks cleared.") }
         if !ownsRun { send("Stopping the current Mac task. Pending files and queued tasks cleared.") }
@@ -493,6 +527,7 @@ final class Telegram {
     }
 
     private func sendResult() {
+        if !ownsRun, let item = store.active { return send(item.status, extra: controls) }
         if !ownsRun, let lastSummary { send(lastSummary, extra: controls) }
         else if let currentResult { send(currentResult.plain, extra: controls) }
         else { send(ownsRun ? "No result card yet. " + statusText() : "No Telegram task results yet. Send me a task first.", extra: controls) }
@@ -501,7 +536,7 @@ final class Telegram {
     private func requestScreenshot() {
         guard !takingScreenshot else { return send("I'm already capturing the task view.") }
         if agent?.question?.sensitive == true { return send("I'm waiting for private input; screenshots are paused until that's answered on the Mac.") }
-        if !ownsRun {
+        if !ownsRun, !(agent?.isRunning == true && store.active?.background == true) {
             guard let lastScreenshot else { return send("No saved task screenshot yet. Start a Telegram task, then ask for a screenshot.") }
             return sendPhoto(lastScreenshot, caption: "Saved final view from the last task: " + taskTitle)
         }
@@ -522,7 +557,7 @@ final class Telegram {
         if !queued.isEmpty {
             DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
                 guard let self, let agent = self.agent, !agent.isRunning, !self.queued.isEmpty else { return }
-                self.begin(self.queued.removeFirst())
+                if let next = self.queued.first(where: { !$0.requiresReview }) { self.startQueued(next.id) }
             }
         }
         guard ownsRun else { return }
