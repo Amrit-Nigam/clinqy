@@ -15,6 +15,8 @@ import AppKit
             return "data:text/html;base64," + Data(html.utf8).base64EncodedString()
         }
         do {
+            worker.runStarted()
+            other.runStarted()
             let firstURL = page("Worker"), secondURL = page("Concurrent browser")
             async let first = worker.newTab(firstURL)
             async let second = other.newTab(secondURL)
@@ -57,6 +59,16 @@ import AppKit
             try check(otherValue["value"] as? String == "", "concurrent browser field unchanged")
             do { _ = try await worker.command("snapshot", tabID: -99); preconditionFailure("accepted unowned tab") } catch { checks += 1 }
             do { _ = try await worker.command("cdpKey", tabID: id, args:["keys":"cmd+v"]); preconditionFailure("accepted shared clipboard shortcut") } catch { checks += 1 }
+            let disposable = try await worker.newTab(page("Disposable"))
+            let completedRun = worker.generation
+            await worker.runEnded(keep: id, generation: completedRun)
+            do { _ = try await worker.command("tabInfo", tabID: disposable); preconditionFailure("kept unused task tab") } catch { checks += 1 }
+            let finalPhoto = try await worker.command("captureTask", tabID: id)
+            try check((finalPhoto["image"] as? String)?.isEmpty == false, "captures retained tab after idle freeze")
+            worker.runStarted()
+            await worker.runEnded(keep: nil, generation: completedRun)
+            let retained = try await worker.command("tabInfo", tabID: id)
+            try check(retained["title"] as? String == "Worker", "stale cleanup leaves the next run's tab alone")
             let recoveredID = try await recovered.newTab(page("Recovered worker"))
             let recoveredInfo = try await recovered.command("tabInfo", tabID: recoveredID)
             try check(recoveredInfo["title"] as? String == "Recovered worker", "reclaims orphaned owned process without replaying its old target")

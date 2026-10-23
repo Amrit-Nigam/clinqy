@@ -191,15 +191,49 @@ extension Agent.Phase {
 
 // MARK: - Orb
 
+/// Tracks whether the window hosting a view is on screen, so animations can pause while it's hidden or covered
+/// (Clinqy keeps its panels around ordered out, and a TimelineView in one keeps drawing otherwise).
+struct OnScreen: NSViewRepresentable {
+    @Binding var visible: Bool
+
+    func makeNSView(context: Context) -> Probe { Probe { visible = $0 } }
+    func updateNSView(_ view: Probe, context: Context) {}
+
+    final class Probe: NSView {
+        private let changed: (Bool) -> Void
+        private var observer: NSObjectProtocol?
+        init(_ changed: @escaping (Bool) -> Void) { self.changed = changed; super.init(frame: .zero) }
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            guard let window else { report(false); return }
+            observer = NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                                              object: window, queue: .main) { [weak self, weak window] _ in
+                MainActor.assumeIsolated { self?.report(window?.occlusionState.contains(.visible) == true) }
+            }
+            report(window.occlusionState.contains(.visible))
+        }
+
+        private func report(_ on: Bool) { DispatchQueue.main.async { [changed] in changed(on) } }
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+    }
+}
+
 /// The living dot, an Apple Watch–style "breathe" flower: six petals bloom out and back,
 /// faster while working, swelling with your voice; tinted by mood (teal/cyan when idle).
 private struct Orb: View {
     let mood: Buddy.Mood
     var level: CGFloat = 0
     var size: CGFloat = 26
+    @State private var onScreen = true
 
     var body: some View {
-        TimelineView(.animation) { context in
+        // The slow idle breath doesn't need display rate, and nothing at all while its window is hidden.
+        let busy = mood == .thinking || mood == .acting || mood == .listening
+        TimelineView(.animation(minimumInterval: busy ? 1.0 / 30.0 : 1.0 / 20.0, paused: !onScreen)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             let busy = mood == .thinking || mood == .acting
             let period = busy ? 1.4 : 3.0
@@ -224,6 +258,7 @@ private struct Orb: View {
             .frame(width: size, height: size)
             .animation(.easeInOut(duration: 0.35), value: mood)
         }
+        .background(OnScreen(visible: $onScreen))
     }
 
     private var colors: (Color, Color) {
@@ -869,9 +904,10 @@ private struct Hint: View {
 
 private struct Waveform: View {
     let level: CGFloat
+    @State private var onScreen = true
 
     var body: some View {
-        TimelineView(.animation) { context in
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !onScreen)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             HStack(alignment: .center, spacing: 3) {
                 ForEach(0..<36, id: \.self) { i in
@@ -885,6 +921,7 @@ private struct Waveform: View {
             }
             .frame(maxWidth: .infinity)
         }
+        .background(OnScreen(visible: $onScreen))
     }
 }
 

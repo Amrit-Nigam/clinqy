@@ -71,6 +71,7 @@ enum Background {
     }
 
     static func begin(_ on: Bool) {
+        if on { ChromeWorker.shared.runStarted() }
         active = on
         app = nil
         tab = nil
@@ -81,7 +82,12 @@ enum Background {
 
     static func end() {
         if active, app != nil || tab != nil { last = (tab, app) }
-        if active { lastRun = Date() }
+        if active {
+            lastRun = Date()
+            let keep = last.tab?.connection == ChromeWorker.shared.identity ? last.tab?.id : nil
+            let run = ChromeWorker.shared.generation
+            Task { await ChromeWorker.shared.runEnded(keep: keep, generation: run) }
+        }
         active = false
         userWindows = [:]
         app = nil

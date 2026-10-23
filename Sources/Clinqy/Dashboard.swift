@@ -4,6 +4,8 @@ import SwiftUI
 @MainActor
 final class DashboardModel: ObservableObject {
     @Published var page = "Overview"
+    /// The window showing the dashboard is on screen (set by its window).
+    var windowVisible: () -> Bool = { true }
     @Published var range = UsageRange.month
     @Published var selectedProvider = Provider.current.rawValue
     @Published var modelChoice = "sonnet"
@@ -73,7 +75,7 @@ final class DashboardModel: ObservableObject {
 
     func refresh(settings: Bool = false) {
         summary = UsageStore.summary(range: range)
-        monthlySummary = UsageStore.summary(range: .month)
+        monthlySummary = range == .month ? summary : UsageStore.summary(range: .month)
         if settings {
             selectedProvider = Provider.current.rawValue
             let latest = ["HOTKEY": Config.value("HOTKEY") ?? "ctrl+alt",
@@ -366,7 +368,9 @@ struct DashboardContentView: View {
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) { appeared = true }
         }
         .onDisappear { appeared = false }
-        .onReceive(Timer.publish(every: 8, on: .main, in: .common).autoconnect()) { _ in model.refresh() }
+        .onReceive(Timer.publish(every: 8, on: .main, in: .common).autoconnect()) { _ in
+            if model.windowVisible() { model.refresh() }
+        }
     }
 
     @ViewBuilder private var pageContent: some View {

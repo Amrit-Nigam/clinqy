@@ -7,6 +7,7 @@ final class WorkerCDP {
     private var receiveTask: Task<Void, Never>?
     private var nextID = 0
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
+    private var timeouts: [Int: Task<Void, Never>] = [:]
     var lastChooser: [String: Any]?
     private(set) var connected = true
 
@@ -23,6 +24,7 @@ final class WorkerCDP {
                     switch message { case .data(let d): data = d; case .string(let s): data = Data(s.utf8); @unknown default: continue }
                     guard let body = try JSONSerialization.jsonObject(with: data) as? [String: Any] else { continue }
                     if let id = body["id"] as? Int, let waiter = self.pending.removeValue(forKey: id) {
+                        self.timeouts.removeValue(forKey: id)?.cancel()
                         if let error = body["error"] as? [String: Any] { waiter.resume(throwing: Self.error(error["message"] as? String ?? "Chrome command failed")) }
                         else { waiter.resume(returning: body["result"] as? [String: Any] ?? [:]) }
                     } else if body["method"] as? String == "Page.fileChooserOpened" { self.lastChooser = body["params"] as? [String: Any] }
@@ -41,10 +43,14 @@ final class WorkerCDP {
             Task { [weak self] in
                 guard let self else { return }
                 do { try await self.socket.send(.string(String(decoding: data, as: UTF8.self))) }
-                catch { self.pending.removeValue(forKey: id)?.resume(throwing: error) }
+                catch {
+                    self.timeouts.removeValue(forKey: id)?.cancel()
+                    self.pending.removeValue(forKey: id)?.resume(throwing: error)
+                }
             }
-            Task { [weak self] in
-                try? await Task.sleep(for: .seconds(timeout))
+            timeouts[id] = Task { [weak self] in
+                do { try await Task.sleep(for: .seconds(timeout)) } catch { return }
+                self?.timeouts.removeValue(forKey: id)
                 self?.pending.removeValue(forKey: id)?.resume(throwing: Self.error("Chrome worker command timed out: " + method))
             }
         }
@@ -53,6 +59,8 @@ final class WorkerCDP {
         connected = false
         socket.cancel(with: .goingAway, reason: nil)
         receiveTask?.cancel(); receiveTask = nil
+        for timeout in timeouts.values { timeout.cancel() }
+        timeouts.removeAll()
         let waiters = pending.values; pending.removeAll()
         for waiter in waiters { waiter.resume(throwing: Self.error("Chrome worker disconnected")) }
     }
@@ -73,6 +81,17 @@ final class ChromeWorker {
     private var nextTab = 1_000_000
     private var tabs: [Int: Tab] = [:]
     private var selected: Int?
+    /// Tabs whose page is frozen (scripts, timers and animations stopped) because no run is using them.
+    private var frozen: Set<Int> = []
+    /// Commands under way per tab; a tab is never frozen in the middle of one.
+    private var inFlight: [Int: Int] = [:]
+    /// Bumped when a background run starts, so the previous run's late cleanup leaves the new run's tabs alone.
+    private(set) var generation = 0
+    private var runActive = false
+    private var idleStop: Task<Void, Never>?
+    private var stopping: Task<Void, Never>?
+    /// An idle worker is quit after this long; its profile (and sign-ins) stay on disk for the next run.
+    static let idleLifetime: Duration = .seconds(600)
     private(set) var headless = true
     var connected: Bool { browser?.connected == true }
     var app: NSRunningApplication? { process.flatMap { NSRunningApplication(processIdentifier: $0.processIdentifier) } }
@@ -102,6 +121,8 @@ final class ChromeWorker {
 
     func start() async throws {
         guard !loginMode else { throw WorkerCDP.error("Finish signing in to Worker Chrome from Clinqy's menu before starting background web tasks.") }
+        idleStop?.cancel(); idleStop = nil
+        if let stopping { await stopping.value }
         if connected { return }
         if let starting { return try await starting.value }
         let task = Task { try await launch(headless: true) }
@@ -196,12 +217,64 @@ final class ChromeWorker {
     func finishLogin() async { await stop(); loginMode = false }
     func shutdown() {
         for tab in tabs.values { tab.cdp.close() }
-        tabs.removeAll(); selected = nil
+        tabs.removeAll(); selected = nil; frozen.removeAll()
+        idleStop?.cancel(); idleStop = nil
         browser?.close(); browser = nil
         if let process, process.isRunning { process.terminate() }
     }
 
+    /// A background run finished: close every tab but the one its result shows, freeze that one so its page stops
+    /// using CPU, and quit Chrome if nothing needs it for a while.
+    func runStarted() {
+        generation += 1
+        runActive = true
+        idleStop?.cancel(); idleStop = nil
+    }
+
+    func runEnded(keep: Int?, generation run: Int) async {
+        guard run == generation else { return }
+        runActive = false
+        guard !loginMode, browser != nil else { return }
+        for (id, tab) in tabs where id != keep {
+            guard run == generation else { return }
+            // Retire the tab before yielding: a new run must not acquire one being closed.
+            tabs.removeValue(forKey: id)
+            frozen.remove(id)
+            _ = try? await browser?.call("Target.closeTarget", ["targetId": tab.target], timeout: 3)
+            tab.cdp.close()
+            for url in tab.uploads { try? FileManager.default.removeItem(at: url) }
+        }
+        guard run == generation else { return }
+        if selected.map({ tabs[$0] == nil }) ?? false { selected = keep }
+        if let keep { await freeze(keep, generation: run) }
+        guard run == generation else { return }
+        scheduleIdleStop()
+    }
+
+    /// Only between runs, and never under a command. Marked first, so a command that arrives meanwhile thaws it
+    /// (CDP handles one connection's calls in order).
+    private func freeze(_ id: Int, generation run: Int) async {
+        guard run == generation, !runActive, inFlight[id, default: 0] == 0,
+              let tab = tabs[id], tab.cdp.connected, !frozen.contains(id) else { return }
+        frozen.insert(id)
+        if (try? await tab.cdp.call("Page.setWebLifecycleState", ["state": "frozen"], timeout: 3)) == nil { frozen.remove(id) }
+    }
+
+    private func scheduleIdleStop() {
+        idleStop?.cancel()
+        idleStop = Task { [weak self] in
+            try? await Task.sleep(for: Self.idleLifetime)
+            guard let self, !Task.isCancelled, !self.runActive, !self.loginMode, self.inFlight.isEmpty else { return }
+            let stop = Task { await self.stop() }
+            self.stopping = stop
+            await stop.value
+            self.stopping = nil
+        }
+    }
+
     func stop() async {
+        idleStop?.cancel(); idleStop = nil
+        frozen.removeAll()
         if let browser { _ = try? await browser.call("Browser.close", timeout: 3) }
         for tab in tabs.values { tab.cdp.close(); for url in tab.uploads { try? FileManager.default.removeItem(at: url) } }
         tabs.removeAll(); selected = nil
@@ -246,6 +319,16 @@ final class ChromeWorker {
             return ["tabs": result]
         }
         guard let id = tabID, let tab = tabs[id], tab.cdp.connected else { throw WorkerCDP.error("The owned worker tab is gone. No foreground tab will be used.") }
+        inFlight[id, default: 0] += 1
+        idleStop?.cancel(); idleStop = nil
+        if frozen.remove(id) != nil { _ = try? await tab.cdp.call("Page.setWebLifecycleState", ["state": "active"], timeout: 3) }
+        // Used outside a run (a preview, a Telegram screenshot): back to sleep afterwards.
+        let run = generation
+        defer {
+            inFlight[id, default: 1] -= 1
+            if inFlight[id] == 0 { inFlight.removeValue(forKey: id) }
+            if !runActive { Task { await freeze(id, generation: run); if !runActive { scheduleIdleStop() } } }
+        }
         switch command {
         case "switchTab": selected = id; return ["id": id] // logical selection only; never activate a host window
         case "closeTab":

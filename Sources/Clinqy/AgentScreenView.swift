@@ -29,13 +29,14 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
         }
         if panel == nil { build() }
         display = nil
+        idleGeneration = nil
         bring.title = workerTab == nil ? "Bring it here" : "Tasks & Recovery"
         panel?.center()
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         timer?.invalidate()
         timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { Task { await self?.refresh() } }
+            Task { @MainActor in await self?.refresh() }
         }
         Task { await refresh() }
     }
@@ -84,15 +85,25 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
         return tab?.connection == ChromeWorker.shared.identity ? tab : nil
     }
 
+    /// Once a run is over the picture doesn't change: one capture, not one every 250 ms.
+    private var idleGeneration: Int?
+
     private func refresh() async {
-        guard !capturing, panel?.isVisible == true else { return }
+        guard !capturing, panel?.isVisible == true,
+              panel?.occlusionState.contains(.visible) == true else { return }
+        let running = agent?.isRunning == true && agent?.runBackground == true
+        let generation = ChromeWorker.shared.generation
+        if running { idleGeneration = nil }
+        if !running && idleGeneration == generation { return }
         if let tab = workerTab {
             capturing = true
             defer { capturing = false }
             if agent?.question?.sensitive == true { picture.image = nil; status.stringValue = "Waiting for private input on your Mac"; return }
-            if let png = await BrowserBridge.shared.taskScreenshot(of: tab) { picture.image = NSImage(data: png) }
+            if let png = await BrowserBridge.shared.taskScreenshot(of: tab) {
+                picture.image = NSImage(data: png)
+                idleGeneration = running ? nil : generation
+            }
             status.stringValue = TaskStore.shared.active?.stage ?? "Worker Chrome — final task view"
-            let running = agent?.isRunning == true && agent?.runBackground == true
             stop.isHidden = !running; steer.isEnabled = running
             return
         }
@@ -111,8 +122,8 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
         if let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []),
                                                                   configuration: config) {
             picture.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
+            idleGeneration = running ? nil : generation
         }
-        let running = agent?.isRunning == true && agent?.runBackground == true
         if let q = agent?.question, running {
             status.stringValue = "Asks: " + q.text
             steer.placeholderString = "Your answer — Return to send"
