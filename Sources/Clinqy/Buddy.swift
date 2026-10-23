@@ -23,7 +23,7 @@ final class Buddy {
 
     /// Off: the companion stays hidden while Clinqy is idle and only appears when it listens, thinks or acts.
     var followsMouse = UserDefaults.standard.object(forKey: "buddyFollowsMouse") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(followsMouse, forKey: "buddyFollowsMouse") }
+        didSet { UserDefaults.standard.set(followsMouse, forKey: "buddyFollowsMouse"); wake() }
     }
 
     /// QA mode: the companion becomes an amber targeting reticle with a "QA" tag.
@@ -50,9 +50,11 @@ final class Buddy {
     private var stages: [Stage] = []
     private var timer: Timer?
     private var lastTick = CACurrentMediaTime()
-    /// 120 Hz while anything moves; once everything has settled for a second it stops drawing and only polls.
+    /// Motion follows the display's refresh rate (up to 120 Hz), decorative animation 30 Hz; a parked companion has no idle timer.
     private var fast = false
     private var stillSince: CFTimeInterval?
+    private var mouseMonitors: [Any] = []
+    private var screenObserver: NSObjectProtocol?
 
     // Motion, in global top-left coordinates (CGEvent space). `pos` is the triangle's tip.
     private var pos = CGPoint(x: 400, y: 400)
@@ -105,23 +107,59 @@ final class Buddy {
     }
 
     init() {
+        Efficiency.start()
         rebuildStages()
         let m = Self.mouse()
         pos = CGPoint(x: m.x + Self.offset.dx, y: m.y + Self.offset.dy)
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.rebuildStages() }
         }
         setRate(fast: true)
     }
 
-    private func setRate(fast: Bool) {
-        guard fast != self.fast || timer == nil else { return }
-        self.fast = fast
+    private func watchMouse() {
+        guard mouseMonitors.isEmpty else { return }
+        let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: events, handler: { [weak self] _ in
+            MainActor.assumeIsolated { self?.mouseMoved() }
+        }) { mouseMonitors.append(monitor) }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: events, handler: { [weak self] event in
+            MainActor.assumeIsolated { self?.mouseMoved() }
+            return event
+        }) { mouseMonitors.append(monitor) }
+    }
+
+    deinit {
         timer?.invalidate()
-        let timer = Timer(timeInterval: fast ? 1.0 / 120.0 : 1.0 / 30.0, repeats: true) { [weak self] _ in
+        bubbleTimer?.invalidate()
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        for monitor in mouseMonitors { NSEvent.removeMonitor(monitor) }
+    }
+
+    private func mouseMoved() {
+        // Already animating: no new task, simulation step or timer allocation per mouse event.
+        if !fast, mode == .following { wake() }
+    }
+
+    private func setRate(fast: Bool) {
+        self.fast = fast
+        if fast || mode != .following {
+            for monitor in mouseMonitors { NSEvent.removeMonitor(monitor) }
+            mouseMonitors.removeAll()
+        } else { watchMouse() }
+        if !fast, mode != .following {
+            timer?.invalidate(); timer = nil
+            return
+        }
+        let moving = flight != nil || (mode == .following && hypot(vel.dx, vel.dy) > 1)
+        let interval = fast ? Efficiency.animationInterval(moving: moving) : 0.25
+        guard timer?.timeInterval != interval else { return }
+        timer?.invalidate()
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.tick() }
         }
+        timer.tolerance = fast ? interval * 0.1 : 0.05
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
     }
@@ -143,7 +181,7 @@ final class Buddy {
         let end = CGPoint(x: point.x + 3, y: point.y + 3)
         let start = pos
         let distance = hypot(end.x - start.x, end.y - start.y)
-        if distance < 4 { mode = .parked; return }
+        if distance < 4 { mode = .parked; wake(); return }
         // A person's hand: quick for short hops, never instant, never sluggish.
         let duration = min(0.8, max(0.3, 0.24 + Double(distance) / 1900))
         let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
@@ -399,7 +437,7 @@ final class Buddy {
     private func rebuildStages() {
         stages.forEach { $0.window.orderOut(nil) }
         stages = NSScreen.screens.map(Stage.init)
-        if timer != nil { wake() }
+        wake()
     }
 
     static func mouse() -> CGPoint {
@@ -483,6 +521,8 @@ private final class Stage {
     private var spinnerAlpha: CGFloat = 0
     private var barsAlpha: CGFloat = 0
     private var bubbleAlpha: CGFloat = 0
+    private var measuredLabel = ""
+    private var measuredWidth: CGFloat = 0
 
     init(screen: NSScreen) {
         let frame = screen.frame
@@ -716,7 +756,12 @@ private final class Stage {
         // Bubble: pops in with a little overshoot, text streams in.
         let label = f.bubble ?? ""
         ease(&bubbleAlpha, label.isEmpty ? 0 : 1, 14)
-        let width = label.isEmpty ? bubbleWidth : ceil(NSAttributedString(string: label, attributes: [.font: font]).size().width) + 24
+        if label != measuredLabel {
+            measuredLabel = label
+            measuredWidth = label.isEmpty ? 0 : ceil(NSAttributedString(string: label, attributes: [.font: font]).size().width) + 24
+            text.string = label
+        }
+        let width = label.isEmpty ? bubbleWidth : measuredWidth
         ease(&bubbleWidth, width, 20)
         let height: CGFloat = 28
         let age = min(1, f.bubbleAge / 0.35)
@@ -728,7 +773,6 @@ private final class Stage {
         bubble.cornerRadius = height / 2
         bubble.opacity = Float(bubbleAlpha)
         bubble.borderColor = accent.copy(alpha: 0.45)
-        text.string = label
         text.frame = CGRect(x: 12, y: 6, width: max(0, bubbleWidth - 20), height: 18)
         renderStreak(f, accent: accent, local: local)
         renderMark(f, accent: accent, local: local)

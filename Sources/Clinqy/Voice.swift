@@ -83,10 +83,11 @@ final class Voice: ObservableObject {
         private var early: [AVAudioPCMBuffer] = []
         private var holding = false
         private var closed = false
+        private var nextLevelUpdate: TimeInterval = 0
 
         func set(_ r: SFSpeechAudioBufferRecognitionRequest?) { lock.withLock { request = r } }
 
-        func reset() { lock.withLock { request = nil; sink = nil; early = []; holding = false; closed = false } }
+        func reset() { lock.withLock { request = nil; sink = nil; early = []; holding = false; closed = false; nextLevelUpdate = 0 } }
 
         /// Keep the audio until `attach`.
         func hold() { lock.withLock { early = []; holding = true } }
@@ -104,11 +105,16 @@ final class Voice: ObservableObject {
         /// The mic is off: take no more audio (what was kept stays for a late `attach`).
         func close() { lock.withLock { closed = true; sink = nil } }
 
-        func append(_ b: AVAudioPCMBuffer) {
+        /// Every audio buffer reaches recognition; only the decorative meter is rate-limited.
+        func append(_ b: AVAudioPCMBuffer) -> Bool {
             lock.withLock {
-                guard !closed else { return }
+                guard !closed else { return false }
                 request?.append(b)
                 if let sink { sink(b) } else if holding, let copy = b.copied { early.append(copy) }
+                let now = ProcessInfo.processInfo.systemUptime
+                guard now >= nextLevelUpdate else { return false }
+                nextLevelUpdate = now + 1.0 / 30.0
+                return true
             }
         }
     }
@@ -134,7 +140,7 @@ final class Voice: ObservableObject {
         let feed = self.feed
         feed.reset()
         input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            feed.append(buffer)
+            guard feed.append(buffer) else { return }
             guard let data = buffer.floatChannelData?[0] else { return }
             let n = Int(buffer.frameLength)
             var sum: Float = 0
@@ -142,7 +148,7 @@ final class Voice: ObservableObject {
             let rms = sqrt(sum / Float(max(1, n)))
             let level = CGFloat(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 40)))
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.isListening else { return }
                 self.level = self.level * 0.6 + level * 0.4
                 self.onLevel(self.level)
             }

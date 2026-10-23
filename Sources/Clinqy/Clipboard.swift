@@ -12,10 +12,12 @@ enum Clipboard {
     private static var timer: Timer?
 
     static func start() {
+        guard timer == nil else { return }
         lastText = NSPasteboard.general.string(forType: .string)
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { _ in
             MainActor.assumeIsolated { poll() }
         }
+        timer?.tolerance = 0.2
     }
 
     private static func poll() {

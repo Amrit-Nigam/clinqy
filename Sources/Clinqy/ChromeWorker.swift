@@ -9,6 +9,7 @@ final class WorkerCDP {
     private var pending: [Int: CheckedContinuation<[String: Any], Error>] = [:]
     private var timeouts: [Int: Task<Void, Never>] = [:]
     var lastChooser: [String: Any]?
+    private(set) var contextRevision = 0
     private(set) var connected = true
 
     init(url: URL, session: URLSession) {
@@ -27,7 +28,12 @@ final class WorkerCDP {
                         self.timeouts.removeValue(forKey: id)?.cancel()
                         if let error = body["error"] as? [String: Any] { waiter.resume(throwing: Self.error(error["message"] as? String ?? "Chrome command failed")) }
                         else { waiter.resume(returning: body["result"] as? [String: Any] ?? [:]) }
-                    } else if body["method"] as? String == "Page.fileChooserOpened" { self.lastChooser = body["params"] as? [String: Any] }
+                    } else if let method = body["method"] as? String {
+                        if method == "Page.fileChooserOpened" { self.lastChooser = body["params"] as? [String: Any] }
+                        if ["Runtime.executionContextsCleared", "Runtime.executionContextDestroyed", "Page.frameNavigated"].contains(method) {
+                            self.contextRevision += 1
+                        }
+                    }
                 }
             } catch { self.close() }
         }
@@ -81,6 +87,7 @@ final class ChromeWorker {
     private var nextTab = 1_000_000
     private var tabs: [Int: Tab] = [:]
     private var selected: Int?
+    private var cachedPageScript: String?
     /// Tabs whose page is frozen (scripts, timers and animations stopped) because no run is using them.
     private var frozen: Set<Int> = []
     /// Commands under way per tab; a tab is never frozen in the middle of one.
@@ -108,6 +115,11 @@ final class ChromeWorker {
         var focusedFrame: String?
         var incomplete = false
         var uploads: [URL] = []
+        var helperContexts: [String: Int] = [:]
+        var contextRevision = -1
+        var finalCapture: String?
+        var finalCaptureTask: Task<String?, Never>?
+        var freezeGeneration: Int?
         init(target: String, cdp: WorkerCDP) { self.target = target; self.cdp = cdp }
     }
 
@@ -228,6 +240,12 @@ final class ChromeWorker {
     func runStarted() {
         generation += 1
         runActive = true
+        cachedPageScript = nil // Development helper changes take effect on the next run.
+        for (id, tab) in tabs where tab.finalCaptureTask != nil {
+            tab.finalCaptureTask = nil
+            tab.freezeGeneration = nil
+            frozen.remove(id)
+        }
         idleStop?.cancel(); idleStop = nil
     }
 
@@ -257,7 +275,23 @@ final class ChromeWorker {
         guard run == generation, !runActive, inFlight[id, default: 0] == 0,
               let tab = tabs[id], tab.cdp.connected, !frozen.contains(id) else { return }
         frozen.insert(id)
-        if (try? await tab.cdp.call("Page.setWebLifecycleState", ["state": "frozen"], timeout: 3)) == nil { frozen.remove(id) }
+        tab.freezeGeneration = run
+        // Chrome may resume page timers to service captureScreenshot. Capture once BEFORE freezing;
+        // final previews/exports subsequently return these bytes without touching the renderer.
+        let capture = Task { [cdp = tab.cdp] in
+            (try? await cdp.call("Page.captureScreenshot", ["format": "png", "captureBeyondViewport": false]))?["data"] as? String
+        }
+        tab.finalCaptureTask = capture
+        let image = await capture.value
+        guard tab.freezeGeneration == run else { return }
+        tab.finalCaptureTask = nil
+        guard run == generation, !runActive, inFlight[id, default: 0] == 0, tab.cdp.connected else {
+            frozen.remove(id)
+            return
+        }
+        tab.finalCapture = image
+        if (try? await tab.cdp.call("Page.setWebLifecycleState", ["state": "frozen"], timeout: 3)) == nil,
+           run == generation, tab.freezeGeneration == run { frozen.remove(id) }
     }
 
     private func scheduleIdleStop() {
@@ -321,13 +355,25 @@ final class ChromeWorker {
         guard let id = tabID, let tab = tabs[id], tab.cdp.connected else { throw WorkerCDP.error("The owned worker tab is gone. No foreground tab will be used.") }
         inFlight[id, default: 0] += 1
         idleStop?.cancel(); idleStop = nil
-        if frozen.remove(id) != nil { _ = try? await tab.cdp.call("Page.setWebLifecycleState", ["state": "active"], timeout: 3) }
         // Used outside a run (a preview, a Telegram screenshot): back to sleep afterwards.
         let run = generation
         defer {
             inFlight[id, default: 1] -= 1
             if inFlight[id] == 0 { inFlight.removeValue(forKey: id) }
             if !runActive { Task { await freeze(id, generation: run); if !runActive { scheduleIdleStop() } } }
+        }
+        let captureOnly = !runActive && (command == "captureTask" || command == "capturePreview")
+        if captureOnly {
+            var image = tab.finalCapture
+            if image == nil, let capture = tab.finalCaptureTask { image = await capture.value }
+            if let image, !image.isEmpty {
+                return ["image": image, "tabId": id]
+            }
+            if frozen.contains(id) { throw WorkerCDP.error("The final task screenshot is unavailable. Start a task to refresh the page.") }
+        } else { tab.finalCapture = nil; tab.freezeGeneration = nil }
+        if !captureOnly, frozen.contains(id) {
+            _ = try await tab.cdp.call("Page.setWebLifecycleState", ["state": "active"], timeout: 3)
+            frozen.remove(id)
         }
         switch command {
         case "switchTab": selected = id; return ["id": id] // logical selection only; never activate a host window
@@ -345,6 +391,12 @@ final class ChromeWorker {
             }
             return ["ok": true]
         case "captureTask": return ["image": try await tab.cdp.call("Page.captureScreenshot", ["format": "png", "captureBeyondViewport": false])["data"] ?? "", "tabId": id]
+        case "capturePreview":
+            return ["image": try await tab.cdp.call("Page.captureScreenshot", ["format": "jpeg", "quality": 70,
+                           "optimizeForSpeed": true, "captureBeyondViewport": false])["data"] ?? "", "tabId": id]
+        case "captureVision":
+            return ["image": try await tab.cdp.call("Page.captureScreenshot", ["format": "jpeg", "quality": 85,
+                           "optimizeForSpeed": true, "captureBeyondViewport": false])["data"] ?? "", "tabId": id]
         case "snapshot": return try await snapshot(tab, id: id)
         case "cdpType": _ = try await tab.cdp.call("Input.insertText", ["text": args["text"] as? String ?? ""]); return ["typed": true]
         case "cdpClick":
@@ -361,10 +413,13 @@ final class ChromeWorker {
     }
 
     private func pageScript() throws -> String {
+        if let cachedPageScript { return cachedPageScript }
         let candidates = [scriptURL, Bundle.main.resourceURL?.appendingPathComponent("extension/page.js"),
                           URL(fileURLWithPath: FileManager.default.currentDirectoryPath).appendingPathComponent("extension/page.js")].compactMap { $0 }
         guard let source = candidates.first(where: { FileManager.default.fileExists(atPath: $0.path) }) else { throw WorkerCDP.error("The worker's page helpers are missing. Rebuild Clinqy.") }
-        return try String(contentsOf: source, encoding: .utf8)
+        let script = try String(contentsOf: source, encoding: .utf8)
+        cachedPageScript = script
+        return script
     }
     private func evaluate(_ tab: Tab, expression: String, context: Int? = nil) async throws -> Any {
         var args: [String: Any] = ["expression": expression, "returnByValue": true, "awaitPromise": true, "userGesture": true]
@@ -374,12 +429,22 @@ final class ChromeWorker {
         return (result["result"] as? [String: Any])?["value"] ?? NSNull()
     }
     private func call(_ tab: Tab, frame: String, function: String, args: [Any] = []) async throws -> [String: Any] {
+        if tab.contextRevision != tab.cdp.contextRevision {
+            tab.helperContexts.removeAll()
+            tab.contextRevision = tab.cdp.contextRevision
+        }
+        let encoded = String(data: try JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]), encoding: .utf8)!
+        let expression = "window.__clinqy[\"\(function)\"](...\(encoded))"
+        if let cached = tab.helperContexts[frame] {
+            do { return try await evaluate(tab, expression: expression, context: cached) as? [String: Any] ?? [:] }
+            // The page navigated before Chrome's event arrived: the helper never ran, so a fresh one can.
+            catch where error.localizedDescription.contains("Cannot find context") { tab.helperContexts[frame] = nil }
+        }
         let result = try await tab.cdp.call("Page.createIsolatedWorld", ["frameId": frame, "worldName": "ClinqyWorker"])
         guard let context = result["executionContextId"] as? Int else { throw WorkerCDP.error("An embedded frame isn't available to this worker") }
         _ = try await evaluate(tab, expression: try pageScript(), context: context)
-        let encoded = String(data: try JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]), encoding: .utf8)!
-        let value = try await evaluate(tab, expression: "window.__clinqy[\"\(function)\"](...\(encoded))", context: context)
-        return value as? [String: Any] ?? [:]
+        tab.helperContexts[frame] = context
+        return try await evaluate(tab, expression: expression, context: context) as? [String: Any] ?? [:]
     }
     private func frameList(_ tree: [String: Any]) -> [String] {
         var ids = [(tree["frame"] as? [String: Any])?["id"] as? String].compactMap { $0 }

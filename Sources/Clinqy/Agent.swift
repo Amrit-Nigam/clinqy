@@ -649,8 +649,8 @@ final class Agent: ObservableObject {
                 message += "\nInside the circled area: " + (inside.isEmpty ? "no listed elements (use the screenshot)." : inside.prefix(30).joined(separator: ", "))
             }
             var image: String?
-            if wantsLook, Background.active, let tab = Background.tab, let png = await BrowserBridge.shared.taskScreenshot(of: tab) {
-                image = png.base64EncodedString()
+            if wantsLook, Background.active, let tab = Background.tab, let jpeg = await BrowserBridge.shared.taskVisionScreenshot(of: tab) {
+                image = jpeg.base64EncodedString()
             } else if wantsLook, !Background.active, let shotApp = obs.app {
                 image = await Screenshot.annotated(app: shotApp, elements: obs.elements, circled: circled)
                 if image == nil, let blank = Screenshot.lastBlank { message += "\n" + blank.hint }

@@ -293,9 +293,20 @@ final class BrowserBridge {
     }
 
     /// Captures one owned task tab through the extension. Capturing a hidden tab can take longer than a normal command.
-    func taskScreenshot(of tab: TabInfo) async -> Data? {
+    /// Model inputs are JPEG (matching the providers' image/jpeg payload); exports stay lossless PNG.
+    func taskVisionScreenshot(of tab: TabInfo) async -> Data? {
         if tab.connection == ChromeWorker.shared.identity {
-            guard let raw = try? await ChromeWorker.shared.command("captureTask", tabID: tab.id), let png = raw["image"] as? String else { return nil }
+            guard let raw = try? await ChromeWorker.shared.command("captureVision", tabID: tab.id),
+                  let encoded = raw["image"] as? String else { return nil }
+            return Data(base64Encoded: encoded)
+        }
+        guard let png = await taskScreenshot(of: tab), let bitmap = NSBitmapImageRep(data: png) else { return nil }
+        return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+    }
+
+    func taskScreenshot(of tab: TabInfo, preview: Bool = false) async -> Data? {
+        if tab.connection == ChromeWorker.shared.identity {
+            guard let raw = try? await ChromeWorker.shared.command(preview ? "capturePreview" : "captureTask", tabID: tab.id), let png = raw["image"] as? String else { return nil }
             return Data(base64Encoded: png)
         }
         guard let conn = connections[tab.connection] else {

@@ -16,6 +16,7 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
     private var onFinish: () -> Void = {}
     private let model: OnboardingModel
     private let dashboardModel: DashboardModel
+    private var visibilityObserver: NSObjectProtocol?
 
     /// `run` hands a task to the agent (for "Let Clinqy do it"); `isRunning` says whether one is still going.
     init(onFinish: @escaping () -> Void, run: @escaping (String) -> Void, isRunning: @escaping () -> Bool,
@@ -50,8 +51,12 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
         // Out of the way while Clinqy works on screen, back when it's done.
         model.hideWindow = { [weak self] in self?.orderOut(nil) }
         model.showWindow = { [weak self] in self?.present() }
-        model.windowVisible = { [weak self] in self?.isVisible == true }
+        model.windowVisible = { [weak self] in self?.occlusionState.contains(.visible) == true }
         dashboardModel.windowVisible = model.windowVisible
+        visibilityObserver = NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                                                    object: self, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.model.updatePolling() }
+        }
         let hosting = NSHostingView(rootView: OnboardingView(model: model, dashboardModel: dashboardModel))
         hosting.sizingOptions = []   // don't grow the window by the title bar's height
         contentView = hosting
@@ -89,6 +94,8 @@ final class OnboardingWindow: NSWindow, NSWindowDelegate {
     func windowWillClose(_ notification: Notification) {
         NSApp.setActivationPolicy(.accessory)
     }
+
+    deinit { if let visibilityObserver { NotificationCenter.default.removeObserver(visibilityObserver) } }
 }
 
 // MARK: - Model
@@ -219,7 +226,7 @@ final class OnboardingModel: ObservableObject {
 
     private let persistProgress: Bool
     @Published var showingDashboard = false {
-        didSet { destinationChanged(showingDashboard) }
+        didSet { destinationChanged(showingDashboard); updatePolling() }
     }
     var destinationChanged: (Bool) -> Void = { _ in }
     @Published var step: Step {
@@ -243,10 +250,10 @@ final class OnboardingModel: ObservableObject {
     var hideWindow: () -> Void = {}
     var showWindow: () -> Void = {}
     /// The setup window is on screen (it's kept around closed); the once-a-second redraw only matters then.
-    var windowVisible: () -> Bool = { true }
+    var windowVisible: () -> Bool = { true } { didSet { updatePolling() } }
     /// "Let Clinqy do it" for the extension: idle, working (window hidden), or how it ended.
     enum AutoLoad: Equatable { case idle, working, done, gaveUp }
-    @Published var autoLoad: AutoLoad = .idle
+    @Published var autoLoad: AutoLoad = .idle { didSet { updatePolling() } }
     @Published var browserID = ""
     private var autoStarted: Date?
     private var timer: Timer?
@@ -262,6 +269,14 @@ final class OnboardingModel: ObservableObject {
         if let name = ModelChoice.from(current).keyName { apiKey = Config.value(name) ?? "" }
         savedConfiguration = [choice.rawValue, apiKey, localModel, baseURL]
         browserID = browsers.first?.id ?? ""
+        updatePolling()
+    }
+
+    /// Setup checks stop with the hidden page; extension auto-loading still needs its completion watcher.
+    func updatePolling() {
+        let needed = (windowVisible() && !showingDashboard) || autoLoad == .working
+        guard needed != (timer != nil) else { return }
+        guard needed else { timer?.invalidate(); timer = nil; return }
         timer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
@@ -269,6 +284,7 @@ final class OnboardingModel: ObservableObject {
                 self.watchAutoLoad()
             }
         }
+        timer?.tolerance = 0.2
     }
 
     deinit { timer?.invalidate() }

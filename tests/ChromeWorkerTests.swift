@@ -1,12 +1,29 @@
 import AppKit
 
+@MainActor private final class WorkerActivationLog { var pids: [pid_t] = [] }
+
 @main struct ChromeWorkerTests {
     @MainActor static func main() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-worker-tests-\(UUID())")
         let worker = ChromeWorker(root: root.appendingPathComponent("worker"))
         let other = ChromeWorker(root: root.appendingPathComponent("other"))
         let recovered = ChromeWorker(root: root.appendingPathComponent("worker"))
-        let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
+        let activations = WorkerActivationLog()
+        var ownedPIDs: Set<pid_t> = []
+        let observer = NSWorkspace.shared.notificationCenter.addObserver(forName: NSWorkspace.didActivateApplicationNotification,
+                                                                         object: nil, queue: .main) { note in
+            MainActor.assumeIsolated {
+                if let app = note.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication {
+                    activations.pids.append(app.processIdentifier)
+                }
+            }
+        }
+        defer { NSWorkspace.shared.notificationCenter.removeObserver(observer) }
+        func rememberPID(_ profile: String) throws {
+            let data = try Data(contentsOf: root.appendingPathComponent(profile + "/owner.json"))
+            let owner = try JSONSerialization.jsonObject(with: data) as! [String: Any]
+            ownedPIDs.insert(pid_t(owner["pid"] as! Int))
+        }
         let clipboard = NSPasteboard.general.changeCount
         var checks = 0
         func check(_ value: Bool, _ label: String) throws { guard value else { throw WorkerCDP.error(label) }; checks += 1 }
@@ -21,6 +38,7 @@ import AppKit
             async let first = worker.newTab(firstURL)
             async let second = other.newTab(secondURL)
             let (id, otherID) = try await (first, second)
+            try rememberPID("worker"); try rememberPID("other")
             try await Task.sleep(for: .milliseconds(500))
             let snap = try await worker.command("snapshot", tabID: id)
             let elements = snap["elements"] as? [[String: Any]] ?? []
@@ -47,11 +65,28 @@ import AppKit
             var via = args; via["index"] = attach
             let chooser = try await worker.command("uploadVia", tabID: id, args:via)
             try check(chooser["ok"] as? Bool == true, "intercepts file chooser without opening Finder")
-            try await Task.sleep(for: .milliseconds(500))
-            let uploadRead = try await worker.command("read", tabID: id)
+            var uploadRead: [String: Any] = [:]
+            // Chrome may throttle a background page's 100 ms timer to one second.
+            for _ in 0..<30 {
+                uploadRead = try await worker.command("read", tabID: id)
+                if (uploadRead["text"] as? String ?? "").contains("test attachment") { break }
+                try await Task.sleep(for: .milliseconds(100))
+            }
             try check((uploadRead["text"] as? String ?? "").contains("test attachment"), "uploaded file remains readable after picker returns")
             let photo = try await worker.command("captureTask", tabID: id)
             try check((photo["image"] as? String)?.isEmpty == false, "captures owned task screenshot")
+            let png = Data(base64Encoded: photo["image"] as! String)!
+            try check(Array(png.prefix(4)) == [137, 80, 78, 71], "exported screenshot remains PNG")
+            let preview = try await worker.command("capturePreview", tabID: id)
+            let jpeg = Data(base64Encoded: preview["image"] as! String)!
+            try check(Array(jpeg.prefix(2)) == [255, 216], "live preview uses JPEG")
+            let bitmap = NSBitmapImageRep(data: jpeg)
+            try check(bitmap?.pixelsWide == 1440 && bitmap?.pixelsHigh == 900, "preview preserves the full viewport")
+            if let sample = ProcessInfo.processInfo.environment["CLINQY_TEST_PREVIEW"] {
+                try jpeg.write(to: URL(fileURLWithPath: sample))
+            }
+            let vision = try await worker.command("captureVision", tabID: id)
+            try check(Array(Data(base64Encoded: vision["image"] as! String)!.prefix(2)) == [255, 216], "model screenshot matches JPEG media type")
             let otherSnap = try await other.command("snapshot", tabID: otherID)
             let otherEls = otherSnap["elements"] as? [[String: Any]] ?? []
             let otherName = otherEls.first { ["textbox", "text"].contains($0["role"] as? String ?? "") }!["i"] as! Int
@@ -59,6 +94,22 @@ import AppKit
             try check(otherValue["value"] as? String == "", "concurrent browser field unchanged")
             do { _ = try await worker.command("snapshot", tabID: -99); preconditionFailure("accepted unowned tab") } catch { checks += 1 }
             do { _ = try await worker.command("cdpKey", tabID: id, args:["keys":"cmd+v"]); preconditionFailure("accepted shared clipboard shortcut") } catch { checks += 1 }
+            let navigated = try await worker.newTab(page("Before navigation"))
+            _ = try await worker.command("snapshot", tabID: navigated)
+            _ = try await worker.command("navigate", tabID: navigated, args: ["url": page("After navigation")])
+            try await Task.sleep(for: .milliseconds(500))
+            let nextSnapshot = try await worker.command("snapshot", tabID: navigated)
+            try check(nextSnapshot["title"] as? String == "After navigation", "reinstalls page helpers after navigation")
+            let embeddedHTML = "<title>Embedded form</title><iframe srcdoc=\"<label>Embedded name<input></label>\"></iframe>"
+            let embedded = try await worker.newTab("data:text/html;base64," + Data(embeddedHTML.utf8).base64EncodedString())
+            try await Task.sleep(for: .milliseconds(300))
+            let embeddedSnapshot = try await worker.command("snapshot", tabID: embedded)
+            let embeddedElements = embeddedSnapshot["elements"] as? [[String: Any]] ?? []
+            let embeddedField = embeddedElements.first { ["textbox", "text"].contains($0["role"] as? String ?? "") }?["i"] as? Int
+            try check(embeddedField != nil, "snapshots embedded frame with cached helpers")
+            _ = try await worker.command("fill", tabID: embedded, args: ["index": embeddedField!, "text": "Inside frame"])
+            let embeddedValue = try await worker.command("value", tabID: embedded, args: ["index": embeddedField!])
+            try check(embeddedValue["value"] as? String == "Inside frame", "cached frame context routes actions to the right document")
             let disposable = try await worker.newTab(page("Disposable"))
             let completedRun = worker.generation
             await worker.runEnded(keep: id, generation: completedRun)
@@ -69,13 +120,22 @@ import AppKit
             await worker.runEnded(keep: nil, generation: completedRun)
             let retained = try await worker.command("tabInfo", tabID: id)
             try check(retained["title"] as? String == "Worker", "stale cleanup leaves the next run's tab alone")
+            let endingGeneration = worker.generation
+            let ending = Task { await worker.runEnded(keep: id, generation: endingGeneration) }
+            try await Task.sleep(for: .milliseconds(5))
+            worker.runStarted()
+            _ = try await worker.command("snapshot", tabID: id)
+            await ending.value
+            let stillOwned = try await worker.command("tabInfo", tabID: id)
+            try check(stillOwned["title"] as? String == "Worker", "new run survives an overlapping final-frame capture")
             let recoveredID = try await recovered.newTab(page("Recovered worker"))
+            try rememberPID("worker")
             let recoveredInfo = try await recovered.command("tabInfo", tabID: recoveredID)
             try check(recoveredInfo["title"] as? String == "Recovered worker", "reclaims orphaned owned process without replaying its old target")
             await worker.stop()
             do { _ = try await worker.command("fill", tabID: id, args:["index": name!, "text":"must fail"]); preconditionFailure("fell through after disconnect") } catch { checks += 1 }
             try check(NSPasteboard.general.changeCount == clipboard, "host clipboard unchanged")
-            try check(NSWorkspace.shared.frontmostApplication?.processIdentifier == front, "host foreground app unchanged")
+            try check(!activations.pids.contains(where: { ownedPIDs.contains($0) }), "owned worker never activates foreground (user app switches allowed)")
             await recovered.stop(); await other.stop()
             try? FileManager.default.removeItem(at: root)
             print("PASS: \(checks) headless Chrome isolation checks")

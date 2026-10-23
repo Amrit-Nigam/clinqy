@@ -74,8 +74,10 @@ final class DashboardModel: ObservableObject {
     var requestLimitValue: Int { Int(requestLimit) ?? 0 }
 
     func refresh(settings: Bool = false) {
-        summary = UsageStore.summary(range: range)
-        monthlySummary = range == .month ? summary : UsageStore.summary(range: .month)
+        let current = UsageStore.summary(range: range)
+        if summary != current { summary = current }
+        let month = range == .month ? current : UsageStore.summary(range: .month)
+        if monthlySummary != month { monthlySummary = month }
         if settings {
             selectedProvider = Provider.current.rawValue
             let latest = ["HOTKEY": Config.value("HOTKEY") ?? "ctrl+alt",
@@ -368,7 +370,7 @@ struct DashboardContentView: View {
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) { appeared = true }
         }
         .onDisappear { appeared = false }
-        .onReceive(Timer.publish(every: 8, on: .main, in: .common).autoconnect()) { _ in
+        .onReceive(Timer.publish(every: 8, tolerance: 1, on: .main, in: .common).autoconnect()) { _ in
             if model.windowVisible() { model.refresh() }
         }
     }

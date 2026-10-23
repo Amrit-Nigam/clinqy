@@ -1,5 +1,6 @@
 import AppKit
 import ScreenCaptureKit
+import Combine
 
 /// The live view of Clinqy's hidden screen: what a background run is doing there, buddy and all, a few frames a
 /// second while it's open. The user can steer the run from here (or answer its question), stop it, or "Bring it
@@ -7,7 +8,23 @@ import ScreenCaptureKit
 @MainActor
 final class AgentScreenView: NSObject, NSWindowDelegate {
     static let shared = AgentScreenView()
-    weak var agent: Agent?
+    weak var agent: Agent? {
+        didSet {
+            questionObserver = agent?.$question.sink { [weak self] question in
+                guard let self else { return }
+                self.presentation += 1 // Discard an in-flight image when privacy/question state changes.
+                if question?.sensitive == true { self.picture.image = nil }
+                self.nextCapture = .distantPast
+                Task { await self.refresh() }
+            }
+            phaseObserver = agent?.$phase.removeDuplicates().sink { [weak self] _ in
+                self?.nextCapture = .distantPast
+                Task { await self?.refresh() }
+            }
+        }
+    }
+    private var questionObserver: AnyCancellable?
+    private var phaseObserver: AnyCancellable?
 
     private var panel: NSPanel?
     private let picture = NSImageView()
@@ -18,6 +35,8 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
     private var timer: Timer?
     private var display: SCDisplay?
     private var capturing = false
+    private var nextCapture = Date.distantPast
+    private var presentation = 0
 
     var isOpen: Bool { panel?.isVisible == true }
 
@@ -29,15 +48,18 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
         }
         if panel == nil { build() }
         display = nil
+        presentation += 1
+        nextCapture = .distantPast
         idleGeneration = nil
         bring.title = workerTab == nil ? "Bring it here" : "Tasks & Recovery"
         panel?.center()
         panel?.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
         timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+        timer = Timer.scheduledTimer(withTimeInterval: Efficiency.previewInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in await self?.refresh() }
         }
+        timer?.tolerance = 0.1
         Task { await refresh() }
     }
 
@@ -93,18 +115,35 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
               panel?.occlusionState.contains(.visible) == true else { return }
         let running = agent?.isRunning == true && agent?.runBackground == true
         let generation = ChromeWorker.shared.generation
+        let request = presentation
+        stop.isHidden = !running
+        steer.isEnabled = running
+        if agent?.question?.sensitive == true {
+            picture.image = nil
+            status.stringValue = "Waiting for private input on your Mac"
+            return
+        }
+        if let q = agent?.question, running {
+            status.stringValue = "Asks: " + q.text
+            steer.placeholderString = "Your answer — Return to send"
+        } else {
+            status.stringValue = workerTab != nil ? (TaskStore.shared.active?.stage ?? "Worker Chrome — final task view")
+                : running ? (agent?.steps.last?.text ?? "Working…") : "Done"
+            steer.placeholderString = "Tell it something (“use the cheaper one”) — Return to send"
+        }
         if running { idleGeneration = nil }
         if !running && idleGeneration == generation { return }
+        guard Date() >= nextCapture else { return }
+        let interval = agent?.question != nil || Efficiency.constrained ? Efficiency.waitingPreviewInterval : Efficiency.previewInterval
+        nextCapture = Date().addingTimeInterval(interval)
         if let tab = workerTab {
             capturing = true
             defer { capturing = false }
-            if agent?.question?.sensitive == true { picture.image = nil; status.stringValue = "Waiting for private input on your Mac"; return }
-            if let png = await BrowserBridge.shared.taskScreenshot(of: tab) {
+            if let png = await BrowserBridge.shared.taskScreenshot(of: tab, preview: true) {
+                guard canPublish(request, generation: generation), workerTab?.id == tab.id else { return }
                 picture.image = NSImage(data: png)
                 idleGeneration = running ? nil : generation
             }
-            status.stringValue = TaskStore.shared.active?.stage ?? "Worker Chrome — final task view"
-            stop.isHidden = !running; steer.isEnabled = running
             return
         }
         guard let id = AgentScreen.id else { return }
@@ -115,25 +154,22 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
                 .displays.first { $0.displayID == id }
         }
         guard let display else { return }
+        guard canPublish(request, generation: generation), workerTab == nil else { return }
         let config = SCStreamConfiguration()
-        config.width = display.width
-        config.height = display.height
+        config.width = min(display.width, 1280)
+        config.height = max(1, Int(Double(display.height) * Double(config.width) / Double(max(1, display.width))))
         config.showsCursor = false
         if let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(display: display, excludingWindows: []),
                                                                   configuration: config) {
+            guard canPublish(request, generation: generation), workerTab == nil else { return }
             picture.image = NSImage(cgImage: image, size: NSSize(width: image.width, height: image.height))
             idleGeneration = running ? nil : generation
         }
-        if let q = agent?.question, running {
-            status.stringValue = "Asks: " + q.text
-            steer.placeholderString = "Your answer — Return to send"
-        } else {
-            status.stringValue = running ? (agent?.steps.last?.text ?? "Working…")
-                : AgentScreen.windows().isEmpty ? "Nothing there right now" : "Done"
-            steer.placeholderString = "Tell it something (“use the cheaper one”) — Return to send"
-        }
-        stop.isHidden = !running
-        steer.isEnabled = running
+    }
+
+    private func canPublish(_ request: Int, generation: Int) -> Bool {
+        request == presentation && generation == ChromeWorker.shared.generation
+            && panel?.isVisible == true && agent?.question?.sensitive != true
     }
 
     @objc private func sendSteer() {
@@ -152,6 +188,7 @@ final class AgentScreenView: NSObject, NSWindowDelegate {
     }
 
     func windowWillClose(_ notification: Notification) {
+        presentation += 1
         timer?.invalidate()
         timer = nil
         picture.image = nil
