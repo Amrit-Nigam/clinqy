@@ -137,7 +137,9 @@ enum Provider: String, CaseIterable {
         let tier = ["haiku": 0, "sonnet": 1, "opus": 2][alias]
         guard let tier else { return name }
         switch self {
-        case .agyCLI: return ["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.1-pro"][tier]
+        // The ids `agy models` lists (1.4.7): the same Claude tiers as everywhere else, with Gemini Flash (which takes
+        // --effort; the Claude ids refuse it) as the fast helper. gemini-3.1-pro, the old "opus", isn't a model agy knows.
+        case .agyCLI: return ["gemini-3.8-flash", "claude-sonnet-4-6", "claude-opus-4-6-thinking"][tier]
         case .claudeCLI: return alias == "haiku" ? "claude-haiku-5-5" : name
         // The CLIs pick their own default model for your account; only an explicit model id is passed on.
         case .codexCLI: return ""

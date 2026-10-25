@@ -477,9 +477,9 @@ struct DashboardContentView: View {
                     Text("Model for Clinqy").font(.system(size: 13, weight: .semibold))
                     if model.usesModelTiers {
                         Picker("Model", selection: $model.modelChoice) {
-                            Text("Fast · Haiku").tag("haiku")
-                            Text("Balanced · Sonnet").tag("sonnet")
-                            Text("Most capable · Opus").tag("opus")
+                            Text(tierLabel("Fast", "haiku")).tag("haiku")
+                            Text(tierLabel("Balanced", "sonnet")).tag("sonnet")
+                            Text(tierLabel("Most capable", "opus")).tag("opus")
                             Text("Custom model ID…").tag("custom")
                         }
                         .pickerStyle(.menu)
@@ -725,6 +725,12 @@ struct DashboardContentView: View {
 
     private func format(_ value: Int) -> String { value.formatted(.number) }
     private func providerName(_ raw: String) -> String { Provider(rawValue: raw)?.displayName ?? raw }
+    /// A tier's label names the model it runs on this provider, not just the tier: on agy "Fast" is Gemini Flash,
+    /// not Haiku, and that is a materially different agent (it skips the screenshot unless told to open it).
+    private func tierLabel(_ word: String, _ alias: String) -> String {
+        let id = model.currentProvider.model(alias)
+        return id.isEmpty || id.lowercased() == alias ? "\(word) · \(alias.capitalized)" : "\(word) · \(id)"
+    }
     private func providerSubtitle(_ provider: Provider) -> String {
         let model = provider.model(Brain.defaultModel(for: provider))
         return model.isEmpty ? "Ready · provider chooses its model" : "Ready · \(model)"
