@@ -73,6 +73,14 @@ impl Drop for Session {
 
 // MARK: - CLI (claude / agy, stream-json)
 
+/// What's different about running inside the Antigravity CLI, added to the rules for agy sessions (same text as
+/// the Mac app's `AgySession.agyAddendum`, with the Windows PC in place of the Mac).
+const AGY_ADDENDUM: &str = "\n\nYou are running inside the Antigravity CLI, which offers you its own coding and browser tools. Don't use them: \
+nothing they do reaches the user's screen, and everything on the user's Windows PC is done only through the JSON actions. \
+The one exception: when a turn names a screenshot file, view that file with view_file first (it's the only way \
+to see the screen), then reply with the JSON. Never run commands, write or edit files, open a browser or search \
+the web yourself.";
+
 struct CliState {
     pending: Option<oneshot::Sender<Result<String>>>,
     partial: Option<mpsc::UnboundedSender<String>>,
@@ -90,6 +98,8 @@ struct CliSession {
     dir: PathBuf,
     system: String,
     first_turn: Mutex<bool>,
+    /// agy: screenshots written so far, and the last one's file (deleted when the next one is written).
+    screens: Mutex<(u32, Option<PathBuf>)>,
 }
 
 fn cli_name(p: Provider) -> &'static str {
@@ -123,6 +133,9 @@ impl CliSession {
         let CliCommand { program, prefix } = provider.cli().ok_or_else(|| not_installed(provider))?;
         let exe = program.file_stem().map(|s| s.to_string_lossy().to_lowercase()).unwrap_or_default();
         let is_agy = provider == Provider::AgyCli || exe == "agy";
+        // agy gives the model ~60 coding and browser tools of its own (auto-approved): the rules say what they're
+        // for here, which is only viewing the screenshot file of a turn (stream-json input is text only).
+        let system = if is_agy { format!("{system}{AGY_ADDENDUM}") } else { system.to_string() };
         let dir = std::env::temp_dir().join(format!("clinqy-session-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir)?;
         let mut args: Vec<String> = prefix;
@@ -135,16 +148,24 @@ impl CliSession {
                     .map(String::from),
             );
             let mut m = provider.model(model);
-            let explicit = config::value("AGY_EFFORT").or_else(|| config::value("CLAUDE_EFFORT"));
-            let suffix = ["-low", "-medium", "-high", "-xhigh", "-max"].into_iter().find(|s| m.ends_with(s));
-            if let Some(suffix) = suffix {
-                if let Some(e) = explicit.as_ref().map(|e| e.to_lowercase()) {
-                    m.truncate(m.len() - suffix.len());
-                    args.extend(["--effort".into(), e]);
+            let explicit = config::value("AGY_EFFORT")
+                .or_else(|| config::value("CLAUDE_EFFORT"))
+                .map(|e| e.trim().to_lowercase())
+                .filter(|e| !e.is_empty());
+            // As on the Mac (`AgySession.launchModel`): only gemini-* ids are measured to take --effort (agy 1.4.7);
+            // claude-* ids refuse it as a hard error and the rest are untested, so they get none.
+            if m.to_lowercase().starts_with("gemini-") {
+                let suffix = ["-low", "-medium", "-high", "-xhigh", "-max"].into_iter().find(|s| m.ends_with(s));
+                match (suffix, explicit) {
+                    // The id carries its effort (gemini-3.8-flash-low): keep it, unless one is asked for: then the
+                    // bare id plus --effort, since agy refuses the two together.
+                    (Some(suffix), Some(e)) => {
+                        m.truncate(m.len() - suffix.len());
+                        args.extend(["--effort".into(), e]);
+                    }
+                    (Some(_), None) => {}
+                    (None, e) => args.extend(["--effort".into(), e.unwrap_or_else(|| "low".into())]),
                 }
-            } else if !m.contains("claude") {
-                let default = if model.eq_ignore_ascii_case("opus") { "high" } else { "low" };
-                args.extend(["--effort".into(), explicit.unwrap_or_else(|| default.into()).to_lowercase()]);
             }
             if !m.is_empty() && m != "default" {
                 args.extend(["--model".into(), m]);
@@ -152,7 +173,7 @@ impl CliSession {
         } else {
             // The prompt goes in a file: it's ~20 KB, and Windows command lines are capped.
             let prompt_file = dir.join("system.md");
-            std::fs::write(&prompt_file, system)?;
+            std::fs::write(&prompt_file, &system)?;
             args.extend([
                 "-p".into(),
                 "--input-format".into(),
@@ -195,8 +216,9 @@ impl CliSession {
             stdin: tokio::sync::Mutex::new(stdin),
             child: Mutex::new(Some(child)),
             dir,
-            system: system.to_string(),
+            system,
             first_turn: Mutex::new(true),
+            screens: Mutex::new((0, None)),
         });
         let s = session.clone();
         tokio::spawn(async move {
@@ -241,9 +263,32 @@ impl CliSession {
             if let Some(img) = image.as_ref() {
                 use base64::Engine;
                 if let Ok(bytes) = base64::engine::general_purpose::STANDARD.decode(img) {
-                    let path = self.dir.join("screen.jpg");
+                    // A new file each time: the model remembers what the last one showed, and a same-named file
+                    // would read as already seen. Told to view it "if needed", Gemini Flash never did.
+                    let n = {
+                        let mut screens = self.screens.lock();
+                        screens.0 += 1;
+                        screens.0
+                    };
+                    let path = self.dir.join(format!("screen-{n}.jpg"));
                     if std::fs::write(&path, bytes).is_ok() {
-                        prompt += &format!("\n(Screenshot saved at {}. You can view it with view_file if needed.)", path.display());
+                        if let Some(prev) = self.screens.lock().1.replace(path.clone()) {
+                            let _ = std::fs::remove_file(prev);
+                        }
+                        prompt = prompt.replace("(Screenshot attached:", "(Screenshot in the file below:");
+                        // From the second one on, say it's new: shown the same path twice, or a new name alone, the
+                        // model answered from its memory of the last one. Not that the screen changed, though: the
+                        // retry look after failed steps usually shows the same screen.
+                        let fresh = if n > 1 { " (new, taken just now; look at it again rather than going by earlier screenshots)" } else { "" };
+                        let line = format!(
+                            "\nScreenshot for this turn: {}{fresh} — view it with view_file now, before replying (its red boxes carry the e<N> ids; x/y in click/point are pixels in it).",
+                            path.display()
+                        );
+                        // Before the turn's closing "reply with JSON only" line, so that stays the last thing read.
+                        match prompt.rfind("\n\nReply with the JSON object only") {
+                            Some(i) => prompt.insert_str(i, &line),
+                            None => prompt += &line,
+                        }
                     }
                 }
             }

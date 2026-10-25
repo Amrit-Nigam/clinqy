@@ -346,13 +346,13 @@ PROVIDER=agy-cli
 
 Put each `KEY=value` on its own line, with no comment after the value. `chmod 600 ~/.config/clinqy/env` keeps your keys private.
 
-If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `agy` when `--agy` or `USE_AGY=1` is set). Without it, Clinqy uses the first API key it finds, then `agy` or Codex CLI.
+If `PROVIDER` isn't set (and there's no `--agy` / `USE_AGY=1`), Clinqy picks what this computer has: Claude Code if you're logged in, then Codex CLI, then `agy`, then an installed Claude Code, then the first API key it finds (Anthropic, OpenAI, Gemini, OpenRouter). On Windows a running Ollama comes before the API keys, and Claude Code is the last fallback.
 
 `CLAUDE_MODEL` / `AGY_MODEL` (the agent) and `FAST_MODEL` (the helper for routine steps) work with every provider. Leave them as `sonnet` / `haiku` / `opus` to get each provider's matching tier, or set any model id the provider accepts. On macOS, optional `CODEX_MODEL` selects an explicit Codex CLI model ID; leave it unset to use Codex's configured default:
 
 | Provider | `haiku` (fast) | `sonnet` (agent, default) | `opus` |
 |---|---|---|---|
-| agy-cli | gemini-3.8-flash (low effort) | gemini-3.8-flash | gemini-3.1-pro |
+| agy-cli | gemini-3.8-flash (low effort) | claude-sonnet-4-6 | claude-opus-4-6-thinking |
 | anthropic | claude-haiku-5-5 | claude-sonnet-5-5 | claude-opus-5-5 |
 | openai | gpt-5.6-luna | gpt-5.6-terra | gpt-5.6-sol |
 | gemini | gemini-3.5-flash-lite | gemini-3.6-flash | gemini-3.6-flash |
@@ -363,7 +363,8 @@ If `PROVIDER` isn't set, Clinqy uses the `claude` CLI when it's installed (or `a
 Notes:
 - **Use a vision model.** Clinqy sometimes sends a screenshot.
 - **Speed.** The Claude CLI, the Antigravity CLI (`agy`) and the HTTP APIs keep one conversation per task, so each turn costs only model time. Anthropic replies are prompt-cached, and only the newest screenshot is sent again. Codex CLI has no long-lived chat mode, so it starts once per turn and is noticeably slower.
-- **Effort.** `CLAUDE_EFFORT` and `AGY_EFFORT` also set the reasoning effort for models.
+- **Effort.** `CLAUDE_EFFORT` and `AGY_EFFORT` also set the reasoning effort for models. On `agy` it applies to the Gemini models (`gemini-3.8-flash`, or a fixed `gemini-3.8-flash-low` / `-medium` / `-high` id); the Claude ids there don't take it.
+- **Antigravity and screenshots.** `agy`'s stream-json input is text only, so a screenshot goes to the model as a file it opens with its `view_file` tool: a screenshot turn costs one extra model round trip (about 4 s on Gemini Flash). The element list is text and costs nothing extra, which is why Clinqy only takes a screenshot when the list isn't enough. `agy models` shows which ids your account can use; `AGY_MODEL=gemini-3.8-flash` is the fastest, `sonnet` (the default) the better reasoner.
 - **Rate limits.** The system prompt is about 10k tokens. A free-tier OpenAI account (10k tokens/min) can't fit it on the larger models.
 - **Which one is in use.** Menu bar → **Check Permissions…** shows the current provider.
 
@@ -380,11 +381,14 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `CLAUDE_PATH` · `AGY_PATH` · `CODEX_PATH` | auto-detected | Path to each CLI |
 | `CLAUDE_MODEL` / `AGY_MODEL` | `sonnet` | Model for the agent (any provider) |
 | `CODEX_MODEL` (macOS) | Codex default | Optional explicit model ID for Codex CLI |
-| `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step |
+| `CLAUDE_EFFORT` / `AGY_EFFORT` | `low` | `low` is noticeably faster per step. On `agy` it applies only to a Gemini `AGY_MODEL` (where it overrides a `-low`/`-medium`/`-high` suffix); its Claude ids (`sonnet`, `opus`) take no effort, and the helper has `FAST_EFFORT` |
 | `VOICE_LANGUAGE` | `auto` | `auto` (the Mac's language), `en`, `hinglish`, `hi`, or a locale like `en-GB` (the menu setting wins) |
 | `VOICE_MODEL` | `speech` | Mac: which of Apple's models hears languages both cover, `speech` (SpeechTranscriber) or `dictation` (DictationTranscriber, the system Dictation's). Hindi always uses `dictation` |
 | `WHISPER_MODEL` | `small-q5_1` | Windows only: the whisper.cpp model |
 | `FAST_MODEL` | `haiku` | Faster model for routine steps; `off` to use only the main model |
+| `FAST_EFFORT` (macOS) | `low` | The helper's reasoning effort (or the one in a `FAST_MODEL` id like `gemini-3.8-flash-medium`); not taken from `CLAUDE_EFFORT` / `AGY_EFFORT` |
+| `FAST_TIMEOUT` (macOS) | `20` | Seconds a helper turn may take before the main model answers it instead |
+| `MODEL_TIMEOUT` (macOS) | `180` | Seconds to wait for a model reply before retrying once on a fresh session (at least 60); raise it for slow models such as `opus` on `agy` |
 | `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
 | `UPDATE_CHECK` | on | Mac: `off` stops the daily check for a new version on GitHub |
 | `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |

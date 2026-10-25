@@ -167,7 +167,9 @@ impl Provider {
         };
         let pick = |a: [&str; 3]| a[tier].to_string();
         match self {
-            Provider::AgyCli => pick(["gemini-3.8-flash", "gemini-3.8-flash", "gemini-3.1-pro"]),
+            // The ids `agy models` lists (1.4.7): the same Claude tiers as everywhere else, with Gemini Flash (which
+            // takes --effort; the Claude ids refuse it) as the fast helper. gemini-3.1-pro isn't a model agy knows.
+            Provider::AgyCli => pick(["gemini-3.8-flash", "claude-sonnet-4-6", "claude-opus-4-6-thinking"]),
             Provider::ClaudeCli => {
                 if alias == "haiku" {
                     "claude-haiku-5-5".into()
@@ -365,6 +367,8 @@ mod tests {
     fn tiers() {
         assert_eq!(Provider::Anthropic.model("opus"), "claude-opus-5-5");
         assert_eq!(Provider::ClaudeCli.model("sonnet"), "sonnet");
+        assert_eq!(Provider::AgyCli.model("sonnet"), "claude-sonnet-4-6");
+        assert_eq!(Provider::AgyCli.model("haiku"), "gemini-3.8-flash");
         assert_eq!(Provider::OpenAi.model("my-model"), "my-model");
     }
 }

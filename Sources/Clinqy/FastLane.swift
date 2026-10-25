@@ -21,12 +21,34 @@ final class FastLane {
     /// Same, for a stint started on its own (the lead didn't plan it, so it checks in sooner).
     static let maxAutoStint = 4
 
+    /// The helper's reasoning effort: FAST_EFFORT, else the effort baked into a FAST_MODEL id like gemini-3.8-flash-medium,
+    /// else low. Deliberately not AGY_EFFORT/CLAUDE_EFFORT: on agy those reach only the Gemini ids (the Claude ones refuse
+    /// --effort), so with a Claude lead they would slow just the helper (Flash takes 33-60 s a turn at medium, 3-6 s at low).
+    static func effort(for model: String, on provider: Provider) -> String {
+        if let e = Config.value("FAST_EFFORT")?.trimmingCharacters(in: .whitespaces), !e.isEmpty { return e.lowercased() }
+        let id = provider.model(model).lowercased()
+        for s in ["low", "medium", "high", "xhigh", "max"] where id.hasSuffix("-" + s) { return s }
+        return "low"
+    }
+
+    /// Longest a helper turn may take before the lead gets it instead (FAST_TIMEOUT, seconds). Flash-low turns take
+    /// 3-13 s, but a thinking spike has run 96-139 s, a turn the lead would have answered in ~5 s.
+    static var timeout: Double {
+        Double((Config.value("FAST_TIMEOUT") ?? "").trimmingCharacters(in: .whitespaces)).flatMap { $0 > 0 ? $0 : nil } ?? 20
+    }
+
+    /// How long a helper turn waits for its briefing to land before the lead takes that turn instead.
+    private static let briefingWait: Double = 3
+
+    private struct HelperTimeout: Error {}
+
     /// Whether navigation streaks start a helper stint without the lead asking.
     static var autoDelegates: Bool {
         !["off", "none", "no", "0", "false"].contains((Config.value("FAST_AUTO") ?? "on").lowercased())
     }
 
     private let model: String?
+    private let provider: Provider
     private let intro: String
     private var session: AgySession?
     /// The lead's routine plan; set = the next turns go to the helper.
@@ -42,6 +64,9 @@ final class FastLane {
     private var briefed = false
     /// The task's context, sent to the helper ahead of its first stint (see `warm`).
     private var briefing: Task<Void, Never>?
+    private var briefingStarted: Date?
+    /// The helper's briefing wasn't done, so the lead took a turn of a stint that hadn't begun: the stint carries on next turn.
+    private var deferred = false
     /// The previous turn ("say: actions"), waiting for its results.
     private var lastTurn: String?
     private var lastSignature = ""
@@ -57,10 +82,12 @@ final class FastLane {
     /// Who answered the last turn, for the log: "fast · ", "lead ← fast (why) · ", or "".
     private(set) var tag = ""
 
-    init(intro: String, leadModel: String) {
+    init(intro: String, leadModel: String, provider: Provider = Provider.current) {
         self.intro = intro
-        let fast = Self.model
-        model = fast == leadModel ? nil : fast
+        self.provider = provider
+        // Compared as the ids they resolve to: AGY_MODEL=gemini-3.8-flash is the same model as haiku there, and a
+        // second process of it would only add a cold start and hand-offs.
+        model = Self.model.flatMap { provider.model($0).lowercased() == provider.model(leadModel).lowercased() ? nil : $0 }
     }
 
     /// Appended to the lead's first message: how to hand routine steps off (empty when off).
@@ -88,6 +115,10 @@ final class FastLane {
         tag = ""
         if let why = blocker(turnText: turnText, failures: failures) {
             if plan != nil { end(why) }
+        } else if image != nil, provider == .agyCLI {
+            // On agy a screenshot costs the helper a view_file round trip (2-4 s, the context read twice) for a turn it can
+            // only answer with listed ids: x/y clicks are the lead's. Not the stint's fault, so it doesn't count against it.
+            end("this screen needs the screenshot (x/y clicks are the lead's)", penalize: false)
         } else if let reply = await helperReply(turnText, image: image) {
             tag = "fast · "
             return reply
@@ -124,9 +155,26 @@ final class FastLane {
 
     private func helperReply(_ turnText: String, image: String?) async -> String? {
         guard let model, let plan else { return nil }
-        await briefing?.value
-        briefing = nil
-        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model); briefed = false }
+        if briefing != nil {
+            // Don't hold the turn for a briefing still on its way (a cold start plus the rules can take 20 s): the lead
+            // takes this one and the stint begins at the next, once the helper is ready.
+            let until = Date().addingTimeInterval(Self.briefingWait)
+            while briefing != nil, Date() < until { try? await Task.sleep(for: .milliseconds(100)) }
+            if briefing != nil {
+                if let started = briefingStarted, Date().timeIntervalSince(started) > 3 * Self.timeout {
+                    // Stalled: drop it, so the next warm() starts a fresh session.
+                    close()
+                    briefed = false
+                    end("the helper didn't get ready")
+                } else {
+                    deferred = true
+                }
+                return nil
+            }
+        }
+        if session?.isAlive != true { session = try? newSession(model); briefed = false }
+        // A turn that carries the briefing (and, on a fresh process, the rules) runs longer than the rest.
+        let budget = Self.timeout + (briefed ? 0 : 20)
         var text = ""
         if !briefed {
             text += "The lead's context for this task:\n\(intro)\n\n"
@@ -138,11 +186,26 @@ final class FastLane {
             text += "\n"
         }
         text += turnText + Self.jsonOnly
+        let message = text
         let reply: String
         do {
-            if session?.isAlive != true { session = try AgySession(system: Self.system, model: model) }
+            if session?.isAlive != true { session = try newSession(model) }
             guard let s = session else { return nil }
-            reply = try await withTaskCancellationHandler { try await s.send(text, image: image) } onCancel: { s.close() }
+            reply = try await withThrowingTaskGroup(of: String.self) { g in
+                // The handler is what makes the deadline work: send ignores cancellation, and the group waits for every child.
+                g.addTask { try await withTaskCancellationHandler { try await s.send(message, image: image) } onCancel: { s.close() } }
+                g.addTask { try await Task.sleep(for: .seconds(budget)); throw HelperTimeout() }
+                defer { g.cancelAll() }
+                return try await g.next()!
+            }
+        } catch is HelperTimeout {
+            // Its process goes with the turn; the next stint starts a fresh one (warm() hides most of that start).
+            session?.close()
+            session = nil
+            briefed = false
+            autoAfter = min(autoAfter + 1, 5)
+            end("the helper took over \(Int(budget)) s", penalize: false)
+            return nil
         } catch {
             end("the helper failed: \(error.localizedDescription)")
             return nil
@@ -176,6 +239,8 @@ final class FastLane {
 
     private func leadReply(_ turnText: String, image: String?, lead: AgySession,
                            partial: (@Sendable (String) -> Void)?) async throws -> String {
+        let wasDeferred = deferred
+        deferred = false
         var text = turnText
         if !unreported.isEmpty || handback != nil {
             text = "While you waited, a faster helper did routine steps for you:\n"
@@ -199,11 +264,17 @@ final class FastLane {
         if model != nil, !finishing, let routine = json.flatMap({ Self.routine(in: $0, say: say, actions: actions) }) {
             // "routine":true names no steps, so it gets the same navigation-only limits as an automatic stint.
             start(routine, auto: json?["routine"] is Bool)
-        } else if model != nil, !finishing, Self.autoDelegates, routineStreak >= autoAfter {
+        } else if wasDeferred, !finishing, plan != nil, stintTurns == 0 {
+            // The helper wasn't ready for this turn's stint: keep it for the next one.
+        } else if model != nil, !finishing, Self.autoDelegates, routineStreak >= autoAfter,
+                  // On agy the turn after a look carries a screenshot, which goes straight back to the lead.
+                  !(provider == .agyCLI && actions.contains { ($0["do"] as? String)?.lowercased() == "look" }) {
             start(Self.keepGoing(say: say, actions: actions), auto: true)
         } else {
             plan = nil
-            if Self.autoDelegates, routineStreak == autoAfter - 1 { warm() }
+            // Brief the helper early, so its cold start and rules turn overlap the lead's turns instead of
+            // holding up the first stint.
+            if !finishing { warm() }
         }
         return reply
     }
@@ -245,16 +316,28 @@ final class FastLane {
     /// message: read cold, the briefing made that turn ~3 s slower than the rest.
     private func warm() {
         guard let model else { return }
-        if session?.isAlive != true { session = try? AgySession(system: Self.system, model: model); briefed = false }
+        if session?.isAlive != true { session = try? newSession(model); briefed = false }
         guard !briefed, briefing == nil, let s = session else { return }
         briefed = true
         let text = "The lead's context for this task:\n\(intro)\n\nNo steps for you yet; reply {\"say\":\"ready\",\"actions\":[]}."
-        briefing = Task { _ = try? await s.send(text) }
+        let started = Date()
+        briefingStarted = started
+        briefing = Task { [weak self] in
+            _ = try? await s.send(text)
+            // Landed (or failed, and helperReply starts a fresh session): the next helper turn needn't wait.
+            // Only if it's still the current briefing: a stalled one may have been replaced meanwhile.
+            if self?.briefingStarted == started { self?.briefing = nil }
+        }
     }
 
-    private func end(_ why: String) {
+    /// The helper's session, on the provider the lead-vs-helper comparison resolved, at the helper's own effort.
+    private func newSession(_ model: String) throws -> AgySession {
+        try AgySession(system: Self.system, model: model, provider: provider, effort: Self.effort(for: model, on: provider))
+    }
+
+    private func end(_ why: String, penalize: Bool = true) {
         // An automatic stint that did nothing was a bad fit: wait for a longer streak before the next one.
-        if auto, stintTurns == 0 { autoAfter = min(autoAfter + 1, 5) }
+        if penalize, auto, stintTurns == 0 { autoAfter = min(autoAfter + 1, 5) }
         plan = nil
         auto = false
         stintTurns = 0
