@@ -157,7 +157,7 @@ final class Buddy {
         guard timer?.timeInterval != interval else { return }
         timer?.invalidate()
         let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+            onMainRunLoop { self?.tick() }
         }
         timer.tolerance = fast ? interval * 0.1 : 0.05
         RunLoop.main.add(timer, forMode: .common)
@@ -257,7 +257,7 @@ final class Buddy {
         bubbleAppeared = CACurrentMediaTime()
         wake()
         bubbleTimer = Timer.scheduledTimer(withTimeInterval: 0.028, repeats: true) { [weak self] t in
-            MainActor.assumeIsolated {
+            onMainRunLoop {
                 guard let self, let full = self.bubbleText else { t.invalidate(); return }
                 self.bubbleShown += 1
                 if self.bubbleShown >= full.count {
@@ -861,5 +861,14 @@ private final class Stage {
             l.shadowColor = accent
             l.opacity = fade
         }
+    }
+}
+
+/// Runs `body` from a main-run-loop timer without `MainActor.assumeIsolated`'s runtime executor check,
+/// which intermittently segfaults (swift_task_isMainExecutorImpl) when hit at frame rate on macOS 27.
+/// Only for callbacks that are guaranteed to fire on the main thread.
+private func onMainRunLoop(_ body: @MainActor () -> Void) {
+    withoutActuallyEscaping(body) { body in
+        unsafeBitCast(body, to: (() -> Void).self)()
     }
 }
