@@ -1,4 +1,5 @@
 import AppKit
+import ObjCCatch
 import ObjectiveC
 
 /// A screen only Clinqy uses: a virtual display (CoreGraphics' private CGVirtualDisplay, as BetterDisplay makes them)
@@ -44,7 +45,15 @@ enum AgentScreen {
         CGCompleteDisplayConfiguration(config, .forSession)
     }
 
+    /// Private API through KVC and selectors: a key renamed in a later macOS raises an Objective-C exception, which
+    /// must not escape into Swift (it corrupts the concurrency runtime). Then there's simply no workspace screen.
     private static func make() -> (display: AnyObject, id: CGDirectDisplayID)? {
+        var made: (display: AnyObject, id: CGDirectDisplayID)?
+        if let failure = ObjCCatch({ made = build() }) { NSLog("Clinqy: agent screen: \(failure)"); return nil }
+        return made
+    }
+
+    private static func build() -> (display: AnyObject, id: CGDirectDisplayID)? {
         guard let descriptorClass = NSClassFromString("CGVirtualDisplayDescriptor") as? NSObject.Type,
               let displayClass = NSClassFromString("CGVirtualDisplay") as? NSObject.Type,
               let modeClass = NSClassFromString("CGVirtualDisplayMode") as? NSObject.Type,

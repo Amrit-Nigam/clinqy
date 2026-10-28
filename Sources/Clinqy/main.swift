@@ -642,7 +642,7 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--reload-exten
     RunLoop.main.run()
 }
 
-let app = NSApplication.shared
+let app = ClinqyApplication.shared
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.setActivationPolicy(.accessory)
