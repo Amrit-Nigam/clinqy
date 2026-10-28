@@ -1,4 +1,5 @@
 import AVFoundation
+import ObjCCatch
 import Speech
 
 /// Push-to-talk speech recognition, on-device. On macOS 26 the Mac's own speech model (SpeechModel, Transcription)
@@ -21,7 +22,7 @@ final class Voice: ObservableObject {
     /// True while the mic is open only for a possible follow-up after a finished task.
     @Published private(set) var isFollowUp = false
 
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognition: SFSpeechRecognitionTask?
     private var recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -83,10 +84,11 @@ final class Voice: ObservableObject {
         private var early: [AVAudioPCMBuffer] = []
         private var holding = false
         private var closed = false
+        private var nextLevelUpdate: TimeInterval = 0
 
         func set(_ r: SFSpeechAudioBufferRecognitionRequest?) { lock.withLock { request = r } }
 
-        func reset() { lock.withLock { request = nil; sink = nil; early = []; holding = false; closed = false } }
+        func reset() { lock.withLock { request = nil; sink = nil; early = []; holding = false; closed = false; nextLevelUpdate = 0 } }
 
         /// Keep the audio until `attach`.
         func hold() { lock.withLock { early = []; holding = true } }
@@ -104,11 +106,16 @@ final class Voice: ObservableObject {
         /// The mic is off: take no more audio (what was kept stays for a late `attach`).
         func close() { lock.withLock { closed = true; sink = nil } }
 
-        func append(_ b: AVAudioPCMBuffer) {
+        /// Every audio buffer reaches recognition; only the decorative meter is rate-limited.
+        func append(_ b: AVAudioPCMBuffer) -> Bool {
             lock.withLock {
-                guard !closed else { return }
+                guard !closed else { return false }
                 request?.append(b)
                 if let sink { sink(b) } else if holding, let copy = b.copied { early.append(copy) }
+                let now = ProcessInfo.processInfo.systemUptime
+                guard now >= nextLevelUpdate else { return false }
+                nextLevelUpdate = now + 1.0 / 30.0
+                return true
             }
         }
     }
@@ -128,30 +135,45 @@ final class Voice: ObservableObject {
         partial = ""
         delivered = false
 
+        // A fresh engine reads the current mic. A reused one keeps the format of the device it first saw, and after
+        // the input changes (AirPods, another mic) installTap raises an Objective-C exception instead of failing.
+        engine = AVAudioEngine()
+        let engine = self.engine
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
-        input.removeTap(onBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { error = "No microphone input available"; return }
         let feed = self.feed
         feed.reset()
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            feed.append(buffer)
-            guard let data = buffer.floatChannelData?[0] else { return }
-            let n = Int(buffer.frameLength)
-            var sum: Float = 0
-            for i in 0..<n { sum += data[i] * data[i] }
-            let rms = sqrt(sum / Float(max(1, n)))
-            let level = CGFloat(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 40)))
-            Task { @MainActor in
-                guard let self else { return }
-                self.level = self.level * 0.6 + level * 0.4
-                self.onLevel(self.level)
+        let tapFailure = ObjCCatch {
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                guard feed.append(buffer) else { return }
+                guard let data = buffer.floatChannelData?[0] else { return }
+                let n = Int(buffer.frameLength)
+                var sum: Float = 0
+                for i in 0..<n { sum += data[i] * data[i] }
+                let rms = sqrt(sum / Float(max(1, n)))
+                let level = CGFloat(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 40)))
+                Task { @MainActor in
+                    guard let self, self.isListening else { return }
+                    self.level = self.level * 0.6 + level * 0.4
+                    self.onLevel(self.level)
+                }
             }
         }
-        do {
+        if let tapFailure {
+            NSLog("Clinqy: mic tap failed: \(tapFailure)")
+            error = "Couldn't open the microphone: \(tapFailure)"
+            return
+        }
+        var startError: Error?
+        let startFailure = ObjCCatch {
             engine.prepare()
-            try engine.start()
-        } catch {
-            self.error = "Couldn't start the microphone: \(error.localizedDescription)"
+            do { try engine.start() } catch { startError = error }
+        }
+        if let failure = startFailure ?? startError?.localizedDescription {
+            input.removeTap(onBus: 0)
+            NSLog("Clinqy: mic start failed: \(failure)")
+            self.error = "Couldn't start the microphone: \(failure)"
             return
         }
         isListening = true

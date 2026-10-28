@@ -96,9 +96,15 @@ enum Tables {
                     return "saved \(rows.count) rows to \(url.path) (\(appName) isn't installed, so it's a CSV file)"
                 }
                 let config = NSWorkspace.OpenConfiguration()
-                config.activates = true
-                _ = try? await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: config)
-                return "saved \(rows.count) rows to \(url.path) and opened it in \(appName) (it's now frontmost; save as a .\(destination == "numbers" ? "numbers" : "xlsx") file there if they want)"
+                config.activates = !Background.active
+                let had = NSWorkspace.shared.runningApplications.first { $0.bundleURL == app }.map { Hand.windowIDs(pid: $0.processIdentifier) } ?? []
+                let opened = try? await NSWorkspace.shared.open([url], withApplicationAt: app, configuration: config)
+                if Background.active, let opened {
+                    Background.app = opened
+                    try? await Task.sleep(for: .milliseconds(1200))
+                    AgentScreen.adopt(opened, keep: had)
+                }
+                return "saved \(rows.count) rows to \(url.path) and opened it in \(appName) (it's now \(Background.active ? "open behind the user's windows" : "frontmost"); save as a .\(destination == "numbers" ? "numbers" : "xlsx") file there if they want)"
             }
             return "saved \(rows.count) rows × \(width) columns to \(url.path)"
 

@@ -14,6 +14,7 @@ final class Buddy {
             let now = CACurrentMediaTime()
             if mood == .failure { shakeStart = now }
             if mood == .success { pop = now }
+            wake()
         }
     }
 
@@ -22,17 +23,24 @@ final class Buddy {
 
     /// Off: the companion stays hidden while Clinqy is idle and only appears when it listens, thinks or acts.
     var followsMouse = UserDefaults.standard.object(forKey: "buddyFollowsMouse") as? Bool ?? true {
-        didSet { UserDefaults.standard.set(followsMouse, forKey: "buddyFollowsMouse") }
+        didSet { UserDefaults.standard.set(followsMouse, forKey: "buddyFollowsMouse"); wake() }
     }
 
     /// QA mode: the companion becomes an amber targeting reticle with a "QA" tag.
-    var qaMode = false
+    var qaMode = false { didSet { wake() } }
+    /// A background run nobody is watching: the buddy doesn't fly to clicks in windows the user can't see.
+    var quiet = false
+    /// A background run on Clinqy's hidden screen: the buddy only goes, points and frames things there.
+    var confine: CGRect?
+    /// Parked at the screen's edge, off doing a background run (see `goAway`).
+    private(set) var away = false
 
     /// A check result: green flash + pop when it held, red flash + shake when it didn't.
     func signal(_ ok: Bool) {
         let now = CACurrentMediaTime()
         flash = (ok, now)
         if ok { pop = now } else { shakeStart = now }
+        wake()
     }
     private var flash: (Bool, CFTimeInterval)?
 
@@ -42,6 +50,11 @@ final class Buddy {
     private var stages: [Stage] = []
     private var timer: Timer?
     private var lastTick = CACurrentMediaTime()
+    /// Motion follows the display's refresh rate (up to 120 Hz), decorative animation 30 Hz; a parked companion has no idle timer.
+    private var fast = false
+    private var stillSince: CFTimeInterval?
+    private var mouseMonitors: [Any] = []
+    private var screenObserver: NSObjectProtocol?
 
     // Motion, in global top-left coordinates (CGEvent space). `pos` is the triangle's tip.
     private var pos = CGPoint(x: 400, y: 400)
@@ -94,30 +107,81 @@ final class Buddy {
     }
 
     init() {
+        Efficiency.start()
         rebuildStages()
         let m = Self.mouse()
         pos = CGPoint(x: m.x + Self.offset.dx, y: m.y + Self.offset.dy)
-        NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
+        screenObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification,
                                                object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated { self?.rebuildStages() }
         }
-        let timer = Timer(timeInterval: 1.0 / 120.0, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated { self?.tick() }
+        setRate(fast: true)
+    }
+
+    private func watchMouse() {
+        guard mouseMonitors.isEmpty else { return }
+        let events: NSEvent.EventTypeMask = [.mouseMoved, .leftMouseDragged, .rightMouseDragged, .otherMouseDragged]
+        if let monitor = NSEvent.addGlobalMonitorForEvents(matching: events, handler: { [weak self] _ in
+            MainActor.assumeIsolated { self?.mouseMoved() }
+        }) { mouseMonitors.append(monitor) }
+        if let monitor = NSEvent.addLocalMonitorForEvents(matching: events, handler: { [weak self] event in
+            MainActor.assumeIsolated { self?.mouseMoved() }
+            return event
+        }) { mouseMonitors.append(monitor) }
+    }
+
+    deinit {
+        timer?.invalidate()
+        bubbleTimer?.invalidate()
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver) }
+        for monitor in mouseMonitors { NSEvent.removeMonitor(monitor) }
+    }
+
+    private func mouseMoved() {
+        // Already animating: no new task, simulation step or timer allocation per mouse event.
+        if !fast, mode == .following { wake() }
+    }
+
+    private func setRate(fast: Bool) {
+        self.fast = fast
+        if fast || mode != .following {
+            for monitor in mouseMonitors { NSEvent.removeMonitor(monitor) }
+            mouseMonitors.removeAll()
+        } else { watchMouse() }
+        if !fast, mode != .following {
+            timer?.invalidate(); timer = nil
+            return
         }
+        let moving = flight != nil || (mode == .following && hypot(vel.dx, vel.dy) > 1)
+        let interval = fast ? Efficiency.animationInterval(moving: moving) : 0.25
+        guard timer?.timeInterval != interval else { return }
+        timer?.invalidate()
+        let timer = Timer(timeInterval: interval, repeats: true) { [weak self] _ in
+            onMainRunLoop { self?.tick() }
+        }
+        timer.tolerance = fast ? interval * 0.1 : 0.05
         RunLoop.main.add(timer, forMode: .common)
         self.timer = timer
+    }
+
+    /// Back to full frame rate (something changed that has to animate).
+    private func wake() {
+        stillSince = nil
+        setRate(fast: true)
     }
 
     // MARK: - API
 
     /// Flies along an arc so the tip lands just below-right of `point`, pointing at it. Frames `rect` if given.
     func travel(to point: CGPoint, framing rect: CGRect? = nil) async {
+        if quiet { return }
+        if let confine, !confine.contains(point) { return }
         highlight = rect.map { $0.insetBy(dx: -5, dy: -5) }
         typing = false
         let end = CGPoint(x: point.x + 3, y: point.y + 3)
         let start = pos
         let distance = hypot(end.x - start.x, end.y - start.y)
-        if distance < 4 { mode = .parked; return }
+        if distance < 4 { mode = .parked; wake(); return }
         // A person's hand: quick for short hops, never instant, never sluggish.
         let duration = min(0.8, max(0.3, 0.24 + Double(distance) / 1900))
         let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
@@ -125,6 +189,7 @@ final class Buddy {
         let control = CGPoint(x: mid.x, y: mid.y - lift)
         finishFlight()
         mode = .flying
+        wake()
         await withCheckedContinuation { continuation in
             flight = Flight(start: start, control: control, end: end, began: CACurrentMediaTime(),
                             duration: duration, done: continuation)
@@ -133,16 +198,40 @@ final class Buddy {
 
     /// Press-in squash with a ripple at the tip.
     func click() {
+        if quiet { return }
         pressStart = CACurrentMediaTime()
         ripples.append((pos, pressStart))
         if ripples.count > 4 { ripples.removeFirst() }
+        wake()
     }
 
     /// Gentle bob while text goes in.
-    func setTyping(_ on: Bool) { typing = on }
+    func setTyping(_ on: Bool) { typing = on; wake() }
+
+    /// Off to work somewhere else, until the run is done or needs the user (`goHome` brings it back): onto Clinqy's
+    /// hidden screen when there is one (`to`; it leaves through the corner that screen touches), else to the right
+    /// edge of the user's screen, half out of view.
+    func goAway(to elsewhere: CGRect? = nil) {
+        highlight = nil
+        typing = false
+        let m = Self.mouse()
+        let screen = NSScreen.screens.map { AXEngine.flipped($0.frame) }.first { $0.contains(m) }
+            ?? AXEngine.flipped(NSScreen.main?.frame ?? .zero)
+        let end = elsewhere.map { CGPoint(x: $0.midX, y: $0.midY) } ?? CGPoint(x: screen.maxX - 10, y: screen.minY + screen.height * 0.22)
+        away = true
+        let start = pos
+        let distance = hypot(end.x - start.x, end.y - start.y)
+        let mid = CGPoint(x: (start.x + end.x) / 2, y: (start.y + end.y) / 2)
+        finishFlight()
+        mode = .flying
+        flight = Flight(start: start, control: CGPoint(x: mid.x, y: mid.y - min(distance * 0.25, 120)), end: end,
+                        began: CACurrentMediaTime(), duration: min(1.1, max(0.5, 0.3 + Double(distance) / 1600)), done: nil)
+        wake()
+    }
 
     /// Clears the target frame, then flies back to the mouse and resumes following.
     func goHome() {
+        away = false
         highlight = nil
         typing = false
         guard mode != .following else { return }
@@ -156,6 +245,7 @@ final class Buddy {
         finishFlight()
         flight = Flight(start: start, control: CGPoint(x: mid.x, y: mid.y - min(distance * 0.2, 70)), end: end,
                         began: CACurrentMediaTime(), duration: min(0.9, max(0.35, 0.25 + Double(distance) / 1800)), done: nil)
+        wake()
     }
 
     /// A small speech bubble beside the triangle, streamed in character by character.
@@ -165,8 +255,9 @@ final class Buddy {
         bubbleText = String(text.replacingOccurrences(of: "\n", with: " ").prefix(90))
         bubbleShown = 0
         bubbleAppeared = CACurrentMediaTime()
+        wake()
         bubbleTimer = Timer.scheduledTimer(withTimeInterval: 0.028, repeats: true) { [weak self] t in
-            MainActor.assumeIsolated {
+            onMainRunLoop {
                 guard let self, let full = self.bubbleText else { t.invalidate(); return }
                 self.bubbleShown += 1
                 if self.bubbleShown >= full.count {
@@ -183,6 +274,8 @@ final class Buddy {
     /// Marks something on screen: flies beside it, draws a circle around it and an arrow to it, shows `label`.
     /// Stays until `clearMark()` or the next mark; the buddy stays parked next to it meanwhile.
     func mark(_ rect: CGRect, label: String?) async {
+        if quiet { return }
+        if let confine, !confine.contains(CGPoint(x: rect.midX, y: rect.midY)) { return }
         highlight = nil
         let screen = NSScreen.screens.map { AXEngine.flipped($0.frame) }.first { $0.contains(CGPoint(x: rect.midX, y: rect.midY)) }
             ?? AXEngine.flipped(NSScreen.main?.frame ?? .zero)
@@ -195,14 +288,15 @@ final class Buddy {
         await travel(to: tail)
         mark = Mark(rect: rect, tail: tail, began: CACurrentMediaTime(), seed: CGFloat.random(in: 0...(2 * .pi)),
                     mouse: Self.mouse())
+        wake()
         try? await Task.sleep(for: .milliseconds(900))
         if let label, !label.isEmpty { bubble(label, for: 3) }
     }
 
-    func clearMark() { mark = nil }
+    func clearMark() { mark = nil; wake() }
 
     /// Fades out the frame around the element just used (the UI has usually moved on).
-    func clearHighlight() { highlight = nil }
+    func clearHighlight() { highlight = nil; wake() }
 
     /// Recent positions (global), for the short streak drawn behind the buddy as it moves.
     private var trail: [(CGPoint, CFTimeInterval)] = []
@@ -302,6 +396,26 @@ final class Buddy {
         // Only when Clinqy moves it itself (not while it's just following the user's mouse).
         if flight != nil, mode != .returning { trail.append((pos, now)) }
         trail.removeAll { now - $0.1 > 0.1 }
+
+        // Nothing moving, fading or pulsing: after a second of that, stop drawing until something changes.
+        let goal = CGPoint(x: mouse.x + Self.offset.dx, y: mouse.y + Self.offset.dy)
+        let still = flight == nil && mode != .returning && trail.isEmpty && ripples.isEmpty && mark == nil
+            && bubbleText == nil && !typing && mood != .thinking && mood != .listening
+            && hypot(vel.dx, vel.dy) < 1 && (mode != .following || hypot(goal.x - pos.x, goal.y - pos.y) < 0.5)
+            && abs(offstage - (leave ? 1 : 0)) < 0.005 && abs(highlightAlpha - (highlight == nil ? 0 : 1)) < 0.005
+            && abs(scale - 1) < 0.002 && abs(angle - targetAngle) < 0.002
+            && now - shakeStart > 0.45 && now - pressStart > 0.26 && now - pop > 0.5
+            && (flash.map { now - $0.1 > 0.7 } ?? true)
+        if !still {
+            wake()
+        } else if let since = stillSince {
+            if now - since > 1 {
+                setRate(fast: false)
+                return
+            }
+        } else {
+            stillSince = now
+        }
         let frame = Frame(
             now: now, pos: pos, trail: trail.map(\.0), angle: angle, scale: scale, speed: hypot(vel.dx, vel.dy), mood: mood,
             shake: now - shakeStart < 0.45 ? now - shakeStart : nil,
@@ -323,6 +437,7 @@ final class Buddy {
     private func rebuildStages() {
         stages.forEach { $0.window.orderOut(nil) }
         stages = NSScreen.screens.map(Stage.init)
+        wake()
     }
 
     static func mouse() -> CGPoint {
@@ -406,6 +521,8 @@ private final class Stage {
     private var spinnerAlpha: CGFloat = 0
     private var barsAlpha: CGFloat = 0
     private var bubbleAlpha: CGFloat = 0
+    private var measuredLabel = ""
+    private var measuredWidth: CGFloat = 0
 
     init(screen: NSScreen) {
         let frame = screen.frame
@@ -639,7 +756,12 @@ private final class Stage {
         // Bubble: pops in with a little overshoot, text streams in.
         let label = f.bubble ?? ""
         ease(&bubbleAlpha, label.isEmpty ? 0 : 1, 14)
-        let width = label.isEmpty ? bubbleWidth : ceil(NSAttributedString(string: label, attributes: [.font: font]).size().width) + 24
+        if label != measuredLabel {
+            measuredLabel = label
+            measuredWidth = label.isEmpty ? 0 : ceil(NSAttributedString(string: label, attributes: [.font: font]).size().width) + 24
+            text.string = label
+        }
+        let width = label.isEmpty ? bubbleWidth : measuredWidth
         ease(&bubbleWidth, width, 20)
         let height: CGFloat = 28
         let age = min(1, f.bubbleAge / 0.35)
@@ -651,7 +773,6 @@ private final class Stage {
         bubble.cornerRadius = height / 2
         bubble.opacity = Float(bubbleAlpha)
         bubble.borderColor = accent.copy(alpha: 0.45)
-        text.string = label
         text.frame = CGRect(x: 12, y: 6, width: max(0, bubbleWidth - 20), height: 18)
         renderStreak(f, accent: accent, local: local)
         renderMark(f, accent: accent, local: local)
@@ -740,5 +861,14 @@ private final class Stage {
             l.shadowColor = accent
             l.opacity = fade
         }
+    }
+}
+
+/// Runs `body` from a main-run-loop timer without `MainActor.assumeIsolated`'s runtime executor check,
+/// which intermittently segfaults (swift_task_isMainExecutorImpl) when hit at frame rate on macOS 27.
+/// Only for callbacks that are guaranteed to fire on the main thread.
+private func onMainRunLoop(_ body: @MainActor () -> Void) {
+    withoutActuallyEscaping(body) { body in
+        unsafeBitCast(body, to: (() -> Void).self)()
     }
 }

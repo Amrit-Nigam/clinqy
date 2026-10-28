@@ -3,8 +3,8 @@ import CoreGraphics
 
 /// Background clicks through private SkyLight, for Chromium/Electron/Catalyst windows that ignore a plain
 /// postToPid click (they hit-test against WindowServer's active window). Recipe from mac-computer-use (after
-/// trycua/cua). Undocumented ABI: only with BACKGROUND_CLICKS=1, every symbol probed at load, and fully off if
-/// any is missing rather than half-posting a sequence. Never chosen automatically.
+/// trycua/cua). Undocumented ABI: used by background runs, or by any run with BACKGROUND_CLICKS=1; every symbol is
+/// probed at load, and it's fully off if any is missing rather than half-posting a sequence.
 enum SkyLight {
     private typealias PostToPid = @convention(c) (pid_t, UnsafeMutableRawPointer?) -> Void
     private typealias SetIntField = @convention(c) (UnsafeMutableRawPointer?, UInt32, Int64) -> Void
@@ -37,6 +37,8 @@ enum SkyLight {
     }()
 
     static var isEnabled: Bool { Config.value("BACKGROUND_CLICKS") == "1" && symbols != nil }
+    /// This macOS has every symbol the background path needs.
+    static var isAvailable: Bool { symbols != nil }
 
     /// Private CGEvent fields the Chromium-compatible path sets.
     private enum Field {
@@ -61,10 +63,19 @@ enum SkyLight {
         return psn.withUnsafeBytes { p in record.withUnsafeBufferPointer { s.postRecord(p.baseAddress, $0.baseAddress) } } == 0
     }
 
+    /// Makes `window` of `pid` the key window of an app that thinks it's active, without raising it or taking focus
+    /// from the app in front (yabai's focus-without-raise): keys posted to the app then reach that window.
+    @discardableResult
+    static func focus(pid: pid_t, window: CGWindowID) -> Bool {
+        guard let s = symbols else { return false }
+        var psn = [UInt8](repeating: 0, count: 8)
+        guard psn.withUnsafeMutableBytes({ s.processForPID(pid, $0.baseAddress) }) == 0 else { return false }
+        return activate(s, psn: psn, window: window, focused: true)
+    }
+
     /// Clicks `point` (global, top-left) in `window` of `pid` without moving the cursor or raising the app.
     /// Returns nil on success, otherwise why it didn't click.
     static func click(at point: CGPoint, pid: pid_t, window: CGWindowID, frame: CGRect) -> String? {
-        guard Config.value("BACKGROUND_CLICKS") == "1" else { return "background clicks are off (BACKGROUND_CLICKS=1 enables them)" }
         guard let s = symbols else { return "background clicks unavailable: SkyLight symbols missing on this macOS" }
         guard frame.contains(point) else { return "background click point is outside the target window" }
         guard let source = CGEventSource(stateID: .hidSystemState) else { return "couldn't create an event source" }

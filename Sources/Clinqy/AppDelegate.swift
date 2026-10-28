@@ -17,6 +17,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var resultPanel: ResultPanel!
     private var hotKey: HotKey?
     private var talkHotKey: PushToTalkHotKey?
+    /// fn+⌃: plain dictation. Hold and speak (or tap to start, tap to stop); the words are typed where the cursor is.
+    private var dictateHotKey: HotKey?
+    private var dictating = false
+    private var dictateStarted: Date?
     private var openMenuItem: NSMenuItem?
     private var talkMenuItem: NSMenuItem?
     private var pressedAt: Date?
@@ -29,6 +33,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var followUpOpen = false
 
     func applicationWillTerminate(_ notification: Notification) {
+        // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
+        ChromeWorker.shared.shutdown()
+        AgentScreen.quit()
         Persist.flush()
     }
 
@@ -46,11 +53,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                              onCircle: { [weak self] in self?.startCircling() })
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
-        agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
+        agent.onResult = { [weak self] in
+            guard let self, let result = self.agent.result else { return }
+            Telegram.shared.present(result)
+            if !self.agent.runBackground { self.resultPanel.show() }
+        }
         // Review before submit: the form's answers come up in the bar; it goes away once the user decides.
         UI.agent = agent
         UI.present = { [weak self] in self?.panel.showCentered(); self?.island.show() }
         UI.dismiss = { [weak self] in self?.panel.orderOut(nil) }
+        // A plain kill (an update, a rebuild, logging out) quits like ⌘Q, so the hidden screen is emptied first.
+        signal(SIGTERM, SIG_IGN)
+        terminateSignal.setEventHandler { NSApp.terminate(nil) }
+        terminateSignal.resume()
+        // A background run's notifications: answered there, or tapped to come here.
+        Notifier.start()
+        Telegram.shared.agent = agent
+        Telegram.shared.start()
+        // Switching to an app whose windows are on the hidden screen gets the user a window they can see.
+        Background.onBusyApp = { [weak self] text in self?.buddy.bubble(text, for: 4) }
+        Background.watchSwitches()
+        AgentScreenView.shared.agent = agent
+        Notifier.onAnswer = { [weak self] text in self?.agent.answer(text) }
+        // "Done": show the window it worked in. "Needs you": the bar, to answer.
+        Notifier.onOpen = { [weak self] question in
+            guard let self else { return }
+            if question || self.agent.question != nil { self.panel.showCentered(); self.island.show() }
+            else { AgentScreenView.shared.show() }
+        }
         enableOpenAtLogin()
         _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
         linkCommand()
@@ -86,9 +116,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Clipboard.start()
         startScheduler()
 
+        TaskStore.shared.onReady = { [weak self] id in
+            guard let self, !self.agent.isRunning, let item = TaskStore.shared.record(id) else { return }
+            if item.source == .telegram { Telegram.shared.startQueued(id, reviewed: true) }
+            else if TaskStore.shared.start(id, explicitlyReviewed: true) {
+                self.agent.selectedFiles = item.files.map { URL(fileURLWithPath: $0) }
+                self.agent.submit(item.request, background: item.background, taskID: id)
+            }
+        }
         agent.onStart = { [weak self] in
             guard let self else { return }
-            self.setStatusIcon(running: true)
+            self.setStatusIcon(running: true, background: self.agent.runBackground)
             StepUndo.shared.clear()
             // Keystrokes must reach the target app, and clicks must not land on our windows.
             self.panel.orderOut(nil)
@@ -100,7 +138,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.setStatusIcon(running: false)
             self.island.show(for: 4.5)
             // Stopped by the user: bring the bar back so they can say what to do differently ("no, the other one").
-            if !ok, answer == "Stopped", !self.agent.isTest, !self.voiceRun {
+            if !ok, answer == "Stopped", !self.agent.isTest, !self.agent.runBackground, !self.voiceRun {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     guard let self, !self.agent.isRunning, !self.panel.isVisible, !Recorder.shared.isRecording else { return }
                     self.panel.showCentered()
@@ -113,6 +151,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Paused for the user's input: bring the bar up with the question; hide it again once answered.
         agent.onQuestion = { [weak self] in
             guard let self else { return }
+            // A background run asks through a notification instead: the bar would take the user's focus.
+            if self.agent.runBackground { self.island.show(); return }
             self.panel.showCentered()
             self.island.show()
         }
@@ -121,6 +161,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voice.onFinal = { [weak self] text in
             guard let self else { return }
             self.buddy.mood = .idle
+            if self.dictating {
+                self.dictating = false
+                self.island.hide()
+                self.typeDictation(text)
+                return
+            }
             let followUp = self.followUpOpen
             self.followUpOpen = false
             // A spoken reply to a question answers it; while working it steers; otherwise it's a new request.
@@ -139,6 +185,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voice.onGaveUp = { [weak self] in
             guard let self else { return }
             self.followUpOpen = false
+            self.dictating = false
             if !self.agent.isRunning { self.agent.continuation = nil }
             self.buddy.mood = .idle
             self.island.hide()
@@ -156,6 +203,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
         menu.addItem(withTitle: "Job Profile…", action: #selector(openProfile), keyEquivalent: "")
+        menu.addItem(withTitle: "Tasks & Recovery…", action: #selector(showTasks), keyEquivalent: "")
+        menu.addItem(withTitle: "Sign In to Worker Chrome…", action: #selector(workerLogin), keyEquivalent: "")
+        menu.addItem(withTitle: "Finish Worker Chrome Sign-in", action: #selector(finishWorkerLogin), keyEquivalent: "")
         menu.addItem(withTitle: "Stats…", action: #selector(showStats), keyEquivalent: "")
         let schedules = NSMenuItem(title: "Schedules", action: nil, keyEquivalent: "")
         let schedulesMenu = NSMenu()
@@ -166,6 +216,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let dry = menu.addItem(withTitle: "Dry Run (show, don't act)", action: #selector(toggleDryRun(_:)), keyEquivalent: "")
         dry.state = agent.dryRun ? .on : .off
+        let background = menu.addItem(withTitle: "Work in the Background", action: #selector(toggleBackground(_:)), keyEquivalent: "")
+        background.state = Background.always ? .on : .off
+        // The Dashboard has the same switch.
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak background] _ in
+            MainActor.assumeIsolated { background?.state = Background.always ? .on : .off }
+        }
+        background.toolTip = "Web tasks use a separate Chrome profile. File and supported service tasks run directly; native app tasks ask for foreground access."
+        menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
+        menu.addItem(withTitle: "Telegram…", action: #selector(setUpTelegram), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
         follow.state = buddy.followsMouse ? .on : .off
         let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
@@ -188,12 +247,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         configureHotKeys()
 
-        if !Permissions.allGranted {
+        if !CommandLine.arguments.contains("--background-launch"), !Permissions.allGranted {
             Permissions.requestMissing()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.checkPermissions() }
         }
 
-        if OnboardingWindow.isDone {
+        if OnboardingWindow.isDone, !CommandLine.arguments.contains("--background-launch") {
             DispatchQueue.main.async { [weak self] in self?.showDashboard() }
         }
     }
@@ -366,12 +425,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.letClinqyLoadExtension()
     }
 
-    /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
-    private var menu: NSMenu?
+    private let terminateSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 
-    private func setStatusIcon(running: Bool) {
+    /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
+    /// A background run gets a small menu instead (watch it or stop it): clicking the icon is how the user looks in on it.
+    private var menu: NSMenu?
+    private var runMenu: NSMenu?
+
+    private func setStatusIcon(running: Bool, background: Bool = false) {
         guard let button = statusItem.button else { return }
-        if running {
+        // A background run: blue, as the corner badge, and saying so (it's working out of sight).
+        button.toolTip = running ? (background ? "Clinqy is working in the background" : "Click to stop Clinqy") : nil
+        if running && background {
+            button.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Clinqy (working in the background)")
+            button.contentTintColor = .systemBlue
+            button.action = nil
+            if runMenu == nil {
+                let m = NSMenu()
+                m.delegate = self
+                runMenu = m
+            }
+            statusItem.menu = runMenu
+        } else if running {
             button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop Clinqy")
             button.contentTintColor = .systemRed
             statusItem.menu = nil
@@ -562,6 +637,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             PushToTalkHotKey(spec: spec, onPress: { [weak self] in self?.dedicatedTalkDown() },
                              onRelease: { [weak self] in self?.dedicatedTalkUp() })
         }
+        let dictate = Config.value("DICTATE_HOTKEY") ?? "fn+ctrl"
+        dictateHotKey = dictate.lowercased() == "off" ? nil
+            : HotKey(spec: dictate, onPress: { [weak self] in self?.dictateDown() },
+                     onRelease: { [weak self] in self?.dictateUp() },
+                     onOtherKey: { [weak self] in self?.dictateAbandoned() })
         openMenuItem?.title = "Open Clinqy  (\(menuShortcutLabel(summon)))"
         let talkLabel = talkHotKey == nil ? menuShortcutLabel(summon) + " · hold" : menuShortcutLabel(Config.value("TALK_HOTKEY") ?? "")
         talkMenuItem?.title = "Talk  (hold \(talkLabel))"
@@ -592,6 +672,59 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         hotKey?.enabled = enabled
         talkHotKey?.enabled = enabled
+        dictateHotKey?.enabled = enabled
+    }
+
+    // MARK: - Dictation
+
+    private func dictateDown() {
+        if dictating {   // tapped on earlier: this press ends it
+            dictateStarted = nil
+            endDictation()
+            return
+        }
+        guard !holdToTalk, !voice.isListening else { return }
+        dictating = true
+        dictateStarted = Date()
+        island.show()
+        startListening(autoStop: false)
+    }
+
+    /// Held: done speaking. A quick tap: keep listening hands-free until the next press.
+    private func dictateUp() {
+        guard dictating, let started = dictateStarted else { return }
+        dictateStarted = nil
+        if Date().timeIntervalSince(started) < 0.35 { return }
+        endDictation()
+    }
+
+    /// Stops listening; nothing heard means nothing typed, so tidy up if no words arrive.
+    private func endDictation() {
+        voice.stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.dictating, !self.voice.isListening else { return }
+            self.dictating = false
+            self.island.hide()
+            self.buddy.mood = self.agent.isRunning ? .acting : .idle
+        }
+    }
+
+    /// fn+⌃ was part of another shortcut (fn+⌃+arrow…): drop the dictation.
+    private func dictateAbandoned() {
+        guard dictating, dictateStarted != nil else { return }
+        dictating = false
+        dictateStarted = nil
+        voice.cancel()
+        island.hide()
+        buddy.mood = agent.isRunning ? .acting : .idle
+    }
+
+    /// Types what was said into whatever has the keyboard focus, like the keyboard would.
+    private func typeDictation(_ text: String) {
+        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return }
+        Agent.writeLog("dictation: typed \(words.count) characters")
+        AXEngine.enter(words)
     }
 
     private func dedicatedTalkDown() {
@@ -726,6 +859,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openProfile() { Profile.open() }
 
+    @objc func showTasks() { TasksPanel.shared.show() }
+
+    @objc func workerLogin() {
+        guard !agent.isRunning else { buddy.bubble("Finish or stop the current task before signing in to Worker Chrome", for: 5); return }
+        Task {
+            do { try await ChromeWorker.shared.openLogin() }
+            catch { buddy.bubble(error.localizedDescription, for: 8) }
+        }
+    }
+    @objc func finishWorkerLogin() {
+        guard !agent.isRunning else { return }
+        Task { await ChromeWorker.shared.finishLogin() }
+    }
+
     @objc func showStats() {
         agent.result = StatsCard.card
         agent.onResult()
@@ -735,6 +882,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        if menu === runMenu { return fillRunMenu(menu) }
         let items = Scheduler.all
         if items.isEmpty {
             let none = menu.addItem(withTitle: "Nothing scheduled", action: nil, keyEquivalent: "")
@@ -756,6 +904,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let add = menu.addItem(withTitle: "New Schedule…", action: #selector(newSchedule), keyEquivalent: "")
         add.target = self
+    }
+
+    /// The background run's menu: what it's on now, watch it, stop it.
+    private func fillRunMenu(_ menu: NSMenu) {
+        let now = agent.question.map { "Asks: " + $0.text } ?? agent.steps.last?.text ?? "Working…"
+        let status = menu.addItem(withTitle: String(now.prefix(60)) + (now.count > 60 ? "…" : ""), action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Stop", action: #selector(stopFromMenuBar), keyEquivalent: "").target = self
     }
 
     @objc func removeSchedule(_ item: NSMenuItem) {
@@ -803,6 +961,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleDryRun(_ item: NSMenuItem) {
         agent.dryRun.toggle()
         item.state = agent.dryRun ? .on : .off
+    }
+
+    @objc func showBackgroundWork() { AgentScreenView.shared.show() }
+
+    /// Connects a Telegram bot (its token from @BotFather), then pairs the user's chat with a one-time link.
+    @objc func setUpTelegram() {
+        let bot = Telegram.shared
+        NSApp.activate(ignoringOtherApps: true)
+        if bot.token != nil {
+            let alert = NSAlert()
+            alert.messageText = "Telegram"
+            alert.informativeText = bot.chatID == nil ? "The bot is set up but no chat is paired yet."
+                : "Paired: tasks you message the bot run on this Mac, in the background unless you say otherwise."
+            alert.addButton(withTitle: "Pair a Chat")
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Disconnect")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: return pairTelegram()
+            case .alertThirdButtonReturn:
+                try? Config.write(["TELEGRAM_BOT_TOKEN": nil, "TELEGRAM_CHAT_ID": nil])
+                bot.start()
+                return
+            default: return
+            }
+        }
+        let alert = NSAlert()
+        alert.messageText = "Message Clinqy from Telegram"
+        alert.informativeText = "In Telegram, message @BotFather, send /newbot and follow its steps. Paste the token it gives you here. "
+            + "Only the chat you pair next can give Clinqy tasks."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "123456789:AA…"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        try? Config.write(["TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": nil])
+        pairTelegram()
+    }
+
+    private func pairTelegram() {
+        Task { @MainActor in
+            let bot = Telegram.shared
+            guard await bot.checkToken() != nil else {
+                let alert = NSAlert()
+                alert.messageText = "Telegram didn't accept that token"
+                alert.informativeText = "Check it in @BotFather (/mybots → API Token) and try again."
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+                return
+            }
+            bot.start()
+            let (code, link) = bot.pairLink()
+            let alert = NSAlert()
+            alert.messageText = "Pair your Telegram chat"
+            alert.informativeText = "Open the bot and press Start, or send it:\n/pair \(code)\n\nThe code works for 10 minutes."
+            alert.addButton(withTitle: "Open in Telegram")
+            alert.addButton(withTitle: "Done")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn, let link { NSWorkspace.shared.open(link) }
+        }
+    }
+
+    @objc func toggleBackground(_ item: NSMenuItem) {
+        Background.always.toggle()
+        item.state = Background.always ? .on : .off
     }
 
     @objc func toggleFollowCursor(_ item: NSMenuItem) {

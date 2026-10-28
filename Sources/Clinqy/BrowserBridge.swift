@@ -52,7 +52,7 @@ final class BrowserBridge {
         /// Why the page couldn't be read, when it couldn't (never just "0 elements").
         var problem: String?
         /// Viewport's on-screen rect estimated from window geometry (fallback when Accessibility can't say).
-        let estimatedArea: CGRect?
+        var estimatedArea: CGRect?
         /// Scrolling boxes (modals) with more fields out of view; their counts are included in above/below.
         var panes: [Pane] = []
         /// The browser tab this was read from; `pinned` = read by id (snapshot(tab:)), so commands go to that tab
@@ -66,7 +66,7 @@ final class BrowserBridge {
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var counter = 0
 
-    var isConnected: Bool { !connections.isEmpty }
+    var isConnected: Bool { ChromeWorker.shared.connected || !connections.isEmpty }
 
     enum BridgeError: LocalizedError {
         case notConnected, timeout, failed(String)
@@ -126,6 +126,7 @@ final class BrowserBridge {
                 guard let self else { return }
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any], msg["type"] as? String == "hello" {
                     self.checkVersion(msg["version"] as? String ?? "", on: conn)
+                    if msg["version"] as? String == Self.extensionVersion { self.tidyAfterRestart(conn) }
                 }
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                    let id = msg["id"] as? String, let cont = self.pending.removeValue(forKey: id) {
@@ -159,7 +160,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.8.7"
+    static let extensionVersion = "1.9.6"
     /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
     /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
     private var reloadAsked: [String: Int] = [:]
@@ -167,8 +168,53 @@ final class BrowserBridge {
     private func checkVersion(_ version: String, on conn: NWConnection) {
         guard version != Self.extensionVersion, reloadAsked[version, default: 0] < 3 else { return }
         reloadAsked[version, default: 0] += 1
-        Agent.writeLog("browser extension v\(version) connected, app expects v\(Self.extensionVersion): reloading it")
+        let key = ObjectIdentifier(conn)
+        DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+            let browser = self?.owners[key].map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "a browser"
+            Agent.writeLog("browser extension v\(version) connected in \(browser), app expects v\(Self.extensionVersion): reloading it")
+        }
+        Self.refreshInstalledCopy()
         Task { _ = try? await request(conn, ["cmd": "reload"], timeout: 5) }
+    }
+
+    /// As each browser connects in the first minute after Clinqy starts: a background window an earlier Clinqy left
+    /// open (it crashed, or was killed before it could close it) is closed, so it never sits on the user's screen.
+    /// Not once this Clinqy has a hidden screen or a background run: then that window is in use.
+    private let started = Date()
+
+    private func tidyAfterRestart(_ conn: NWConnection) {
+        guard Date().timeIntervalSince(started) < 60, AgentScreen.bounds == nil, !Background.active else { return }
+        Task {
+            do {
+                let r = try await request(conn, ["cmd": "closeAgentWindow"], timeout: 3)
+                if let id = r["closed"] as? Int { Agent.writeLog("closed a background window an earlier Clinqy left open (window \(id))") }
+            } catch {
+                Agent.writeLog("couldn't check for a background window an earlier Clinqy left open: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    /// The user took over Clinqy's background window: it's theirs now, never closed by Clinqy.
+    func releaseBackgroundWindows() async {
+        for conn in connections.values { _ = try? await request(conn, ["cmd": "releaseAgentWindow"], timeout: 2) }
+    }
+
+    /// The browser loads the extension from a copy in Application Support (setup made it): after an app update that
+    /// copy is still the old one, so a reload would only bring the old version back. Puts this app's copy there first.
+    private static func refreshInstalledCopy() {
+        let fm = FileManager.default
+        let installed = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension")
+        guard let bundled = Bundle.main.url(forResource: "extension", withExtension: nil), fm.fileExists(atPath: installed.path) else { return }
+        let version = { (dir: URL) in
+            (try? JSONSerialization.jsonObject(with: Data(contentsOf: dir.appendingPathComponent("manifest.json")))) .flatMap { ($0 as? [String: Any])?["version"] as? String }
+        }
+        guard version(installed) != version(bundled) else { return }
+        for name in (try? fm.contentsOfDirectory(atPath: bundled.path)) ?? [] {
+            let target = installed.appendingPathComponent(name)
+            try? fm.removeItem(at: target)
+            try? fm.copyItem(at: bundled.appendingPathComponent(name), to: target)
+        }
+        Agent.writeLog("updated the browser extension's files to v\(version(bundled) ?? "?")")
     }
 
     /// Asks every connected browser to reload the extension (after it's been updated on disk).
@@ -213,9 +259,78 @@ final class BrowserBridge {
         return nil
     }
 
+    /// Whether `app` (a browser) has the extension connected.
+    func isConnected(_ app: NSRunningApplication) -> Bool {
+        guard let bundle = app.bundleURL?.resolvingSymlinksInPath().path else { return false }
+        return owners.contains { connections[$0.key] != nil && $0.value == bundle }
+    }
+
+    /// Opens `url` in Clinqy's own browser window, made without focus behind the user's (one window per browser, reused),
+    /// in `app` if it has the extension, else any connected browser. Returns the tab and the browser it's in.
+    /// `at`: where its window goes (Clinqy's hidden screen), in global top-left points.
+    func backgroundTab(_ url: String, in app: NSRunningApplication? = nil, at: CGRect? = nil) async -> (tab: TabInfo, browser: NSRunningApplication?, window: CGRect?)? {
+        do {
+            let worker = ChromeWorker.shared
+            let id = try await worker.newTab(url)
+            return (TabInfo(id: id, url: url, connection: worker.identity), worker.app, CGRect(x: 0, y: 0, width: 1440, height: 900))
+        } catch { Agent.writeLog("worker: " + error.localizedDescription); return nil }
+    }
+
+    /// Reads `tab` by id, wherever it is (Clinqy's background window included). The page is pinned to it.
+    func snapshot(of tab: TabInfo) async -> Page? {
+        if tab.connection == ChromeWorker.shared.identity {
+            guard let raw = try? await ChromeWorker.shared.command("snapshot", tabID: tab.id) else { return nil }
+            var page = parse(raw, connection: tab.connection)
+            page.pinned = true
+            page.estimatedArea = CGRect(origin: .zero, size: page.viewport)
+            return page
+        }
+        guard let conn = connections[tab.connection],
+              let r = try? await request(conn, ["cmd": "snapshot", "tabId": tab.id], timeout: 5) else { return nil }
+        var page = parse(r, connection: tab.connection)
+        page.pinned = true
+        return page
+    }
+
+    /// Captures one owned task tab through the extension. Capturing a hidden tab can take longer than a normal command.
+    /// Model inputs are JPEG (matching the providers' image/jpeg payload); exports stay lossless PNG.
+    func taskVisionScreenshot(of tab: TabInfo) async -> Data? {
+        if tab.connection == ChromeWorker.shared.identity {
+            guard let raw = try? await ChromeWorker.shared.command("captureVision", tabID: tab.id),
+                  let encoded = raw["image"] as? String else { return nil }
+            return Data(base64Encoded: encoded)
+        }
+        guard let png = await taskScreenshot(of: tab), let bitmap = NSBitmapImageRep(data: png) else { return nil }
+        return bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85])
+    }
+
+    func taskScreenshot(of tab: TabInfo, preview: Bool = false) async -> Data? {
+        if tab.connection == ChromeWorker.shared.identity {
+            guard let raw = try? await ChromeWorker.shared.command(preview ? "capturePreview" : "captureTask", tabID: tab.id), let png = raw["image"] as? String else { return nil }
+            return Data(base64Encoded: png)
+        }
+        guard let conn = connections[tab.connection] else {
+            Agent.writeLog("telegram screenshot: task browser disconnected")
+            return nil
+        }
+        do {
+            let reply = try await request(conn, ["cmd": "captureTask", "tabId": tab.id], timeout: 12)
+            guard let base64 = reply["image"] as? String, let image = Data(base64Encoded: base64) else {
+                Agent.writeLog("telegram screenshot: browser returned no image")
+                return nil
+            }
+            Agent.writeLog("telegram screenshot: captured \(image.count) bytes from task tab")
+            return image
+        } catch {
+            Agent.writeLog("telegram screenshot: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
     /// Runs a tab-level command (newTab, goBack, navigate) in the browser that owns `tab`.
     @discardableResult
     func tabCommand(_ cmd: String, on tab: TabInfo, _ args: [String: Any] = [:]) async -> [String: Any]? {
+        if tab.connection == ChromeWorker.shared.identity { return try? await ChromeWorker.shared.command(cmd, tabID: tab.id, args: args) }
         guard let conn = connections[tab.connection] else { return nil }
         var body = args
         body["cmd"] = cmd
@@ -272,6 +387,7 @@ final class BrowserBridge {
     }
 
     func perform(_ cmd: String, on page: Page, _ args: [String: Any] = [:], timeout: Double = 4) async throws -> [String: Any] {
+        if page.connection == ChromeWorker.shared.identity { return try await ChromeWorker.shared.command(cmd, tabID: page.tabId, args: args) }
         guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
         var body = args
         body["cmd"] = cmd
@@ -294,6 +410,13 @@ final class BrowserBridge {
 
     /// Tabs of the front browser window, in strip order. `opened` = Clinqy opened it (only those can be closed).
     func tabs(in app: NSRunningApplication? = nil) async throws -> [BrowserTab] {
+        if Background.active {
+            let raw = try await ChromeWorker.shared.command("tabs", tabID: nil)
+            return (raw["tabs"] as? [[String: Any]] ?? []).compactMap { t in
+                guard let id = t["id"] as? Int else { return nil }
+                return BrowserTab(id: id, title: t["title"] as? String ?? "", url: t["url"] as? String ?? "", active: t["active"] as? Bool == true, opened: true)
+            }
+        }
         guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         let r = try await request(conn, ["cmd": "tabs"], timeout: 3)
         return (r["tabs"] as? [[String: Any]] ?? []).compactMap { t in
@@ -305,18 +428,21 @@ final class BrowserBridge {
 
     /// Brings tab `id` to the front of its window.
     func switchTab(_ id: Int, in app: NSRunningApplication? = nil) async throws {
+        if Background.active { _ = try await ChromeWorker.shared.command("switchTab", tabID: id); return }
         guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         _ = try await request(conn, ["cmd": "switchTab", "tabId": id], timeout: 3)
     }
 
     /// Closes tab `id` — only a tab Clinqy opened (the extension refuses others, with a reason).
     func closeTab(_ id: Int, in app: NSRunningApplication? = nil) async throws {
+        if Background.active { _ = try await ChromeWorker.shared.command("closeTab", tabID: id); return }
         guard let (_, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         _ = try await request(conn, ["cmd": "closeTab", "tabId": id], timeout: 3)
     }
 
     /// Reads tab `id` without bringing it to the front. The page is pinned: perform() on it acts on that tab.
     func snapshot(tab id: Int, in app: NSRunningApplication? = nil) async -> Page? {
+        if Background.active { return await snapshot(of: TabInfo(id: id, url: "", connection: ChromeWorker.shared.identity)) }
         guard let (key, conn) = await frontConnection(for: app),
               let r = try? await request(conn, ["cmd": "snapshot", "tabId": id], timeout: 5) else { return nil }
         var page = parse(r, connection: key)
