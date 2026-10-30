@@ -117,6 +117,12 @@ fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
 
+/// The saved tasks, read only: for another process, which must not run recovery on a file the app is using.
+pub fn peek() -> Vec<Record> {
+    let text = std::fs::read_to_string(crate::paths::data_dir().join("tasks.json")).unwrap_or_default();
+    serde_json::from_str(&text).unwrap_or_default()
+}
+
 pub fn tasks() -> &'static TaskStore {
     static STORE: OnceLock<TaskStore> = OnceLock::new();
     STORE.get_or_init(|| TaskStore::open(crate::paths::data_dir().join("tasks.json")))
@@ -182,6 +188,8 @@ impl TaskStore {
         let clean = mask(request);
         let changed = clean != request;
         let id = uuid::Uuid::new_v4().to_string();
+        // Old finished tasks go; anything unfinished stays.
+        const KEEP: usize = 300;
         let record = Record {
             id: id.clone(),
             request: clean,
@@ -199,7 +207,18 @@ impl TaskStore {
             requires_review: changed,
             review_reason: changed.then(|| PRIVATE.to_string()),
         };
-        self.mutate(|items| items.push(record)).then_some(id)
+        self.mutate(|items| {
+            items.push(record);
+            while items.len() > KEEP {
+                match items.iter().position(|r| r.state.terminal()) {
+                    Some(i) => {
+                        items.remove(i);
+                    }
+                    None => break,
+                }
+            }
+        })
+        .then_some(id)
     }
 
     /// Moves a queued task to running; refused while another is active, or when it needs a review it hasn't had.

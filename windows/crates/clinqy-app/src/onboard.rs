@@ -27,7 +27,7 @@ pub fn short_name(p: Provider) -> &'static str {
 /// The model the provider really runs (the tier name "sonnet" becomes, for agy, its Gemini model).
 pub fn model_label(p: Provider) -> String {
     let m = p.model(&p.default_model());
-    if m.is_empty() { "its default".into() } else { m }
+    if m.is_empty() { "default model".into() } else { m }
 }
 
 /// Whether a provider can be used as it is, and if not, exactly what to do.
@@ -84,12 +84,7 @@ pub fn choose(p: Provider, model: Option<&str>) -> std::io::Result<()> {
         clinqy_core::config::set("USE_AGY", "")?;
     }
     if let Some(m) = model.filter(|m| !m.trim().is_empty()) {
-        let key = match p {
-            Provider::AgyCli => "AGY_MODEL",
-            Provider::Ollama | Provider::Compatible => "LOCAL_MODEL",
-            _ => "CLAUDE_MODEL",
-        };
-        clinqy_core::config::set(key, m.trim())?;
+        clinqy_core::config::set(p.model_key(), m.trim())?;
     }
     Ok(())
 }
@@ -126,6 +121,95 @@ pub async fn test(p: Provider) -> Result<Duration, String> {
 
 fn first_line(s: &str) -> String {
     s.lines().find(|l| !l.trim().is_empty()).unwrap_or(s).chars().take(300).collect()
+}
+
+/// A provider as the Clinqy window shows it: whether it's ready here, and how to get it there.
+pub fn provider_info(p: Provider) -> serde_json::Value {
+    let installed = !p.is_cli() || p.cli().is_some();
+    let configured = p.is_configured();
+    let kind = match p {
+        Provider::ClaudeCli | Provider::CodexCli | Provider::AgyCli => "cli",
+        Provider::Ollama | Provider::Compatible => "local",
+        _ => "api",
+    };
+    let state = match kind {
+        "cli" if !installed => "not found",
+        "cli" if !configured => "log in",
+        "api" if !configured => "needs a key",
+        "local" if !configured => "not running",
+        _ => "ready",
+    };
+    let (install, login, guide) = match p {
+        Provider::ClaudeCli => ("winget install Anthropic.ClaudeCode", "claude", "https://claude.com/claude-code"),
+        Provider::CodexCli => ("npm i -g @openai/codex", "codex login", "https://github.com/openai/codex"),
+        Provider::AgyCli => ("", "agy", "https://antigravity.google/docs/cli/overview"),
+        Provider::Ollama => ("winget install Ollama.Ollama", "", "https://ollama.com/download"),
+        _ => ("", "", ""),
+    };
+    let (key_name, key_link) = match p {
+        Provider::Anthropic => ("Anthropic API key", "https://console.anthropic.com/settings/keys"),
+        Provider::OpenAi => ("OpenAI API key", "https://platform.openai.com/api-keys"),
+        Provider::Gemini => ("Gemini API key", "https://aistudio.google.com/apikey"),
+        Provider::OpenRouter => ("OpenRouter API key", "https://openrouter.ai/keys"),
+        Provider::Compatible => ("API key (optional)", ""),
+        _ => ("", ""),
+    };
+    let subtitle = match (kind, configured) {
+        (_, true) => format!("Ready · {}", model_label(p)),
+        ("cli", _) => MODELS.iter().find(|m| m.1 == p).map(|m| m.2.to_string()).unwrap_or_default(),
+        ("api", _) => "Add your key to use it".to_string(),
+        _ => "Start it on this PC to use it".to_string(),
+    };
+    serde_json::json!({
+        "id": p.id(), "name": p.display_name(), "kind": kind, "installed": installed, "configured": configured, "state": state, "subtitle": subtitle,
+        "install": install, "login": login, "guide": guide, "keyName": key_name, "keyLink": key_link,
+        "help": if p == Provider::Ollama { "Local models stay on this PC. Use a vision model: Clinqy sends screenshots." } else { "" },
+    })
+}
+
+/// The variable a provider's key is saved in.
+pub fn key_var(p: Provider) -> Option<&'static str> {
+    Some(match p {
+        Provider::Anthropic => "ANTHROPIC_API_KEY",
+        Provider::OpenAi => "OPENAI_API_KEY",
+        Provider::Gemini => "GEMINI_API_KEY",
+        Provider::OpenRouter => "OPENROUTER_API_KEY",
+        Provider::Compatible => "OPENAI_COMPATIBLE_API_KEY",
+        _ => return None,
+    })
+}
+
+/// The coding agents the Clinqy window can connect: (id, name, where it goes).
+pub const AGENT_ROWS: [(&str, &str, &str); 6] = [
+    ("claude", "Claude Code", "claude mcp add"),
+    ("codex", "Codex", "~/.codex/config.toml"),
+    ("agy", "Antigravity CLI", "agy mcp add"),
+    ("cursor", "Cursor", "~/.cursor/mcp.json"),
+    ("gemini", "Gemini CLI", "~/.gemini/settings.json"),
+    ("windsurf", "Windsurf", "~/.codeium/windsurf/mcp_config.json"),
+];
+
+/// The browser Clinqy adds its extension to, and the request that does it. None when the extension folder is missing.
+pub fn extension_task(browser: Option<&str>) -> Result<(String, String, std::path::PathBuf), String> {
+    let dir = crate::setup::extension_dir().ok_or("couldn't find the extension folder next to Clinqy")?;
+    let name = match browser.map(|b| b.to_lowercase()) {
+        Some(b) if b.contains("edge") => "Microsoft Edge".to_string(),
+        Some(b) if b.contains("brave") => "Brave".to_string(),
+        Some(b) if b.contains("chrome") => "Google Chrome".to_string(),
+        Some(b) => return Err(format!("I can add the extension to Chrome, Edge or Brave, not {b:?}")),
+        None => clinqy_windows::apps::default_browser().filter(|b| ["Google Chrome", "Microsoft Edge", "Brave"].contains(&b.as_str())).unwrap_or_else(|| "Google Chrome".into()),
+    };
+    let page = match name.as_str() {
+        "Microsoft Edge" => "edge://extensions",
+        "Brave" => "brave://extensions",
+        _ => "chrome://extensions",
+    };
+    let toggle = if name == "Microsoft Edge" { "in the left sidebar" } else { "top right" };
+    let task = format!(
+        "Open {name} and go to {page} (type it into the address bar). If Developer mode ({toggle}) is off, turn it on. Click Load unpacked. In the folder dialog, click the address bar at the top, type {}, press Enter, then click Select Folder. Stop when the Clinqy extension shows in the list. Don't change any other setting.",
+        dir.display()
+    );
+    Ok((name, task, dir))
 }
 
 /// The `clinqy` command an agent should start for MCP: the installed copy if there is one, else this one.

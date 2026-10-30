@@ -104,6 +104,10 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
             agent.set_paused(cmd == "pause");
             out.end(json!({"event": "ok", "text": if cmd == "pause" { "Paused (clinqy resume carries on, clinqy stop ends it)" } else { "Resumed" }})).await
         }
+        "dashboard" => {
+            shared.send(UserEvent::Menu(if s("page") == "live" { "live" } else { "dashboard" }.into()));
+            out.end(json!({"event": "ok"})).await
+        }
         "status" => out.end(json!({"event": "ok", "snapshot": agent.snapshot(), "extension": clinqy_core::bridge::bridge().is_connected()})).await,
         "answer" => {
             agent.answer(Some(s("text")));

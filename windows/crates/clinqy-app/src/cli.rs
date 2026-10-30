@@ -19,9 +19,11 @@ pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding ag
   clinqy page [read|url]                   What's in the browser tab in front (via the extension), read-only.
   clinqy look [read|url]                   What's in front (the app's controls, or the browser tab), read-only.
   clinqy answer \"<text>\"                    Answer the question Clinqy is waiting on.
+  clinqy tasks                             Recent tasks and what happened to them.
   clinqy stop                              Stop the current task now.
   clinqy pause | resume                    Hold the current task at its next step, then carry on.
   clinqy open                              Open the command bar.
+  clinqy dashboard [live]                  Open the Clinqy window (settings, models, tasks), or the background work view.
   clinqy stats [days] [--last]             Success rate, time per turn, click outcomes, common failures (default 7 days).
   clinqy memory [\"request\"]                What memory holds (or exactly which facts a request would be sent).
   clinqy extension install [chrome|edge|brave]
@@ -32,6 +34,7 @@ pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding ag
   clinqy model <claude|codex|agy|ollama|anthropic|openai|gemini|openrouter|compatible> [model-id]
         Use that one (saved in the settings file), then check it really answers. `clinqy model test` checks again.
         `clinqy model auto` (the default): use what's installed, in this order: Claude Code, Codex, agy, Ollama.
+  clinqy models [name]                     The models that provider offers on this PC (default: the one in use).
   clinqy connect <claude|agy|cursor|codex|gemini|windsurf> ...
         Add Clinqy as an MCP server to those coding agents (keeps their other servers).
   clinqy settings [--path]                 Open the settings file (keys, hotkeys, everything else).
@@ -93,9 +96,19 @@ pub fn main(args: Vec<String>) -> i32 {
         }
         "answer" => simple("answer", json!({"text": rest.join(" ")}), false),
         "stop" | "cancel" => simple("cancel", json!({}), false),
+        "tasks" => {
+            for t in clinqy_core::taskstore::peek().iter().rev().take(20) {
+                println!("{} {:<16} {}{}", t.short_id(), t.state.label(), if t.background { "[background] " } else { "" }, t.request.chars().take(80).collect::<String>());
+                if let Some(p) = &t.pending_action {
+                    println!("         check outcome: {p}. It will not be replayed automatically.");
+                }
+            }
+            0
+        }
         "pause" => simple("pause", json!({}), false),
         "resume" => simple("resume", json!({}), false),
         "open" | "show" => simple("show", json!({}), true),
+        "dashboard" | "app" => simple("dashboard", json!({"page": rest.first()}), true),
         "extension" => {
             if rest.first().map(|s| s == "reload").unwrap_or(false) {
                 simple("reload-extension", json!({}), true)
@@ -130,7 +143,8 @@ pub fn main(args: Vec<String>) -> i32 {
             }
             0
         }
-        "model" | "models" => model_cmd(&rest),
+        "model" => model_cmd(&rest),
+        "models" => models_cmd(&rest),
         "connect" => connect_cmd(&rest),
         "settings" | "config" => {
             crate::setup::ensure_env_file();
@@ -445,6 +459,27 @@ fn model_cmd(rest: &[String]) -> i32 {
     }
 }
 
+/// `clinqy models [name]`.
+fn models_cmd(rest: &[String]) -> i32 {
+    use crate::onboard;
+    let p = match rest.first() {
+        Some(name) => {
+            let name = name.to_lowercase();
+            match onboard::MODELS.iter().find(|m| m.0 == name).map(|m| m.1).or_else(|| clinqy_core::provider::Provider::parse(&name)) {
+                Some(p) => p,
+                None => return fail(&format!("I don't know the model provider {name:?}")),
+            }
+        }
+        None => clinqy_core::provider::Provider::current(),
+    };
+    let saved = clinqy_core::models::saved(p);
+    println!("{} on this PC (clinqy model {} <id> to choose):", onboard::short_name(p), onboard::short_name(p));
+    for m in rt().block_on(clinqy_core::models::list(p)) {
+        println!("  {}{:<28} {}", if m.id == saved { "* " } else { "  " }, if m.id.is_empty() { "(default)" } else { m.id.as_str() }, m.label);
+    }
+    0
+}
+
 /// `clinqy connect <agent> ...`.
 fn connect_cmd(rest: &[String]) -> i32 {
     use crate::onboard;
@@ -470,26 +505,12 @@ fn connect_cmd(rest: &[String]) -> i32 {
 /// `clinqy extension install [browser]`: Clinqy loads its own extension, like a person would, then waits for it to
 /// connect.
 fn extension_install(browser: Option<&str>) -> i32 {
-    let Some(dir) = crate::setup::extension_dir() else { return fail("couldn't find the extension folder next to Clinqy") };
-    let name = match browser.map(|b| b.to_lowercase()) {
-        Some(b) if b.contains("edge") => "Microsoft Edge".to_string(),
-        Some(b) if b.contains("brave") => "Brave".to_string(),
-        Some(b) if b.contains("chrome") => "Google Chrome".to_string(),
-        Some(b) => return fail(&format!("I can add the extension to Chrome, Edge or Brave, not {b:?}")),
-        None => match clinqy_windows::apps::default_browser() {
-            Some(b) if ["Google Chrome", "Microsoft Edge", "Brave"].contains(&b.as_str()) => b,
-            Some(b) => {
-                println!("Your default browser is {b}, which can't load Clinqy's extension; using Google Chrome. (clinqy extension install edge|brave to pick another)");
-                "Google Chrome".into()
-            }
-            None => "Google Chrome".into(),
-        },
+    let (name, task, dir) = match crate::onboard::extension_task(browser) {
+        Ok(t) => t,
+        Err(e) => return fail(&e),
     };
-    let page = match name.as_str() {
-        "Microsoft Edge" => "edge://extensions",
-        "Brave" => "brave://extensions",
-        _ => "chrome://extensions",
-    };
+    let page = name.split(' ').next_back().unwrap_or("").to_lowercase();
+    let page = format!("{page}://extensions");
     let connected = || rt().block_on(async { ipc::call("status", json!({}), |_| {}).await.ok().and_then(|v| v["extension"].as_bool()).unwrap_or(false) });
     let code = rt().block_on(async { ipc::ensure_app().await.map(|_| 0).unwrap_or(2) });
     if code != 0 {
@@ -499,13 +520,6 @@ fn extension_install(browser: Option<&str>) -> i32 {
         println!("✓ The browser extension is already connected.");
         return 0;
     }
-    let toggle = if name == "Microsoft Edge" { "in the left sidebar" } else { "top right" };
-    let task = format!(
-        "Open {name} and go to {page} (type it into the address bar). If Developer mode ({toggle}) is off, turn it on. \
-         Click Load unpacked. In the folder dialog, click the address bar at the top, type {dir}, press Enter, then click \
-         Select Folder. Stop when the Clinqy extension shows in the list. Don't change any other setting.",
-        dir = dir.display()
-    );
     println!("Clinqy is adding its extension to {name} (folder {})…", dir.display());
     let r = stream("run", json!({"text": task}), true);
     for _ in 0..20 {

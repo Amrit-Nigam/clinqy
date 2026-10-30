@@ -2,6 +2,7 @@
 //! `Buddy` (the companion cursor); `hotkey` watches for the summon chord.
 
 pub mod apps;
+pub mod badge;
 pub mod circle;
 pub mod clipboard;
 pub mod com;

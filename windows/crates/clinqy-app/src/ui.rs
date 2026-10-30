@@ -1,7 +1,8 @@
 //! The windows, styled exactly like the Mac app's panels: the command bar (Spotlight-like; takes the keyboard),
-//! the result card (top right; clickable but never takes focus), and the status island (top centre; drawn
-//! natively in `clinqy_windows::island` so it can be click-through). The bar and card are WebView2 pages on
-//! transparent windows, so their 22 pt / 18 pt corners are the Mac's; all are kept out of screenshots and shares.
+//! the result card (top right; clickable but never takes focus), the status island (top centre; drawn natively in
+//! `clinqy_windows::island` so it can be click-through), the Clinqy window (setup and dashboard) and the background
+//! work view. The bar and card are WebView2 pages on transparent windows, so their 22 pt / 18 pt corners are the
+//! Mac's; those two and the island are kept out of screenshots and shares.
 
 use crate::app::UserEvent;
 use clinqy_core::platform::Mood;
@@ -81,25 +82,38 @@ pub struct Bar {
     _context: WebContext,
 }
 
-/// The settings and usage dashboard: a regular, resizable window rather than a transient overlay.
+/// The Clinqy window: setup and the dashboard, styled like the Mac app's. A regular, resizable window.
 pub struct Dashboard {
     pub window: Window,
     view: WebView,
     _context: WebContext,
 }
 
+/// @font-face rules for the Mac app's fonts (Geist Pixel and Geist Mono), inside the page.
+fn fonts() -> String {
+    use base64::Engine;
+    let face = |name: &str, weight: &str, bytes: &[u8]| {
+        format!(
+            "@font-face{{font-family:\"{name}\";font-weight:{weight};src:url(data:font/woff2;base64,{}) format(\"woff2\")}}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        )
+    };
+    face("Geist Mono", "100 900", include_bytes!("../../../../website/public/fonts/GeistMono-Variable.woff2")) + &face("Geist Pixel", "400", include_bytes!("../../../../website/public/fonts/GeistPixel-Square.woff2"))
+}
+
 impl Dashboard {
     pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<Dashboard> {
         let window = WindowBuilder::new()
-            .with_title("Clinqy Dashboard")
+            .with_title("Clinqy")
             .with_visible(false)
             .with_resizable(true)
-            .with_inner_size(LogicalSize::new(1080.0, 740.0))
+            .with_inner_size(LogicalSize::new(1000.0, 700.0))
+            .with_min_inner_size(LogicalSize::new(900.0, 640.0))
             .build(event_loop)?;
         let mut context = web_context();
         let view = WebViewBuilder::with_web_context(&mut context)
-            .with_html(include_str!("ui/web/dashboard.html"))
-            .with_background_color((17, 20, 23, 255))
+            .with_html(include_str!("ui/web/app.html").replace("/*FONTS*/", &fonts()))
+            .with_background_color((8, 9, 13, 255))
             .with_ipc_handler(move |req| {
                 let _ = proxy.send_event(UserEvent::Dashboard(req.body().to_string()));
             })
@@ -115,10 +129,8 @@ impl Dashboard {
         self.update(state);
         if !self.visible() {
             let (x, y, w, h) = work_area();
-            let scale = self.window.scale_factor();
-            let width = (1080.0 * scale) as i32;
-            let height = (740.0 * scale) as i32;
-            self.window.set_outer_position(PhysicalPosition::new(x + (w - width) / 2, y + (h - height) / 2));
+            let size = self.window.outer_size();
+            self.window.set_outer_position(PhysicalPosition::new(x + (w - size.width as i32) / 2, y + (h - size.height as i32) / 2));
         }
         self.window.set_visible(true);
         clinqy_windows::apps::bring_to_front(self.window.hwnd() as isize);
@@ -131,6 +143,65 @@ impl Dashboard {
 
     pub fn update(&self, state: &Value) {
         js(&self.view, "update", state);
+    }
+
+    /// Goes to "setup" or a dashboard tab.
+    pub fn show_page(&self, page: &str) {
+        js(&self.view, "show", &Value::String(page.to_string()));
+    }
+
+    pub fn call(&self, script: &str) {
+        let _ = self.view.evaluate_script(&format!("window.clinqy && window.clinqy.{script}"));
+    }
+}
+
+/// "Clinqy — background work": what the background browser shows, refreshed while it's open, with a box to steer it.
+pub struct LiveView {
+    pub window: Window,
+    view: WebView,
+    _context: WebContext,
+}
+
+impl LiveView {
+    pub fn new(event_loop: &EventLoop<UserEvent>, proxy: EventLoopProxy<UserEvent>) -> anyhow::Result<LiveView> {
+        let window = WindowBuilder::new()
+            .with_title("Clinqy — background work")
+            .with_visible(false)
+            .with_resizable(true)
+            .with_inner_size(LogicalSize::new(760.0, 520.0))
+            .with_min_inner_size(LogicalSize::new(480.0, 360.0))
+            .build(event_loop)?;
+        let mut context = web_context();
+        let view = WebViewBuilder::with_web_context(&mut context)
+            .with_html(page(include_str!("ui/web/live.html")))
+            .with_background_color((8, 9, 13, 255))
+            .with_ipc_handler(move |req| {
+                let _ = proxy.send_event(UserEvent::Live(req.body().to_string()));
+            })
+            .build(&window)?;
+        Ok(LiveView { window, view, _context: context })
+    }
+
+    pub fn visible(&self) -> bool {
+        unsafe { IsWindowVisible(HWND(self.window.hwnd() as _)).as_bool() }
+    }
+
+    pub fn present(&self) {
+        self.window.set_visible(true);
+        clinqy_windows::apps::bring_to_front(self.window.hwnd() as isize);
+        self.window.set_focus();
+    }
+
+    pub fn hide(&self) {
+        self.window.set_visible(false);
+    }
+
+    pub fn frame(&self, jpeg: &str) {
+        js(&self.view, "frame", &Value::String(jpeg.to_string()));
+    }
+
+    pub fn state(&self, state: &Value) {
+        js(&self.view, "state", state);
     }
 }
 

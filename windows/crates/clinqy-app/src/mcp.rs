@@ -24,6 +24,7 @@ fn tools() -> Value {
             "Carry out a natural-language task on the user's Windows PC with Clinqy: it clicks, types and reads in the frontmost app or browser tab, and returns its steps and final answer. Not saved to the user's history or memory. dry=true only points at what it would click or type.",
             json!({"task": {"type": "string", "description": "What to do, in plain words."},
                    "dry": {"type": "boolean", "description": "Rehearse: point at each click and keystroke without doing it."},
+                   "background": {"type": "boolean", "description": "Work in a hidden browser with its own sign-ins, leaving the user's mouse, keyboard and windows alone. Web pages, files and PDFs only."},
                    "timeout": {"type": "integer", "description": "Seconds to wait for the task to finish (default 300)."}}),
             &["task"], false),
         tool("clinqy_look", "Look at the screen",
@@ -41,12 +42,12 @@ fn text(s: &str, is_error: bool) -> Value {
     json!({"content": [{"type": "text", "text": s}], "isError": is_error})
 }
 
-async fn run(task: &str, dry: bool, timeout: u64) -> Value {
+async fn run(task: &str, dry: bool, background: bool, timeout: u64) -> Value {
     if let Err(e) = ipc::ensure_app().await {
         return text(&format!("Clinqy isn't installed or wouldn't start: {e}"), true);
     }
     let mut steps: Vec<String> = vec![];
-    let call = ipc::call("run", json!({"task": task, "test": true, "dry": dry}), |v| {
+    let call = ipc::call("run", json!({"task": task, "test": true, "dry": dry, "background": background}), |v| {
         if v["event"] == "step" {
             let t = v["text"].as_str().unwrap_or("");
             steps.push(if v["state"] == "failed" { format!("  (failed: {t})") } else { format!("- {t}") });
@@ -117,7 +118,7 @@ async fn handle(msg: Value) -> Option<Value> {
                     if task.is_empty() {
                         text("task is required", true)
                     } else {
-                        run(&task, a["dry"] == true, a["timeout"].as_u64().unwrap_or(300)).await
+                        run(&task, a["dry"] == true, a["background"] == true, a["timeout"].as_u64().unwrap_or(300)).await
                     }
                 }
                 "clinqy_look" => look(a["mode"].as_str().unwrap_or("page")).await,

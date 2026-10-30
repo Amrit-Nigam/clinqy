@@ -14,6 +14,7 @@ pub mod history;
 pub mod log;
 pub mod media;
 pub mod memory;
+pub mod models;
 pub mod observation;
 pub mod page;
 pub mod paths;

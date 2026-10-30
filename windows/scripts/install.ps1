@@ -75,7 +75,7 @@ if (-not (($path -split ';') -contains $dest)) {
 
 # Open at login (the tray menu can turn it off).
 if (-not $NoLogin) {
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Clinqy' -Value ('"' + (Join-Path $dest 'ClinqyApp.exe') + '"')
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Clinqy' -Value ('"' + (Join-Path $dest 'ClinqyApp.exe') + '" --login')
 }
 
 # The command bar and result card are WebView2 pages: built into Windows 11, and into Windows 10 with Edge.

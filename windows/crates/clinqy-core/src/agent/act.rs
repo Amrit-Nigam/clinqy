@@ -217,6 +217,8 @@ impl Agent {
                 match reply.as_deref() {
                     Some("Continue in foreground") => {
                         self.leave_background();
+                        // A moment to take their hands off the mouse: it's about to move.
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
                         ctx.app = None;
                         ctx.page = None;
                         ctx.web_area = None;
@@ -227,22 +229,26 @@ impl Agent {
                         tasks().update(id.as_deref(), Some(State::Running), Some("Continuing after your answer"), None, None);
                         return ActionResult::fail(format!("{reason} Use a supported action or a page in the background browser."));
                     }
-                    _ => {
-                        self.cancel();
-                        return ActionResult::fail("Stopped");
-                    }
+                    _ => return self.stop_here().await,
                 }
             }
         }
         let id = self.task_id();
         if !tasks().begin_action(id.as_deref(), &kind) {
-            self.cancel();
-            return ActionResult::fail("Couldn't save the task checkpoint");
+            self.log("couldn't save the task checkpoint");
+            return self.stop_here().await;
         }
         let result = self.execute(action, ctx, rs).await;
         let done = self.steps().iter().filter(|s| s.state == StepState::Ok).count();
         tasks().end_action(id.as_deref(), &kind, result.ok, done);
         result
+    }
+
+    /// Stops the run from inside it. `cancel` aborts this very task, which only takes effect at its next pause: it
+    /// waits here for that, because anything it did on the way would mark the finished run as busy again.
+    async fn stop_here(self: &Arc<Self>) -> ActionResult {
+        self.cancel();
+        std::future::pending().await
     }
 
     async fn execute(self: &Arc<Self>, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {

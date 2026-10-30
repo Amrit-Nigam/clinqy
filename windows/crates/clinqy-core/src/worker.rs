@@ -103,6 +103,15 @@ impl Cdp {
     }
 
     async fn call_for(&self, method: &str, params: Value, timeout: f64) -> Result<Value> {
+        let t0 = std::time::Instant::now();
+        let r = self.call_inner(method, params, timeout).await;
+        if t0.elapsed() > Duration::from_millis(800) {
+            crate::log::write(&format!("    background browser: {method} took {} ms{}", t0.elapsed().as_millis(), if r.is_err() { " and failed" } else { "" }));
+        }
+        r
+    }
+
+    async fn call_inner(&self, method: &str, params: Value, timeout: f64) -> Result<Value> {
         if !self.connected.load(Ordering::Relaxed) {
             bail!("The background browser disconnected. No other browser will be used.");
         }
@@ -369,10 +378,14 @@ impl Worker {
         self.st.lock().login = false;
     }
 
-    pub fn run_started(&self) {
+    /// A background run starts on no page, so it never sees the last task's; a follow-up keeps its place.
+    pub fn run_started(&self, keep_page: bool) {
         let mut s = self.st.lock();
         s.generation += 1;
         s.run_active = true;
+        if !keep_page {
+            s.selected = None;
+        }
         if let Some(idle) = s.idle.take() {
             idle.abort();
         }
@@ -603,7 +616,6 @@ impl Worker {
             }
             "cdpClick" => {
                 let (x, y) = (args["x"].as_f64().unwrap_or(0.0), args["y"].as_f64().unwrap_or(0.0));
-                cdp.call("Input.dispatchMouseEvent", json!({"type": "mouseMoved", "x": x, "y": y})).await?;
                 for count in 1..=args["count"].as_i64().unwrap_or(1).max(1) {
                     cdp.call("Input.dispatchMouseEvent", json!({"type": "mousePressed", "button": "left", "buttons": 1, "x": x, "y": y, "clickCount": count})).await?;
                     cdp.call("Input.dispatchMouseEvent", json!({"type": "mouseReleased", "button": "left", "buttons": 0, "x": x, "y": y, "clickCount": count})).await?;
@@ -926,7 +938,7 @@ mod tests {
     #[ignore]
     async fn drives_a_page_without_any_window() {
         let w: &'static Worker = Box::leak(Box::new(Worker::new(std::env::temp_dir().join(format!("clinqy-worker-tests-{}", uuid::Uuid::new_v4())))));
-        w.run_started();
+        w.run_started(false);
         let id = w.new_tab(&page_url()).await.unwrap();
         tokio::time::sleep(Duration::from_millis(400)).await;
         let page = w.snapshot(Some(id)).await.expect("snapshot");
@@ -939,7 +951,9 @@ mod tests {
         // A real (trusted) click at the element's spot.
         let spot = w.command("locate", Some(id), json!({"index": button})).await.unwrap();
         let (x, y) = (spot["px"].as_f64().unwrap_or(spot["x"].as_f64().unwrap() + 5.0), spot["py"].as_f64().unwrap_or(spot["y"].as_f64().unwrap() + 5.0));
+        let t0 = std::time::Instant::now();
         w.command("cdpClick", Some(id), json!({"x": x, "y": y})).await.unwrap();
+        assert!(t0.elapsed() < Duration::from_secs(1), "a hidden tab mustn't stall input: {:?}", t0.elapsed());
         tokio::time::sleep(Duration::from_millis(200)).await;
         let page = w.snapshot(Some(id)).await.expect("snapshot");
         assert!(page.elements.iter().any(|e| e.text.contains("Confirmed")), "the click landed");

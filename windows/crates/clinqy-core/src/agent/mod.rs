@@ -98,6 +98,8 @@ pub enum Event {
     Answered,
     Result,
     Finished { answer: String, ok: bool, background: bool },
+    /// A background run came to the foreground: it'll use the mouse and keyboard now.
+    WentForeground,
 }
 
 /// What the user copied in the last few minutes, when nothing was selected.
@@ -688,7 +690,7 @@ impl Agent {
         self.quiet.set_quiet(background);
         self.hands.set_hidden(background);
         if background {
-            crate::worker::worker().run_started();
+            crate::worker::worker().run_started(ctx.continuation.is_some());
         }
         {
             let mut u = self.ui.lock();
@@ -784,6 +786,7 @@ impl Agent {
         self.platform.begin_run();
         tokio::spawn(crate::worker::worker().run_ended());
         self.changed();
+        (self.emit)(Event::WentForeground);
     }
 
     /// Ends the run: history, stats, the cursor home, and carrying on by itself when a long task ran out of steps.
