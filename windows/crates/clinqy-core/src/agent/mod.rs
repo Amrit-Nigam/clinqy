@@ -10,7 +10,9 @@ mod run;
 mod tasks;
 mod web;
 
+use crate::hands::{Hands, QuietBuddy};
 use crate::history::{self, Entry, ResultCard};
+use crate::taskstore::tasks;
 use crate::platform::{AppRef, Buddy, Mood, Platform, Point, Rect};
 use crate::provider::Provider;
 use crate::session::{Brain, Session};
@@ -82,6 +84,8 @@ pub struct Snapshot {
     pub dry: bool,
     /// Held by the user between steps (Pause); Resume carries on.
     pub paused: bool,
+    /// The current run works in the background browser, out of the user's way.
+    pub background: bool,
     pub qa: bool,
 }
 
@@ -93,7 +97,7 @@ pub enum Event {
     Question,
     Answered,
     Result,
-    Finished { answer: String, ok: bool },
+    Finished { answer: String, ok: bool, background: bool },
 }
 
 /// What the user copied in the last few minutes, when nothing was selected.
@@ -128,6 +132,8 @@ pub struct RunOptions {
     /// Tests that still show the review card / save form answers.
     pub review_in_tests: bool,
     pub save_in_tests: bool,
+    /// Whoever asked already chose (a caller's flag). The request's own words win over this.
+    pub background: Option<bool>,
 }
 
 /// Mutable state the UI sees.
@@ -172,8 +178,13 @@ struct Snap {
 }
 
 pub struct Agent {
+    /// The agent's hands: the desktop, or the background browser in a background run.
     pub platform: Arc<dyn Platform>,
     pub buddy: Arc<dyn Buddy>,
+    pub(crate) hands: Arc<Hands>,
+    quiet: Arc<QuietBuddy>,
+    /// What the next run decided about where to work.
+    next_background: AtomicBool,
     brain: Brain,
     ui: Mutex<Ui>,
     emit: Box<dyn Fn(Event) + Send + Sync>,
@@ -222,13 +233,21 @@ struct RunInfo {
     linger: f64,
     run_result: Option<ResultCard>,
     finished: bool,
+    background: bool,
+    /// Its record in the task store (test and QA runs have none).
+    task: Option<String>,
 }
 
 impl Agent {
     pub fn new(platform: Arc<dyn Platform>, buddy: Arc<dyn Buddy>, emit: impl Fn(Event) + Send + Sync + 'static) -> Arc<Agent> {
+        let hands = Arc::new(Hands::new(platform));
+        let quiet = Arc::new(QuietBuddy::new(buddy));
         Arc::new(Agent {
-            platform,
-            buddy,
+            platform: hands.clone(),
+            buddy: quiet.clone(),
+            hands,
+            quiet,
+            next_background: AtomicBool::new(false),
             brain: Brain::new(),
             ui: Mutex::new(Ui {
                 phase: Phase::Idle,
@@ -288,6 +307,7 @@ impl Agent {
             dry_run: self.dry_run.load(Ordering::Relaxed),
             dry: self.run_dry.load(Ordering::Relaxed),
             paused: self.paused.load(Ordering::Relaxed) && matches!(u.phase, Phase::Thinking | Phase::Acting | Phase::Waiting),
+            background: self.hands.hidden(),
             qa: u.qa,
         }
     }
@@ -512,6 +532,12 @@ impl Agent {
             dry = true;
         }
         self.run_dry.store(dry, Ordering::Relaxed);
+        // A dry run points at things with the cursor, so it's always in front of the user.
+        let background = crate::background::choice(&mut request).or(opts.background).unwrap_or_else(crate::background::always) && !dry;
+        if request.is_empty() {
+            return;
+        }
+        self.next_background.store(background, Ordering::SeqCst);
         // "continue", "also make the answers": builds on the last task.
         {
             let mut ctx = self.context.lock();
@@ -525,7 +551,7 @@ impl Agent {
             }
         }
         let me = self.clone();
-        let workflow = if !opts.test && !dry { self.workflow_first(&request) } else { None };
+        let workflow = if !opts.test && !dry && !background { self.workflow_first(&request) } else { None };
         self.prepare(&request, opts.test, dry, None);
         let handle = tokio::spawn(async move {
             if let Some(m) = workflow {
@@ -651,6 +677,19 @@ impl Agent {
             };
         }
         self.checks.lock().clear();
+        // Only `submit` runs in the background: QA and workflows work on the screen.
+        let background = self.next_background.swap(false, Ordering::SeqCst);
+        let task = if test || qa.is_some() { None } else { self.open_task(request, &ctx, background) };
+        {
+            let mut c = self.current.lock();
+            c.background = background;
+            c.task = task;
+        }
+        self.quiet.set_quiet(background);
+        self.hands.set_hidden(background);
+        if background {
+            crate::worker::worker().run_started();
+        }
         {
             let mut u = self.ui.lock();
             u.steps.clear();
@@ -686,7 +725,7 @@ impl Agent {
         .into_iter()
         .flatten()
         .collect::<String>();
-        crate::log::write(&format!("=== {}{request}{extra}", if dry { "[dry run] " } else { "" }));
+        crate::log::write(&format!("=== {}{}{request}{extra}", if dry { "[dry run] " } else { "" }, if background { "[background] " } else { "" }));
         self.changed();
         (self.emit)(Event::Started);
         self.start_watchdog(generation);
@@ -719,6 +758,32 @@ impl Agent {
                 return;
             }
         });
+    }
+
+    /// Its record in the task store. A request that can't have one (it held a secret) runs without a checkpoint.
+    fn open_task(&self, request: &str, ctx: &Context, background: bool) -> Option<String> {
+        let files = ctx.selected_files.iter().map(|f| f.display().to_string()).collect();
+        let id = tasks().enqueue(request, files, "windows", background)?;
+        if tasks().start(&id, true) {
+            Some(id)
+        } else {
+            tasks().cancel_queued(&id);
+            None
+        }
+    }
+
+    pub(crate) fn task_id(&self) -> Option<String> {
+        self.current.lock().task.clone()
+    }
+
+    /// The run comes to the foreground (the user said so, for something that can't be done hidden).
+    pub(crate) fn leave_background(&self) {
+        self.current.lock().background = false;
+        self.hands.set_hidden(false);
+        self.quiet.set_quiet(false);
+        self.platform.begin_run();
+        tokio::spawn(crate::worker::worker().run_ended());
+        self.changed();
     }
 
     /// Ends the run: history, stats, the cursor home, and carrying on by itself when a long task ran out of steps.
@@ -763,6 +828,12 @@ impl Agent {
         self.log(&if ok { format!("✓ {text}") } else { format!("✗ {text}") });
         let keep_front = info.opened_last || run::keeps_front_app(&request);
         self.platform.end_run(keep_front);
+        tasks().finish(info.task.as_deref(), ok, text);
+        if self.hands.hidden() {
+            self.hands.set_hidden(false);
+            self.quiet.set_quiet(false);
+            tokio::spawn(crate::worker::worker().run_ended());
+        }
         crate::replay::end(ok);
         let steps = self.steps();
         if !info.test {
@@ -795,7 +866,13 @@ impl Agent {
             history::history().add(Entry {
                 id: uuid::Uuid::new_v4().to_string(),
                 date: info.started_at.unwrap_or_else(chrono::Utc::now).to_rfc3339(),
-                request: if info.dry { format!("Dry run: {request}") } else { request.clone() },
+                request: if info.dry {
+                    format!("Dry run: {request}")
+                } else if info.background {
+                    format!("In the background: {request}")
+                } else {
+                    request.clone()
+                },
                 answer: text.to_string(),
                 ok,
                 steps: steps.iter().map(|s| s.text.clone()).collect(),
@@ -807,7 +884,7 @@ impl Agent {
             });
         }
         self.changed();
-        (self.emit)(Event::Finished { answer: text.to_string(), ok });
+        (self.emit)(Event::Finished { answer: text.to_string(), ok, background: info.background });
         // Out of steps or stuck isn't the end of the task: carry on by itself a few times.
         let progressed = steps.iter().filter(|s| s.state == StepState::Ok).count() >= 10;
         let limit = if progressed { 12 } else { 3 };
@@ -820,7 +897,7 @@ impl Agent {
                 tokio::time::sleep(Duration::from_millis(1500)).await;
                 if !me.is_running() {
                     me.context.lock().continuation = history::history().latest();
-                    me.submit("continue", RunOptions { auto: true, ..Default::default() });
+                    me.submit("continue", RunOptions { auto: true, background: Some(info.background), ..Default::default() });
                 }
             });
         }

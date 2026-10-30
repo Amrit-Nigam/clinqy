@@ -7,9 +7,10 @@ use std::path::{Path, PathBuf};
 
 pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding agent (Claude Code, Codex, Cursor, Antigravity…).
 
-  clinqy run [--dry|--test] [--agy|--claude] \"<task>\"
+  clinqy run [--dry|--test|--background] [--agy|--claude] \"<task>\"
         Do a task like one asked in the app (saved to History; carries on by itself if it runs out of steps).
         --dry: point at each click/keystroke, don't do it. --test: a throwaway run (not saved, no carrying on).
+        --background: work in a hidden browser, leaving your mouse, keyboard and windows alone.
   clinqy qa <test.md | folder | \"inline test\"> ... [--relearn] [--model sonnet|opus|haiku] [--agy] [--json]
         Run plain-English UI tests. The first run uses the model and compiles a script (saved in .clinqy\\ next to
         the test); later runs replay it with no model, healing only broken steps. Exit code 0 = all passed.
@@ -255,6 +256,7 @@ fn run(rest: &[String]) -> i32 {
     for r in rest {
         match r.as_str() {
             "--dry" => a["dry"] = json!(true),
+            "--background" | "--bg" => a["background"] = json!(true),
             "--test" => a["test"] = json!(true),
             "--agy" | "--agy-cli" => a["agy"] = json!(true),
             "--claude" | "--claude-cli" => a["claude"] = json!(true),

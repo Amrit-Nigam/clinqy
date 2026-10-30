@@ -4,10 +4,12 @@
 
 pub mod agent;
 pub mod applications;
+pub mod background;
 pub mod bridge;
 pub mod clicks;
 pub mod config;
 pub mod files;
+pub mod hands;
 pub mod history;
 pub mod log;
 pub mod media;
@@ -27,7 +29,9 @@ pub mod scheduler;
 pub mod session;
 pub mod skills;
 pub mod stats;
+pub mod taskstore;
 pub mod when;
+pub mod worker;
 pub mod workflow;
 pub mod usage;
 

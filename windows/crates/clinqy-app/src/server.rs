@@ -162,7 +162,7 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
             }
             let rx = shared.events.subscribe();
             let test = flag(&args, "test");
-            let opts = RunOptions { test, dry: flag(&args, "dry"), provider: provider_of(&args), review_in_tests: flag(&args, "review"), save_in_tests: flag(&args, "save"), ..Default::default() };
+            let opts = RunOptions { test, dry: flag(&args, "dry"), provider: provider_of(&args), review_in_tests: flag(&args, "review"), save_in_tests: flag(&args, "save"), background: flag(&args, "background").then_some(true), ..Default::default() };
             agent.submit(&task, opts);
             follow(rx, out, !test).await
         }
@@ -279,7 +279,7 @@ async fn follow(mut rx: broadcast::Receiver<Event>, out: &mut Out, carry_on: boo
                     out.send(json!({"event": "question", "text": q.text, "options": q.options})).await?;
                 }
             }
-            Event::Finished { answer, ok } => {
+            Event::Finished { answer, ok, .. } => {
                 last_done = Some((answer, ok));
             }
             _ => {}

@@ -870,7 +870,7 @@ impl UiState {
                     self.result.show(&serde_json::to_value(card).unwrap_or_default());
                 }
             }
-            AgentEvent::Finished { answer, ok } => {
+            AgentEvent::Finished { answer, ok, background } => {
                 self.sync_pause_item();
                 self.refresh_island();
                 self.refresh_dashboard();
