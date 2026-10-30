@@ -24,6 +24,8 @@ replays on Windows.
    It picks the AI you already have (Claude Code, then Codex, then agy, then Ollama), has Clinqy load its own browser
    extension, connects the agent and checks everything.
 
+The [step-by-step setup guide](SETUP.md) has every step, what you should see and fixes for common problems.
+
 Without a coding agent, run `clinqy setup` in a new terminal: it does the same and ends with a "Needs you" list. Each step
 also works alone:
 

@@ -142,6 +142,8 @@ commands here, tell me to open PowerShell, give me one command at a time to past
 
 **3. Tap Ctrl+Alt** and ask something.
 
+**Want every step, what you should see and fixes for common problems?** Read the [step-by-step Windows setup guide](windows/SETUP.md).
+
 **No AI to paste it into?** Run this in a new terminal after installing:
 
 ```powershell
