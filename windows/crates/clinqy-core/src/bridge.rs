@@ -3,6 +3,7 @@
 //! precise clicks and fills. Only browser-extension origins may connect, so web pages can't reach this server.
 
 use crate::page::Page;
+use crate::worker::{self, worker};
 use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -17,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const PORT: u16 = 47823;
 /// The extension version this app expects (extension/manifest.json). An older copy still running is asked to reload.
-pub const EXTENSION_VERSION: &str = "1.9.6";
+pub const EXTENSION_VERSION: &str = "1.9.7";
 
 /// Finds which program is on the other end of a local TCP connection (by its port): "chrome.exe".
 pub type OwnerLookup = Box<dyn Fn(u16) -> Option<String> + Send + Sync>;
@@ -78,6 +79,11 @@ impl Bridge {
 
     pub fn is_connected(&self) -> bool {
         !self.conns.lock().is_empty()
+    }
+
+    /// Whether pages of the browser `exe` can be read (the background browser needs no extension).
+    pub fn serves(&self, exe: &str) -> bool {
+        exe == worker::EXE || self.is_connected()
     }
 
     /// Starts listening (once). Fails if another Clinqy already holds the port.
@@ -231,6 +237,9 @@ impl Bridge {
 
     /// The page in the focused window of the browser `exe` (any browser with None).
     pub async fn snapshot(&self, exe: Option<&str>) -> Option<Page> {
+        if exe == Some(worker::EXE) {
+            return worker().snapshot(None).await;
+        }
         let pool = self.candidates(exe);
         for &c in &pool {
             if let Ok(r) = self.request(c, args(json!({"cmd": "snapshot"})), 5.0).await {
@@ -254,6 +263,9 @@ impl Bridge {
     }
 
     pub async fn perform(&self, cmd: &str, page: &Page, a: Value, timeout: f64) -> Result<Value> {
+        if page.connection == worker::CONNECTION {
+            return worker().command(cmd, page.tab_id, a).await;
+        }
         let mut body = args(a);
         body.insert("cmd".into(), json!(cmd));
         if page.pinned && !body.contains_key("tabId") {
@@ -277,6 +289,10 @@ impl Bridge {
     }
 
     pub async fn active_tab(&self, exe: Option<&str>) -> Option<TabInfo> {
+        if exe == Some(worker::EXE) {
+            let r = worker().command("tabInfo", None, json!({})).await.ok()?;
+            return Some(TabInfo { id: r["id"].as_i64()?, url: r["url"].as_str().unwrap_or("").into(), connection: worker::CONNECTION });
+        }
         for c in self.candidates(exe) {
             if let Ok(r) = self.request(c, args(json!({"cmd": "tabInfo"})), 1.5).await {
                 if r["focused"] == true {
@@ -290,6 +306,9 @@ impl Bridge {
     }
 
     pub async fn tab_command(&self, cmd: &str, tab: &TabInfo, a: Value) -> Option<Value> {
+        if tab.connection == worker::CONNECTION {
+            return worker().command(cmd, Some(tab.id), a).await.ok();
+        }
         let mut body = args(a);
         body.insert("cmd".into(), json!(cmd));
         self.request(tab.connection, body, 3.0).await.ok()
@@ -308,8 +327,12 @@ impl Bridge {
     }
 
     pub async fn tabs(&self, exe: Option<&str>) -> Result<Vec<BrowserTab>> {
-        let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
-        let r = self.request(c, args(json!({"cmd": "tabs"})), 3.0).await?;
+        let r = if exe == Some(worker::EXE) {
+            worker().command("tabs", None, json!({})).await?
+        } else {
+            let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
+            self.request(c, args(json!({"cmd": "tabs"})), 3.0).await?
+        };
         Ok(r["tabs"]
             .as_array()
             .map(|a| {
@@ -329,17 +352,26 @@ impl Bridge {
     }
 
     pub async fn switch_tab(&self, id: i64, exe: Option<&str>) -> Result<()> {
+        if exe == Some(worker::EXE) {
+            return worker().command("switchTab", Some(id), json!({})).await.map(|_| ());
+        }
         let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
         self.request(c, args(json!({"cmd": "switchTab", "tabId": id})), 3.0).await.map(|_| ())
     }
 
     pub async fn close_tab(&self, id: i64, exe: Option<&str>) -> Result<()> {
+        if exe == Some(worker::EXE) {
+            return worker().command("closeTab", Some(id), json!({})).await.map(|_| ());
+        }
         let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
         self.request(c, args(json!({"cmd": "closeTab", "tabId": id})), 3.0).await.map(|_| ())
     }
 
     /// Reads tab `id` without bringing it forward; commands on the result go to that tab.
     pub async fn snapshot_tab(&self, id: i64, exe: Option<&str>) -> Option<Page> {
+        if exe == Some(worker::EXE) {
+            return worker().snapshot(Some(id)).await;
+        }
         let c = self.front_connection(exe).await?;
         let r = self.request(c, args(json!({"cmd": "snapshot", "tabId": id})), 5.0).await.ok()?;
         let mut p = self.parse(&r, c);

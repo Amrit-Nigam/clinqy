@@ -147,4 +147,7 @@ How to work:
 "#;
 
 /// The closing line that keeps replies to bare JSON.
+/// Added to a background run's first message.
+pub const BACKGROUND: &str = "\nBackground mode uses a separate headless browser with its own profile, never the user's browser or desktop apps, so they keep working while you do. Use open_url to open a page in it. Prefer files, PDF, media and other supported actions without opening apps. No File Explorer, desktop app input, clipboard or shell is permitted in background mode. The background browser has separate sign-ins; if a site needs a login, ask the user to sign in through Clinqy's Background settings and finish signing in. Use ask for missing input. Work that needs a desktop app requires an explicit switch to the foreground.";
+
 pub const REPLY_JSON_ONLY: &str = "\n\nReply with the JSON object only, starting with {";

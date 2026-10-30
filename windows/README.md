@@ -18,23 +18,27 @@ replays on Windows.
 
 1. Download `Clinqy-windows-x64.zip` from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest),
    unzip it and double-click **`Install Clinqy.bat`**. No admin rights needed. It installs to
-   `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH, turns on Open at login
+   `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH
    and starts Clinqy.
 2. Paste the setup prompt from the [main README](../README.md#setup-on-windows) (or the website) into your coding agent.
    It picks the AI you already have (Claude Code, then Codex, then agy, then Ollama), has Clinqy load its own browser
    extension, connects the agent and checks everything.
 
-Without a coding agent, the same in a new terminal:
+The [step-by-step setup guide](SETUP.md) has every step, what you should see and fixes for common problems.
+
+Without a coding agent, run `clinqy setup` in a new terminal: it does the same and ends with a "Needs you" list. Each step
+also works alone:
 
 ```powershell
 clinqy model              # the AI Clinqy uses (`clinqy model agy`, `claude`, `codex`, `ollama`…; `auto` is the default)
+clinqy models             # the models it offers on this PC (`clinqy model codex gpt-6.1-terra` picks one)
 clinqy extension install  # Clinqy loads its own extension into Chrome, Edge or Brave
-clinqy connect claude     # MCP for coding agents: claude, codex, agy, cursor, gemini, windsurf
+clinqy connect all        # MCP for coding agents: all, or claude, codex, agy, cursor, gemini, windsurf
 clinqy doctor
 ```
 
-The tray icon has **Model**, **Browser extension…** and **Check setup…** too. To uninstall, double-click
-`Uninstall Clinqy.bat` in the install folder (`uninstall.ps1 -Purge` also deletes your settings and data).
+Everything is also in the Clinqy window: the gear on the command bar, or tray icon → **Dashboard…**. To uninstall,
+double-click `Uninstall Clinqy.bat` in the install folder (`uninstall.ps1 -Purge` also deletes your settings and data).
 
 ## Using it
 
@@ -54,6 +58,15 @@ as a workflow).
 Only the left Alt counts, so AltGr typing (Ctrl+Alt on many keyboards) never opens Clinqy. Another chord:
 `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) in the settings file.
 
+## Background tasks
+
+Say "in the background" in a request, or turn on Background on the bar, and Clinqy works in a separate headless Chrome or
+Edge with its own profile, while you keep your mouse, keyboard, clipboard and windows. It never falls back to your desktop:
+anything that can't be done hidden stops and asks, on a card in the top right (**Run in foreground**, **Keep in
+background**, **Stop task**), and it tells you when it switches. A badge shows it's working; click it for the live view.
+Tasks are saved in `%APPDATA%\Clinqy\tasks.json` and are never replayed after a restart. `clinqy run --background`, and
+`background` on the MCP tool, do the same.
+
 ## The `clinqy` command and MCP
 
 Same commands as on the Mac, for terminals and coding agents:
@@ -64,7 +77,9 @@ clinqy run --dry "turn on dark mode"          # show, don't do
 clinqy qa tests\qa\checkout.md                # a QA test (Markdown), learned once then replayed
 clinqy workflow "weekly report" week=32
 clinqy look                                   # what's on screen, as text
+clinqy setup                                  # everything at once, then what still needs you
 clinqy doctor                                 # what's set up
+clinqy tasks                                  # recent tasks and what happened to them
 clinqy mcp                                    # stdio MCP server: clinqy_run, clinqy_look, clinqy_stats
 ```
 

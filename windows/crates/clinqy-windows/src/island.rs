@@ -272,6 +272,18 @@ fn render(st: &mut State) {
 }
 
 fn present(st: &mut State, pix: &Pixmap, x: i32, y: i32) {
+    blit(st.hwnd, pix, x, y, st.alpha);
+    if !st.shown {
+        unsafe {
+            let _ = ShowWindow(st.hwnd, SW_SHOWNOACTIVATE);
+            let _ = SetWindowPos(st.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+        }
+        st.shown = true;
+    }
+}
+
+/// Hands a pixmap to a layered window (BGRA premultiplied) at a screen position.
+pub(crate) fn blit(hwnd: HWND, pix: &Pixmap, x: i32, y: i32, alpha: f32) {
     let (w, h) = (pix.width() as i32, pix.height() as i32);
     unsafe {
         let screen = GetDC(None);
@@ -290,17 +302,12 @@ fn present(st: &mut State, pix: &Pixmap, x: i32, y: i32) {
                 d[3] = s[3];
             }
             let old = SelectObject(mem, dib);
-            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (st.alpha * 255.0) as u8, AlphaFormat: AC_SRC_ALPHA as u8 };
-            let _ = UpdateLayeredWindow(st.hwnd, screen, Some(&POINT { x, y }), Some(&SIZE { cx: w, cy: h }), mem, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA);
+            let blend = BLENDFUNCTION { BlendOp: AC_SRC_OVER as u8, BlendFlags: 0, SourceConstantAlpha: (alpha * 255.0) as u8, AlphaFormat: AC_SRC_ALPHA as u8 };
+            let _ = UpdateLayeredWindow(hwnd, screen, Some(&POINT { x, y }), Some(&SIZE { cx: w, cy: h }), mem, Some(&POINT::default()), COLORREF(0), Some(&blend), ULW_ALPHA);
             SelectObject(mem, old);
             let _ = DeleteObject(dib);
         }
         let _ = DeleteDC(mem);
         ReleaseDC(None, screen);
-        if !st.shown {
-            let _ = ShowWindow(st.hwnd, SW_SHOWNOACTIVATE);
-            let _ = SetWindowPos(st.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
-            st.shown = true;
-        }
     }
 }

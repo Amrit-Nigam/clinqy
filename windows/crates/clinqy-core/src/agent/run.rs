@@ -172,7 +172,7 @@ impl Agent {
         // The next request's session starts warming now.
         self.prewarm();
 
-        let target = self.current.lock().target.clone();
+        let target = self.current.lock().target.clone().filter(|_| !self.hands.hidden());
         let mut app = target.clone().or_else(|| self.platform.front_app());
         let mut message = self.intro(&request, &mut rs);
         let mut wants_look = false;
@@ -623,6 +623,9 @@ impl Agent {
             running.join(", "),
             self.platform.default_browser().unwrap_or_else(|| "unknown".into())
         );
+        if self.hands.hidden() {
+            text += crate::prompt::BACKGROUND;
+        }
         {
             let s = self.snaps.lock();
             if !s.0.is_empty() {

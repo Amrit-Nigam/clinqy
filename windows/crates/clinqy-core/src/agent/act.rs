@@ -3,6 +3,8 @@
 
 use super::run::{squash_value, web_index, ActionResult, Ctx, RunState};
 use super::*;
+use crate::background::Route;
+use crate::taskstore::{tasks, State};
 use crate::observation;
 use crate::platform::{Element, Point, Rect, WindowOp};
 use crate::reply::{Action, ActionExt};
@@ -137,7 +139,7 @@ impl Agent {
         ctx.elements = scan.elements;
         ctx.fingerprint = scan.fingerprint;
         let bridge = crate::bridge::bridge();
-        if self.platform.is_browser(&app) && bridge.is_connected() {
+        if self.platform.is_browser(&app) && bridge.serves(&app.exe) {
             if let Some(page) = bridge.snapshot(Some(&app.exe)).await {
                 ctx.web_area = self.platform.web_area(&app).await.or(page.estimated_area);
                 self.adopt(page, ctx);
@@ -202,7 +204,54 @@ impl Agent {
             .cloned()
     }
 
+    /// One action: in a background run the policy decides first, and every action is checkpointed so a crash can
+    /// never leave a side effect looking undone.
     pub(crate) async fn perform(self: &Arc<Self>, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
+        let kind = action.kind();
+        if self.hands.hidden() && !rs.dry {
+            let has_page = ctx.page.as_ref().map(|p| p.connection == crate::worker::CONNECTION).unwrap_or(false);
+            if let Route::Attention(reason) = crate::background::route(action, has_page) {
+                let id = self.task_id();
+                tasks().update(id.as_deref(), Some(State::NeedsAttention), Some(&reason), None, None);
+                let reply = self.ask_user(&format!("{reason} You can continue this task in the foreground, or stop it."), vec!["Keep background mode".into(), "Continue in foreground".into(), "Stop task".into()], false).await;
+                match reply.as_deref() {
+                    Some("Continue in foreground") => {
+                        self.leave_background();
+                        // A moment to take their hands off the mouse: it's about to move.
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
+                        ctx.app = None;
+                        ctx.page = None;
+                        ctx.web_area = None;
+                        ctx.elements.clear();
+                        tasks().update(id.as_deref(), Some(State::Running), Some("Continuing in foreground"), None, Some(false));
+                    }
+                    Some("Keep background mode") => {
+                        tasks().update(id.as_deref(), Some(State::Running), Some("Continuing after your answer"), None, None);
+                        return ActionResult::fail(format!("{reason} Use a supported action or a page in the background browser."));
+                    }
+                    _ => return self.stop_here().await,
+                }
+            }
+        }
+        let id = self.task_id();
+        if !tasks().begin_action(id.as_deref(), &kind) {
+            self.log("couldn't save the task checkpoint");
+            return self.stop_here().await;
+        }
+        let result = self.execute(action, ctx, rs).await;
+        let done = self.steps().iter().filter(|s| s.state == StepState::Ok).count();
+        tasks().end_action(id.as_deref(), &kind, result.ok, done);
+        result
+    }
+
+    /// Stops the run from inside it. `cancel` aborts this very task, which only takes effect at its next pause: it
+    /// waits here for that, because anything it did on the way would mark the finished run as busy again.
+    async fn stop_here(self: &Arc<Self>) -> ActionResult {
+        self.cancel();
+        std::future::pending().await
+    }
+
+    async fn execute(self: &Arc<Self>, action: &Action, ctx: &mut Ctx, rs: &mut RunState) -> ActionResult {
         let kind = action.kind();
         if rs.dry {
             if let Some(r) = self.rehearse(&kind, action, ctx, rs).await {

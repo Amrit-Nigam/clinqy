@@ -1,7 +1,7 @@
 # Installs Clinqy for Windows for the current user (no admin needed):
 #   - copies the app to %LOCALAPPDATA%\Programs\Clinqy (replacing an older version, keeping your settings and data)
 #   - adds a Start menu shortcut and puts `clinqy` on your PATH (for terminals and coding agents)
-#   - opens Clinqy at login, and starts it
+#   - starts it (Open at login is off unless you pass -Login, or turn it on in Clinqy's settings)
 #
 # From an unzipped release:   double-click "Install Clinqy.bat" (it runs this with the right PowerShell settings)
 # Or in one line:             irm <release-url>/install.ps1 | iex      (downloads the latest zip itself)
@@ -9,7 +9,7 @@ param(
     [string]$Zip = '',
     [string]$Url = 'https://github.com/Amrit-Nigam/clinqy/releases/latest/download/Clinqy-windows-x64.zip',
     [switch]$NoStart,
-    [switch]$NoLogin
+    [switch]$Login
 )
 
 $ErrorActionPreference = 'Stop'
@@ -43,11 +43,19 @@ Get-Process ClinqyApp -ErrorAction SilentlyContinue | Stop-Process -Force -Error
 Start-Sleep -Milliseconds 400
 
 New-Item -ItemType Directory -Force $dest | Out-Null
+Get-ChildItem $dest -Filter '*.old-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 foreach ($item in 'ClinqyApp.exe', 'clinqy.exe', 'extension', 'env.example', 'README.md', 'uninstall.ps1', 'Uninstall Clinqy.bat') {
     $from = Join-Path $source $item
     if (Test-Path $from) {
         $to = Join-Path $dest $item
-        if (Test-Path $to) { Remove-Item -Recurse -Force $to }
+        if (Test-Path $to) {
+            try { Remove-Item -Recurse -Force $to -ErrorAction Stop }
+            catch {
+                # A coding agent connected over MCP keeps clinqy.exe running, which locks the file. Windows lets a
+                # running program be renamed, so it moves aside; the next install cleans it up.
+                Move-Item -Force $to ($to + '.old-' + [guid]::NewGuid())
+            }
+        }
         Copy-Item -Recurse $from $to
     }
 }
@@ -73,9 +81,9 @@ if (-not (($path -split ';') -contains $dest)) {
     Say 'Command: clinqy (open a new terminal to use it)'
 }
 
-# Open at login (the tray menu can turn it off).
-if (-not $NoLogin) {
-    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Clinqy' -Value ('"' + (Join-Path $dest 'ClinqyApp.exe') + '"')
+# Open at login only when asked for: the app's own switch does it otherwise (Dashboard -> General).
+if ($Login) {
+    Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Clinqy' -Value ('"' + (Join-Path $dest 'ClinqyApp.exe') + '" --login')
 }
 
 # The command bar and result card are WebView2 pages: built into Windows 11, and into Windows 10 with Edge.

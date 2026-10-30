@@ -1,0 +1,329 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Clinqy</title>
+<style>
+/*FONTS*/
+/* The Mac app's setup and dashboard tokens (OnboardingArt.swift). */
+:root { color-scheme: dark; --bg: #08090D; --raised: #10121A; --line: #1F2330; --text: #E9ECF3; --soft: #8D94A5; --blue: #4A8CFF; --green: #8DFFB0; --orange: #FFB35C; --red: #FF6B64;
+  --fill: rgba(233,236,243,.035); --fill2: rgba(233,236,243,.06); --body: "Segoe UI Variable Text", "Segoe UI", system-ui, sans-serif; --mono: "Geist Mono", Consolas, monospace; --pixel: "Geist Pixel", "Geist Mono", Consolas, monospace; }
+@media (prefers-color-scheme: light) { :root { color-scheme: light; --bg: #F7F7F7; --raised: #FFFFFF; --line: #D1D1D1; --text: #1F1F1F; --soft: #6B6B6B; --blue: #1F5CCC; --green: #1F733B; --orange: #B86A00; --red: #C8332B; --fill: rgba(31,31,31,.035); --fill2: rgba(31,31,31,.06); } }
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text); font: 13px/1.5 var(--body); -webkit-font-smoothing: antialiased; user-select: none; }
+button, input, select { font: inherit; color: inherit; }
+button { background: none; border: 0; padding: 0; cursor: pointer; }
+.app { display: flex; height: 100%; }
+.side { width: 220px; flex: none; border-right: 1px solid var(--line); padding: 48px 20px 26px; display: flex; flex-direction: column; }
+.logo { display: flex; align-items: center; gap: 9px; font: 22px var(--pixel); margin-bottom: 26px; }
+.logo img { width: 24px; height: 24px; border-radius: 5px; }
+.stepnav { display: flex; flex-direction: column; gap: 2px; }
+.stepnav button { display: flex; align-items: center; gap: 10px; text-align: left; padding: 6px 8px; border-radius: 6px; color: var(--soft); font: 12.5px var(--mono); }
+.stepnav button i { font-style: normal; font-size: 11px; width: 16px; color: var(--soft); opacity: .7; }
+.stepnav button:hover { background: var(--fill); color: var(--text); }
+.stepnav button.on { background: var(--fill2); color: var(--text); }
+.stepnav button.on i { color: var(--green); opacity: 1; }
+.rule { height: 1px; background: var(--line); margin: 16px 0; }
+.spacer { flex: 1; }
+.foot { color: var(--soft); font-size: 11px; line-height: 1.45; }
+.main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.scroll { flex: 1; overflow-y: auto; padding: 44px 36px 24px; }
+.scroll::-webkit-scrollbar { width: 10px; } .scroll::-webkit-scrollbar-thumb { background: var(--line); border-radius: 5px; border: 3px solid var(--bg); }
+.inner { max-width: 780px; margin: 0 auto; display: flex; flex-direction: column; gap: 13px; }
+h1 { font: 400 30px/1.15 var(--pixel); margin: 0; letter-spacing: -.01em; }
+h2 { font: 600 13.5px var(--body); margin: 0; }
+p { margin: 0; color: var(--soft); }
+.sub { color: var(--soft); font: 12px var(--mono); }
+.head { display: flex; align-items: flex-end; gap: 16px; margin-bottom: 6px; }
+.head > div:first-child { flex: 1; min-width: 0; }
+.seg { display: flex; flex-wrap: wrap; gap: 2px; padding: 3px; border: 1px solid var(--line); border-radius: 8px; align-self: flex-start; margin-bottom: 4px; }
+.seg button { padding: 4px 12px; border-radius: 6px; color: var(--soft); font: 12px var(--mono); }
+.seg button.on { background: var(--text); color: var(--bg); }
+.seg button:not(.on):hover { color: var(--text); }
+.card { background: var(--fill); border: 1px solid var(--line); border-radius: 8px; padding: 18px; display: flex; flex-direction: column; gap: 13px; }
+.row { display: flex; align-items: center; gap: 12px; min-height: 28px; }
+.row .grow { flex: 1; min-width: 0; }
+.row .grow > div { overflow: hidden; text-overflow: ellipsis; }
+.note { color: var(--soft); font-size: 12px; }
+.tiles { display: grid; grid-template-columns: repeat(3, 1fr); gap: 13px; }
+.tile { background: var(--fill); border: 1px solid var(--line); border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 2px; }
+.tile b { font: 600 23px var(--mono); }
+.tile span { font-size: 12.5px; } .tile small { color: var(--soft); font-size: 11px; }
+.btn { font: 600 12.5px var(--mono); min-height: 32px; padding: 0 10px; border-radius: 2px; border: 1px solid var(--line); white-space: nowrap; }
+.btn::before { content: "[ "; opacity: .55; } .btn::after { content: " ]"; opacity: .55; }
+.btn:hover:not(:disabled) { border-color: var(--soft); }
+.btn.primary { background: var(--text); color: var(--bg); border-color: var(--text); }
+.btn:disabled { opacity: .4; cursor: default; }
+.link { color: var(--blue); font: 12px var(--mono); }
+.link:hover { text-decoration: underline; }
+.badge { font: 11px var(--mono); padding: 1px 7px; border-radius: 7px; background: var(--fill2); color: var(--soft); white-space: nowrap; }
+.badge.ok { color: var(--green); } .badge.warn { color: var(--orange); } .badge.bad { color: var(--red); } .badge.on { color: var(--blue); }
+.key { font: 11px var(--mono); padding: 3px 8px; border-radius: 7px; background: var(--fill2); white-space: nowrap; }
+input[type=text], input[type=password], select { background: var(--raised); border: 1px solid var(--line); border-radius: 4px; padding: 6px 9px; outline: none; min-width: 0; user-select: text; }
+input:focus, select:focus { border-color: var(--blue); }
+.switch { width: 34px; height: 20px; border-radius: 10px; background: var(--fill2); border: 1px solid var(--line); position: relative; flex: none; transition: background .15s; }
+.switch::after { content: ""; position: absolute; left: 2px; top: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--soft); transition: transform .15s, background .15s; }
+.switch.on { background: var(--blue); border-color: var(--blue); } .switch.on::after { transform: translateX(14px); background: #fff; }
+.switch:disabled { opacity: .5; cursor: default; }
+.radio { width: 14px; height: 14px; border-radius: 50%; border: 1px solid var(--soft); flex: none; position: relative; }
+.radio.on { border-color: var(--blue); } .radio.on::after { content: ""; position: absolute; inset: 3px; border-radius: 50%; background: var(--blue); }
+.group { font: 11px var(--mono); color: var(--soft); margin-top: 6px; }
+.picker { display: flex; flex-direction: column; }
+.picker > button { display: flex; align-items: center; gap: 11px; padding: 9px 10px; border-radius: 6px; text-align: left; }
+.picker > button:hover { background: var(--fill); }
+.picker > button.on { background: var(--fill2); }
+.bars { display: flex; align-items: flex-end; gap: 4px; height: 90px; }
+.bars div { flex: 1; background: var(--blue); border-radius: 2px 2px 0 0; min-height: 2px; opacity: .85; }
+.progress { height: 6px; border-radius: 3px; background: var(--fill2); overflow: hidden; }
+.progress div { height: 100%; background: var(--blue); } .progress.over div { background: var(--orange); }
+.task { border-top: 1px solid var(--line); padding-top: 12px; display: flex; flex-direction: column; gap: 4px; }
+.task:first-child { border-top: 0; padding-top: 0; }
+.task .req { font-weight: 500; user-select: text; }
+.status { min-height: 18px; font: 12px var(--mono); color: var(--green); } .status.err { color: var(--orange); }
+.hide { display: none !important; }
+.setupfoot { display: flex; align-items: center; gap: 10px; padding: 16px 36px 20px; border-top: 1px solid var(--line); }
+kbd { font: 11px var(--mono); padding: 3px 8px; border-radius: 7px; background: var(--fill2); }
+.big { display: flex; gap: 14px; align-items: center; }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="side">
+    <div class="logo"><img src="" id="icon" alt="">clinqy</div>
+    <nav class="stepnav" id="steps"></nav>
+    <div class="rule"></div>
+    <div class="stepnav"><button id="dash"><i>▦</i>Dashboard</button></div>
+    <div class="spacer"></div>
+    <div class="foot">Setup and Dashboard are always available from the tray.</div>
+  </aside>
+  <main class="main">
+    <div class="scroll"><div class="inner" id="view"></div></div>
+    <div class="setupfoot hide" id="foot"></div>
+  </main>
+</div>
+<script>
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const post = (type, data = {}) => window.ipc.postMessage(JSON.stringify({ type, ...data }));
+const fmt = (n) => Number(n || 0).toLocaleString();
+const STEPS = ["Welcome", "Model", "Browser extension", "The keys", "Coding agents", "Try it"];
+const TABS = ["Overview", "Usage", "AI & Model", "Background", "Tasks", "Shortcuts", "General"];
+let S = {}, view = "dash", tab = "Overview", step = 0, models = {}, picked = null, custom = "", capturing = "", downMods = new Set(), captureMods = new Set(), drafts = {};
+
+function status() { const t = S.status || ""; if (!t) return ""; return `<div class="status ${/^(Couldn|Enter|Set up|Install|Summon|✗)/.test(t) ? "err" : ""}">${esc(t)}</div>`; }
+const tile = (v, t, n) => `<div class="tile"><b>${esc(v)}</b><span>${esc(t)}</span><small>${esc(n)}</small></div>`;
+function usageTiles(label) { const s = S.summary || {}; const m = s.meteredRequests; return `<div class="tiles">${tile(fmt(s.requests), label, S.rangeLabel)}${tile(m ? fmt(s.inputTokens) : "—", "Input tokens", m ? S.rangeLabel : "Not reported by CLI logins")}${tile(m ? fmt(s.outputTokens) : "—", "Output tokens", m ? S.rangeLabel : "Not reported by CLI logins")}</div>`; }
+function warnBar(title, used, limit) { if (!limit) return ""; const pct = Math.min(100, Math.floor(used * 100 / limit)); return `<div class="row"><span class="grow">${esc(title)}</span><span class="note">${fmt(used)} of ${fmt(limit)}</span></div><div class="progress ${pct >= 100 ? "over" : ""}"><div style="width:${pct}%"></div></div>`; }
+function warnings() {
+  const m = S.monthlySummary || {};
+  return `<div class="card"><h2>Monthly warnings</h2><p>Clinqy tells you when you pass these. It never stops working because of them.</p>
+    ${warnBar("Tokens", (m.inputTokens || 0) + (m.outputTokens || 0), Number(S.tokenLimit))}${warnBar("Requests", m.requests || 0, Number(S.requestLimit))}
+    <div class="row"><span class="grow">Token warning</span><input type="text" id="tokens" value="${esc(S.tokenLimit)}" placeholder="None" style="width:130px"></div>
+    <div class="row"><span class="grow">Request warning</span><input type="text" id="requests" value="${esc(S.requestLimit)}" placeholder="None" style="width:130px"></div>
+    <div class="row"><button class="btn" data-do="limits">Save warnings</button></div></div>`;
+}
+function activity() {
+  const rows = (S.summary || {}).providers || [];
+  const max = Math.max(1, ...rows.map((r) => r.requests));
+  return `<div class="card"><h2>Provider activity</h2>${rows.length ? rows.map((r) => `<div class="row"><span class="grow">${esc(r.providerName)}</span><span class="note">${fmt(r.requests)} requests</span></div><div class="progress"><div style="width:${r.requests * 100 / max}%"></div></div>`).join("") : `<p>Usage tracking starts with your next model request.</p>`}</div>`;
+}
+function daily() {
+  const d = ((S.summary || {}).days || []).slice(-14);
+  if (!d.length) return "";
+  const v = (x) => (x.inputTokens + x.outputTokens) || x.requests, max = Math.max(1, ...d.map(v)), metered = (S.summary || {}).meteredRequests;
+  return `<div class="card"><h2>${metered ? "Daily token usage" : "Daily requests"} · last 14 active days</h2><div class="bars">${d.map((x) => `<div title="${esc(x.day)}: ${fmt(v(x))}" style="height:${Math.max(3, v(x) * 100 / max)}%"></div>`).join("")}</div></div>`;
+}
+const rangeSelect = () => `<select id="range">${[["month", "This month"], ["thirtyDays", "Last 30 days"], ["all", "All time"]].map(([k, l]) => `<option value="${k}" ${S.range === k ? "selected" : ""}>${l}</option>`).join("")}</select>`;
+
+function overview() {
+  return `${usageTiles("Requests")}${warnings()}
+    <div class="card"><h2>AI provider</h2><div class="row"><div class="grow"><div style="font-size:15px;font-weight:600">${esc(S.currentProviderName)}</div><div class="note">${esc(S.model)}${S.auto ? " · picked automatically" : ""}</div></div><button class="btn" data-tab="AI &amp; Model">Manage provider</button></div></div>
+    <div class="card"><h2>Shortcuts</h2><div class="row"><span class="grow">Summon Clinqy</span><span class="key">${esc(S.summonLabel)}</span></div><div class="row"><span class="grow">Push to talk</span><span class="key">${esc(S.talkLabel)}</span></div><div class="row"><button class="btn" data-tab="Shortcuts">Customize shortcuts</button></div></div>
+    ${activity()}`;
+}
+const usage = () => `${usageTiles("Model requests")}${daily()}${warnings()}${activity()}`;
+
+function providerRows() {
+  const groups = [["cli", "Use your login"], ["local", "Run locally"], ["api", "Use an API key"]];
+  return groups.map(([k, title]) => `<div class="group">${title}</div><div class="picker">${(S.providers || []).filter((p) => p.kind === k).map(providerRow).join("")}</div>`).join("");
+}
+function providerRow(p) {
+  const on = p.id === (picked || S.currentProvider);
+  const inUse = p.id === S.currentProvider;
+  return `<button data-provider="${esc(p.id)}" class="${on ? "on" : ""}"><span class="radio ${on ? "on" : ""}"></span><span style="flex:1;min-width:0"><div>${esc(p.name)}</div><div class="note">${esc(p.subtitle)}</div></span>${inUse ? `<span class="badge on">In use</span>` : `<span class="badge ${p.configured ? "ok" : p.kind === "cli" && p.installed ? "warn" : ""}">${esc(p.state)}</span>`}</button>`;
+}
+function providerDetail() {
+  const p = (S.providers || []).find((x) => x.id === (picked || S.currentProvider));
+  if (!p) return "";
+  const list = models[p.id];
+  const saved = list ? list.saved : "";
+  let opts = list ? list.choices.slice() : [];
+  if (list && !opts.some((o) => o.id === saved)) opts = [{ id: saved, label: `${saved} (current)` }, ...opts];
+  const isCustom = custom === p.id;
+  const setup = [];
+  if (p.kind === "cli") {
+    if (!p.installed) setup.push(p.install ? `<button class="btn" data-term="${esc(p.install)}">Install in Terminal</button>` : `<button class="btn" data-open="${esc(p.guide)}">Open install guide</button>`);
+    else if (p.login) setup.push(`<button class="btn" data-term="${esc(p.login)}">Log in in Terminal</button>`);
+  }
+  const key = p.kind === "api" || p.id === "openai-compatible"
+    ? `<div class="row"><input type="password" id="apikey" class="grow" placeholder="${p.configured ? "Saved on this PC. Paste a new key to replace it." : `Paste your ${esc(p.keyName)}`}" style="flex:1">${p.keyLink ? `<button class="link" data-open="${esc(p.keyLink)}">Get a key</button>` : ""}<button class="btn" data-do="apikey">Save key</button></div>` : "";
+  const base = p.id === "openai-compatible" ? `<div class="row"><span>Server</span><input type="text" id="baseurl" style="flex:1" value="${esc(S.baseUrl)}" placeholder="http://localhost:1234/v1"><button class="btn" data-do="baseurl">Save</button></div>` : "";
+  return `<div class="card"><div class="row"><h2 class="grow">${esc(p.name)}</h2>${p.id === S.currentProvider ? "" : `<button class="btn primary" data-do="use" ${p.configured ? "" : "disabled"}>Use</button>`}<button class="btn" data-do="test" ${p.configured ? "" : "disabled"}>Test connection</button></div>
+    ${p.help ? `<p>${esc(p.help)}</p>` : ""}${setup.length ? `<div class="row">${setup.join("")}</div>` : ""}${key}${base}
+    <div class="row"><span class="grow">Model for Clinqy</span>${!p.configured ? `<span class="note">Set this up first</span>` : !list ? `<span class="note">Asking ${esc(p.name)} what it offers…</span>` : `<select id="model" style="max-width:320px">${opts.map((o) => `<option value="${esc(o.id)}" ${!isCustom && o.id === saved ? "selected" : ""}>${esc(o.label)}</option>`).join("")}<option value="__custom" ${isCustom ? "selected" : ""}>Custom model ID…</option></select>`}</div>
+    ${isCustom ? `<div class="row"><input type="text" id="customModel" style="flex:1" placeholder="The model's exact ID" value="${esc(drafts.customModel || "")}"></div>` : ""}
+    ${p.configured && list ? `<div class="row"><span class="grow note">Saved on this PC only. Other devices keep their own choice.</span><button class="btn" data-do="saveModel">Save model</button></div>` : ""}</div>`;
+}
+function ai() {
+  const managed = S.providerManaged ? `<p class="note">The provider is set by an environment variable or launch option, so it can't be changed here.</p>` : "";
+  return `<div class="card"><div class="row"><div class="grow"><h2>AI provider</h2><p>Choose which service answers for Clinqy. With Automatic, it uses the first one you have: Claude Code, then Codex, then agy, then Ollama.</p></div></div>
+    <div class="row"><span class="grow">Automatic</span><button class="switch ${S.auto ? "on" : ""}" data-do="auto" ${S.providerManaged ? "disabled" : ""}></button></div>${managed}</div>${providerDetail()}<div class="card">${providerRows()}</div>`;
+}
+function background() {
+  const b = S.background || {};
+  return `<div class="card"><div class="row"><div class="grow"><h2>Work in the background</h2><p>Every task runs in a hidden browser, so you keep your mouse, keyboard and windows. Say “in the background” or “in front of me” in a request to choose for just that task.</p></div><button class="switch ${b.always ? "on" : ""}" data-do="background" ${b.managed ? "disabled" : ""}></button></div>${b.managed ? `<p class="note">Set by BACKGROUND_TASKS in the environment.</p>` : ""}</div>
+    <div class="card"><h2>Background browser</h2><p>A separate ${esc(b.browser || "browser")} with its own profile: your own browser is never touched. Sites you need signed in for, sign in to here once and it stays signed in.</p>
+    ${b.browser ? `<div class="row">${b.signingIn ? `<span class="badge warn">Signing in</span><span class="grow note">Sign in to your sites in the window that opened, then finish here.</span><button class="btn primary" data-do="finishLogin">Finish sign-in</button>` : `<span class="grow note">${b.running ? "In use by a task." : "Not running. It starts when a task needs it."}</span><button class="btn" data-do="signIn" ${b.busy ? "disabled" : ""}>Sign in…</button>`}</div>` : `<p class="note" style="color:var(--orange)">Install Google Chrome or Microsoft Edge to use background web tasks.</p>`}</div>
+    <div class="card"><h2>What runs in the background</h2><p>Web pages, files, PDFs, media and anything that needs no window. If a task needs a desktop app, Clinqy stops and asks: keep it hidden, continue in the foreground, or stop.</p><div class="row"><button class="btn" data-tab="Tasks">Tasks &amp; Recovery</button><button class="btn" data-do="live" ${b.hasView ? "" : "disabled"}>Show background work</button></div></div>`;
+}
+function tasks() {
+  const list = S.tasks || [];
+  const body = list.length ? list.map((t) => `<div class="task"><div class="row"><span class="grow req">${esc(t.request)}</span><span class="badge ${t.state === "Succeeded" ? "ok" : t.state === "Failed" || t.state === "Interrupted" ? "bad" : t.state === "Running" ? "on" : ""}">${esc(t.state)}</span></div>
+      <div class="note">${esc(t.shortId)} · ${t.background ? "background" : "foreground"} · ${esc(t.when)}</div>${t.stage && t.stage !== t.result ? `<div class="note">Now: ${esc(t.stage)}</div>` : ""}${t.steps ? `<div class="note">${t.steps} steps completed${t.lastStep ? ` · Last confirmed step: ${esc(t.lastStep)}` : ""}</div>` : ""}
+      ${t.pending ? `<div class="note" style="color:var(--orange)">Check outcome: ${esc(t.pending)}. This action will not be replayed automatically.</div>` : ""}${t.result ? `<div class="note" style="user-select:text">${esc(t.result)}</div>` : ""}${t.reason ? `<div class="note" style="color:var(--orange)">${esc(t.reason)}</div>` : ""}
+      ${t.state === "Queued" ? `<div class="row"><button class="btn" data-start="${esc(t.id)}" ${S.taskActive || (t.reason || "").includes("Private values") ? "disabled" : ""}>${t.reason ? "Reviewed — start task" : "Start task"}</button><button class="btn" data-cancel="${esc(t.id)}">Cancel task</button></div>` : ""}</div>`).join("") : `<p>No saved tasks yet.</p>`;
+  return `<div class="card"><h2>Tasks &amp; Recovery</h2><p>Interrupted tasks stay stopped. Check what actually happened before sending fresh instructions. Restored queued tasks can be reviewed and started below.</p>${S.taskError ? `<p style="color:var(--orange)">${esc(S.taskError)}</p>` : ""}</div><div class="card">${body}</div>`;
+}
+function shortcuts() {
+  const m = S.hotkeysManaged;
+  const rec = (kind) => `<button class="btn" data-capture="${kind}" ${m ? "disabled" : ""}>${capturing === kind ? "Press keys…" : "Record"}</button>`;
+  return `<div class="card"><h2>Summon Clinqy</h2><p>Tap the modifier keys to open the command bar.</p><div class="row"><span class="grow key" style="flex:none">${esc(drafts.summonLabel || S.summonLabel)}</span><span class="spacer"></span>${rec("summon")}</div></div>
+    <div class="card"><h2>Push to talk</h2><p>Hold to speak, let go to send. Clinqy only listens while it's held.</p><div class="row"><span class="key">${esc(drafts.talkLabel || S.talkLabel)}</span><span class="spacer"></span><button class="link" data-do="talkOff" ${m ? "disabled" : ""}>Turn off</button>${rec("talk")}</div></div>
+    <div class="row"><button class="btn" data-do="shortcuts" ${m ? "disabled" : ""}>Save shortcuts</button>${m ? `<span class="note">Set by environment variables.</span>` : ""}</div>
+    <div class="card"><h2>All keyboard shortcuts</h2>${allKeys().map(([keys, what]) => `<div class="row"><span class="grow">${esc(what)}</span>${keys.map((k) => `<span class="key">${esc(k)}</span>`).join("")}</div>`).join("")}
+    <p>Say “in the background” or “in front of me” in any request to choose where just that task runs.</p></div>`;
+}
+function allKeys() {
+  const open = S.summonLabel, talk = S.talkLabel;
+  return [
+    [[open], "Open or close the command bar (tap)"],
+    [[talk], talk === "Off" ? "Push to talk (off)" : "Talk: hold and speak, let go to send"],
+    [[open], "While a task runs: add to it, pause or stop it (tap)"],
+    [["Enter"], "Send your request or answer"],
+    [["Esc"], "Close the command bar"],
+    [["Esc"], "Cancel while circling something on screen"],
+    [[talk], "A quick tap still goes to the app in front"],
+  ];
+}
+function general() {
+  const g = S.general || {};
+  return `<div class="card"><div class="row"><div class="grow"><h2>Open at login</h2><p>Start Clinqy when you sign in to Windows.</p></div><button class="switch ${g.login ? "on" : ""}" data-do="login"></button></div>
+    <div class="row"><div class="grow"><h2>Keep listening after a spoken task</h2><p>The mic stays open for 5 seconds for a follow-up.</p></div><button class="switch ${g.followUp ? "on" : ""}" data-do="followUp"></button></div>
+    <div class="row"><div class="grow"><h2>Voice language</h2></div><select id="voice">${(g.languages || []).map(([c, l]) => `<option value="${esc(c)}" ${c === g.language ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></div></div>
+    <div class="card"><h2>Your data</h2><p>Stored on this PC. Model calls go only to the provider you chose.</p><div class="row"><button class="btn" data-do="memory">Edit memory…</button><button class="btn" data-do="profile">Job profile…</button><button class="btn" data-do="settings">Settings file…</button></div></div>
+    <div class="card"><div class="row"><div class="grow"><h2>Check setup</h2><p>What's ready and what isn't.</p></div><button class="btn" data-do="check">Check setup…</button></div></div>`;
+}
+const PAGES = { Overview: overview, Usage: usage, "AI & Model": ai, Background: background, Tasks: tasks, Shortcuts: shortcuts, General: general };
+function dashboard() {
+  const period = tab === "Overview" || tab === "Usage";
+  return `<div class="head"><div><h1>Dashboard</h1><div class="sub">${esc(S.currentProviderName)} · ${esc(S.model)}</div></div>${period ? rangeSelect() : ""}</div>
+    <div class="seg">${TABS.map((t) => `<button data-tab="${esc(t)}" class="${t === tab ? "on" : ""}">${esc(t)}</button>`).join("")}</div>${status()}${PAGES[tab]()}`;
+}
+
+const SETUP = [
+  () => `<h1>Your cursor's new buddy.</h1><p style="font-size:15px">It does the clicking. You watch it work.</p><p>A few quick steps: pick the AI that drives Clinqy, add the browser extension, and learn the keys. Everything stays on this PC except the model calls.</p>`,
+  () => `<h1>Pick a model</h1><p>Clinqy works with what you already have, on this PC.</p>${status()}${providerDetail()}<div class="card">${providerRows()}</div>`,
+  () => { const e = S.extension || {}; return `<h1>Add the browser extension</h1><p>It lets Clinqy read and use web pages exactly, in your own browser.</p>${status()}<div class="card"><div class="row"><span class="badge ${e.connected ? "ok" : "warn"}">${e.connected ? "Connected" : "Not connected yet"}</span><span class="grow note">${esc(e.browser || "")}</span></div><p>Clinqy can open the extensions page, turn on Developer mode, click Load unpacked and pick the folder for you. This window steps aside while it works.</p><div class="row"><button class="btn primary" data-do="extInstall" ${e.connected ? "disabled" : ""}>Let Clinqy do it</button><button class="btn" data-do="extHelp">Copy path, show folder</button></div></div>`; },
+  () => `<h1>The keys</h1>${status()}<div class="card"><div class="big"><kbd>${esc(S.summonLabel)}</kbd><p>Tap to open the command bar, then type what you want and press Enter.</p></div><div class="big"><kbd>${esc(S.talkLabel)}</kbd><p>Hold and speak. Clinqy listens only while it's held, and sends when you let go.</p></div><div class="big"><kbd>${esc(S.summonLabel)}</kbd><p>While a task runs, tap to add to it, pause it or stop it. Say “in the background” to keep working while it does.</p></div></div>`,
+  () => `<h1>Coding agents</h1><p>Let your coding agents use Clinqy over MCP. Their other servers are kept.</p>${status()}<div class="card">${(S.agents || []).map((a) => `<div class="row"><div class="grow"><div>${esc(a.name)}</div><div class="note">${esc(a.detail)}</div></div><button class="btn" data-connect="${esc(a.id)}">Connect</button></div>`).join("")}</div>`,
+  () => `<h1>Try it</h1><p>Tap ${esc(S.summonLabel)} and ask something, like “where's the dark mode setting?”</p>${status()}<div class="row"><button class="btn primary" data-do="tryIt">Open Clinqy</button></div>`,
+];
+
+function render() {
+  const a = document.activeElement;
+  if (a && a.tagName === "INPUT" && (a.id !== "customModel" || !drafts.rerender)) { for (const i of document.querySelectorAll("#view input[id]")) drafts[i.id] = i.value; }
+  const keep = a && a.id ? { id: a.id, start: a.selectionStart, end: a.selectionEnd } : null;
+  const vals = {}; for (const i of document.querySelectorAll("#view input[id]")) vals[i.id] = i.value;
+  $("steps").innerHTML = STEPS.map((s, i) => `<button data-step="${i}" class="${view === "setup" && step === i ? "on" : ""}"><i>${String(i + 1).padStart(2, "0")}</i>${esc(s)}</button>`).join("");
+  $("dash").classList.toggle("on", view === "dash");
+  $("view").innerHTML = view === "dash" ? dashboard() : SETUP[step]();
+  for (const id in vals) { const i = $(id); if (i && vals[id]) i.value = vals[id]; }
+  if (keep) { const i = $(keep.id); if (i && i.tagName === "INPUT") { i.focus(); try { i.setSelectionRange(keep.start, keep.end); } catch {} } }
+  const f = $("foot");
+  f.classList.toggle("hide", view !== "setup");
+  if (view === "setup") f.innerHTML = `<button class="btn" data-go="-1" ${step ? "" : "disabled"}>Back</button><span class="spacer"></span><button class="btn primary" data-go="1">${step === STEPS.length - 1 ? "Done" : step ? "Continue" : "Get started"}</button>`;
+  const wanted = picked || S.currentProvider;
+  const p = (S.providers || []).find((x) => x.id === wanted);
+  if (p && p.configured && !models[wanted] && (tab === "AI & Model" || (view === "setup" && step === 1))) { models[wanted] = null; post("models", { provider: wanted }); }
+}
+
+window.clinqy = {
+  update(next) { const had = document.activeElement?.tagName === "SELECT"; S = next || {}; if (had) return; render(); },
+  show(where) { if (where === "setup") { view = "setup"; step = 0; } else { view = "dash"; tab = where || "Overview"; } render(); },
+  models(provider, choices, saved) { models[provider] = { choices, saved }; render(); },
+  icon(src) { $("icon").src = src; },
+};
+
+document.addEventListener("click", (e) => {
+  const b = e.target.closest("button"); if (!b || b.disabled) return;
+  const d = b.dataset;
+  if (d.step !== undefined) { view = "setup"; step = Number(d.step); post("refresh"); render(); }
+  else if (b.id === "dash") { view = "dash"; render(); }
+  else if (d.tab) { tab = d.tab; picked = null; custom = ""; post("refresh"); render(); }
+  else if (d.go) { const n = step + Number(d.go); if (n >= STEPS.length) { view = "dash"; tab = "Overview"; post("setupDone"); } else step = Math.max(0, n); post("refresh"); render(); }
+  else if (d.provider) { picked = d.provider; custom = ""; render(); }
+  else if (d.term) post("terminal", { command: d.term });
+  else if (d.open) post("open", { url: d.open });
+  else if (d.connect) post("connect", { agent: d.connect });
+  else if (d.start) post("taskStart", { id: d.start });
+  else if (d.cancel) post("taskCancel", { id: d.cancel });
+  else if (d.capture) { capturing = capturing === d.capture ? "" : d.capture; downMods.clear(); captureMods.clear(); post("capture", { enabled: !!capturing }); render(); }
+  else if (d.do) act(d.do);
+});
+function act(what) {
+  const wanted = picked || S.currentProvider;
+  switch (what) {
+    case "use": post("provider", { provider: wanted }); picked = null; break;
+    case "auto": post("auto", { on: !S.auto }); picked = null; break;
+    case "test": post("testModel", { provider: wanted }); break;
+    case "apikey": { const v = $("apikey").value.trim(); if (v) { post("apiKey", { provider: wanted, key: v }); $("apikey").value = ""; models[wanted] = undefined; } break; }
+    case "baseurl": post("baseUrl", { url: $("baseurl").value.trim() }); models[wanted] = undefined; break;
+    case "saveModel": { const sel = $("model").value; const id = sel === "__custom" ? ($("customModel")?.value || "").trim() : sel; if (sel === "__custom" && !id) return; post("saveModel", { provider: wanted, model: id }); if (models[wanted]) models[wanted].saved = id; if (sel === "__custom") { models[wanted].choices.push({ id, label: id }); custom = ""; } break; }
+    case "limits": post("limits", { tokens: $("tokens").value.trim(), requests: $("requests").value.trim() }); break;
+    case "background": post("background", { on: !S.background.always }); break;
+    case "shortcuts": post("shortcuts", { summon: drafts.summon || S.summonSpec, talk: drafts.talk ?? S.talkSpec }); drafts = {}; break;
+    case "talkOff": drafts.talk = "off"; drafts.talkLabel = "Off"; render(); break;
+    case "login": post("login", { on: !S.general.login }); break;
+    case "followUp": post("followUp", { on: !S.general.followUp }); break;
+    default: post(what);
+  }
+}
+document.addEventListener("change", (e) => {
+  const t = e.target;
+  if (t.id === "range") post("range", { range: t.value });
+  else if (t.id === "voice") post("voice", { language: t.value });
+  else if (t.id === "model") { custom = t.value === "__custom" ? (picked || S.currentProvider) : ""; render(); }
+});
+window.addEventListener("keydown", (e) => {
+  if (!capturing) return;
+  e.preventDefault();
+  if (e.key === "Escape") { capturing = ""; post("capture", { enabled: false }); render(); return; }
+  const mod = { Control: "ctrl", Alt: "alt", Shift: "shift", Meta: "win" }[e.key];
+  if (mod) { downMods.add(mod); captureMods.add(mod); return; }
+  if (capturing === "talk" && downMods.size) {
+    const key = e.code === "Space" ? "space" : e.key.toLowerCase();
+    if (/^f([1-9]|1[0-2])$/.test(key) || /^[a-z0-9]$/.test(key)) { const order = ["ctrl", "alt", "shift", "win"].filter((m) => captureMods.has(m)); const spec = [...order, key].join("+"); drafts.talk = spec; drafts.talkLabel = spec.split("+").map((p) => p.length === 1 ? p.toUpperCase() : p[0].toUpperCase() + p.slice(1)).join("+"); capturing = ""; post("capture", { enabled: false }); render(); }
+  }
+});
+window.addEventListener("keyup", (e) => {
+  const mod = { Control: "ctrl", Alt: "alt", Shift: "shift", Meta: "win" }[e.key];
+  if (!mod) return;
+  downMods.delete(mod);
+  if (capturing === "summon" && !downMods.size && captureMods.size) { const order = ["ctrl", "alt", "shift", "win"].filter((m) => captureMods.has(m)); drafts.summon = order.join("+"); drafts.summonLabel = order.map((p) => p[0].toUpperCase() + p.slice(1)).join("+"); capturing = ""; post("capture", { enabled: false }); render(); }
+});
+setInterval(() => { if (!capturing && document.activeElement?.tagName !== "INPUT" && document.activeElement?.tagName !== "SELECT") post("refresh"); }, 8000);
+post("ready");
+</script>
+</body>
+</html>

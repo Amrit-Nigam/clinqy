@@ -68,9 +68,11 @@ impl Provider {
     pub fn is_configured(self) -> bool {
         match self {
             Provider::ClaudeCli => self.cli().is_some() && claude_logged_in(),
-            Provider::AgyCli | Provider::CodexCli => self.cli().is_some(),
+            Provider::CodexCli => self.cli().is_some() && crate::paths::home().join(".codex").join("auth.json").exists(),
+            Provider::AgyCli => self.cli().is_some(),
             Provider::Anthropic | Provider::OpenAi | Provider::Gemini | Provider::OpenRouter => self.key().is_some(),
-            Provider::Ollama | Provider::Compatible => true,
+            Provider::Ollama => reachable(&self.base_url()),
+            Provider::Compatible => config::value("OPENAI_BASE_URL").is_some(),
         }
     }
 
@@ -184,10 +186,34 @@ impl Provider {
         }
     }
 
-    /// The agent's model name for this provider (CLAUDE_MODEL / AGY_MODEL, default "sonnet").
+    /// The setting this provider's model is saved in: each has its own, so switching never sends one provider's
+    /// model name to another. On this device only (the settings file isn't synced).
+    pub fn model_key(self) -> &'static str {
+        match self {
+            Provider::ClaudeCli => "CLAUDE_MODEL",
+            Provider::AgyCli => "AGY_MODEL",
+            Provider::CodexCli => "CODEX_MODEL",
+            Provider::Anthropic => "ANTHROPIC_MODEL",
+            Provider::OpenAi => "OPENAI_MODEL",
+            Provider::Gemini => "GEMINI_MODEL",
+            Provider::OpenRouter => "OPENROUTER_MODEL",
+            Provider::Ollama | Provider::Compatible => "LOCAL_MODEL",
+        }
+    }
+
+    /// The agent's model name for this provider: its own setting, else a tier name left in the older shared settings
+    /// (CLAUDE_MODEL, AGY_MODEL), else "sonnet".
     pub fn default_model(self) -> String {
-        let (a, b) = if self == Provider::AgyCli { ("AGY_MODEL", "CLAUDE_MODEL") } else { ("CLAUDE_MODEL", "AGY_MODEL") };
-        config::value(a).or_else(|| config::value(b)).unwrap_or_else(|| "sonnet".into())
+        if let Some(own) = config::value(self.model_key()) {
+            return own;
+        }
+        // An Anthropic-format id still works on the providers that serve those models.
+        if self == Provider::Anthropic {
+            if let Some(m) = config::value("CLAUDE_MODEL") {
+                return m;
+            }
+        }
+        ["CLAUDE_MODEL", "AGY_MODEL"].iter().find_map(|k| config::value(k).filter(|m| ["haiku", "sonnet", "opus"].contains(&m.to_lowercase().as_str()))).unwrap_or_else(|| "sonnet".into())
     }
 
     pub fn base_url(self) -> String {
