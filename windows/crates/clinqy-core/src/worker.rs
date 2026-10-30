@@ -178,10 +178,16 @@ struct State {
     tabs: BTreeMap<i64, Arc<Tab>>,
     selected: Option<i64>,
     idle: Option<tokio::task::JoinHandle<()>>,
+    /// This run works in a tab of the user's own browser, through the extension on this connection.
+    own: Option<u64>,
+    /// The last run's tabs are still in the Clinqy tab group, to go when the next run opens one.
+    retire: bool,
+    /// The picture of the tab when the run ended: a finished run doesn't touch the user's browser again.
+    own_last: Option<String>,
 }
 
 pub struct Worker {
-    root: PathBuf,
+    home: PathBuf,
     /// Starting and stopping happen one at a time.
     gate: tokio::sync::Mutex<()>,
     st: Mutex<State>,
@@ -190,6 +196,30 @@ pub struct Worker {
 pub fn worker() -> &'static Worker {
     static W: OnceLock<Worker> = OnceLock::new();
     W.get_or_init(|| Worker::new(crate::paths::local_dir().join("BackgroundBrowser")))
+}
+
+/// The folders browsers keep their everyday profiles in. Chrome refuses automation there, and only one browser can
+/// use a profile at a time, so the worker never does.
+fn everyday_profiles() -> Vec<PathBuf> {
+    let Some(local) = std::env::var_os("LOCALAPPDATA").map(PathBuf::from) else { return vec![] };
+    [r"Google\Chrome\User Data", r"Google\Chrome Beta\User Data", r"Microsoft\Edge\User Data", r"BraveSoftware\Brave-Browser\User Data"].iter().map(|t| local.join(t)).collect()
+}
+
+/// Why `folder` can't be the background browser's profile, if it can't.
+pub fn profile_problem(folder: &str) -> Option<String> {
+    let path = Path::new(folder);
+    if !path.is_absolute() {
+        return Some("Use a full folder path, such as D:\\Clinqy\\Browser.".into());
+    }
+    let lower = |p: &Path| p.display().to_string().trim_end_matches('\\').to_lowercase();
+    let wanted = lower(path);
+    let everyday = everyday_profiles().iter().any(|e| wanted == lower(e) || wanted.starts_with(&format!("{}\\", lower(e))));
+    everyday.then(|| "That's your everyday browser profile. Browsers don't allow automation there, so choose another folder and use Sign in… to sign in to your sites.".into())
+}
+
+/// Background tasks work in a tab of the user's own browser rather than the hidden one (BACKGROUND_BROWSER=chrome).
+pub fn in_own_browser() -> bool {
+    crate::config::value("BACKGROUND_BROWSER").as_deref() == Some("chrome")
 }
 
 /// The browser the worker runs: the same kind the user has, Chrome first. WORKER_BROWSER overrides it.
@@ -219,8 +249,17 @@ fn http() -> reqwest::Client {
 }
 
 impl Worker {
+    /// WORKER_PROFILE, else Clinqy's own folder.
+    fn root(&self) -> PathBuf {
+        crate::config::value("WORKER_PROFILE").filter(|f| !f.is_empty()).map(PathBuf::from).unwrap_or_else(|| self.home.clone())
+    }
+
+    pub fn profile(&self) -> PathBuf {
+        self.root()
+    }
+
     fn new(root: PathBuf) -> Worker {
-        Worker { root, gate: tokio::sync::Mutex::new(()), st: Mutex::new(State { next_tab: 1_000_000, ..Default::default() }) }
+        Worker { home: root, gate: tokio::sync::Mutex::new(()), st: Mutex::new(State { next_tab: 1_000_000, ..Default::default() }) }
     }
 
     pub fn connected(&self) -> bool {
@@ -241,6 +280,9 @@ impl Worker {
 
     pub fn has_tab(&self) -> bool {
         let s = self.st.lock();
+        if s.own.is_some() {
+            return s.selected.is_some();
+        }
         s.selected.map(|t| s.tabs.contains_key(&t)).unwrap_or(false)
     }
 
@@ -260,15 +302,19 @@ impl Worker {
 
     async fn launch(&self, headless: bool) -> Result<()> {
         let exe = find_browser().ok_or_else(|| anyhow!("Install Google Chrome or Microsoft Edge to use background web tasks."))?;
-        std::fs::create_dir_all(&self.root)?;
-        let port_file = self.root.join("DevToolsActivePort");
+        if let Some(problem) = profile_problem(&self.root().display().to_string()) {
+            bail!("{problem}");
+        }
+        std::fs::create_dir_all(&self.root())?;
+        let port_file = self.root().join("DevToolsActivePort");
         // Never attach to an old browser, or a normal session, merely because its endpoint file exists.
         self.drop_child();
         self.close_orphan(&exe, !headless).await?;
-        let _ = std::fs::remove_dir_all(self.root.join("Uploads"));
+        self.close_strays(&exe).await;
+        let _ = std::fs::remove_dir_all(self.root().join("Uploads"));
         let _ = std::fs::remove_file(&port_file);
         let mut args = vec![
-            format!("--user-data-dir={}", self.root.display()),
+            format!("--user-data-dir={}", self.root().display()),
             "--remote-debugging-address=127.0.0.1".to_string(),
             "--remote-debugging-port=0".to_string(),
             "--no-first-run".to_string(),
@@ -298,8 +344,8 @@ impl Worker {
                     if let Some(socket) = body["webSocketDebuggerUrl"].as_str().filter(|s| loopback(s)) {
                         let browser = Cdp::connect(socket).await?;
                         browser.call("Browser.getVersion", json!({})).await?;
-                        std::fs::write(self.root.join("owner.json"), json!({"pid": pid, "socket": socket, "headless": headless}).to_string())?;
-                        let downloads = self.root.join("Downloads");
+                        std::fs::write(self.root().join("owner.json"), json!({"pid": pid, "socket": socket, "headless": headless}).to_string())?;
+                        let downloads = self.root().join("Downloads");
                         std::fs::create_dir_all(&downloads)?;
                         let _ = browser.call("Browser.setDownloadBehavior", json!({"behavior": "allow", "downloadPath": downloads.display().to_string()})).await;
                         let mut s = self.st.lock();
@@ -326,17 +372,31 @@ impl Worker {
         }
     }
 
+    /// A browser left on this profile holds it, and a new one then exits at once. The record of it can be gone (the app
+    /// was killed), so this looks for the process itself. Only one with this exact profile and a debugging port can
+    /// match, which the user's own browser never has.
+    async fn close_strays(&self, exe: &Path) {
+        use std::os::windows::process::CommandExt;
+        let script = "Get-CimInstance Win32_Process -Filter \"Name='$env:CLINQY_NAME'\" |                       Where-Object { $_.CommandLine -and $_.CommandLine.Contains('--user-data-dir=' + $env:CLINQY_PROFILE) -and $_.CommandLine.Contains('--remote-debugging-port') -and -not $_.CommandLine.Contains('--type=') } |                       ForEach-Object { Stop-Process -Id $_.ProcessId -Force }";
+        let name = exe.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default();
+        let profile = self.root();
+        let _ = tokio::task::spawn_blocking(move || {
+            Command::new("powershell").args(["-NoProfile", "-NonInteractive", "-Command", script]).env("CLINQY_NAME", name).env("CLINQY_PROFILE", profile).creation_flags(crate::session::CREATE_NO_WINDOW).output()
+        })
+        .await;
+    }
+
     /// After a crash: closes a browser only if its executable, profile and debugging flag all match what we recorded.
     /// Old tabs are discarded; nothing from an interrupted run is executed.
     async fn close_orphan(&self, exe: &Path, allow_headed: bool) -> Result<()> {
-        let file = self.root.join("owner.json");
+        let file = self.root().join("owner.json");
         let Some(owner) = std::fs::read_to_string(&file).ok().and_then(|t| serde_json::from_str::<Value>(&t).ok()) else { return Ok(()) };
         let (Some(pid), Some(socket)) = (owner["pid"].as_u64(), owner["socket"].as_str().filter(|s| loopback(s))) else {
             let _ = std::fs::remove_file(&file);
             return Ok(());
         };
         let line = command_line(pid).await.unwrap_or_default().to_lowercase();
-        let ours = line.contains(&exe.display().to_string().to_lowercase()) && line.contains(&format!("--user-data-dir={}", self.root.display()).to_lowercase()) && line.contains("--remote-debugging-port=0");
+        let ours = line.contains(&exe.display().to_string().to_lowercase()) && line.contains(&format!("--user-data-dir={}", self.root().display()).to_lowercase()) && line.contains("--remote-debugging-port=0");
         if !ours {
             let _ = std::fs::remove_file(&file);
             return Ok(());
@@ -383,9 +443,15 @@ impl Worker {
         let mut s = self.st.lock();
         s.generation += 1;
         s.run_active = true;
+        s.own = if in_own_browser() { crate::bridge::bridge().own_browser() } else { None };
+        if in_own_browser() && s.own.is_none() {
+            crate::log::write("    background: the browser extension isn't connected, so this run uses the hidden browser");
+        }
         if !keep_page {
             s.selected = None;
+            s.retire = s.own.is_some();
         }
+        s.own_last = None;
         if let Some(idle) = s.idle.take() {
             idle.abort();
         }
@@ -394,6 +460,16 @@ impl Worker {
     /// A run finished: every tab closes but the one its result shows, which is pictured and frozen so it stops using
     /// CPU, and the browser quits if nothing needs it for a while.
     pub async fn run_ended(&'static self) {
+        if let Some(conn) = self.own() {
+            let shot = self.picture(None, 80).await;
+            {
+                let mut s = self.st.lock();
+                s.run_active = false;
+                s.own_last = shot;
+            }
+            let _ = crate::bridge::bridge().ask(conn, "clinqyDone", json!({}), 5.0).await;
+            return;
+        }
         let (generation, keep, others, browser) = {
             let mut s = self.st.lock();
             s.run_active = false;
@@ -466,16 +542,84 @@ impl Worker {
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
         self.drop_child();
-        let _ = std::fs::remove_file(self.root.join("owner.json"));
+        let _ = std::fs::remove_file(self.root().join("owner.json"));
     }
 
     /// On quitting the app: no browser is left behind.
     pub fn shutdown(&self) {
         self.drop_child();
-        let _ = std::fs::remove_file(self.root.join("owner.json"));
+        let _ = std::fs::remove_file(self.root().join("owner.json"));
+    }
+
+    /// The extension reconnects whenever Chrome restarts its worker, so the current connection, not the first one.
+    fn own(&self) -> Option<u64> {
+        let conn = self.st.lock().own?;
+        crate::bridge::bridge().own_browser().or(Some(conn))
+    }
+
+    /// A tab for the run in the user's own browser: in the Clinqy tab group, never brought to the front.
+    async fn own_tab(&self, conn: u64, url: &str) -> Result<i64> {
+        let bridge = crate::bridge::bridge();
+        if std::mem::take(&mut self.st.lock().retire) {
+            let _ = bridge.ask(conn, "clinqyClear", json!({}), 5.0).await;
+        }
+        let made = bridge.ask(conn, "clinqyTab", json!({"url": url, "width": VIEWPORT.0, "height": VIEWPORT.1}), 15.0).await?;
+        let id = made["id"].as_i64().ok_or_else(|| anyhow!("Your browser didn't open a tab for Clinqy"))?;
+        self.st.lock().selected = Some(id);
+        Ok(id)
+    }
+
+    /// `command` for a run in the user's own browser. The extension answers the same commands.
+    async fn own_command(&self, conn: u64, command: &str, id: Option<i64>, args: Value) -> Result<Value> {
+        let bridge = crate::bridge::bridge();
+        let selected = self.selected();
+        match command {
+            "newTab" => Ok(json!({"id": self.own_tab(conn, args["url"].as_str().unwrap_or("about:blank")).await?})),
+            "switchTab" => {
+                self.st.lock().selected = id;
+                Ok(json!({"id": id}))
+            }
+            "tabs" => {
+                let Some(tab) = selected else { return Ok(json!({"tabs": []})) };
+                let info = bridge.ask(conn, "tabInfo", json!({"tabId": tab}), 5.0).await?;
+                Ok(json!({"tabs": [{"id": tab, "url": info["url"], "title": info["title"], "opened": true, "active": true}]}))
+            }
+            _ => {
+                let tab = id.or(selected).ok_or_else(gone)?;
+                let mut args = args;
+                args["tabId"] = json!(tab);
+                bridge.ask(conn, command, args, 30.0).await
+            }
+        }
+    }
+
+    /// A run in the user's browser when it isn't open: opens it minimized and waits for the extension. If that doesn't
+    /// work, the run carries on in the hidden browser.
+    async fn open_own_browser(&self) {
+        let run_active = self.st.lock().run_active;
+        if !run_active || !in_own_browser() || self.own().is_some() {
+            return;
+        }
+        let Some(exe) = find_browser() else { return };
+        crate::log::write("    background: opening your browser for the Clinqy tab");
+        let _ = Command::new(exe).arg("--start-minimized").stdin(std::process::Stdio::null()).stdout(std::process::Stdio::null()).stderr(std::process::Stdio::null()).spawn();
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Some(conn) = crate::bridge::bridge().own_browser() {
+                let mut s = self.st.lock();
+                s.own = Some(conn);
+                s.retire = true;
+                return;
+            }
+        }
+        crate::log::write("    background: the browser extension didn't connect, so this run uses the hidden browser");
     }
 
     pub async fn new_tab(&self, url: &str) -> Result<i64> {
+        self.open_own_browser().await;
+        if let Some(conn) = self.own() {
+            return self.own_tab(conn, url).await;
+        }
         self.start().await?;
         let (browser, port) = {
             let s = self.st.lock();
@@ -520,12 +664,24 @@ impl Worker {
         let raw = self.command("snapshot", id, json!({})).await.ok()?;
         let mut page = Page::parse(&raw, CONNECTION);
         page.pinned = true;
+        if self.own().is_some() {
+            page.tab_id = id.or(self.selected());
+        }
         page.estimated_area = Some(crate::platform::Rect::new(0.0, 0.0, page.viewport.0, page.viewport.1));
         Some(page)
     }
 
     /// A JPEG of the tab for the model or the live view. Between runs it's the picture kept at the end of the run.
     pub async fn picture(&self, id: Option<i64>, quality: u32) -> Option<String> {
+        if let Some(conn) = self.own() {
+            let (running, last) = { let s = self.st.lock(); (s.run_active, s.own_last.clone()) };
+            if !running {
+                return last;
+            }
+            let args = json!({"tabId": id.or(self.selected())?, "format": "jpeg", "quality": quality});
+            let shot = crate::bridge::bridge().ask(conn, "captureTask", args, 10.0).await.ok()?;
+            return shot["image"].as_str().map(String::from);
+        }
         let (_, tab) = self.tab(id).ok()?;
         if tab.frozen.load(Ordering::Relaxed) {
             return tab.last_image.lock().clone();
@@ -537,6 +693,10 @@ impl Worker {
     /// A lossless picture of the tab, for a saved screenshot.
     pub async fn png(&self, id: Option<i64>) -> Option<Vec<u8>> {
         use base64::Engine;
+        if let Some(conn) = self.own() {
+            let shot = crate::bridge::bridge().ask(conn, "captureTask", json!({"tabId": id.or(self.selected())?}), 10.0).await.ok()?;
+            return base64::engine::general_purpose::STANDARD.decode(shot["image"].as_str()?).ok();
+        }
         let (_, tab) = self.tab(id).ok()?;
         let shot = tab.cdp.call("Page.captureScreenshot", json!({"format": "png", "captureBeyondViewport": false})).await.ok()?;
         base64::engine::general_purpose::STANDARD.decode(shot["data"].as_str()?).ok()
@@ -544,6 +704,9 @@ impl Worker {
 
     /// The same commands the extension answers, on one of the worker's own tabs.
     pub async fn command(&self, command: &str, id: Option<i64>, args: Value) -> Result<Value> {
+        if let Some(conn) = self.own() {
+            return self.own_command(conn, command, id, args).await;
+        }
         match command {
             "newTab" => return Ok(json!({"id": self.new_tab(args["url"].as_str().unwrap_or("about:blank")).await?})),
             "tabs" => {
@@ -841,7 +1004,7 @@ async fn page_command(worker: &Worker, cdp: &Cdp, st: &mut TabState, command: &s
             let (frame, local, _) = element.ok_or_else(missing)?;
             let data = base64::engine::general_purpose::STANDARD.decode(args["data"].as_str().unwrap_or("")).map_err(|_| anyhow!("The upload file is missing"))?;
             call(cdp, st, &frame, "markUpload", json!([local])).await?;
-            let directory = worker.root.join("Uploads").join(uuid::Uuid::new_v4().to_string());
+            let directory = worker.root().join("Uploads").join(uuid::Uuid::new_v4().to_string());
             std::fs::create_dir_all(&directory)?;
             st.uploads.push(directory.clone()); // The browser may read the file only when the form is submitted.
             let name = Path::new(args["name"].as_str().unwrap_or("attachment")).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| "attachment".into());
@@ -925,6 +1088,17 @@ async fn key(cdp: &Cdp, chord: &str) -> Result<Value> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn everyday_browser_profiles_are_refused() {
+        let local = std::env::var("LOCALAPPDATA").unwrap();
+        for folder in [format!(r"{local}\Google\Chrome\User Data"), format!(r"{local}\google\chrome\user data\"), format!(r"{local}\Google\Chrome\User Data\Profile 1"), format!(r"{local}\Microsoft\Edge\User Data")] {
+            assert!(super::profile_problem(&folder).is_some(), "{folder}");
+        }
+        assert!(super::profile_problem(r"D:\Clinqy\Browser").is_none());
+        assert!(super::profile_problem(&format!(r"{local}\Google\Chrome\User Data2")).is_none());
+        assert!(super::profile_problem("Browser").is_some());
+    }
+
     use super::*;
     use base64::Engine;
 

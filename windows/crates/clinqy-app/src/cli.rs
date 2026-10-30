@@ -40,12 +40,15 @@ pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding ag
   clinqy setup [--model <name>] [--connect <names|all|none>] [--no-extension]
         Everything at once: the model (auto unless named), coding agents (all unless named), the browser extension,
         then what's ready and what still needs you.
+  clinqy voice check [seconds]             Try Windows' speech service on this PC, and say what it heard.
+  clinqy update [--check] [--force]        Install the newest version, keeping your settings and data. --check only
+        looks; --force reinstalls even when up to date. It waits for you if a task is running.
   clinqy settings [--path]                 Open the settings file (keys, hotkeys, everything else).
   clinqy doctor                            What's set up and what isn't (model, extension, voice, Outlook).
   clinqy mcp                               Serve Clinqy as an MCP server on stdio (claude mcp add clinqy -- clinqy mcp).
 ";
 
-fn rt() -> tokio::runtime::Runtime {
+pub fn rt() -> tokio::runtime::Runtime {
     tokio::runtime::Builder::new_multi_thread().worker_threads(2).enable_all().build().expect("runtime")
 }
 
@@ -195,6 +198,18 @@ pub fn main(args: Vec<String>) -> i32 {
                 Err(e) => fail(&e.to_string()),
             }
         }
+        "voice" => {
+            let secs = rest.get(1).and_then(|s| s.parse::<u64>().ok()).unwrap_or(3);
+            let end = std::time::Instant::now() + std::time::Duration::from_secs(secs);
+            match crate::winspeech::listen(&|| std::time::Instant::now() >= end) {
+                Ok(text) => {
+                    println!("Windows speech works. Heard: {text:?}");
+                    0
+                }
+                Err(e) => fail(&format!("Windows speech can't run: {e}")),
+            }
+        }
+        "update" | "upgrade" => crate::update::command(&rest),
         "version" => {
             println!("clinqy {}", env!("CARGO_PKG_VERSION"));
             0

@@ -182,9 +182,11 @@ function ai() {
 }
 function background() {
   const b = S.background || {};
-  return `<div class="card"><div class="row"><div class="grow"><h2>Work in the background</h2><p>Every task runs in a hidden browser, so you keep your mouse, keyboard and windows. Say “in the background” or “in front of me” in a request to choose for just that task.</p></div><button class="switch ${b.always ? "on" : ""}" data-do="background" ${b.managed ? "disabled" : ""}></button></div>${b.managed ? `<p class="note">Set by BACKGROUND_TASKS in the environment.</p>` : ""}</div>
-    <div class="card"><h2>Background browser</h2><p>A separate ${esc(b.browser || "browser")} with its own profile: your own browser is never touched. Sites you need signed in for, sign in to here once and it stays signed in.</p>
+  return `<div class="card"><div class="row"><div class="grow"><h2>Work in the background</h2><p>Every task runs out of your way, so you keep your mouse, keyboard and windows. Say “in the background” or “in front of me” in a request to choose for just that task.</p></div><button class="switch ${b.always ? "on" : ""}" data-do="background" ${b.managed ? "disabled" : ""}></button></div>${b.managed ? `<p class="note">Set by BACKGROUND_TASKS in the environment.</p>` : ""}</div>
+    <div class="card"><div class="row"><div class="grow"><h2>Work in a tab in my browser</h2><p>Tasks use your own browser and its sign-ins, in a blue Clinqy tab group, while you carry on in any other tab or window. They act in your real accounts, and your browser shows a debugging bar while a task runs. Needs the browser extension.</p></div><button class="switch ${b.ownBrowser ? "on" : ""}" data-do="backgroundBrowser" ${b.busy ? "disabled" : ""}></button></div></div>
+    <div class="card"><h2>${b.ownBrowser ? "Hidden browser (not in use)" : "Background browser"}</h2><p>A separate ${esc(b.browser || "browser")} with its own profile, because browsers don't allow automation on your everyday profile. Sign in to the sites you need here once and they stay signed in.</p>
     ${b.browser ? `<div class="row">${b.signingIn ? `<span class="badge warn">Signing in</span><span class="grow note">Sign in to your sites in the window that opened, then finish here.</span><button class="btn primary" data-do="finishLogin">Finish sign-in</button>` : `<span class="grow note">${b.running ? "In use by a task." : "Not running. It starts when a task needs it."}</span><button class="btn" data-do="signIn" ${b.busy ? "disabled" : ""}>Sign in…</button>`}</div>` : `<p class="note" style="color:var(--orange)">Install Google Chrome or Microsoft Edge to use background web tasks.</p>`}</div>
+    <div class="card"><h2>Profile folder</h2><p>Where the background browser keeps its sign-ins. Leave it empty to use Clinqy's own folder.</p><div class="row"><input type="text" id="workerprofile" class="grow" value="${esc(b.profile || "")}" placeholder="${esc(b.profileUsed || "")}"><button class="btn" data-do="workerProfile" ${b.busy || b.signingIn ? "disabled" : ""}>Save</button></div></div>
     <div class="card"><h2>What runs in the background</h2><p>Web pages, files, PDFs, media and anything that needs no window. If a task needs a desktop app, Clinqy stops and asks: keep it hidden, continue in the foreground, or stop.</p><div class="row"><button class="btn" data-tab="Tasks">Tasks &amp; Recovery</button><button class="btn" data-do="live" ${b.hasView ? "" : "disabled"}>Show background work</button></div></div>`;
 }
 function tasks() {
@@ -220,6 +222,7 @@ function general() {
   const g = S.general || {};
   return `<div class="card"><div class="row"><div class="grow"><h2>Open at login</h2><p>Start Clinqy when you sign in to Windows.</p></div><button class="switch ${g.login ? "on" : ""}" data-do="login"></button></div>
     <div class="row"><div class="grow"><h2>Keep listening after a spoken task</h2><p>The mic stays open for 5 seconds for a follow-up.</p></div><button class="switch ${g.followUp ? "on" : ""}" data-do="followUp"></button></div>
+    <div class="row"><div class="grow"><h2>Voice engine</h2><p>Whisper is the most accurate and stays on this PC. Windows speech answers sooner, and may send audio to Microsoft. If it can't run, Clinqy uses Whisper.</p></div><select id="voiceEngine"><option value="whisper" ${g.voiceEngine !== "windows" ? "selected" : ""}>Whisper, on this PC</option><option value="windows" ${g.voiceEngine === "windows" ? "selected" : ""}>Windows speech</option></select></div>
     <div class="row"><div class="grow"><h2>Voice language</h2></div><select id="voice">${(g.languages || []).map(([c, l]) => `<option value="${esc(c)}" ${c === g.language ? "selected" : ""}>${esc(l)}</option>`).join("")}</select></div></div>
     <div class="card"><h2>Your data</h2><p>Stored on this PC. Model calls go only to the provider you chose.</p><div class="row"><button class="btn" data-do="memory">Edit memory…</button><button class="btn" data-do="profile">Job profile…</button><button class="btn" data-do="settings">Settings file…</button></div></div>
     <div class="card"><div class="row"><div class="grow"><h2>Check setup</h2><p>What's ready and what isn't.</p></div><button class="btn" data-do="check">Check setup…</button></div></div>`;
@@ -290,6 +293,8 @@ function act(what) {
     case "apikey": { const v = $("apikey").value.trim(); if (v) { post("apiKey", { provider: wanted, key: v }); $("apikey").value = ""; models[wanted] = undefined; } break; }
     case "baseurl": post("baseUrl", { url: $("baseurl").value.trim() }); models[wanted] = undefined; break;
     case "saveModel": { const sel = $("model").value; const id = sel === "__custom" ? ($("customModel")?.value || "").trim() : sel; if (sel === "__custom" && !id) return; post("saveModel", { provider: wanted, model: id }); if (models[wanted]) models[wanted].saved = id; if (sel === "__custom") { models[wanted].choices.push({ id, label: id }); custom = ""; } break; }
+    case "backgroundBrowser": post("backgroundBrowser", { on: !S.background.ownBrowser }); break;
+    case "workerProfile": post("workerProfile", { folder: $("workerprofile").value.trim() }); break;
     case "limits": post("limits", { tokens: $("tokens").value.trim(), requests: $("requests").value.trim() }); break;
     case "background": post("background", { on: !S.background.always }); break;
     case "shortcuts": post("shortcuts", { summon: drafts.summon || S.summonSpec, talk: drafts.talk ?? S.talkSpec }); drafts = {}; break;
@@ -303,6 +308,7 @@ document.addEventListener("change", (e) => {
   const t = e.target;
   if (t.id === "range") post("range", { range: t.value });
   else if (t.id === "voice") post("voice", { language: t.value });
+  else if (t.id === "voiceEngine") post("voiceEngine", { engine: t.value });
   else if (t.id === "model") { custom = t.value === "__custom" ? (picked || S.currentProvider) : ""; render(); }
 });
 window.addEventListener("keydown", (e) => {

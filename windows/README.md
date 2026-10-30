@@ -35,6 +35,7 @@ clinqy models             # the models it offers on this PC (`clinqy model codex
 clinqy extension install  # Clinqy loads its own extension into Chrome, Edge or Brave
 clinqy connect all        # MCP for coding agents: all, or claude, codex, agy, cursor, gemini, windsurf
 clinqy doctor
+clinqy update             # install the newest version, keeping your settings and data
 ```
 
 Everything is also in the Clinqy window: the gear on the command bar, or tray icon → **Dashboard…**. To uninstall,
