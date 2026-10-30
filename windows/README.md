@@ -18,7 +18,7 @@ replays on Windows.
 
 1. Download `Clinqy-windows-x64.zip` from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest),
    unzip it and double-click **`Install Clinqy.bat`**. No admin rights needed. It installs to
-   `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH, turns on Open at login
+   `%LOCALAPPDATA%\Programs\Clinqy`, adds a Start menu shortcut, puts `clinqy` on your PATH
    and starts Clinqy.
 2. Paste the setup prompt from the [main README](../README.md#setup-on-windows) (or the website) into your coding agent.
    It picks the AI you already have (Claude Code, then Codex, then agy, then Ollama), has Clinqy load its own browser

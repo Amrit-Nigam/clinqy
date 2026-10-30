@@ -1,7 +1,7 @@
 # Installs Clinqy for Windows for the current user (no admin needed):
 #   - copies the app to %LOCALAPPDATA%\Programs\Clinqy (replacing an older version, keeping your settings and data)
 #   - adds a Start menu shortcut and puts `clinqy` on your PATH (for terminals and coding agents)
-#   - opens Clinqy at login, and starts it
+#   - starts it (Open at login is off unless you pass -Login, or turn it on in Clinqy's settings)
 #
 # From an unzipped release:   double-click "Install Clinqy.bat" (it runs this with the right PowerShell settings)
 # Or in one line:             irm <release-url>/install.ps1 | iex      (downloads the latest zip itself)
@@ -9,7 +9,7 @@ param(
     [string]$Zip = '',
     [string]$Url = 'https://github.com/Amrit-Nigam/clinqy/releases/latest/download/Clinqy-windows-x64.zip',
     [switch]$NoStart,
-    [switch]$NoLogin
+    [switch]$Login
 )
 
 $ErrorActionPreference = 'Stop'
@@ -81,8 +81,8 @@ if (-not (($path -split ';') -contains $dest)) {
     Say 'Command: clinqy (open a new terminal to use it)'
 }
 
-# Open at login (the tray menu can turn it off).
-if (-not $NoLogin) {
+# Open at login only when asked for: the app's own switch does it otherwise (Dashboard -> General).
+if ($Login) {
     Set-ItemProperty -Path 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Run' -Name 'Clinqy' -Value ('"' + (Join-Path $dest 'ClinqyApp.exe') + '" --login')
 }
 
