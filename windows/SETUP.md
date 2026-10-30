@@ -100,6 +100,9 @@ clinqy run --background "open example.com and tell me the page title"
 | **Hold Ctrl+H** | Talk. It listens only while you hold the keys. |
 | **Gear on the bar** | Open the Clinqy window: AI and model, background tasks, tasks, and every keyboard shortcut. |
 | **Background switch on the bar** | Run tasks out of your way while you keep working. |
+| **Ctrl+P / Ctrl+S during a task** | Pause or resume / stop. In a background task press twice within 2 seconds, so the first press still reaches your app. The rest of the time they're Print and Save as usual. |
+| **Follow up**, or `clinqy add "…"` | Add to a task at any time. A finished task carries on with everything you added. |
+| **Drag the capsule or the bar** | Move it anywhere. It's back in its usual place the next time it opens. |
 
 If a background task needs your screen, a card appears at the top right and waits for you. Choose **Run in foreground**,
 **Keep in background** or **Stop task**.
@@ -153,6 +156,8 @@ automation on your everyday one. You have two options, both in the Clinqy window
 
 **Still stuck?** The log is at `%LOCALAPPDATA%\Clinqy\Logs\agent.log`.
 
+**A task says "Couldn't finish".** Clinqy couldn't do it, and says what stopped it. Use **Follow up** to tell it what to try next.
+
 ## Update or uninstall
 
 **Update:** run `clinqy update`, or click **Update now** on the card Clinqy shows when a new version is out. It checks
@@ -189,6 +194,18 @@ Run on 31 October 2026 on Windows 11 with Clinqy for Windows 0.3.0.
   first-time steps didn't run. The prompt's "Needs you" path wasn't used.
 - **SmartScreen.** The zip was downloaded with PowerShell rather than a browser, so SmartScreen had no reason to appear.
 - **A plain chat with no terminal.** The prompt covers it, but it wasn't run this time.
+
+### Added in 0.3.2
+
+Tested on 31 October 2026 with simulated keyboard and mouse input.
+
+| Check | Result |
+|---|---|
+| A page fails and the model answers from memory | Challenged, then reported as failed, with nothing saved to memory |
+| Follow-up during a task, after it, and later again | All picked up, with the task's context |
+| Ctrl+P and Ctrl+S on the screen | Pause, resume and stop all worked, repeatedly |
+| Ctrl+S in a background task | One press left the task running, and a second within 2 seconds stopped it |
+| Dragging the capsule and the bar | Both moved by exactly the drag, and the capsule was back at the top center for the next task |
 
 ### Added in 0.3.1
 

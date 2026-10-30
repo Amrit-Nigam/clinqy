@@ -107,6 +107,10 @@
 <script>
 const $ = (s) => document.querySelector(s);
 const send = (o) => window.ipc.postMessage(JSON.stringify(o));
+// Anything that isn't a control drags the bar; it's centred again the next time it opens.
+document.addEventListener("mousedown", (e) => {
+  if (e.button === 0 && !e.target.closest("input, textarea, select, button, a, .row, [contenteditable]")) send({ type: "drag" });
+});
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const O = orb($("#orb"));
 let S = { snap: {}, history: [], workflows: [], skills: [], listening: false, transcript: "", status: "", hotkey: "Ctrl+Alt", talkKey: "Ctrl+H",

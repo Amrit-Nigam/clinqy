@@ -404,6 +404,10 @@ impl Island {
         }
     }
 
+    pub fn recenter(&self) {
+        self.native.recenter();
+    }
+
     pub fn hide(&self) {
         let mut last = self.last.lock();
         if last.visible {

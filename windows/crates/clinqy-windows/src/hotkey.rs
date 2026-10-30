@@ -21,6 +21,109 @@ pub enum HotEvent {
     /// Push-to-talk went down / came up (its key or its modifiers let go).
     TalkDown,
     TalkUp,
+    /// Pause or stop, while a task runs.
+    TaskKey(TaskKey),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskKey {
+    Pause,
+    Stop,
+    /// A background task: the app in front had this press, and a second one acts.
+    PauseHint,
+    StopHint,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TaskMode {
+    Off,
+    /// The task has the screen, so one press acts.
+    Foreground,
+    /// The user is working: Ctrl+S has to stay Save, so it takes a second press.
+    Background,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TaskKeyPress {
+    Pass,
+    Swallow,
+    Hint,
+    Act,
+}
+
+const SECOND_PRESS: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// What a press of a task key does. `since` is how long ago the same key was last pressed.
+fn task_key_press(mode: TaskMode, repeat: bool, since: Option<std::time::Duration>) -> TaskKeyPress {
+    match mode {
+        TaskMode::Off => TaskKeyPress::Pass,
+        TaskMode::Foreground if repeat => TaskKeyPress::Swallow,
+        TaskMode::Foreground => TaskKeyPress::Act,
+        TaskMode::Background if repeat => TaskKeyPress::Pass,
+        TaskMode::Background if since.is_some_and(|s| s <= SECOND_PRESS) => TaskKeyPress::Act,
+        TaskMode::Background => TaskKeyPress::Hint,
+    }
+}
+
+static TASK_MODE: RwLock<TaskMode> = RwLock::new(TaskMode::Off);
+static TASK_KEYS: RwLock<[Option<(Mods, u16)>; 2]> = RwLock::new([None, None]);
+/// The task key being held and its latest event, and the last one pressed and when.
+static TASK_HELD: parking_lot::Mutex<(u16, Option<std::time::Instant>, Option<(u16, std::time::Instant)>)> = parking_lot::Mutex::new((0, None, None));
+/// Longer than Windows' longest delay before a held key repeats. A key-up can go missing (a swallowed key's often
+/// does when the window in front changes), so "held" can't last longer than this without another event.
+const REPEAT_GAP: std::time::Duration = std::time::Duration::from_millis(1100);
+
+/// Pause and stop while a task runs ("off" turns one off).
+pub fn set_task_keys(pause: &str, stop: &str) {
+    *TASK_KEYS.write().unwrap_or_else(|e| e.into_inner()) = [parse_talk(pause), parse_talk(stop)];
+}
+
+/// Tests may send input that counts as the user's (CLINQY_ACCEPT_SYNTHETIC_KEYS=1).
+pub(crate) fn accept_synthetic() -> bool {
+    *ACCEPT_SYNTHETIC.get_or_init(|| std::env::var("CLINQY_ACCEPT_SYNTHETIC_KEYS").as_deref() == Ok("1"))
+}
+
+pub fn set_task_mode(mode: TaskMode) {
+    let mut current = TASK_MODE.write().unwrap_or_else(|e| e.into_inner());
+    if *current != mode {
+        TASK_HELD.lock().0 = 0;
+    }
+    *current = mode;
+}
+
+/// A task key going down or up, with the Mods exactly as held. True when the app in front mustn't get it.
+fn task_key(vk: u16, mods: Mods, down: bool, on: &(dyn Fn(HotEvent) + Send + Sync)) -> bool {
+    let mode = *TASK_MODE.read().unwrap_or_else(|e| e.into_inner());
+    let mut held = TASK_HELD.lock();
+    if !down {
+        if held.0 == vk {
+            held.0 = 0;
+        }
+        return false;
+    }
+    if mode == TaskMode::Off {
+        return false;
+    }
+    let keys = *TASK_KEYS.read().unwrap_or_else(|e| e.into_inner());
+    let Some(which) = keys.iter().position(|k| *k == Some((mods, vk))) else { return false };
+    let now = std::time::Instant::now();
+    let repeat = held.0 == vk && held.1.is_some_and(|at| now - at < REPEAT_GAP);
+    let since = held.2.filter(|(last, _)| *last == vk).map(|(_, at)| now - at);
+    held.0 = vk;
+    held.1 = Some(now);
+    if !repeat {
+        held.2 = Some((vk, now));
+    }
+    drop(held);
+    let press = task_key_press(mode, repeat, since);
+    match (press, which) {
+        (TaskKeyPress::Act, 0) => on(HotEvent::TaskKey(TaskKey::Pause)),
+        (TaskKeyPress::Act, _) => on(HotEvent::TaskKey(TaskKey::Stop)),
+        (TaskKeyPress::Hint, 0) => on(HotEvent::TaskKey(TaskKey::PauseHint)),
+        (TaskKeyPress::Hint, _) => on(HotEvent::TaskKey(TaskKey::StopHint)),
+        _ => {}
+    }
+    matches!(press, TaskKeyPress::Act | TaskKeyPress::Swallow)
 }
 
 #[derive(Clone, Copy, Default, PartialEq, Eq, Debug)]
@@ -143,7 +246,7 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                 let down = matches!(wp.0 as u32, WM_KEYDOWN | WM_SYSKEYDOWN);
                 let vk = VIRTUAL_KEY(k.vkCode as u16);
                 let mut st = STATE.lock();
-                let (mods, held, spoiled) = &mut *st;
+                let mods = &mut st.0;
                 let is_mod = match vk {
                     VK_LCONTROL | VK_RCONTROL | VK_CONTROL => {
                         // AltGr sends a fake left Ctrl with this scan code first: ignore it.
@@ -168,6 +271,15 @@ unsafe extern "system" fn proc_(code: i32, wp: WPARAM, lp: LPARAM) -> LRESULT {
                     }
                     _ => false,
                 };
+                if !is_mod {
+                    let held = *mods;
+                    drop(st);
+                    if task_key(vk.0, held, down, h.on.as_ref()) {
+                        return LRESULT(1);
+                    }
+                    st = STATE.lock();
+                }
+                let (mods, held, spoiled) = &mut *st;
                 let mut event = None;
                 // Push-to-talk: its key with exactly its modifiers. Held, its key is swallowed (repeats too).
                 if let Some((tm, tk)) = config.talk {
@@ -286,6 +398,18 @@ pub fn set_enabled(enabled: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn task_keys_leave_save_alone_during_background_work() {
+        let (fg, bg, soon, late) = (TaskMode::Foreground, TaskMode::Background, std::time::Duration::from_secs(1), std::time::Duration::from_secs(3));
+        assert_eq!(task_key_press(TaskMode::Off, false, Some(soon)), TaskKeyPress::Pass);
+        assert_eq!(task_key_press(fg, false, None), TaskKeyPress::Act);
+        assert_eq!(task_key_press(fg, true, None), TaskKeyPress::Swallow);
+        assert_eq!(task_key_press(bg, false, None), TaskKeyPress::Hint);
+        assert_eq!(task_key_press(bg, false, Some(late)), TaskKeyPress::Hint);
+        assert_eq!(task_key_press(bg, false, Some(soon)), TaskKeyPress::Act);
+        assert_eq!(task_key_press(bg, true, Some(soon)), TaskKeyPress::Pass);
+    }
 
     #[test]
     fn parses_talk_keys() {

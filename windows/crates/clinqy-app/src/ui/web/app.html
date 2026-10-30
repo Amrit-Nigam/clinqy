@@ -210,6 +210,8 @@ function allKeys() {
   const open = S.summonLabel, talk = S.talkLabel;
   return [
     [[open], "Open or close the command bar (tap)"],
+    [["Ctrl+P"], "While a task runs: pause or resume. In a background task, press twice"],
+    [["Ctrl+S"], "While a task runs: stop. In a background task, press twice"],
     [[talk], talk === "Off" ? "Push to talk (off)" : "Talk: hold and speak, let go to send"],
     [[open], "While a task runs: add to it, pause or stop it (tap)"],
     [["Enter"], "Send your request or answer"],

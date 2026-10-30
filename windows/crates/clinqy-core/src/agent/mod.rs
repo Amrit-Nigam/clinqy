@@ -187,6 +187,8 @@ pub struct Agent {
     quiet: Arc<QuietBuddy>,
     /// What the next run decided about where to work.
     next_background: AtomicBool,
+    /// The last run was a background one, so a follow-up to it is too.
+    last_background: AtomicBool,
     brain: Brain,
     ui: Mutex<Ui>,
     emit: Box<dyn Fn(Event) + Send + Sync>,
@@ -236,6 +238,8 @@ struct RunInfo {
     run_result: Option<ResultCard>,
     finished: bool,
     background: bool,
+    /// What the user added during the run, kept with the task for anything that continues it.
+    follow_ups: Vec<String>,
     /// Its record in the task store (test and QA runs have none).
     task: Option<String>,
 }
@@ -250,6 +254,7 @@ impl Agent {
             hands,
             quiet,
             next_background: AtomicBool::new(false),
+            last_background: AtomicBool::new(false),
             brain: Brain::new(),
             ui: Mutex::new(Ui {
                 phase: Phase::Idle,
@@ -373,9 +378,23 @@ impl Agent {
             return self.answer(Some(text.to_string()));
         }
         self.added.lock().push(text.to_string());
+        self.current.lock().follow_ups.push(text.to_string());
         self.push_step(&format!("You: {text}"), StepState::Info);
         self.progress();
         self.log(&format!("  + user added: {text}"));
+    }
+
+    /// More for the task: folded into the running one, or, once it's over, the latest task carries on with it.
+    pub fn follow_up(self: &Arc<Self>, raw: &str) {
+        let text = raw.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.is_running() {
+            return self.add_context(text);
+        }
+        self.context.lock().continuation = history::history().latest();
+        self.submit(text, RunOptions::default());
     }
 
     /// The user's reply to the current question (None = declined / cancelled). A waiting review takes it too:
@@ -535,7 +554,8 @@ impl Agent {
         }
         self.run_dry.store(dry, Ordering::Relaxed);
         // A dry run points at things with the cursor, so it's always in front of the user.
-        let background = crate::background::choice(&mut request).or(opts.background).unwrap_or_else(crate::background::always) && !dry;
+        let continuing = self.context.lock().continuation.is_some() && self.last_background.load(Ordering::SeqCst);
+        let background = crate::background::choice(&mut request).or(opts.background).or(continuing.then_some(true)).unwrap_or_else(crate::background::always) && !dry;
         if request.is_empty() {
             return;
         }
@@ -883,11 +903,23 @@ impl Agent {
                 result: run_result,
                 trace: (!info.trace.is_empty()).then(|| info.trace.clone()),
                 read_text: info.read_text.as_ref().map(|t| t.chars().take(8000).collect()),
-                task: info.continuation.as_ref().map(|c| c.task.clone().unwrap_or(c.request.clone())),
+                task: task_with_follow_ups(info.continuation.as_ref().map(|c| c.task.clone().unwrap_or(c.request.clone())), &request, &info.follow_ups),
             });
         }
         self.changed();
+        self.last_background.store(info.background, Ordering::SeqCst);
         (self.emit)(Event::Finished { answer: text.to_string(), ok, background: info.background });
+        // Something added as the task ended was never seen: it carries on with that, rather than losing it.
+        let late = std::mem::take(&mut *self.added.lock());
+        if !late.is_empty() && text != "Stopped" && !info.test && !info.dry && info.qa.is_none() {
+            self.log("carrying on with what the user added at the end");
+            let me = self.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                me.follow_up(&late.join("\n"));
+            });
+            return;
+        }
         // Out of steps or stuck isn't the end of the task: carry on by itself a few times.
         let progressed = steps.iter().filter(|s| s.state == StepState::Ok).count() >= 10;
         let limit = if progressed { 12 } else { 3 };
@@ -1010,4 +1042,32 @@ pub fn circle_bounds(points: &[Point]) -> Rect {
         y1 = y1.max(p.y);
     }
     Rect::new(x0, y0, x1 - x0, y1 - y0)
+}
+
+/// The whole task as a later run should see it: what it was, and everything the user added.
+fn task_with_follow_ups(task: Option<String>, request: &str, follow_ups: &[String]) -> Option<String> {
+    if follow_ups.is_empty() {
+        return task;
+    }
+    let added = follow_ups.iter().map(|f| format!("- {f}")).collect::<Vec<_>>().join("
+");
+    Some(format!("{}
+The user then added:
+{added}", task.as_deref().unwrap_or(request)))
+}
+
+#[cfg(test)]
+mod follow_up_tests {
+    use super::task_with_follow_ups;
+
+    #[test]
+    fn follow_ups_stay_with_the_task() {
+        assert_eq!(task_with_follow_ups(None, "book a table", &[]), None);
+        assert_eq!(task_with_follow_ups(Some("plan a trip".into()), "continue", &[]).as_deref(), Some("plan a trip"));
+        let both = task_with_follow_ups(None, "book a table", &["for four".into(), "at eight".into()]).unwrap();
+        assert_eq!(both, "book a table
+The user then added:
+- for four
+- at eight");
+    }
 }

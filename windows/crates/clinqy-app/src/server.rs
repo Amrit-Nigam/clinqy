@@ -114,7 +114,7 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
             out.end(json!({"event": "ok"})).await
         }
         "add" => {
-            agent.add_context(&s("text"));
+            agent.follow_up(&s("text"));
             out.end(json!({"event": "ok"})).await
         }
         "cancel" => {
