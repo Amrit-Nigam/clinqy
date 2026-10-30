@@ -48,6 +48,9 @@ double-click `Uninstall Clinqy.bat` in the install folder (`uninstall.ps1 -Purge
 | **Tap Ctrl+Alt** | Open the command bar. Type, press Enter. |
 | **Hold Ctrl+H** | Talk: it listens only while you hold it and sends when you let go (on-device Whisper, downloaded the first time). A quick tap still reaches the app in front. |
 | **Ctrl+Alt while it works** | Add to the task or change the plan; **Pause** / **Resume** (holds before its next step) or **Stop** (at once). |
+| **Ctrl+P / Ctrl+S while it works** | Pause or resume / stop. Only while a task runs, so they're Print and Save the rest of the time. In a background task press twice within 2 seconds: the first press still reaches your app. `PAUSE_HOTKEY` and `STOP_HOTKEY` change them. |
+| **Follow up** on the finished card, or `clinqy add "…"` | More for the task, any time. A finished task carries on from where it was, with everything you added. |
+| **Drag the capsule or the bar** | Move it anywhere. It's back at the top center the next time it opens. |
 | **Click the tray icon while it works** | Stop. The tray menu also has Pause. `clinqy pause`, `clinqy resume` and `clinqy stop` work from a terminal. |
 | **Esc** | Close the bar. |
 

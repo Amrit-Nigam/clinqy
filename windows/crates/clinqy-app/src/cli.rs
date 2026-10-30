@@ -19,7 +19,9 @@ pub const HELP: &str = "clinqy — drive Clinqy from a terminal or any coding ag
   clinqy page [read|url]                   What's in the browser tab in front (via the extension), read-only.
   clinqy look [read|url]                   What's in front (the app's controls, or the browser tab), read-only.
   clinqy answer \"<text>\"                    Answer the question Clinqy is waiting on.
+  clinqy status                            Whether a task is running, paused or in the background.
   clinqy tasks                             Recent tasks and what happened to them.
+  clinqy add \"<text>\"                       More for the task: the running one, or the latest one if it's finished.
   clinqy stop                              Stop the current task now.
   clinqy pause | resume                    Hold the current task at its next step, then carry on.
   clinqy open                              Open the command bar.
@@ -100,6 +102,16 @@ pub fn main(args: Vec<String>) -> i32 {
             let sub = rest.first().cloned().unwrap_or_else(|| "page".into());
             simple("page", json!({"cmd": sub}), true)
         }
+        "status" => {
+            let v = rt().block_on(async { ipc::call("status", json!({}), |_| {}).await.ok() });
+            let s = v.as_ref().map(|v| &v["snapshot"]);
+            match s {
+                Some(s) if s["running"] == true => println!("running{}{}", if s["paused"] == true { ", paused" } else { "" }, if s["background"] == true { ", in the background" } else { "" }),
+                _ => println!("idle"),
+            }
+            0
+        }
+        "add" => simple("add", json!({"text": rest.join(" ")}), true),
         "answer" => simple("answer", json!({"text": rest.join(" ")}), false),
         "stop" | "cancel" => simple("cancel", json!({}), false),
         "tasks" => {

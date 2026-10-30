@@ -5,7 +5,7 @@ use crate::ui::{Bar, Dashboard, Island, LiveView, ResultPanel};
 use clinqy_core::agent::{Context, Copied, Event as AgentEvent, RunOptions};
 use clinqy_core::platform::{Mood, Platform};
 use clinqy_core::{bridge, history, workflow, Agent};
-use clinqy_windows::hotkey::{self, HotEvent};
+use clinqy_windows::hotkey::{self, HotEvent, TaskKey};
 use clinqy_windows::{Overlay, WindowsPlatform};
 use parking_lot::Mutex;
 use serde_json::{json, Value};
@@ -87,6 +87,16 @@ pub fn run() -> anyhow::Result<()> {
     let p2 = proxy.clone();
     let agent = Agent::new(platform.clone(), overlay.clone(), move |e| {
         let _ = ev_tx.send(e.clone());
+        // Here, not on the UI thread: the pause and stop keys can't wait for it to get to this.
+        match &e {
+            AgentEvent::Changed(run) => hotkey::set_task_mode(match (run.running, run.background) {
+                (false, _) => hotkey::TaskMode::Off,
+                (true, false) => hotkey::TaskMode::Foreground,
+                (true, true) => hotkey::TaskMode::Background,
+            }),
+            AgentEvent::Finished { .. } => hotkey::set_task_mode(hotkey::TaskMode::Off),
+            _ => {}
+        }
         let _ = p2.send_event(UserEvent::Agent(e));
     });
     let p3 = proxy.clone();
@@ -121,6 +131,10 @@ pub fn run() -> anyhow::Result<()> {
     let talk_label = hotkey::talk_label(&talk);
     {
         let p = proxy.clone();
+        hotkey::set_task_keys(
+            &clinqy_core::config::value("PAUSE_HOTKEY").unwrap_or_else(|| "ctrl+p".into()),
+            &clinqy_core::config::value("STOP_HOTKEY").unwrap_or_else(|| "ctrl+s".into()),
+        );
         hotkey::start(&hk, &talk, move |e| {
             let _ = p.send_event(UserEvent::Hot(e));
         });
@@ -1159,8 +1173,11 @@ impl UiState {
     /// A background run finished: a card that goes by itself.
     fn finished_card(&mut self, answer: &str, ok: bool) {
         let title = if ok { "Done" } else if answer == "Stopped" { "Stopped" } else { "Couldn't finish" };
-        let actions = if clinqy_core::worker::worker().has_tab() { json!([["Show me", "__live"]]) } else { json!([]) };
-        self.notice_card(title, answer, actions, 12);
+        let mut actions = vec![json!(["Follow up", "__follow"])];
+        if clinqy_core::worker::worker().has_tab() {
+            actions.push(json!(["Show me", "__live"]));
+        }
+        self.notice_card(title, answer, json!(actions), 12);
     }
 
     /// A short message on the card that never takes focus; it goes by itself.
@@ -1239,6 +1256,19 @@ impl UiState {
         match h {
             // The summon chord: a tap opens (or closes) the bar; listening is push-to-talk's job.
             HotEvent::Pressed | HotEvent::Spoiled => {}
+            HotEvent::TaskKey(key) => {
+                let agent = self.agent().clone();
+                match key {
+                    TaskKey::Pause => {
+                        let paused = !agent.is_paused();
+                        agent.set_paused(paused);
+                        self.notice_card(if paused { "Paused" } else { "Resumed" }, "Press the same keys to carry on, or stop.", json!([]), 3);
+                    }
+                    TaskKey::Stop => agent.cancel(),
+                    TaskKey::PauseHint => self.notice_card("Press again to pause", "Press those keys again within 2 seconds to pause this background task.", json!([]), 3),
+                    TaskKey::StopHint => self.notice_card("Press again to stop", "Press those keys again within 2 seconds to stop this background task.", json!([]), 3),
+                }
+            }
             HotEvent::Released => {
                 if self.bar.visible() {
                     self.bar.hide();
@@ -1298,6 +1328,9 @@ impl UiState {
             }
             AgentEvent::Started => {
                 self.island_until = None;
+                if self.agent().context.lock().continuation.is_none() {
+                    self.island.recenter();
+                }
                 self.bar.hide();
                 // A background run shows the badge instead: nothing on the screen moves.
                 let background = self.agent().snapshot().background;
@@ -1361,6 +1394,8 @@ impl UiState {
                 // Stopped by the user: the bar comes back so they can say what to do differently.
                 if !ok && answer == "Stopped" && !self.voice_run && !background {
                     self.show_bar();
+                    // Opening the bar cancels the island's timer, and it would stay up.
+                    self.island_until = Some(Instant::now() + Duration::from_millis(1500));
                 }
                 let spoken = std::mem::take(&mut self.voice_run);
                 if spoken && ok && clinqy_core::config::on("FOLLOW_UP", false) {
@@ -1385,6 +1420,9 @@ impl UiState {
         let agent = self.agent().clone();
         match m["type"].as_str().unwrap_or("") {
             "ready" => self.refresh_bar(),
+            "drag" => {
+                let _ = self.bar.window.drag_window();
+            }
             "resize" => self.bar.resize(m["height"].as_f64().unwrap_or(120.0)),
             "hide" => {
                 if agent.question().is_some() {
@@ -1517,6 +1555,10 @@ impl UiState {
                     "__reply" | "__edit" => self.show_bar(),
                     "__submit" => agent.decide_review(true, None),
                     "__live" => self.show_live(),
+                    "__follow" => {
+                        agent.context.lock().continuation = history::history().latest();
+                        self.show_bar();
+                    }
                     "__later" => {}
                     "__update" => {
                         let proxy = self.shared.proxy.lock().clone();

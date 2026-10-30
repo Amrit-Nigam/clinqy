@@ -27,6 +27,10 @@ fn tools() -> Value {
                    "background": {"type": "boolean", "description": "Work in a hidden browser with its own sign-ins, leaving the user's mouse, keyboard and windows alone. Web pages, files and PDFs only."},
                    "timeout": {"type": "integer", "description": "Seconds to wait for the task to finish (default 300)."}}),
             &["task"], false),
+        tool("clinqy_add", "Add to a task",
+            "Give Clinqy more for its task: the running one takes it at its next step, or the latest task carries on with it if it has finished.",
+            json!({"text": {"type": "string", "description": "What to add, in plain words."}}),
+            &["text"], false),
         tool("clinqy_look", "Look at the screen",
             "What's in front right now, read-only. In a browser (with the Clinqy extension): the tab's title, URL, every field, button and link with its w-id, values and errors, and the visible text; mode=read gives the page's full text. In other apps: the window, focused element and visible controls from UI Automation.",
             json!({"mode": {"type": "string", "enum": ["page", "read", "url"], "description": "page (default), read (full text) or url."}}),
@@ -119,6 +123,17 @@ async fn handle(msg: Value) -> Option<Value> {
                         text("task is required", true)
                     } else {
                         run(&task, a["dry"] == true, a["background"] == true, a["timeout"].as_u64().unwrap_or(300)).await
+                    }
+                }
+                "clinqy_add" => {
+                    let added = a["text"].as_str().unwrap_or("").trim().to_string();
+                    if added.is_empty() {
+                        text("text is required", true)
+                    } else {
+                        match ipc::call("add", json!({"text": added}), |_| {}).await {
+                            Ok(_) => text("Added to the task.", false),
+                            Err(e) => text(&e.to_string(), true),
+                        }
                     }
                 }
                 "clinqy_look" => look(a["mode"].as_str().unwrap_or("page")).await,
