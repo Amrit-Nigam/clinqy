@@ -59,6 +59,9 @@ final class BrowserBridge {
         /// even while it's in the background.
         var tabId: Int?
         var pinned = false
+        /// Tokens bind references to an exact document and listing, including same-URL reloads.
+        var documentID: String?
+        var snapshotID: String?
     }
 
     private var listener: NWListener?
@@ -160,7 +163,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.9.6"
+    static let extensionVersion = "1.9.7"
     /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
     /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
     private var reloadAsked: [String: Int] = [:]
@@ -387,11 +390,17 @@ final class BrowserBridge {
     }
 
     func perform(_ cmd: String, on page: Page, _ args: [String: Any] = [:], timeout: Double = 4) async throws -> [String: Any] {
-        if page.connection == ChromeWorker.shared.identity { return try await ChromeWorker.shared.command(cmd, tabID: page.tabId, args: args) }
-        guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
+        guard let documentID = page.documentID, let snapshotID = page.snapshotID, let tabID = page.tabId else {
+            throw BridgeError.failed("This browser observation has no freshness tokens. Update the extension and take a fresh look.")
+        }
         var body = args
+        body["documentID"] = documentID
+        body["snapshotID"] = snapshotID
+        // Every action remains pinned to the observed tab, even when the user switches tabs.
+        body["tabId"] = tabID
+        if page.connection == ChromeWorker.shared.identity { return try await ChromeWorker.shared.command(cmd, tabID: tabID, args: body) }
+        guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
         body["cmd"] = cmd
-        if page.pinned, body["tabId"] == nil, let id = page.tabId { body["tabId"] = id }
         return try await request(conn, body, timeout: timeout)
     }
 
@@ -464,6 +473,7 @@ final class BrowserBridge {
     /// that couldn't be read, or more than half its elements changed): send the full listing instead.
     static func diff(previous: Page, current: Page) -> String? {
         guard previous.connection == current.connection, previous.tabId == current.tabId,
+              previous.documentID == current.documentID,
               previous.problem == nil, current.problem == nil,
               samePage(previous.url, current.url) else { return nil }
         let old = Dictionary(previous.elements.map { ($0.index, $0) }, uniquingKeysWith: { a, _ in a })
@@ -553,6 +563,7 @@ final class BrowserBridge {
                     headings: r["headings"] as? [String] ?? [], elements: els,
                     messages: r["messages"] as? [String] ?? [], text: r["text"] as? String ?? "",
                     above: r["above"] as? Int ?? 0, below: r["below"] as? Int ?? 0, ready: r["ready"] as? String ?? "complete",
-                    problem: r["error"] as? String, estimatedArea: Self.estimate(r), panes: panes, tabId: r["tabId"] as? Int)
+                    problem: r["error"] as? String, estimatedArea: Self.estimate(r), panes: panes, tabId: r["tabId"] as? Int,
+                    documentID: r["documentID"] as? String, snapshotID: r["snapshotID"] as? String)
     }
 }

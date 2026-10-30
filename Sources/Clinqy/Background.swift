@@ -1,10 +1,9 @@
 import AppKit
 
-/// A run that works out of the user's way: nothing is brought to the front, the pointer and keyboard stay theirs, and
-/// the buddy stays with them instead of flying to each click. Web pages are worked in Clinqy's own browser window
-/// (opened without focus, behind theirs) with input sent to that tab through the extension; other apps get clicks
-/// and keys posted to their process, with SkyLight's focus-without-raise where a window has to think it's active.
-/// The user hears back through notifications: when it's done, and when it needs them.
+/// Current background policy allows supported direct tools and owned headless Chrome/CDP only. Native app
+/// input, shared clipboard use and arbitrary scripts require attention and an explicit foreground switch.
+/// This type also retains experimental native-window bookkeeping; those mechanisms are not a guarantee that
+/// arbitrary native apps can run without focus. Local work requires an awake Mac and a running Clinqy process.
 @MainActor
 enum Background {
     /// This run is a background run.

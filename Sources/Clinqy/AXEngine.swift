@@ -18,6 +18,9 @@ struct UIElementInfo: @unchecked Sendable {
     var value: String? = nil
     /// Lives in the focused window's sheet or dialog (listed first: it's what the user has to answer).
     var inDialog: Bool = false
+    /// Window and observation that supplied this reference. Positional e-ids are valid only within this observation.
+    var observationID: UUID? = nil
+    var windowID: CGWindowID? = nil
 
     var center: CGPoint { CGPoint(x: frame.midX, y: frame.midY) }
 }
@@ -65,12 +68,13 @@ enum AXEngine {
 
     /// Collects visible actionable elements from `app`, breadth-first, up to `limit`. A sheet or modal dialog on
     /// the focused window is walked first; the menu bar only when asked (`pressMenu` reaches it by path).
-    static func elements(of app: NSRunningApplication, limit: Int = 200, menuBar: Bool = false) -> [UIElementInfo] {
+    static func elements(of app: NSRunningApplication, window snapshot: NativeWindowObservation? = nil, limit: Int = 200, menuBar: Bool = false) -> [UIElementInfo] {
+        if let snapshot, snapshot.pid != app.processIdentifier || snapshot.staleness() != nil { return [] }
         let root = AXUIElementCreateApplication(app.processIdentifier)
         AXUIElementSetMessagingTimeout(root, 0.5)
 
         var roots: [(AXUIElement, Bool)] = []
-        let window = mainWindow(root)
+        let window = snapshot?.element ?? mainWindow(root)
         let dialog = window.flatMap { dialogElement(in: $0) }
         if let dialog, let window, !CFEqual(dialog.element, window) { roots.append((dialog.element, true)) }
         if let window { roots.append((window, dialog.map { CFEqual($0.element, window) } ?? false)) }
@@ -121,7 +125,7 @@ enum AXEngine {
                         label: label.isEmpty ? "(unlabeled \(role.dropFirst(2)))" : label,
                         frame: frame, element: element,
                         ref: n == 1 ? base : "\(base)~\(n)",
-                        value: valueText(raw, role: role), inDialog: inDialog))
+                        value: valueText(raw, role: role), inDialog: inDialog, observationID: snapshot?.id, windowID: snapshot?.windowID))
                 }
             }
 
@@ -134,7 +138,7 @@ enum AXEngine {
         if found.count > limit { found = trimmed(found, to: limit) }
         return found.enumerated().map { i, e in
             UIElementInfo(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, element: e.element,
-                          ref: e.ref, value: e.value, inDialog: e.inDialog)
+                          ref: e.ref, value: e.value, inDialog: e.inDialog, observationID: e.observationID, windowID: e.windowID)
         }
     }
 
@@ -204,13 +208,12 @@ enum AXEngine {
         return elements.first { $0.ref == key } ?? elements.first { $0.id.caseInsensitiveCompare(key) == .orderedSame }
     }
 
-    /// The same control in a fresh scan: same ref, else the nearest one sharing its ref base (a "~N" repeat that
-    /// shifted because a twin appeared above it).
+    /// A fresh scan may resolve a semantic ref only when it is unique. Numbered duplicates are observation-local.
     static func twin(of wanted: UIElementInfo, in elements: [UIElementInfo]) -> UIElementInfo? {
-        if let exact = elements.first(where: { $0.ref == wanted.ref && !wanted.ref.isEmpty }) { return exact }
+        guard !wanted.ref.isEmpty else { return nil }
         let base = wanted.ref.split(separator: "~").first.map(String.init) ?? ""
-        let near = { (e: UIElementInfo) in hypot(e.frame.midX - wanted.frame.midX, e.frame.midY - wanted.frame.midY) }
-        return elements.filter { !base.isEmpty && $0.ref.hasPrefix(base) }.min { near($0) < near($1) }
+        let matches = elements.filter { $0.ref == base || $0.ref.hasPrefix(base + "~") }
+        return matches.count == 1 && !wanted.ref.contains("~") ? matches[0] : nil
     }
 
     /// Children, at most `childCap`. Long tables and lists hand over their visible rows instead, since the first
@@ -249,6 +252,10 @@ enum AXEngine {
 
     /// The focused window, else the first. A focused sheet (Save panels) stands for its parent window here;
     /// `dialogElement` finds the sheet again.
+    static func selectedWindow(of app: NSRunningApplication) -> AXUIElement? {
+        mainWindow(AXUIElementCreateApplication(app.processIdentifier))
+    }
+
     private static func mainWindow(_ root: AXUIElement, orFirst: Bool = true) -> AXUIElement? {
         guard let w: AXUIElement = attr(root, kAXFocusedWindowAttribute)
                 ?? (orFirst ? (attr(root, kAXWindowsAttribute) as [AXUIElement]?)?.first : nil) else { return nil }
@@ -375,23 +382,23 @@ enum AXEngine {
 
     /// Cheap signature of what's on screen; if it doesn't change after an action, the action missed.
     static func fingerprint(of app: NSRunningApplication) -> Int {
-        // Light walk: role + title + description + value only (a full label read is ~3x slower).
-        var hasher = Hasher()
         let root = AXUIElementCreateApplication(app.processIdentifier)
-        var queue: [AXUIElement] = []
-        if let window = mainWindow(root, orFirst: false) { queue.append(window) }
+        guard let window = mainWindow(root, orFirst: false) else { return 0 }
+        return fingerprint(of: window)
+    }
+
+    /// Content revision of an exact window. It must not silently switch to whichever window is now focused.
+    static func fingerprint(of window: AXUIElement) -> Int {
+        var hasher = Hasher()
+        var queue: [AXUIElement] = [window]
         var head = 0
         while head < queue.count, head < 600 {
             let el = queue[head]
             head += 1
             let v = attrs(el, fingerprintAttrs)
             for x in v { hasher.combine(x as? String) }
-            if let n = v[3] as? NSNumber { hasher.combine(n) }   // checkbox and slider values
+            if let n = v[3] as? NSNumber { hasher.combine(n) }
             queue.append(contentsOf: children(of: el, role: v[0] as? String ?? ""))
-        }
-        if let f: AXUIElement = attr(root, kAXFocusedUIElementAttribute) {
-            hasher.combine(attr(f, kAXRoleAttribute) as String?)
-            hasher.combine(attr(f, kAXValueAttribute) as String?)
         }
         return hasher.finalize()
     }
@@ -475,10 +482,23 @@ enum AXEngine {
         post(down, to: pid)
     }
 
-    /// Presses a control through Accessibility (exact, no mouse movement). Returns false if unsupported.
+    enum PressDelivery { case unsupported, delivered, uncertain }
+
+    /// Unsupported is the only safe signal for another input route. Timeouts may occur after the app applied it.
+    static func axPressDelivery(_ element: AXUIElement) -> PressDelivery {
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(element, &names) == .success else { return .uncertain }
+        guard (names as? [String] ?? []).contains(kAXPressAction as String) else { return .unsupported }
+        switch AXUIElementPerformAction(element, kAXPressAction as CFString) {
+        case .success: return .delivered
+        case .actionUnsupported: return .unsupported
+        default: return .uncertain
+        }
+    }
+
     static func axPress(_ element: AXUIElement) -> Bool {
-        guard actions(of: element).contains(kAXPressAction as String) else { return false }
-        return AXUIElementPerformAction(element, kAXPressAction as CFString) == .success
+        if case .delivered = axPressDelivery(element) { return true }
+        return false
     }
 
     private static func actions(of element: AXUIElement) -> [String] {
@@ -490,6 +510,21 @@ enum AXEngine {
     /// Gives keyboard focus to a text box through Accessibility.
     static func focus(_ element: AXUIElement) -> Bool {
         AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, kCFBooleanTrue) == .success
+    }
+
+    /// Read back the exact focus target (or its editable descendant), never merely "some text field".
+    static func focusedWithin(_ target: AXUIElement, in app: NSRunningApplication) -> Bool {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let focused: AXUIElement = attr(root, kAXFocusedUIElementAttribute),
+              let role: String = attr(focused, kAXRoleAttribute),
+              ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXWebArea"].contains(role) else { return false }
+        var current: AXUIElement? = focused
+        for _ in 0..<16 {
+            guard let item = current else { break }
+            if CFEqual(item, target) { return true }
+            current = attr(item, kAXParentAttribute)
+        }
+        return false
     }
 
     // MARK: - Keyboard layout

@@ -4,9 +4,34 @@ import ScreenCaptureKit
 /// Captures the target app's window and draws numbered boxes over the elements we'll offer GPT,
 /// so it sees the real screen and can refer to elements by the same "e<N>" ids.
 enum Screenshot {
-    /// Geometry of the most recent capture, so a position on the image can be mapped back to the screen.
-    nonisolated(unsafe) static var lastWindowFrame: CGRect?
-    nonisolated(unsafe) static var lastImageSize: CGSize?
+    /// Immutable capture passed with the observation. Resizing for the byte budget is reflected in geometry.
+    struct Capture: @unchecked Sendable {
+        let window: NativeWindowObservation
+        let image: CGImage
+        let rawImage: CGImage
+        let data: Data
+        let geometry: ObservationGeometry
+        var imageSize: CGSize { geometry.imageSize }
+        var base64: String { data.base64EncodedString() }
+        var pointScale: CGSize { geometry.pointScale }
+        func screenPoint(x: Double, y: Double) -> CGPoint? {
+            guard window.staleness(includeContent: true) == nil else { return nil }
+            return geometry.screenPoint(x: x, y: y)
+        }
+
+        /// Raw pixel actions also compare the target's current visual neighbourhood. Canvas-only changes may
+        /// leave AX untouched; checking a fresh patch prevents clicking old screenshot coordinates in that case.
+        func validatedScreenPoint(x: Double, y: Double) async -> CGPoint? {
+            guard let point = screenPoint(x: x, y: y),
+                  let fresh = await Screenshot.currentImage(window: window, width: rawImage.width, height: rawImage.height),
+                  let oldPatch = Screenshot.targetPatch(rawImage, x: x / imageSize.width, y: y / imageSize.height),
+                  let newPatch = Screenshot.targetPatch(fresh, x: x / imageSize.width, y: y / imageSize.height),
+                  ObservationGeometry.visuallyMatches(oldPatch, newPatch), window.staleness(includeContent: true) == nil else { return nil }
+            return point
+        }
+    }
+    /// Debug-only image cache. Action targeting must use Capture, never these diagnostic values.
+    nonisolated(unsafe) private static var lastWindowFrame: CGRect?
     /// The last annotated capture (what the model saw) and whose window it was, for click traces.
     nonisolated(unsafe) static var lastImage: CGImage?
     nonisolated(unsafe) static var lastPID: pid_t?
@@ -51,19 +76,40 @@ enum Screenshot {
         return mean < 5 ? .allBlack : mean > 250 ? .allWhite : .uniform
     }
 
-    /// Converts a point in the last screenshot's pixels to global screen coordinates.
-    static func screenPoint(x: Double, y: Double) -> CGPoint? {
-        guard let frame = lastWindowFrame, let size = lastImageSize, size.width > 0 else { return nil }
-        return CGPoint(x: frame.minX + x * frame.width / size.width, y: frame.minY + y * frame.height / size.height)
+    private static func currentImage(window snapshot: NativeWindowObservation, width: Int, height: Int) async -> CGImage? {
+        guard snapshot.staleness(includeContent: true) == nil, CGPreflightScreenCaptureAccess(),
+              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
+              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }) else { return nil }
+        let config = SCStreamConfiguration()
+        config.width = width
+        config.height = height
+        config.showsCursor = false
+        return try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window), configuration: config)
+    }
+
+    /// A local target patch in grayscale. Normalized x/y refer to top-left image coordinates.
+    private static func targetPatch(_ image: CGImage, x: Double, y: Double) -> [UInt8]? {
+        let side = 64
+        let region = CGRect(x: x * Double(image.width) - 32, y: y * Double(image.height) - 32, width: 64, height: 64)
+            .intersection(CGRect(x: 0, y: 0, width: image.width, height: image.height)).integral
+        guard !region.isEmpty, let patch = image.cropping(to: region) else { return nil }
+        var pixels = [UInt8](repeating: 0, count: side * side)
+        let ok = pixels.withUnsafeMutableBytes { buffer -> Bool in
+            guard let context = CGContext(data: buffer.baseAddress, width: side, height: side, bitsPerComponent: 8, bytesPerRow: side,
+                                          space: CGColorSpaceCreateDeviceGray(), bitmapInfo: CGImageAlphaInfo.none.rawValue) else { return false }
+            context.draw(patch, in: CGRect(x: 0, y: 0, width: side, height: side))
+            return true
+        }
+        return ok ? pixels : nil
     }
 
     /// A clean, full-resolution PNG of the app's main window (what ⌃⌘⇧4 on that window would copy).
     static func windowPNG(app: NSRunningApplication, windowID: CGWindowID? = nil) async -> Data? {
-        guard CGPreflightScreenCaptureAccess(),
+        let snapshot = NativeWindowObservation.capture(app, windowID: windowID)
+        guard let snapshot, CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
-              let window = content.windows
-                .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 && (windowID == nil || $0.windowID == windowID) })
-                .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }),
+              snapshot.staleness() == nil
         else { return nil }
         let config = SCStreamConfiguration()
         let scale = min(2, 2000 / window.frame.width)
@@ -75,16 +121,16 @@ enum Screenshot {
         return NSBitmapImageRep(cgImage: image).representation(using: .png, properties: [:])
     }
 
-    static func annotated(app: NSRunningApplication, elements: [UIElementInfo], circled: Annotation? = nil) async -> String? {
-        guard CGPreflightScreenCaptureAccess(),
+    static func capture(app: NSRunningApplication, window snapshot: NativeWindowObservation?, elements: [UIElementInfo], circled: Annotation? = nil) async -> Capture? {
+        lastBlank = nil
+        guard let snapshot, snapshot.pid == app.processIdentifier, snapshot.staleness(includeContent: true) == nil,
+              elements.allSatisfy({ $0.observationID == snapshot.id && $0.windowID == snapshot.windowID }),
+              CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
-              let window = content.windows
-                .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 })
-                .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }),
+              ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame)
         else { return nil }
 
-        lastWindowFrame = window.frame
-        lastBlank = nil
         let config = SCStreamConfiguration()
         // Long side, not width: a tall narrow window would otherwise blow past the budget.
         let scale = min(1, maxSide / max(window.frame.width, window.frame.height))
@@ -92,8 +138,8 @@ enum Screenshot {
         config.height = Int(window.frame.height * scale)
         config.showsCursor = false
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config)
-        else { return nil }
+        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: filter, configuration: config),
+              snapshot.staleness(includeContent: true) == nil else { return nil }
         if let blank = blankness(image) {
             lastBlank = blank
             lastImage = nil
@@ -101,8 +147,6 @@ enum Screenshot {
         }
 
         let width = image.width, height = image.height
-        lastImageSize = CGSize(width: width, height: height)
-        lastPID = app.processIdentifier
         guard let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
                                   space: CGColorSpaceCreateDeviceRGB(),
                                   bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
@@ -144,26 +188,28 @@ enum Screenshot {
         }
         NSGraphicsContext.restoreGraphicsState()
 
-        guard let annotated = ctx.makeImage() else { return nil }
+        guard let annotated = ctx.makeImage(), let encoded = budgeted(annotated), snapshot.staleness(includeContent: true) == nil else { return nil }
         lastImage = annotated
-        return budgeted(annotated)?.base64EncodedString()
+        lastPID = snapshot.pid
+        lastWindowFrame = snapshot.frame
+        return Capture(window: snapshot, image: annotated, rawImage: image, data: encoded.data,
+                       geometry: ObservationGeometry(frame: snapshot.frame, imageSize: encoded.size))
     }
 
-    /// JPEG within `maxBytes`: lower quality first, then shrink (updating `lastImageSize`, so x/y the model
-    /// reads off the smaller image still map back to the right screen point).
-    private static func budgeted(_ image: CGImage) -> Data? {
+    /// JPEG within `maxBytes`, returning the dimensions of the encoded image alongside its bytes.
+    private static func budgeted(_ image: CGImage) -> (data: Data, size: CGSize)? {
         var image = image
         for _ in 0..<3 {
             for quality in [0.6, 0.45, 0.3] {
                 guard let jpeg = NSBitmapImageRep(cgImage: image)
                     .representation(using: .jpeg, properties: [.compressionFactor: quality]) else { return nil }
-                if jpeg.count <= maxBytes { return jpeg }
+                if jpeg.count <= maxBytes { return (jpeg, CGSize(width: image.width, height: image.height)) }
             }
             guard let smaller = resized(image, by: 0.75) else { return nil }
             image = smaller
-            lastImageSize = CGSize(width: image.width, height: image.height)
         }
-        return NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.3])
+        guard let data = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.3]) else { return nil }
+        return (data, CGSize(width: image.width, height: image.height))
     }
 
     private static func resized(_ image: CGImage, by factor: CGFloat) -> CGImage? {
@@ -199,11 +245,9 @@ enum Screenshot {
     static func saveClickTrace(app: NSRunningApplication, point: CGPoint, step: Int, runID: String) async -> URL? {
         var image = lastImage, frame = lastWindowFrame
         if image == nil || lastPID != app.processIdentifier || frame.map({ !$0.contains(point) }) ?? true {
-            guard CGPreflightScreenCaptureAccess(),
+            guard let snapshot = NativeWindowObservation.capture(app), CGPreflightScreenCaptureAccess(),
                   let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
-                  let window = content.windows
-                    .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 })
-                    .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+                  let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID })
             else { return nil }
             let config = SCStreamConfiguration()
             let scale = min(1, maxSide / max(window.frame.width, window.frame.height))

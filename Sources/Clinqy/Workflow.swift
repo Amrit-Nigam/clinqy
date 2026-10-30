@@ -107,22 +107,50 @@ final class Workflows: ObservableObject {
         return dir.appendingPathComponent("workflows.json")
     }()
 
+    @Published private(set) var storageError: String?
+    private var corrupt = false
+
     private init() {
-        if let data = try? Data(contentsOf: url), let saved = try? JSONDecoder.iso8601.decode([Workflow].self, from: data) { all = saved }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do { all = try JSONDecoder.iso8601.decode([Workflow].self, from: Data(contentsOf: url)) }
+        catch {
+            corrupt = true
+            storageError = "Workflows couldn't be read safely. The existing file was preserved; scheduled workflows are disabled."
+        }
     }
 
-    func add(_ w: Workflow) { all.insert(w, at: 0); save() }
-    func remove(_ w: Workflow) { all.removeAll { $0.id == w.id }; save() }
-    func update(_ w: Workflow) {
-        guard let i = all.firstIndex(where: { $0.id == w.id }) else { return }
-        all[i] = w
-        save()
+    @discardableResult
+    func add(_ w: Workflow) -> Bool { mutate { $0.insert(w, at: 0) } }
+    @discardableResult
+    func remove(_ w: Workflow) -> Bool { mutate { $0.removeAll { $0.id == w.id } } }
+    @discardableResult
+    func update(_ w: Workflow) -> Bool {
+        guard let i = all.firstIndex(where: { $0.id == w.id }) else { return false }
+        return mutate { $0[i] = w }
     }
     func named(_ name: String) -> Workflow? {
         all.first { $0.name.lowercased() == name.lowercased() } ?? all.first { $0.name.lowercased().contains(name.lowercased()) }
     }
 
-    private func save() { Persist.write(all, to: url, encoder: .iso8601) }
+    /// Schedule acknowledgement must be durable before the caller treats it as saved. Workflow files are
+    /// small; use an atomic synchronous write instead of the best-effort asynchronous history/cache queue.
+    private func mutate(_ change: (inout [Workflow]) -> Void) -> Bool {
+        guard !corrupt else { return false }
+        let previous = all
+        change(&all)
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try JSONEncoder.iso8601.encode(all).write(to: url, options: .atomic)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            storageError = nil
+            return true
+        } catch {
+            all = previous
+            storageError = "Couldn't save workflows. The existing file was preserved; scheduled task records prevent duplicate dispatch."
+            return false
+        }
+    }
 }
 
 /// What a run that worked did, kept so a similar request later starts from the known path instead of exploring.

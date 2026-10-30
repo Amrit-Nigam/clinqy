@@ -3,9 +3,16 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.6";
+const SCRIPT_VERSION = "1.9.7";
 let socket = null;
 let retry = 1000;
+// A snapshot must not overwrite index maps while an earlier action is resolving its target.
+let commandQueue = Promise.resolve();
+function serializedHandle(msg) {
+  const next = commandQueue.then(() => handle(msg));
+  commandQueue = next.catch(() => {});
+  return next;
+}
 
 function connect() {
   if (socket && (socket.readyState === WebSocket.OPEN || socket.readyState === WebSocket.CONNECTING)) return;
@@ -19,7 +26,7 @@ function connect() {
     try { msg = JSON.parse(event.data); } catch { return; }
     if (!msg.id) return;
     try {
-      send({ id: msg.id, ok: true, result: await handle(msg) });
+      send({ id: msg.id, ok: true, result: await serializedHandle(msg) });
     } catch (err) {
       send({ id: msg.id, ok: false, error: String(err && err.message || err) });
     }
@@ -43,11 +50,15 @@ async function activeTab() {
 
 // Runs window.__clinqy[name](...args) in a frame; errors come back as values, so one frame never sinks the rest.
 // Async so a page function may return a promise (waitText); executeScript waits for it.
-const runner = async (n, a) => {
+const runner = async (n, a, expected = null) => {
   try {
     const f = window.__clinqy && window.__clinqy[n];
     if (!f) return { __error: "no page function " + n };
-    return { __ok: await f(...a) };
+    if (n === "snapshot" && a[0] && a[0].excludeTop && window === window.top) return { __error: "top frame already observed" };
+    if (n === "snapshot" || n === "selection" || n === "focusStatus") return { __ok: await f(...a) };
+    if (!expected) throw new Error("missing browser observation tokens; take a new look");
+    const token = expected.documentID ? expected : expected[window.__clinqy.documentID];
+    return { __ok: await window.__clinqy.invoke(n, a, token) };
   } catch (e) { return { __error: String(e && e.message || e) }; }
 };
 
@@ -93,7 +104,8 @@ async function call(tabId, frameId, name, args = []) {
   const target = { tabId, frameIds: [frameId] };
   await inject(target);
   let res;
-  try { [res] = await chrome.scripting.executeScript({ target, func: runner, args: [name, args] }); }
+  const token = (await mapFor(tabId)).frameTokens?.[frameId] || null;
+  try { [res] = await chrome.scripting.executeScript({ target, func: runner, args: [name, args, token] }); }
   catch (e) { throw new Error("the page can't be scripted: " + String(e && e.message || e)); }
   const out = res && res.result;
   if (!out) throw new Error("the page didn't answer");
@@ -106,7 +118,9 @@ async function callAll(tabId, name, args = []) {
   const target = { tabId, allFrames: true };
   await inject(target);
   let res = [];
-  try { res = await chrome.scripting.executeScript({ target, func: runner, args: [name, args] }); } catch {}
+  const frameTokens = (await mapFor(tabId)).frameTokens || {};
+  const tokens = Object.fromEntries(Object.values(frameTokens).map((t) => [t.documentID, t]));
+  try { res = await chrome.scripting.executeScript({ target, func: runner, args: [name, args, tokens] }); } catch {}
   return res.filter((r) => r && r.result && !r.result.__error).map((r) => ({ frameId: r.frameId, result: r.result.__ok }));
 }
 
@@ -171,21 +185,28 @@ const samePage = (a, b) => {
 async function snapshot(tab) {
   const top = await call(tab.id, 0, "snapshot");
   const list = top.elements.map((e) => ({ key: e.key, frameId: 0, local: e.i, e }));
+  if (!top.documentID || !top.snapshotID) throw new Error("update browser page helpers before acting");
+  const frameBoxes = {};
+  const frameTokens = { 0: { documentID: top.documentID, snapshotID: top.snapshotID } };
   const offsets = { 0: { x: 0, y: 0 } };
   const elements = top.elements;
   const extraText = [];
   if (top.frames && top.frames.length) {
-    const subs = (await callAll(tab.id, "snapshot")).filter((s) => s.frameId !== 0 && /^https?:/.test(s.result.url || ""));
+    const subs = (await callAll(tab.id, "snapshot", [{ excludeTop: true }])).filter((s) => s.frameId !== 0 && /^https?:/.test(s.result.url || ""));
     const free = [...top.frames];
     for (const { frameId, result: sub } of subs) {
       // Which visible frame box is this page? Same address, or (failing that) the only one of exactly its size.
-      let k = free.findIndex((f) => f.src && samePage(f.src, sub.url));
+      const addressed = free.map((f, j) => [f, j]).filter(([f]) => f.src && samePage(f.src, sub.url));
+      let k = addressed.length === 1 ? addressed[0][1] : -1;
       if (k < 0) {
         const sized = free.map((f, j) => [f, j]).filter(([f]) => Math.abs(f.w - sub.viewport.w) <= 2 && Math.abs(f.h - sub.viewport.h) <= 2);
         if (sized.length === 1) k = sized[0][1];
       }
       if (k < 0) continue;
       const f = free.splice(k, 1)[0];
+      if (!sub.documentID || !sub.snapshotID) continue;
+      frameTokens[frameId] = { documentID: sub.documentID, snapshotID: sub.snapshotID };
+      frameBoxes[frameId] = f;
       offsets[frameId] = { x: f.x, y: f.y };
       let host = "frame";
       try { host = new URL(sub.url).hostname; } catch {}
@@ -194,7 +215,7 @@ async function snapshot(tab) {
         if (y + e.h < 0 || y > top.viewport.h || x + e.w < 0 || x > top.viewport.w) continue;
         const moved = { ...e, x, y, frame: host };
         elements.push(moved);
-        list.push({ key: e.key != null ? host + "|" + e.key : null, frameId, local: e.i, e: moved });
+        list.push({ key: e.key != null ? frameId + "|" + sub.documentID + "|" + e.key : null, frameId, local: e.i, e: moved });
       }
       top.messages = (top.messages || []).concat(sub.messages || []);
       if (sub.text) extraText.push(`[${host}] ${sub.text}`);
@@ -203,9 +224,12 @@ async function snapshot(tab) {
       if (sub.panes && sub.panes.length) top.panes = (top.panes || []).concat(sub.panes.map((p) => ({ ...p, frame: host })));
     }
   }
-  await saveMap(tab.id, { ...assignIds(await mapFor(tab.id), top.url, list), offsets });
+  const previous = await mapFor(tab.id);
+  const snapshotID = crypto.randomUUID();
+  await saveMap(tab.id, { ...assignIds(previous.documentID === top.documentID ? previous : null, top.url, list),
+    documentID: top.documentID, snapshotID, frameTokens, frameBoxes, offsets });
   if (extraText.length) top.text = [top.text, ...extraText].filter(Boolean).join(" · ").slice(0, 2200);
-  return { ...top, elements, tabId: tab.id, active: !!tab.active };
+  return { ...top, snapshotID, elements, tabId: tab.id, active: !!tab.active };
 }
 
 // The frame that has the caret: the top page, or a frame inside it when the top page's focus is on an <iframe>
@@ -374,7 +398,7 @@ async function handle(msg) {
     return { closed: null };
   }
   // A command may name its tab (a snapshot of a background tab, acting on a tab the app pinned); else the one in front.
-  const tab = msg.tabId != null && msg.cmd !== "goBack" ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
+  const tab = msg.tabId != null ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
   if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
   if (msg.cmd === "selection") {
@@ -401,6 +425,40 @@ async function handle(msg) {
     mine.add(t.id);
     await setOpened(mine);
     return { id: t.id };
+  }
+  const unguarded = new Set(["snapshot", "goBack", "navigate"]);
+  if (!unguarded.has(msg.cmd)) {
+    const map = await mapFor(tab.id);
+    if (msg.documentID !== map.documentID || msg.snapshotID !== map.snapshotID || !map.documentID || !map.snapshotID)
+      throw new Error("stale browser observation; update the extension and take a new look");
+    await call(tab.id, 0, "check");
+    if (["cdpKey", "cdpType", "cdpScroll"].includes(msg.cmd)) {
+      // A child can reload without changing its parent's URL or document token.
+      for (const frame of Object.keys(map.frameTokens || {}).map(Number)) await call(tab.id, frame, "check");
+      const statuses = await callAll(tab.id, "focusStatus");
+      const leaves = statuses.filter(({ result }) => result.hasFocus && !result.frame);
+      for (const { frameId, result } of leaves) {
+        if (map.frameTokens?.[frameId]?.documentID !== result.documentID)
+          throw new Error("the focused embedded document was not observed; take a new look before input");
+      }
+      const top = statuses.find(({ frameId }) => frameId === 0);
+      if (!top || (top.result.frame && !leaves.length))
+        throw new Error("the focused embedded document cannot be verified; take a new look before input");
+    }
+    if (msg.cmd === "cdpClick" && Number.isInteger(msg.index)) {
+      const { frameId, local } = await route(tab.id, msg.index);
+      if (frameId !== 0) {
+        const observedBox = map.frameBoxes?.[frameId];
+        const liveBoxes = (await call(tab.id, 0, "frameBoxes")).frames || [];
+        const currentBox = observedBox && liveBoxes.find((box) => box.nodeToken === observedBox.nodeToken);
+        if (!currentBox || ["x", "y", "w", "h"].some((key) => Math.abs(currentBox[key] - observedBox[key]) > 0.5))
+          throw new Error("the embedded frame moved or was replaced; take a new look");
+      }
+      const spot = await call(tab.id, frameId, "locate", [local]);
+      const offset = map.offsets[frameId];
+      if (!offset || !spot.hit || !spot.still || Math.abs(Number(msg.x) - spot.px - offset.x) > 2 || Math.abs(Number(msg.y) - spot.py - offset.y) > 2)
+        throw new Error("the click target moved or was covered; take a new look");
+    }
   }
   if (msg.cmd === "cdpClick") return await cdpClick(tab.id, msg.x, msg.y, Number(msg.count) || 1);
   if (msg.cmd === "cdpKey") return await cdpKey(tab.id, msg.keys);
@@ -446,6 +504,12 @@ async function handle(msg) {
     case "click": case "focus": case "value": case "isActive": case "prepare": case "state": case "chosen":
     case "alive": case "focusFor":
       return await indexed(msg.cmd);
+    case "clickOption": {
+      const frame = Number(msg.pointFrame);
+      if (!Number.isInteger(frame) || !(await mapFor(tab.id)).frameTokens?.[frame] || typeof msg.pointToken !== "string")
+        throw new Error("the option has no current target token; take a new look");
+      return await call(tab.id, frame, "clickOption", [msg.pointToken]);
+    }
     case "activeOption": return await indexed("activeOption", [msg.want || ""]);
     case "locate": {
       // In top-page coordinates, so a frame's element (LinkedIn's Easy Apply form) is placed right too.
@@ -471,14 +535,15 @@ async function handle(msg) {
     case "waitText": return await call(tab.id, 0, "waitText", [msg.text, !!msg.gone, Number(msg.ms) || 10000]);
     case "upload": {
       if (msg.index >= 0) return await indexed("upload", [msg.name, msg.type, msg.data]);
-      try { return await call(tab.id, 0, "upload", [-1, msg.name, msg.type, msg.data]); }
-      catch (e) {
-        // No upload field on the page itself: try the embedded forms.
-        for (const frameId of Object.keys((await mapFor(tab.id)).offsets || {}).map(Number).filter((f) => f !== 0)) {
-          try { return await call(tab.id, frameId, "upload", [-1, msg.name, msg.type, msg.data]); } catch {}
-        }
-        throw e;
+      const map = await mapFor(tab.id);
+      const counts = [];
+      for (const frame of Object.keys(map.frameTokens || {}).map(Number)) {
+        const result = await call(tab.id, frame, "fileInputCount");
+        if (result.count > 0) counts.push({ frame, count: result.count });
       }
+      if (!counts.length) throw new Error("this page has no file upload field (it may use its own picker, e.g. Google Drive)");
+      if (counts.length !== 1 || counts[0].count !== 1) throw new Error("ambiguous file upload fields; choose the exact input");
+      return await call(tab.id, counts[0].frame, "upload", [-1, msg.name, msg.type, msg.data]);
     }
     case "findOption": {
       // The open list may be in the page or in an embedded form; report its box in top-page coordinates. The
@@ -493,7 +558,7 @@ async function handle(msg) {
         if (frameId !== 0 && !offsets[frameId]) continue;   // a frame we can't place on screen
         if (result.found) {
           const o = offsets[frameId] || { x: 0, y: 0 };
-          return { ...result, x: result.x + o.x, y: result.y + o.y, px: result.px + o.x, py: result.py + o.y };
+          return { ...result, pointFrame: frameId, x: result.x + o.x, y: result.y + o.y, px: result.px + o.x, py: result.py + o.y };
         }
         if (!fallback || (result.options || []).length > (fallback.options || []).length) fallback = result;
       }

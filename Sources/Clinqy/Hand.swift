@@ -85,33 +85,40 @@ final class Hand {
 
     /// How the last element click went through: "axpress" or "real" (for the click log).
     private(set) var lastMethod = ""
+    private(set) var lastClickUncertain = false
 
-    /// Clicks an element: Accessibility press first, a real click if that did nothing.
-    /// Returns why it didn't click (something else now at that spot), or nil.
+    /// Submit one input delivery. A successful AX request must not be followed by another click merely
+    /// because its visible acknowledgement is slow; the caller owns effect verification.
     @discardableResult
-    func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int) async -> String? {
+    func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int, window requested: WindowSnapshot? = nil) async -> String? {
+        lastClickUncertain = false
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID else { return refuse("the element's window cannot be verified; look again") }
+        if let requested, el.observationID != requested.id { return refuse("the element belongs to another observation; look again") }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        guard window.frame.contains(el.center) else { return refuse("the element is outside the observed window; look again") }
         lastMethod = "axpress"
         await buddy.travel(to: el.center, framing: el.frame)
-        try? await Task.sleep(for: .milliseconds(80))   // aim
+        try? await Task.sleep(for: .milliseconds(80))
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
         buddy.click()
         let element = el.element
-        var pressed = await Task.detached { AXEngine.axPress(element) }.value
-        if pressed {
-            pressed = false
-            for _ in 0..<5 {
-                try? await Task.sleep(for: .milliseconds(60))
-                if await AXEngine.fingerprintAsync(of: app) != fingerprint { pressed = true; break }
-            }
+        switch await Task.detached(operation: { AXEngine.axPressDelivery(element) }).value {
+        case .delivered: return nil
+        case .uncertain:
+            lastClickUncertain = true
+            return nil // Observe the effect; never issue a second input after an ambiguous AX reply.
+        case .unsupported: break
         }
-        if !pressed {
-            if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: element) { return refuse(why) }
-            if Background.active {
-                lastMethod = "background"
-                return backgroundClick(at: el.center, pid: app.processIdentifier)
-            }
-            lastMethod = "real"
-            realClick(at: el.center)
+        // An explicitly unsupported AX action permits one checked pixel input.
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        if Background.active {
+            lastMethod = "background"
+            return backgroundClick(at: el.center, pid: app.processIdentifier)
         }
+        lastMethod = "real"
+        realClick(at: el.center)
         return nil
     }
 
@@ -121,10 +128,16 @@ final class Hand {
     @discardableResult
     func click(at point: CGPoint, pid: pid_t? = nil, window: WindowSnapshot? = nil, mode: ClickMode = .real) async -> String? {
         let mode = Background.active ? .background : mode
-        if let why = window?.staleness() { return refuse(why) }
+        if let window {
+            guard pid == window.pid, window.frame.contains(point) else { return refuse("the point is outside the observed target window; look again") }
+            if let why = window.staleness(includeContent: true) { return refuse(why) }
+        }
         if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
         try? await Task.sleep(for: .milliseconds(80))
+        // Cursor animation is asynchronous: verify again immediately before input delivery.
+        if let why = window?.staleness(includeContent: true) { return refuse(why) }
+        if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         buddy.click()
         switch mode {
         case .real:
@@ -172,35 +185,36 @@ final class Hand {
 
     /// Puts the caret in a text box: travel, click, focus. Returns why it didn't, or nil.
     @discardableResult
-    func focus(_ el: UIElementInfo, in app: NSRunningApplication) async -> String? {
+    func focus(_ el: UIElementInfo, in app: NSRunningApplication, window requested: WindowSnapshot? = nil) async -> String? {
+        guard Self.isTextRole(el.role) else { return refuse("the requested element is not a text input; look again before typing") }
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID,
+              requested.map { el.observationID == $0.id } ?? true else { return refuse("the field belongs to another observation; look again") }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
         await buddy.travel(to: el.center, framing: el.frame)
         try? await Task.sleep(for: .milliseconds(90))
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
         buddy.click()
-        if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: el.element) {
-            // Something covers the field: focusing through Accessibility alone is still safe.
+        var settable = DarwinBoolean(false)
+        let canFocus = AXUIElementIsAttributeSettable(el.element, kAXFocusedAttribute as CFString, &settable) == .success && settable.boolValue
+        if canFocus {
             _ = AXEngine.focus(el.element)
-            return Self.isTextRole(AXEngine.focusedRole(of: app)) ? nil : refuse(why)
+        } else {
+            if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+            if Background.active {
+                if let why = backgroundClick(at: el.center, pid: app.processIdentifier) { return refuse(why) }
+            } else { realClick(at: el.center) }
         }
-        if Background.active {
-            // Accessibility focus first; a click (to the app, not through the user's pointer) only if that didn't take.
-            _ = AXEngine.focus(el.element)
-            try? await Task.sleep(for: .milliseconds(120))
-            if Self.isTextRole(AXEngine.focusedRole(of: app)) { return nil }
-            return backgroundClick(at: el.center, pid: app.processIdentifier)
-        }
-        realClick(at: el.center)
-        _ = AXEngine.focus(el.element)
         try? await Task.sleep(for: .milliseconds(120))
-        // If the caret didn't land in a text box, click once more like a person would.
-        if !Self.isTextRole(AXEngine.focusedRole(of: app)) {
-            realClick(at: el.center)
-            try? await Task.sleep(for: .milliseconds(150))
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        guard AXEngine.focusedWithin(el.element, in: app) else {
+            return refuse("the requested field did not acquire verifiable focus; look again before typing")
         }
         return nil
     }
 
     static func isTextRole(_ role: String?) -> Bool {
-        guard let role else { return true }   // unknown: don't second-guess
+        guard let role else { return false }
         return ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXWebArea"].contains(role)
     }
 
@@ -304,29 +318,8 @@ final class Hand {
         return nil
     }
 
-    /// A window as it was when scanned, to check it's still there and in the same place before clicking into it.
-    struct WindowSnapshot: @unchecked Sendable {
-        let element: AXUIElement
-        let frame: CGRect
-        let pid: pid_t
-
-        /// The app's focused (or first) window, as it is now.
-        static func capture(_ app: NSRunningApplication) -> WindowSnapshot? {
-            let root = AXUIElementCreateApplication(app.processIdentifier)
-            let window: AXUIElement? = axAttr(root, kAXFocusedWindowAttribute)
-                ?? (axAttr(root, kAXWindowsAttribute) as [AXUIElement]?)?.first
-            guard let window, let frame = AXEngine.liveFrame(of: window) else { return nil }
-            return WindowSnapshot(element: window, frame: frame, pid: app.processIdentifier)
-        }
-
-        /// Why the window no longer matches the scan (closed, or moved/resized by more than 2 pt), or nil.
-        func staleness() -> String? {
-            guard let now = AXEngine.liveFrame(of: element) else { return "the window was closed since the last look; look again" }
-            let moved = abs(now.minX - frame.minX) > 2 || abs(now.minY - frame.minY) > 2
-                || abs(now.width - frame.width) > 2 || abs(now.height - frame.height) > 2
-            return moved ? "the window moved or resized since the last look; look again" : nil
-        }
-    }
+    /// Kept as an alias for input callers; observation, capture and execution share one immutable identity.
+    typealias WindowSnapshot = NativeWindowObservation
 
     /// Numbers of `pid`'s normal-level windows, wherever they are.
     nonisolated static func windowIDs(pid: pid_t) -> Set<CGWindowID> {

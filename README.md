@@ -99,7 +99,15 @@ Use **Show Background Work** for a screenshot view of the owned worker page. Fil
 
 **Tasks & Recovery…** and Telegram **`/tasks`** read the same persisted task state: current stage, completed steps, last confirmed action and results. Requests, attachment paths and checkpoints are saved in owner-only `~/Library/Application Support/Clinqy/tasks.json`. After a restart, active tasks become **Interrupted**, retaining any in-flight action marker. They never resume or repeat sends/submissions automatically. Check the real outcome and send fresh instructions. Restored queued requests require review: start them in the Mac panel or use **`/run <id>`** in the paired Telegram chat. Missing files and unreadable task storage prevent execution. Downloading/staged attachments and unanswered questions are not resumed; resend any message that did not receive an acceptance reply.
 
+Actions distinguish **confirmed**, **unverified**, **failed** and **refused** outcomes. Input sent to an app is not automatically a confirmed checkpoint. Uncertain sends/submissions stay stopped until the requested outcome is checked with fresh evidence; generic visual changes and closed dialogs do not prove success. Native screenshots, accessibility elements and coordinate actions are bound to one observed window; stale or ambiguous targets require another observation.
+
+Scheduled requests and daily workflows always start in background mode with no foreground selection, clipboard or follow-up context. Each occurrence is saved as a unique task before the schedule advances, so a handoff retry cannot create a duplicate job. Restored queued occurrences require review; interrupted submissions never replay automatically. New schedules default to catching up once after wake/relaunch, coalescing missed repeats. The New Schedule menu also offers skipping runs more than two hours late; older schedules keep that previous skip behavior. Storage failures and skipped runs appear in the Schedules menu. Schedules run locally while Clinqy is open and the Mac is awake; closing the chat window does not quit Clinqy.
+
 Validation: `zsh tests/background-tasks.sh` checks persistence, interruption, queue review and capability routing. `zsh tests/chrome-worker.sh` uses two temporary headless Chrome profiles and local dummy pages to check form input, upload bytes and intercepted choosers, screenshots, targeting, orphan cleanup, disconnect handling and unchanged host clipboard/foreground application. It never uses your signed-in browser or submits to an external site.
+
+`zsh tests/scheduler.sh` checks durable schedule dispatch, failed writes, restart deduplication and missed-run policy. `zsh tests/observations.sh` checks screenshot scaling and stale-window geometry without operating your desktop.
+
+`zsh tests/native-compatibility.sh` probes native targeting against two disposable fixture windows only. It checks exact-window observations, moved-window rejection and unchanged foreground app, pointer, clipboard and existing window order. It explicitly skips when Accessibility permission or the graphical session is unavailable; it never prompts for permissions or sends input to your applications. A passing fixture probe does not enable general native background control. Legacy daily workflow schedules still run only during their configured minute; new scheduled requests expose their missed-run policy explicitly.
 
 ## Setup on Windows
 
@@ -366,6 +374,17 @@ By default Clinqy runs on the Claude Code CLI with your Claude login. To switch 
 | Ollama | `PROVIDER=ollama` and `LOCAL_MODEL=qwen3-vl` |
 | Any OpenAI-compatible server | `PROVIDER=openai-compatible`, `OPENAI_BASE_URL=…`, `OPENAI_COMPATIBLE_API_KEY=…` and `LOCAL_MODEL=…` |
 
+On macOS, Codex also has an opt-in persistent transport:
+
+```bash
+PROVIDER=codex-cli
+CODEX_TRANSPORT=app-server
+```
+
+This uses the installed Codex CLI's existing sign-in and one live, ephemeral conversation per Clinqy session. Each turn sends only its new input and screenshot. Clinqy's outer harness executes actions; the embedded Codex process has no execution environments, inherited MCP servers are explicitly disabled, and app/plugin, shell, browser and computer tools are disabled. The adapter checks effective restrictions before inference and refuses incompatible configurations. It was checked against Codex CLI 0.165.0. The [official app-server protocol](https://learn.chatgpt.com/docs/app-server) changes over time, so this transport remains opt-in. Leave `CODEX_TRANSPORT` unset or choose `exec` for the existing per-turn compatibility transport.
+
+An interrupted, timed-out or disconnected app-server turn is **never replayed or automatically retried through exec**. Start a new task after checking its outcome. `zsh tests/codex-session.sh` exercises a local fake process, including blocked pipes and cancellation, without calling a model. Set `CLINQY_CODEX_PREFLIGHT=/absolute/path/to/codex` when running that test to additionally check the installed CLI's configuration and thread restrictions; this preflight creates no inference turn and changes no sign-in settings.
+
 For example, Antigravity CLI:
 
 ```bash
@@ -438,6 +457,10 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 
 ```bash
 swift build --build-system native
+zsh tests/background-tasks.sh          # task checkpoints and background routing
+zsh tests/scheduler.sh                 # durable handoff, restart dedupe and missed-run policy
+zsh tests/observations.sh              # immutable capture coordinates and geometry guards
+zsh tests/codex-session.sh             # persistent protocol/isolation tests, no model calls
 .build/debug/Clinqy --selftest     # safety rules, reply parsing, stats parsing, replay fixtures, scripting dictionaries
 .build/debug/Clinqy replay tests/replay   # recorded runs re-checked offline
 tests/run.sh [filter]                 # end-to-end in Chrome against local pages in tests/site

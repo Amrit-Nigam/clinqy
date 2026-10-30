@@ -24,6 +24,10 @@ enum BackgroundPolicy {
                 return .attention("This shortcut can use shared browser or system state. Use page fields, direct uploads or file tools instead.")
             }
             return hasWorkerPage ? .browser : .attention("No owned Chrome page is available for this key.")
+        case "verify":
+            if action["path"] as? String != nil { return .api }
+            return hasWorkerPage && (!((action["value"] as? String) != nil) || webID) ? .browser
+                : .attention("Verify a saved file path or an outcome on the owned Chrome page. I won't inspect your foreground window.")
         case "read", "extract":
             return action["path"] != nil || action["file"] != nil ? .api : hasWorkerPage ? .browser : .attention("Give a file path or open a worker Chrome page. I won't read your foreground document.")
         case "files":

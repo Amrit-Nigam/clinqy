@@ -107,10 +107,15 @@ final class ChromeWorker {
     private final class Tab {
         let target: String
         let cdp: WorkerCDP
+        var commandActive = false
+        var commandWaiters: [CheckedContinuation<Void, Never>] = []
         var elements: [Int: Element] = [:]
         var keys: [String: Int] = [:]
         var nextElement = 0
         var page = ""
+        var documentID: String?
+        var snapshotID: String?
+        var frameTokens: [String: [String: Any]] = [:]
         var frames: [String] = []
         var focusedFrame: String?
         var incomplete = false
@@ -353,6 +358,13 @@ final class ChromeWorker {
             return ["tabs": result]
         }
         guard let id = tabID, let tab = tabs[id], tab.cdp.connected else { throw WorkerCDP.error("The owned worker tab is gone. No foreground tab will be used.") }
+        if tab.commandActive { await withCheckedContinuation { tab.commandWaiters.append($0) } }
+        else { tab.commandActive = true }
+        defer {
+            if tab.commandWaiters.isEmpty { tab.commandActive = false }
+            else { tab.commandWaiters.removeFirst().resume() }
+        }
+        guard tabs[id] === tab, tab.cdp.connected else { throw WorkerCDP.error("The queued worker tab is no longer available") }
         inFlight[id, default: 0] += 1
         idleStop?.cancel(); idleStop = nil
         // Used outside a run (a preview, a Telegram screenshot): back to sleep afterwards.
@@ -374,6 +386,37 @@ final class ChromeWorker {
         if !captureOnly, frozen.contains(id) {
             _ = try await tab.cdp.call("Page.setWebLifecycleState", ["state": "active"], timeout: 3)
             frozen.remove(id)
+        }
+        let unguarded: Set<String> = ["switchTab", "closeTab", "tabInfo", "navigate", "goBack", "captureTask", "capturePreview", "captureVision", "snapshot"]
+        if !unguarded.contains(command) {
+            guard let documentID = tab.documentID, let snapshotID = tab.snapshotID,
+                  args["documentID"] as? String == documentID, args["snapshotID"] as? String == snapshotID,
+                  let top = tab.frames.first else { throw WorkerCDP.error("Stale browser observation. Take a new look before acting.") }
+            _ = try await call(tab, frame: top, function: "check")
+            if ["cdpKey", "cdpType", "cdpScroll"].contains(command) {
+                // Trusted input routes through the browser's live focus/hit testing. A top-document token
+                // alone cannot authorize input after an embedded document was replaced or added.
+                guard !tab.incomplete,
+                      let tree = try await tab.cdp.call("Page.getFrameTree")["frameTree"] as? [String: Any],
+                      Set(frameList(tree)) == Set(tab.frames) else {
+                    throw WorkerCDP.error("The embedded frame set changed or is unreadable. Take a new look before input.")
+                }
+                for frame in tab.frames { _ = try await call(tab, frame: frame, function: "check") }
+            }
+            if command == "cdpClick", let index = args["index"] as? Int {
+                guard let element = tab.elements[index] else { throw WorkerCDP.error("The click target is stale. Take a new look.") }
+                let liveOffset = try await offset(element.frame, tab: tab)
+                guard abs(liveOffset.x - element.offset.x) <= 0.5, abs(liveOffset.y - element.offset.y) <= 0.5 else {
+                    throw WorkerCDP.error("The embedded frame moved. Take a new look before clicking.")
+                }
+                let located = try await call(tab, frame: element.frame, function: "locate", args: [element.local])
+                guard located["hit"] as? Bool == true, located["still"] as? Bool == true,
+                      let x = (args["x"] as? NSNumber)?.doubleValue, let y = (args["y"] as? NSNumber)?.doubleValue,
+                      let px = (located["px"] as? NSNumber)?.doubleValue, let py = (located["py"] as? NSNumber)?.doubleValue,
+                      abs(x - px - element.offset.x) <= 2, abs(y - py - element.offset.y) <= 2 else {
+                    throw WorkerCDP.error("The click target moved or was covered. Take a new look.")
+                }
+            }
         }
         switch command {
         case "switchTab": selected = id; return ["id": id] // logical selection only; never activate a host window
@@ -425,7 +468,14 @@ final class ChromeWorker {
         var args: [String: Any] = ["expression": expression, "returnByValue": true, "awaitPromise": true, "userGesture": true]
         if let context { args["contextId"] = context }
         let result = try await tab.cdp.call("Runtime.evaluate", args, timeout: 20)
-        if result["exceptionDetails"] != nil { throw WorkerCDP.error("The worker page operation failed. Take a fresh look before retrying.") }
+        if let details = result["exceptionDetails"] as? [String: Any] {
+            let description = (details["exception"] as? [String: Any])?["description"] as? String ?? ""
+            if description.contains("this page has no file upload field") {
+                throw WorkerCDP.error("this page has no file upload field (it may use its own picker, e.g. Google Drive)")
+            }
+            if description.contains("ambiguous file upload fields") { throw WorkerCDP.error("ambiguous file upload fields; choose the exact input") }
+            throw WorkerCDP.error("The worker page operation failed. Take a fresh look before retrying.")
+        }
         return (result["result"] as? [String: Any])?["value"] ?? NSNull()
     }
     private func call(_ tab: Tab, frame: String, function: String, args: [Any] = []) async throws -> [String: Any] {
@@ -434,7 +484,13 @@ final class ChromeWorker {
             tab.contextRevision = tab.cdp.contextRevision
         }
         let encoded = String(data: try JSONSerialization.data(withJSONObject: args, options: [.fragmentsAllowed]), encoding: .utf8)!
-        let expression = "window.__clinqy[\"\(function)\"](...\(encoded))"
+        let expression: String
+        if function == "snapshot" { expression = "window.__clinqy.snapshot()" }
+        else {
+            guard let token = tab.frameTokens[frame] else { throw WorkerCDP.error("Take a fresh snapshot of this frame before acting") }
+            let expected = String(data: try JSONSerialization.data(withJSONObject: token), encoding: .utf8)!
+            expression = "window.__clinqy.invoke(\"\(function)\",\(encoded),\(expected))"
+        }
         if let cached = tab.helperContexts[frame] {
             do { return try await evaluate(tab, expression: expression, context: cached) as? [String: Any] ?? [:] }
             // The page navigated before Chrome's event arrived: the helper never ran, so a fresh one can.
@@ -465,16 +521,23 @@ final class ChromeWorker {
         guard let top = tab.frames.first else { throw WorkerCDP.error("The worker page has no frame") }
         var result = try await call(tab, frame: top, function: "snapshot")
         let url = result["url"] as? String ?? ""
-        if tab.page != url { tab.page = url; tab.keys.removeAll(); tab.nextElement = 0 }
+        guard let documentID = result["documentID"] as? String else { throw WorkerCDP.error("The page helpers need updating; no document token was returned") }
+        if tab.documentID != documentID { tab.keys.removeAll(); tab.nextElement = 0 }
+        tab.page = url; tab.documentID = documentID; tab.snapshotID = UUID().uuidString
+        tab.frameTokens.removeAll()
         tab.elements.removeAll()
         var elements: [[String: Any]] = []
         for frame in tab.frames {
             do {
                 let part = frame == top ? result : try await call(tab, frame: frame, function: "snapshot")
+                guard let document = part["documentID"] as? String, let revision = part["snapshotID"] as? String else {
+                    throw WorkerCDP.error("An embedded frame has no freshness token")
+                }
+                tab.frameTokens[frame] = ["documentID": document, "snapshotID": revision]
                 let origin = try await offset(frame, tab: tab)
                 for var element in part["elements"] as? [[String: Any]] ?? [] {
                     guard let local = element["i"] as? Int else { continue }
-                    let key = frame + ":" + (element["key"] as? String ?? "\(element["role"] ?? ""):\(element["text"] ?? ""):\(local)")
+                    let key = frame + ":" + document + ":" + (element["key"] as? String ?? "\(element["role"] ?? ""):\(element["text"] ?? ""):\(local)")
                     let global: Int
                     if let previous = tab.keys[key] { global = previous }
                     else { global = tab.nextElement; tab.nextElement += 1; tab.keys[key] = global }
@@ -487,6 +550,7 @@ final class ChromeWorker {
             } catch { if frame == top { throw error }; tab.incomplete = true }
         }
         result["elements"] = elements; result["tabId"] = id; result["focused"] = false
+        result["documentID"] = tab.documentID; result["snapshotID"] = tab.snapshotID
         result["window"] = ["left": 0, "top": 0, "width": 1440, "height": 900]
         if tab.incomplete { result["error"] = "An embedded frame could not be read safely. Its form review or upload needs attention." }
         return result
@@ -502,10 +566,16 @@ final class ChromeWorker {
         }
         switch command {
         case "click", "focus", "value", "isActive", "prepare", "state", "chosen", "alive", "focusFor": return try await indexed(command)
+        case "clickOption":
+            guard let frame = args["pointFrame"] as? String, tab.frameTokens[frame] != nil, let token = args["pointToken"] as? String else {
+                throw WorkerCDP.error("The option has no current target token. Take a new look.")
+            }
+            return try await call(tab, frame: frame, function: "clickOption", args: [token])
         case "activeOption": return try await indexed(command, [args["want"] ?? ""])
         case "fill": return try await indexed(command, [args["text"] ?? ""])
         case "locate", "findOption":
             var result = command == "locate" ? try await indexed(command) : try await call(tab, frame: element?.frame ?? top, function: command, args: [args["text"] ?? "", element?.local ?? -1])
+            if command == "findOption" { result["pointFrame"] = element?.frame ?? top }
             for k in ["x", "px"] { if let value = result[k] as? Double { result[k] = value + (element?.offset.x ?? 0) } }
             for k in ["y", "py"] { if let value = result[k] as? Double { result[k] = value + (element?.offset.y ?? 0) } }
             return result
@@ -521,8 +591,14 @@ final class ChromeWorker {
             return result
         case "upload":
             if element != nil { return try await indexed("upload", [args["name"] ?? "attachment", args["type"] ?? "", args["data"] ?? ""]) }
-            for frame in tab.frames { if let result = try? await call(tab, frame: frame, function: "upload", args: [-1, args["name"] ?? "attachment", args["type"] ?? "", args["data"] ?? ""]), result["ok"] as? Bool == true { return result } }
-            throw WorkerCDP.error("No direct file input found. Use the site's upload button.")
+            var possible: [(String, Int)] = []
+            for frame in tab.frames {
+                let count = try await call(tab, frame: frame, function: "fileInputCount")["count"] as? Int ?? 0
+                if count > 0 { possible.append((frame, count)) }
+            }
+            guard !possible.isEmpty else { throw WorkerCDP.error("this page has no file upload field (it may use its own picker, e.g. Google Drive)") }
+            guard possible.count == 1, possible[0].1 == 1 else { throw WorkerCDP.error("ambiguous file upload fields; choose the exact input") }
+            return try await call(tab, frame: possible[0].0, function: "upload", args: [-1, args["name"] ?? "attachment", args["type"] ?? "", args["data"] ?? ""])
         case "uploadVia":
             guard let element, let base64 = args["data"] as? String, let data = Data(base64Encoded: base64) else { throw WorkerCDP.error("The upload file is missing") }
             _ = try await indexed("markUpload")

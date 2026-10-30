@@ -17,40 +17,135 @@ enum Scheduler {
         }
     }
 
+    enum MissedRunPolicy: String, Codable, CaseIterable {
+        /// One occurrence runs after wake/relaunch; older repeat occurrences are coalesced.
+        case catchUpLatest
+        case skipAfterTwoHours
+
+        var label: String {
+            switch self {
+            case .catchUpLatest: return "Catch up once after wake or relaunch"
+            case .skipAfterTwoHours: return "Skip when more than two hours late"
+            }
+        }
+    }
+
     struct Item: Codable, Identifiable, Equatable {
         var id = UUID()
         var request: String
-        /// When it runs next.
         var next: Date
         var rule: Repeat
         var lastRun: Date?
+        // Optional for compatibility with schedules created before missed-run policy was explicit.
+        var missedRunPolicy: MissedRunPolicy? = nil
+        var policy: MissedRunPolicy { missedRunPolicy ?? .skipAfterTwoHours }
+
+        /// Stable across a crash between durable task creation and schedule acknowledgement.
+        var occurrenceID: String { "schedule:" + id.uuidString.lowercased() + ":" + String(Int64(next.timeIntervalSince1970 * 1000)) }
     }
 
-    private static let url: URL = {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Clinqy", isDirectory: true)
-        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-        return dir.appendingPathComponent("schedules.json")
-    }()
-
-    static var all: [Item] {
-        guard let data = try? Data(contentsOf: url) else { return [] }
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-        return ((try? decoder.decode([Item].self, from: data)) ?? []).sorted { $0.next < $1.next }
+    struct Dispatch {
+        let item: Item
+        let taskID: UUID
     }
 
-    private static func save(_ items: [Item]) {
-        let encoder = JSONEncoder()
-        encoder.dateEncodingStrategy = .iso8601
-        encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
-        try? encoder.encode(items).write(to: url, options: .atomic)
+    /// File-backed state with injectable storage for recovery tests. The task store acts as a durable outbox:
+    /// create/deduplicate the occurrence there BEFORE advancing the schedule here. Recovery can safely retry
+    /// the handoff, but never replays an existing running, interrupted or completed task.
+    @MainActor
+    final class Store {
+        let file: URL
+        private(set) var storageError: String?
+        private(set) var lastNotice: String?
+
+        init(file: URL) { self.file = file }
+
+        var all: [Item] { (try? load()) ?? [] }
+
+        private func load() throws -> [Item] {
+            do {
+                guard FileManager.default.fileExists(atPath: file.path) else { return [] }
+                let decoder = JSONDecoder()
+                decoder.dateDecodingStrategy = .iso8601
+                return try decoder.decode([Item].self, from: Data(contentsOf: file)).sorted { $0.next < $1.next }
+            } catch {
+                storageError = "Schedules couldn't be read safely. The existing file was preserved; scheduled starts are disabled."
+                throw error
+            }
+        }
+
+        private func save(_ items: [Item]) throws {
+            do {
+                let fm = FileManager.default
+                try fm.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+                let encoder = JSONEncoder()
+                encoder.dateEncodingStrategy = .iso8601
+                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                try encoder.encode(items).write(to: file, options: .atomic)
+                try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+                storageError = nil
+            } catch {
+                storageError = "Couldn't save schedules. The occurrence stays due until its task is safely queued and the schedule is saved."
+                throw error
+            }
+        }
+
+        @discardableResult
+        func add(_ item: Item) -> Bool {
+            do { var items = try load(); items.append(item); try save(items); return true }
+            catch { return false }
+        }
+
+        @discardableResult
+        func remove(_ id: UUID) -> Bool {
+            do { try save(try load().filter { $0.id != id }); return true }
+            catch { return false }
+        }
+
+        func dispatchDue(now: Date = Date(), enqueue: (Item, String) -> UUID?) -> Dispatch? {
+            do {
+                var items = try load()
+                for index in items.indices where items[index].next <= now {
+                    let item = items[index]
+                    let skip = item.policy == .skipAfterTwoHours && now.timeIntervalSince(item.next) > 2 * 3600
+                    if skip {
+                        advance(&items, index: index, now: now, dispatched: false)
+                        try save(items)
+                        lastNotice = "Skipped missed schedule: “\(item.request)” (more than two hours late)."
+                        // Mutating indices invalidates the iteration; another due item is handled next tick.
+                        return nil
+                    }
+                    guard let taskID = enqueue(item, item.occurrenceID) else {
+                        storageError = "Scheduled task couldn't be saved. Its schedule stays due; check Tasks & Recovery."
+                        return nil
+                    }
+                    advance(&items, index: index, now: now, dispatched: true)
+                    try save(items)
+                    lastNotice = nil
+                    return Dispatch(item: item, taskID: taskID)
+                }
+                return nil
+            } catch { return nil }
+        }
+
+        private func advance(_ items: inout [Item], index: Int, now: Date, dispatched: Bool) {
+            if items[index].rule == .none { items.remove(at: index) }
+            else {
+                if dispatched { items[index].lastRun = now }
+                items[index].next = Scheduler.nextOccurrence(after: now, from: items[index].next, rule: items[index].rule)
+            }
+        }
     }
 
-    /// Schedules `request` at `when` (the first run), repeating by `rule`. A time already past moves to its next
-    /// occurrence (or tomorrow for a one-off). Returns a line for the agent / user.
+    private static let store = Store(file: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("Clinqy/schedules.json"))
+    static var all: [Item] { store.all }
+    static var storageError: String? { store.storageError }
+    static var lastNotice: String? { store.lastNotice }
+
+    /// Schedules `request` at `when`. Missed repeating runs coalesce into one catch-up by default.
     @discardableResult
-    static func add(request: String, when: Date, repeat rule: Repeat = .none) -> String {
+    static func add(request: String, when: Date, repeat rule: Repeat = .none, missed: MissedRunPolicy = .catchUpLatest) -> String {
         let text = request.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return "FAILED: nothing to schedule" }
         var first = when
@@ -58,25 +153,22 @@ enum Scheduler {
             first = rule == .none ? Calendar.current.date(byAdding: .day, value: 1, to: first) ?? first : nextOccurrence(after: Date(), from: first, rule: rule)
         }
         if rule == .weekdays, Calendar.current.isDateInWeekend(first) { first = nextOccurrence(after: first, from: first, rule: .weekdays) }
-        var items = all
-        let item = Item(request: text, next: first, rule: rule)
-        items.append(item)
-        save(items)
+        let item = Item(request: text, next: first, rule: rule, missedRunPolicy: missed)
+        guard store.add(item) else { return "FAILED: " + (store.storageError ?? "Couldn't save schedule") }
         Agent.writeLog("scheduled: “\(text)” · \(describe(item))")
-        return "scheduled: “\(text)” — \(describe(item))"
+        return "scheduled: “\(text)” — \(describe(item)); \(missed.label.lowercased())"
     }
 
     /// Schedules from a natural phrase: "at 9am", "tomorrow 8:30", "in 20 minutes", "every weekday at 9",
     /// "daily at 18:00", "every hour". nil when the phrase can't be read.
     @discardableResult
-    static func add(request: String, phrase: String) -> String? {
+    static func add(request: String, phrase: String, missed: MissedRunPolicy = .catchUpLatest) -> String? {
         guard let (when, rule) = parse(phrase) else { return nil }
-        return add(request: request, when: when, repeat: rule)
+        return add(request: request, when: when, repeat: rule, missed: missed)
     }
 
-    static func remove(_ id: UUID) {
-        save(all.filter { $0.id != id })
-    }
+    @discardableResult
+    static func remove(_ id: UUID) -> Bool { store.remove(id) }
 
     /// "Tomorrow 9:00 AM · weekdays".
     static func describe(_ item: Item) -> String {
@@ -92,26 +184,21 @@ enum Scheduler {
         }
     }
 
-    /// The first item due now, moved on to its next run (or removed, when it was a one-off). Runs missed by more than
-    /// two hours (the Mac was asleep or Clinqy closed) are skipped instead of firing late.
-    static func takeDue(now: Date = Date()) -> Item? {
-        var items = all
-        var fire: Item?
-        var changed = false
-        for i in items.indices.reversed() where items[i].next <= now {
-            let late = now.timeIntervalSince(items[i].next) > 2 * 3600
-            if !late, fire == nil { fire = items[i] }
-            if late { Agent.writeLog("schedule skipped (missed): “\(items[i].request)” at \(items[i].next)") }
-            changed = true
-            if items[i].rule == .none {
-                if late || fire?.id == items[i].id { items.remove(at: i) }
-            } else if late || fire?.id == items[i].id {
-                items[i].lastRun = fire?.id == items[i].id ? now : items[i].lastRun
-                items[i].next = nextOccurrence(after: now, from: items[i].next, rule: items[i].rule)
-            }
-        }
-        if changed { save(items) }
-        return fire
+    static func dispatchDue(now: Date = Date(), enqueue: (Item, String) -> UUID?) -> Dispatch? {
+        store.dispatchDue(now: now, enqueue: enqueue)
+    }
+
+    /// Latest daily occurrence already due today. Restarts use its stable timestamp for task deduplication.
+    static func dailyOccurrence(time: String, now: Date = Date(), lastRun: Date?, catchUp: Bool = true) -> Date? {
+        let parts = time.split(separator: ":")
+        guard parts.count == 2, let hour = Int(parts[0]), let minute = Int(parts[1]),
+              (0..<24).contains(hour), (0..<60).contains(minute),
+              let occurrence = Calendar.current.date(bySettingHour: hour, minute: minute, second: 0, of: now),
+              occurrence <= now, lastRun.map({ $0 < occurrence }) ?? true else { return nil }
+        // Legacy workflow schedules have no explicit missed-run policy. Preserve their original minute-only
+        // behavior; durable queued occurrences still resume through TaskStore after dispatch.
+        if !catchUp, now.timeIntervalSince(occurrence) >= 60 { return nil }
+        return occurrence
     }
 
     private static func nextOccurrence(after now: Date, from base: Date, rule: Repeat) -> Date {

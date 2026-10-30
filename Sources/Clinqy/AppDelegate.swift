@@ -119,6 +119,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         TaskStore.shared.onReady = { [weak self] id in
             guard let self, !self.agent.isRunning, let item = TaskStore.shared.record(id) else { return }
             if item.source == .telegram { Telegram.shared.startQueued(id, reviewed: true) }
+            else if self.isScheduledTask(item) { self.startScheduledTask(id, reviewed: true) }
             else if TaskStore.shared.start(id, explicitlyReviewed: true) {
                 self.agent.selectedFiles = item.files.map { URL(fileURLWithPath: $0) }
                 self.agent.submit(item.request, background: item.background, taskID: id)
@@ -547,39 +548,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     model: q["model"].flatMap { $0.isEmpty ? nil : $0 }, provider: qaProvider, report: out)
     }
 
-    /// Runs workflows scheduled for this minute (checked every 30 s; once a day each), and scheduled requests
-    /// (Scheduler) once they're due.
+    /// Durable dispatch happens before schedule acknowledgement. Every unattended run uses isolated
+    /// background tools and starts without the foreground application's selection, clipboard or history.
     private var scheduler: Timer?
+    private var lastScheduleIssue: String?
 
     private func startScheduler() {
         scheduler = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, !self.agent.isRunning, self.agent.question == nil, !Recorder.shared.isRecording else { return }
-                if let item = Scheduler.takeDue() {
-                    Agent.writeLog("scheduled request: \(item.request) (\(item.rule.label))")
-                    // Whatever is in front when it fires; nothing selected or copied rides along.
-                    let front = NSWorkspace.shared.frontmostApplication
-                    if let front, front.bundleIdentifier != Bundle.main.bundleIdentifier { self.agent.targetApp = front }
-                    self.agent.selectedText = nil
-                    self.agent.selectedFiles = []
-                    self.agent.copied = nil
-                    self.agent.annotation = nil
-                    self.agent.continuation = nil
-                    self.agent.submit(item.request)
-                    return
-                }
-                let now = Date()
-                let hm = now.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
-                for var wf in Workflows.shared.all where wf.schedule == hm {
-                    if let last = wf.lastScheduledRun, Calendar.current.isDate(last, inSameDayAs: now) { continue }
-                    wf.lastScheduledRun = now
-                    Workflows.shared.update(wf)
-                    Agent.writeLog("scheduled: \(wf.name) at \(hm)")
-                    self.agent.runWorkflow(wf)
-                    break
-                }
+            MainActor.assumeIsolated { self?.dispatchSchedules() }
+        }
+    }
+
+    private func dispatchSchedules(now: Date = Date()) {
+        guard !agent.isRunning, agent.question == nil, !Recorder.shared.isRecording, TaskStore.shared.active == nil else { return }
+        let store = TaskStore.shared
+        // A crash requires review, but a task queued by this process can still be started after a
+        // previous handoff/acknowledgement failure. Never create a second occurrence to recover it.
+        if let queued = store.queued.first(where: { self.isScheduledTask($0) && !$0.requiresReview }) {
+            startScheduledTask(queued.id)
+            return
+        }
+        if let dispatch = Scheduler.dispatchDue(now: now, enqueue: { item, key in
+            store.enqueue(item.request, source: .mac, background: true, idempotencyKey: key)
+        }) {
+            Agent.writeLog("scheduled request queued: \(dispatch.item.request) (\(dispatch.item.rule.label))")
+            startScheduledTask(dispatch.taskID)
+            reportScheduleIssue()
+            return
+        }
+        reportScheduleIssue()
+        // Workflow occurrences use the same durable outbox/deduplication rule. Existing workflow schedules
+        // retain minute-only eligibility; already queued task records survive acknowledgement failures.
+        for var workflow in Workflows.shared.all {
+            guard let time = workflow.schedule,
+                  let occurrence = Scheduler.dailyOccurrence(time: time, now: now, lastRun: workflow.lastScheduledRun, catchUp: false) else { continue }
+            let key = "workflow:" + workflow.id.uuidString.lowercased() + ":" + String(Int64(occurrence.timeIntervalSince1970))
+            guard let id = store.enqueue("Workflow: " + workflow.name, source: .mac, background: true, idempotencyKey: key) else {
+                reportScheduleIssue(store.storageError ?? "Scheduled workflow couldn't be saved; it remains due.")
+                return
+            }
+            workflow.lastScheduledRun = now
+            if !Workflows.shared.update(workflow) { reportScheduleIssue(Workflows.shared.storageError) }
+            startScheduledTask(id)
+            return
+        }
+    }
+
+    private func isScheduledTask(_ item: TaskStore.Record) -> Bool {
+        guard let key = item.dispatchKey else { return false }
+        return key.hasPrefix("schedule:") || key.hasPrefix("schedule-now:") || key.hasPrefix("workflow:")
+    }
+
+    private func startScheduledTask(_ id: UUID, reviewed: Bool = false) {
+        let store = TaskStore.shared
+        guard let item = store.record(id), item.state == .queued, !item.requiresReview || reviewed else { return }
+        var workflow: Workflow?
+        if let key = item.dispatchKey, key.hasPrefix("workflow:") {
+            let parts = key.split(separator: ":")
+            workflow = parts.count > 1 ? Workflows.shared.all.first { $0.id.uuidString.lowercased() == parts[1] } : nil
+            guard workflow != nil else {
+                store.update(id, state: .failed, stage: "The scheduled workflow no longer exists. Create a new task.")
+                return
             }
         }
+        guard store.start(id, explicitlyReviewed: reviewed) else { return }
+        agent.targetApp = nil
+        agent.selectedText = nil
+        agent.selectedFiles = []
+        agent.copied = nil
+        agent.annotation = nil
+        agent.continuation = nil
+        if let workflow { agent.runWorkflow(workflow, background: true, taskID: id) }
+        else { agent.submit(item.request, background: true, taskID: id, unattended: true) }
+    }
+
+    private func reportScheduleIssue(_ issue: String? = nil) {
+        let current = issue ?? Scheduler.storageError ?? Workflows.shared.storageError ?? Scheduler.lastNotice
+        if let current, current != lastScheduleIssue { Agent.writeLog(current) }
+        lastScheduleIssue = current
     }
 
     // MARK: - Hotkey
@@ -884,6 +930,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.removeAllItems()
         if menu === runMenu { return fillRunMenu(menu) }
         let items = Scheduler.all
+        if let issue = Scheduler.storageError ?? Workflows.shared.storageError ?? Scheduler.lastNotice {
+            let error = menu.addItem(withTitle: issue, action: nil, keyEquivalent: "")
+            error.isEnabled = false
+            menu.addItem(.separator())
+        }
+        let behavior = menu.addItem(withTitle: "Runs locally while Clinqy is open; missed runs follow each schedule's policy.", action: nil, keyEquivalent: "")
+        behavior.isEnabled = false
         if items.isEmpty {
             let none = menu.addItem(withTitle: "Nothing scheduled", action: nil, keyEquivalent: "")
             none.isEnabled = false
@@ -892,6 +945,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let title = "\(item.request.prefix(50))\(item.request.count > 50 ? "…" : "")  ·  \(Scheduler.describe(item))"
             let row = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             let sub = NSMenu()
+            sub.addItem(withTitle: item.policy.label, action: nil, keyEquivalent: "").isEnabled = false
             let run = sub.addItem(withTitle: "Run Now", action: #selector(runScheduleNow(_:)), keyEquivalent: "")
             run.representedObject = item.request
             run.target = self
@@ -918,13 +972,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func removeSchedule(_ item: NSMenuItem) {
         guard let id = item.representedObject as? UUID else { return }
-        Scheduler.remove(id)
+        if !Scheduler.remove(id) { reportScheduleIssue() }
     }
 
     @objc func runScheduleNow(_ item: NSMenuItem) {
         guard let request = item.representedObject as? String, !agent.isRunning else { return }
-        agent.continuation = nil
-        agent.submit(request)
+        guard let id = TaskStore.shared.enqueue(request, source: .mac, background: true,
+                                                idempotencyKey: "schedule-now:" + UUID().uuidString) else {
+            reportScheduleIssue(TaskStore.shared.storageError)
+            return
+        }
+        startScheduledTask(id)
     }
 
     /// Asks for a request and when to run it ("every weekday at 9", "tomorrow 8:30", "in 20 minutes").
@@ -936,9 +994,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         request.placeholderString = "What should I do? e.g. check placement mail"
         let when = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         when.placeholderString = "When? e.g. every weekday at 9"
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
+        request.frame.origin.y = 64
+        when.frame.origin.y = 34
+        let missed = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
+        missed.addItems(withTitles: Scheduler.MissedRunPolicy.allCases.map(\.label))
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 88))
         box.addSubview(request)
         box.addSubview(when)
+        box.addSubview(missed)
         alert.accessoryView = box
         alert.window.initialFirstResponder = request
         alert.addButton(withTitle: "Schedule")
@@ -948,8 +1011,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let text = request.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let done = NSAlert()
-        if let line = Scheduler.add(request: text, phrase: when.stringValue) {
-            done.messageText = "Scheduled"
+        let policy = Scheduler.MissedRunPolicy.allCases[max(0, missed.indexOfSelectedItem)]
+        if let line = Scheduler.add(request: text, phrase: when.stringValue, missed: policy) {
+            done.messageText = line.hasPrefix("FAILED:") ? "Schedule couldn't be saved" : "Scheduled"
             done.informativeText = line
         } else {
             done.messageText = "I couldn't read “\(when.stringValue)” as a time"

@@ -17,7 +17,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const PORT: u16 = 47823;
 /// The extension version this app expects (extension/manifest.json). An older copy still running is asked to reload.
-pub const EXTENSION_VERSION: &str = "1.9.6";
+pub const EXTENSION_VERSION: &str = "1.9.7";
 
 /// Finds which program is on the other end of a local TCP connection (by its port): "chrome.exe".
 pub type OwnerLookup = Box<dyn Fn(u16) -> Option<String> + Send + Sync>;
@@ -254,13 +254,14 @@ impl Bridge {
     }
 
     pub async fn perform(&self, cmd: &str, page: &Page, a: Value, timeout: f64) -> Result<Value> {
+        let document = page.document_id.as_ref().ok_or_else(|| anyhow!("Update the browser extension and take a fresh look: missing document token"))?;
+        let snapshot = page.snapshot_id.as_ref().ok_or_else(|| anyhow!("Update the browser extension and take a fresh look: missing snapshot token"))?;
+        let tab = page.tab_id.ok_or_else(|| anyhow!("Take a fresh look: missing tab identity"))?;
         let mut body = args(a);
         body.insert("cmd".into(), json!(cmd));
-        if page.pinned && !body.contains_key("tabId") {
-            if let Some(t) = page.tab_id {
-                body.insert("tabId".into(), json!(t));
-            }
-        }
+        body.insert("tabId".into(), json!(tab));
+        body.insert("documentID".into(), json!(document));
+        body.insert("snapshotID".into(), json!(snapshot));
         self.request(page.connection, body, timeout).await
     }
 

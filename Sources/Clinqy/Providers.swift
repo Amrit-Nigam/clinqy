@@ -174,8 +174,8 @@ enum Provider: String, CaseIterable {
     }
 }
 
-/// One conversation over a provider's HTTP API (or a one-shot `codex exec` per turn), standing in for
-/// the CLI session: it keeps the whole exchange so each turn has the same context the CLI session would.
+/// One conversation over a provider's HTTP API or configured Codex transport. App-server keeps a live
+/// model-only thread; the compatibility exec transport sends the exchange again on each turn.
 final class APIChat: @unchecked Sendable {
     private struct Turn { var user: Bool; var text: String; var image: String? }
 
@@ -184,6 +184,7 @@ final class APIChat: @unchecked Sendable {
     private let system: String
     private let model: String
     private let effort: String
+    private let codexServer: CodexAppServer?
     private let lock = NSLock()
     private var turns: [Turn] = []
     private var inFlight: Task<String, Error>?
@@ -205,6 +206,12 @@ final class APIChat: @unchecked Sendable {
         self.system = system
         self.model = provider.model(model)
         self.effort = (effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
+        let transport = (Config.value("CODEX_TRANSPORT") ?? "exec").lowercased()
+        if provider == .codexCLI, !["exec", "app-server"].contains(transport) {
+            throw AgySession.BrainError.failed("CODEX_TRANSPORT must be exec or app-server")
+        }
+        codexServer = provider == .codexCLI && transport == "app-server"
+            ? CodexAppServer(executable: provider.cliPath!, system: system, model: provider.model(model)) : nil
     }
 
     var isAlive: Bool { lock.withLock { !closed } }
@@ -215,6 +222,7 @@ final class APIChat: @unchecked Sendable {
         let task = inFlight
         lock.unlock()
         task?.cancel()
+        if let codexServer { Task { await codexServer.close() } }
     }
 
     func send(_ text: String, image: String?) async throws -> String {
@@ -257,7 +265,15 @@ final class APIChat: @unchecked Sendable {
     }
 
     private func request(_ history: [Turn], plain: Bool) async throws -> String {
-        if provider == .codexCLI { return try await runCLI(history) }
+        if provider == .codexCLI {
+            if let codexServer, let latest = history.last {
+                // Only new input goes to the persistent thread. Never auto-fallback/replay a failed turn.
+                let reply = try await codexServer.send(latest.text, image: latest.image)
+                UsageStore.record(provider: provider, model: model)
+                return reply
+            }
+            return try await runCLI(history)
+        }
         var req: URLRequest
         var body: [String: Any]
         switch provider {
@@ -364,8 +380,8 @@ final class APIChat: @unchecked Sendable {
         }
     }
 
-    /// Codex CLI has no long-lived chat mode to talk to, so each turn runs the CLI once with the
-    /// instructions and the conversation so far on stdin, and the screenshot as a file.
+    /// Explicit compatibility transport for CLIs without the model-only app-server protocol.
+    /// Each turn runs once with the conversation so far; failed app-server turns never enter this path.
     private func runCLI(_ history: [Turn]) async throws -> String {
         guard let path = provider.cliPath else { throw ClaudeSession.BrainError.notInstalled }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-\(provider.rawValue)-\(UUID().uuidString)")

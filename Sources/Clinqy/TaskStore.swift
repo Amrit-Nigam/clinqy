@@ -29,6 +29,10 @@ final class TaskStore: ObservableObject {
         var lastConfirmedStep: String?
         /// Written before an action starts, cleared only after it returns. Its contents contain no arguments/secrets.
         var pendingAction: String?
+        /// A returned input whose application effect still needs independent readback.
+        var unverifiedAction: String?
+        var dispatchKey: String?
+        var lastActionOutcome: ActionOutcome?
         var result: String?
         var createdAt = Date()
         var updatedAt = Date()
@@ -41,6 +45,7 @@ final class TaskStore: ObservableObject {
             var lines = ["\(state.label): \(request)", "Now: \(stage)", "\(completedSteps) steps completed"]
             if let lastConfirmedStep { lines.append("Last confirmed step: " + lastConfirmedStep) }
             if let pendingAction { lines.append("Outcome needs checking: " + pendingAction + ". It will not be replayed automatically.") }
+            if let unverifiedAction { lines.append("Unverified outcome: " + unverifiedAction + ". Check the real state before retrying.") }
             if let result { lines.append(result) }
             if requiresReview { lines.append(reviewReason ?? "Review this queued task before starting it after a restart.") }
             return lines.joined(separator: "\n")
@@ -90,12 +95,15 @@ final class TaskStore: ObservableObject {
     var recovery: [Record] { records.filter { $0.state == .interrupted || ($0.state == .queued && $0.requiresReview) } }
 
     @discardableResult
-    func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil) -> UUID? {
+    func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil, idempotencyKey: String? = nil) -> UUID? {
+        if let idempotencyKey, let existing = records.first(where: { $0.dispatchKey == idempotencyKey }) { return existing.id }
         let clean = redact(request)
         let item = Record(request: clean, files: files.map(\.path), source: source, background: background,
                           requiresReview: clean != request, conversationID: conversationID,
                           reviewReason: clean != request ? "Private values were removed from this request. Rewrite it without secrets before running it." : nil)
-        guard mutate({ $0.append(item) }) else { return nil }
+        var scheduled = item
+        scheduled.dispatchKey = idempotencyKey
+        guard mutate({ $0.append(scheduled) }) else { return nil }
         return item.id
     }
 
@@ -127,20 +135,36 @@ final class TaskStore: ObservableObject {
         guard let item = record(id), !item.state.terminal else { return false }
         return change(id) { $0.state = .running; $0.pendingAction = kind; $0.stage = "Working: " + kind }
     }
-    func endAction(_ id: UUID?, kind: String, ok: Bool, completedSteps: Int) {
-        guard let id, let item = record(id), !item.state.terminal else { return }
-        _ = change(id) {
+    @discardableResult
+    func endAction(_ id: UUID?, kind: String, outcome: ActionOutcome, completedSteps: Int) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal else { return false }
+        return change(id) {
             $0.pendingAction = nil
             $0.completedSteps = completedSteps
-            if ok { $0.lastConfirmedStep = kind }
+            $0.lastActionOutcome = outcome
+            if outcome.isConfirmed { $0.lastConfirmedStep = kind }
+            if outcome.needsVerification { $0.unverifiedAction = kind }
+        }
+    }
+    /// Only a successful, explicit state assertion resolves an uncertain side effect.
+    @discardableResult
+    func confirmAction(_ id: UUID?, evidence: String) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal else { return false }
+        return change(id) {
+            if let action = $0.unverifiedAction { $0.lastConfirmedStep = action + " (" + redact(evidence) + ")" }
+            $0.unverifiedAction = nil
         }
     }
     func finish(_ id: UUID?, ok: Bool, answer: String) {
         guard let id else { return }
         _ = change(id) {
-            $0.state = answer == "Stopped" ? .cancelled : ok ? .succeeded : .failed
-            $0.stage = redact(answer)
-            $0.result = redact(answer)
+            $0.state = answer == "Stopped" ? .cancelled : ok && $0.pendingAction == nil && $0.unverifiedAction == nil ? .succeeded : .failed
+            let checked = ok && ($0.pendingAction != nil || $0.unverifiedAction != nil)
+                ? "Outcome not confirmed. Check the real application before retrying. " + answer : answer
+            $0.stage = redact(checked)
+            $0.result = redact(checked)
             // Preserve an in-flight checkpoint when cancellation races with a side effect.
         }
     }
