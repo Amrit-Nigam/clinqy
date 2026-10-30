@@ -37,6 +37,8 @@ pub enum UserEvent {
     TrayClick,
     ShowBar,
     Notice(String),
+    /// A newer version is out.
+    UpdateAvailable(String),
     BarBlur,
     VoiceLevel(f32),
     VoiceText(String, bool),
@@ -311,6 +313,17 @@ pub fn run() -> anyhow::Result<()> {
         match event {
             Event::NewEvents(StartCause::Init) => {
                 std::thread::spawn(crate::setup::register_links);
+                let updates = proxy_for_loop.clone();
+                std::thread::spawn(move || {
+                    // After the `clinqy` that restarted this app has exited, so its old file can go.
+                    std::thread::sleep(Duration::from_secs(20));
+                    crate::update::remove_old_files();
+                    if clinqy_core::config::on("UPDATE_CHECK", true) {
+                        if let Some(version) = crate::update::available() {
+                            let _ = updates.send_event(UserEvent::UpdateAvailable(version));
+                        }
+                    }
+                });
                 if crate::setup::first_run() {
                     ui.show_dashboard("setup");
                 } else if !std::env::args().any(|a| a == "--login") {
@@ -643,6 +656,12 @@ impl UiState {
                 }
             }
             UserEvent::Menu(id) => self.on_menu(&id),
+            UserEvent::UpdateAvailable(version) => {
+                if !self.agent().is_running() {
+                    let text = "Updating takes a few seconds and keeps your settings, memory and history.";
+                    self.notice_card(&format!("Clinqy {version} is available"), text, json!([["Update now", "__update"], ["Later", "__later"]]), 30);
+                }
+            }
             UserEvent::Notice(text) => {
                 crate::setup::beep();
                 self.notice = Some(text);
@@ -746,6 +765,9 @@ impl UiState {
                 "managed": std::env::var_os("BACKGROUND_TASKS").is_some(),
                 "browser": browser.as_deref().map(clinqy_core::worker::browser_name),
                 "signingIn": worker.in_login(),
+                "ownBrowser": clinqy_core::worker::in_own_browser(),
+                "profile": clinqy_core::config::value("WORKER_PROFILE").unwrap_or_default(),
+                "profileUsed": worker.profile().display().to_string(),
                 "running": worker.connected(),
                 "busy": snapshot.running,
                 "hasView": snapshot.background || worker.has_tab(),
@@ -759,6 +781,7 @@ impl UiState {
                 "login": crate::setup::starts_at_login(),
                 "followUp": clinqy_core::config::on("FOLLOW_UP", false),
                 "language": crate::voice::language_setting(),
+                "voiceEngine": crate::voice::engine(),
                 "languages": crate::voice::LANGUAGES,
             },
         })
@@ -960,6 +983,35 @@ impl UiState {
                     shared.send(UserEvent::Status(text));
                 });
             }
+            "backgroundBrowser" => {
+                if self.agent().is_running() {
+                    return self.set_status("Wait for the background task to finish first.");
+                }
+                match clinqy_core::config::set("BACKGROUND_BROWSER", if on { "chrome" } else { "" }) {
+                    Ok(()) => self.set_status(if on { "Background tasks now work in a Clinqy tab in your browser." } else { "Background tasks now work in the hidden browser." }),
+                    Err(e) => self.set_status(format!("✗ Couldn't save it: {e}")),
+                }
+            }
+            "workerProfile" => {
+                let folder = string("folder");
+                if self.agent().is_running() || clinqy_core::worker::worker().in_login() {
+                    return self.set_status("Wait for the background task to finish first.");
+                }
+                if let Some(problem) = (!folder.is_empty()).then(|| clinqy_core::worker::profile_problem(&folder)).flatten() {
+                    return self.set_status(format!("✗ {problem}"));
+                }
+                let shared = self.shared.clone();
+                tokio::spawn(async move {
+                    // The browser has to close on the old profile before the setting moves.
+                    clinqy_core::worker::worker().stop().await;
+                    let text = match clinqy_core::config::set("WORKER_PROFILE", &folder) {
+                        Ok(()) if folder.is_empty() => "Background browser: back to Clinqy's own profile.".to_string(),
+                        Ok(()) => format!("Background browser: using {folder}. Use Sign in… for sites that need it."),
+                        Err(e) => format!("✗ Couldn't save it: {e}"),
+                    };
+                    shared.send(UserEvent::Status(text));
+                });
+            }
             "finishLogin" => {
                 let shared = self.shared.clone();
                 tokio::spawn(async move {
@@ -1010,6 +1062,13 @@ impl UiState {
             "followUp" => {
                 let _ = clinqy_core::config::set("FOLLOW_UP", if on { "on" } else { "" });
                 self.refresh_dashboard();
+            }
+            "voiceEngine" => {
+                let engine = string("engine");
+                match clinqy_core::config::set("VOICE_ENGINE", if engine == "windows" { "windows" } else { "" }) {
+                    Ok(()) => self.set_status("Voice engine saved. It's used from the next time you talk."),
+                    Err(e) => self.set_status(format!("✗ Couldn't save it: {e}")),
+                }
             }
             "voice" => {
                 let code = string("language");
@@ -1458,6 +1517,15 @@ impl UiState {
                     "__reply" | "__edit" => self.show_bar(),
                     "__submit" => agent.decide_review(true, None),
                     "__live" => self.show_live(),
+                    "__later" => {}
+                    "__update" => {
+                        let proxy = self.shared.proxy.lock().clone();
+                        std::thread::spawn(move || {
+                            if !crate::update::run_from_app() {
+                                let _ = proxy.send_event(UserEvent::Notice("Couldn't update. Try `clinqy update` in a terminal.".into()));
+                            }
+                        });
+                    }
                     value => agent.answer(Some(value.to_string())),
                 }
             }

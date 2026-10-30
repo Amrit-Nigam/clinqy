@@ -18,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const PORT: u16 = 47823;
 /// The extension version this app expects (extension/manifest.json). An older copy still running is asked to reload.
-pub const EXTENSION_VERSION: &str = "1.9.7";
+pub const EXTENSION_VERSION: &str = "1.9.8";
 
 /// Finds which program is on the other end of a local TCP connection (by its port): "chrome.exe".
 pub type OwnerLookup = Box<dyn Fn(u16) -> Option<String> + Send + Sync>;
@@ -260,6 +260,20 @@ impl Bridge {
     fn parse(&self, r: &Value, conn: u64) -> Page {
         crate::replay::record_page(r);
         Page::parse(r, conn)
+    }
+
+    /// The connection to the user's own browser for a task to work in: Chrome when it's there, else any.
+    pub fn own_browser(&self) -> Option<u64> {
+        let conns = self.conns.lock();
+        let chrome = conns.iter().find(|(_, c)| c.owner.as_deref().unwrap_or("").to_lowercase().contains("chrome")).map(|(id, _)| *id);
+        chrome.or_else(|| conns.keys().min().copied())
+    }
+
+    /// One command on `conn`, for a task working in a tab of the user's browser.
+    pub async fn ask(&self, conn: u64, cmd: &str, a: Value, timeout: f64) -> Result<Value> {
+        let mut body = args(a);
+        body.insert("cmd".into(), json!(cmd));
+        self.request(conn, body, timeout).await
     }
 
     pub async fn perform(&self, cmd: &str, page: &Page, a: Value, timeout: f64) -> Result<Value> {

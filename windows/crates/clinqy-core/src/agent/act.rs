@@ -210,6 +210,9 @@ impl Agent {
         let kind = action.kind();
         if self.hands.hidden() && !rs.dry {
             let has_page = ctx.page.as_ref().map(|p| p.connection == crate::worker::CONNECTION).unwrap_or(false);
+            if has_page && kind == "click" && !action.contains_key("id") && !action.contains_key("x") {
+                return ActionResult::fail("In the background, click an element by its w-id from the page's list, not by its text.");
+            }
             if let Route::Attention(reason) = crate::background::route(action, has_page) {
                 let id = self.task_id();
                 tasks().update(id.as_deref(), Some(State::NeedsAttention), Some(&reason), None, None);
