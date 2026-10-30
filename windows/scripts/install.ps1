@@ -43,11 +43,19 @@ Get-Process ClinqyApp -ErrorAction SilentlyContinue | Stop-Process -Force -Error
 Start-Sleep -Milliseconds 400
 
 New-Item -ItemType Directory -Force $dest | Out-Null
+Get-ChildItem $dest -Filter '*.old-*' -ErrorAction SilentlyContinue | Remove-Item -Force -ErrorAction SilentlyContinue
 foreach ($item in 'ClinqyApp.exe', 'clinqy.exe', 'extension', 'env.example', 'README.md', 'uninstall.ps1', 'Uninstall Clinqy.bat') {
     $from = Join-Path $source $item
     if (Test-Path $from) {
         $to = Join-Path $dest $item
-        if (Test-Path $to) { Remove-Item -Recurse -Force $to }
+        if (Test-Path $to) {
+            try { Remove-Item -Recurse -Force $to -ErrorAction Stop }
+            catch {
+                # A coding agent connected over MCP keeps clinqy.exe running, which locks the file. Windows lets a
+                # running program be renamed, so it moves aside; the next install cleans it up.
+                Move-Item -Force $to ($to + '.old-' + [guid]::NewGuid())
+            }
+        }
         Copy-Item -Recurse $from $to
     }
 }

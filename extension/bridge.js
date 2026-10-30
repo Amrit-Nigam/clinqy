@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.6";
+const SCRIPT_VERSION = "1.9.7";
 let socket = null;
 let retry = 1000;
 
@@ -270,12 +270,15 @@ async function backgroundTab(url, at) {
 
 const attached = new Set();
 
-chrome.debugger.onDetach.addListener((source) => attached.delete(source.tabId));
+// Chrome can run this script with an older manifest's permissions until the extension is reloaded: without the
+// debugger permission only the debugger-based actions are unavailable, and everything else has to keep working.
+if (chrome.debugger) chrome.debugger.onDetach.addListener((source) => attached.delete(source.tabId));
 
 async function cdp(tabId, method, params = {}) {
   if (!attached.has(tabId)) {
     const mine = await openedTabs();
     if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
+    if (!chrome.debugger) throw new Error("reload the Clinqy extension to allow this action");
     try { await chrome.debugger.attach({ tabId }, "1.3"); }
     catch (e) { if (!/already attached/i.test(String(e && e.message || e))) throw e; }
     attached.add(tabId);

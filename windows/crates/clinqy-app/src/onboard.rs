@@ -224,6 +224,23 @@ pub fn clinqy_exe() -> PathBuf {
 /// The coding agents `clinqy connect` knows.
 pub const AGENTS: [&str; 6] = ["claude", "agy", "cursor", "codex", "gemini", "windsurf"];
 
+/// The coding agents on this PC: those whose CLI or settings folder is here.
+pub fn installed_agents() -> Vec<&'static str> {
+    let home = clinqy_core::paths::home();
+    AGENTS
+        .into_iter()
+        .filter(|a| match *a {
+            "claude" => Provider::ClaudeCli.cli().is_some(),
+            "codex" => Provider::CodexCli.cli().is_some(),
+            "agy" => Provider::AgyCli.cli().is_some(),
+            "cursor" => home.join(".cursor").is_dir(),
+            "gemini" => home.join(".gemini").is_dir(),
+            "windsurf" => home.join(".codeium").join("windsurf").is_dir(),
+            _ => false,
+        })
+        .collect()
+}
+
 /// Adds Clinqy as an MCP server to one coding agent, keeping its other servers. Returns what was done.
 pub fn connect(agent: &str) -> Result<String, String> {
     let exe = clinqy_exe();
