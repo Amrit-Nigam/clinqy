@@ -40,7 +40,7 @@ import AppKit
         var checks = 0
         func check(_ value: Bool, _ label: String) throws { guard value else { throw WorkerCDP.error(label) }; checks += 1 }
         func page(_ label: String) -> String {
-            let html = "<title>\(label)</title><label>Name<input id='name'></label><label>Resume<input id='upload' type='file' onchange=\"setTimeout(async()=>{document.querySelector('#uploadStatus').textContent=await this.files[0].text()},100)\"></label><button onclick=\"document.querySelector('#upload').click()\">Attach sample</button><p id='uploadStatus'></p><button onclick=\"document.body.dataset.sent='yes';this.textContent='Confirmed'\">Submit sample</button>"
+            let html = "<title>\(label)</title><nav><img src='http://127.0.0.1:1/nav.png' width='90' height='70'></nav><img src='http://127.0.0.1:1/article.png' alt='Article image' width='90' height='70'><img src='http://127.0.0.1:1/icon.png' width='16' height='16'><label>Name<input id='name'></label><label>Resume<input id='upload' type='file' onchange=\"setTimeout(async()=>{document.querySelector('#uploadStatus').textContent=await this.files[0].text()},100)\"></label><button onclick=\"document.querySelector('#upload').click()\">Attach sample</button><p id='uploadStatus'></p><button onclick=\"document.body.dataset.sent='yes';this.textContent='Confirmed'\">Submit sample</button>"
             return "data:text/html;base64," + Data(html.utf8).base64EncodedString()
         }
         do {
@@ -53,6 +53,9 @@ import AppKit
             try rememberPID("worker"); try rememberPID("other")
             try await Task.sleep(for: .milliseconds(500))
             let snap = try await command(worker, "snapshot", tabID: id)
+            let imageList = try await command(worker, "images", tabID: id)["images"] as? [[String: Any]] ?? []
+            try check(imageList.count == 1 && imageList[0]["alt"] as? String == "Article image", "real browser image discovery excludes navigation and icons")
+            try check(imageList.first?["url"] as? String == "http://127.0.0.1:1/article.png", "real browser image source addresses are exposed without focus")
             let elements = snap["elements"] as? [[String: Any]] ?? []
             let name = elements.first { ["textbox", "text"].contains($0["role"] as? String ?? "") }?["i"] as? Int
             try check(name != nil, "snapshots owned form")

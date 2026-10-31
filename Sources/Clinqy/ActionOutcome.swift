@@ -50,3 +50,28 @@ enum VerificationEvidence {
         return !before.localizedCaseInsensitiveContains(expected) && after.localizedCaseInsensitiveContains(expected)
     }
 }
+
+/// A sheet may report a different AXWindow while still descending from the exact observed parent.
+/// Following only parent/window links never admits an unrelated sibling window from the same app.
+enum NativeWindowHierarchy {
+    static func contains<Node>(_ target: Node, root: Node, parents: (Node) -> [Node], equal: (Node, Node) -> Bool) -> Bool {
+        var queue = [target], seen: [Node] = [], index = 0
+        while index < queue.count && seen.count < 64 {
+            let node = queue[index]; index += 1
+            if equal(node, root) { return true }
+            if seen.contains(where: { equal($0, node) }) { continue }
+            seen.append(node); queue.append(contentsOf: parents(node))
+        }
+        return false
+    }
+}
+enum TaskCompletionPolicy {
+    static func reportsFailure(_ summary: String) -> Bool {
+        summary.range(of: #"(?i)^\s*(?:i |we )?(couldn['’]?t|cannot|can['’]?t|was unable to|were unable to|unable to|failed to)\s+(send|attach|finish|complete|deliver|capture|open|submit|save|upload)\b"#, options: .regularExpression) != nil
+    }
+    static func requestsWriteUp(_ request: String) -> Bool {
+        let text = request.components(separatedBy: "\n\nPrevious Telegram task").first ?? request
+        if text.range(of: #"(?is)\b(no|not|don't|do not|without)\b.{0,40}\b(doc|document|write[ -]?up|report)\b"#, options: .regularExpression) != nil { return false }
+        return text.range(of: #"(?is)\b(create|make|write|prepare|document|paste|put|add|insert)\b.{0,100}\b(doc|document|report|guide|write[ -]?up)\b"#, options: .regularExpression) != nil
+    }
+}

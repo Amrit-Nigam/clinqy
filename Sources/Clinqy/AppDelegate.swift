@@ -42,6 +42,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var followUpOpen = false
 
     func applicationWillTerminate(_ notification: Notification) {
+        defer { TaskPowerAssertions.shared.shutdown() }
         // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
         BrowserJobs.shared.shutdown()
         ChromeWorker.shared.shutdown()

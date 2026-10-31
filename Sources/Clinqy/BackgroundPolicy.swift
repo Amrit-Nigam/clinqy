@@ -33,6 +33,8 @@ enum BackgroundPolicy {
             if action["path"] as? String != nil { return .api }
             return hasWorkerPage && (!((action["value"] as? String) != nil) || webID) ? .browser
                 : .attention("Verify a saved file path or an outcome on the owned browser page. I won't inspect your foreground window.")
+        case "image" where action["path"] != nil: return .api
+        case "images", "image": return hasWorkerPage ? .browser : .attention("Open an owned task page before reading its images.")
         case "read", "extract":
             return action["path"] != nil || action["file"] != nil ? .api : hasWorkerPage ? .browser : .attention("Give a file path or open a task browser page. I won't read your foreground document.")
         case "files":

@@ -60,15 +60,14 @@ final class Agent: ObservableObject {
         else if let window = telegramWindow, !window.app.isTerminated { await Launcher.bringToFront(window.app) }
     }
 
-    private func rememberTelegramTarget(app: NSRunningApplication?, page: BrowserBridge.Page?) {
+    private func rememberTelegramTarget(app: NSRunningApplication?, page: BrowserBridge.Page?, window: NativeWindowObservation? = nil) {
         guard telegramOwned || runBackground else { return }
         if let page, let id = page.tabId {
             telegramTab = .init(id: id, url: page.url, connection: page.connection)
             telegramWindow = nil
-        } else if let app, !Launcher.isBrowser(app),
-                  let window = AgentScreen.windows().first(where: { $0.pid == app.processIdentifier }) {
+        } else if let app, !Launcher.isBrowser(app) {
             telegramTab = nil
-            telegramWindow = (app, window.id)
+            telegramWindow = (window ?? NativeWindowObservation.capture(app)).map { (app, $0.windowID) }
         }
     }
     /// Answers the user marked private; masked in the log.
@@ -118,6 +117,14 @@ final class Agent: ObservableObject {
     let executionContext: TaskExecutionContext?
     var isolatedBrowserJob = false
     var runReceiptID: String?
+    var imageOutputRequirement: Int?
+    var deliveredImageOutputs = 0
+    private var requiredImageOutputs = 0
+    private var deliveredImageKeys: Set<String> = []
+    private var pendingVisualImage: ImageAsset?
+    private var imageCompletionBlocks = 0
+    private var powerLease: UUID?
+    private(set) var outputFiles: [URL] = []
     private var currentTaskDraft = ""
     private var newTaskDraft = ""
     @Published var inputPanelVisible = false
@@ -310,10 +317,25 @@ final class Agent: ObservableObject {
             .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
             .trimmingCharacters(in: .whitespaces).prefix(80)
         let url = folder.appendingPathComponent(String(format: "%02d ", count + 1) + name + ".png")
-        do { try png.write(to: url); return url } catch {
+        do {
+            try png.write(to: url)
+            if !outputFiles.contains(url) { outputFiles.append(url) }
+            TaskStore.shared.setOutputs(taskRecordID, files: outputFiles)
+            return url
+        } catch {
             log("    couldn't save the screenshot to \(url.path): \(error.localizedDescription)")
             return nil
         }
+    }
+
+    private func deliverSnapshot(_ png: Data, file: URL?, caption: String) async -> ActionResult {
+        guard telegramOwned, requiredImageOutputs > 0 else { return fail("Screenshot delivery must be requested in this Telegram task.") }
+        do {
+            let asset = try ImageAssets.decode(png, source: file?.path ?? "clinqy-screenshot:" + runID + ":" + String(snaps.count), title: caption)
+            guard await Telegram.shared.deliverImage(asset, caption: caption, from: self) else { return fail("Screenshot delivery was not acknowledged; do not report it sent.") }
+            if deliveredImageKeys.insert(asset.key).inserted { deliveredImageOutputs += 1 }
+            return .init(ok: true, summary: "Screenshot delivered to Telegram (acknowledged)" + (file.map { "; saved at " + $0.path } ?? ""))
+        } catch { return fail(error.localizedDescription) }
     }
 
     nonisolated static func saysUnfinished(_ say: String) -> Bool {
@@ -528,15 +550,20 @@ final class Agent: ObservableObject {
 
     /// Resets per-run state; shared by requests, workflow replays and QA runs.
     fileprivate func prepare(_ request: String, test: Bool, dry: Bool = false, background: Bool = false, external: Bool = false) {
+        if let powerLease { TaskPowerAssertions.shared.end(powerLease) }
+        powerLease = TaskPowerAssertions.shared.begin(preventDisplaySleep: !background)
         externalRun = external
         providerOverride = nil
         modelOverride = nil
         isTest = test || echo
         if isTest { taskRecordID = nil }
         runDry = dry
+        outputFiles = []
         completedBrowserTab = nil
         pendingVerification = nil
         completionEvidence = CompletionEvidence()
+        deliveredImageOutputs = 0; deliveredImageKeys = []; pendingVisualImage = nil; imageCompletionBlocks = 0
+        requiredImageOutputs = telegramOwned ? (imageOutputRequirement ?? ImageRequest.count(request)) : 0
         started = Date()
         trace = []
         lastTarget = nil
@@ -607,6 +634,7 @@ final class Agent: ObservableObject {
     // MARK: - Loop
 
     fileprivate func run(_ request: String) async {
+        guard !Task.isCancelled, isRunning else { return }
         guard runBackground || AXEngine.isTrusted else {
             return finish(ok: false, "Turn on Accessibility for Clinqy in System Settings → Privacy & Security.")
         }
@@ -660,7 +688,8 @@ final class Agent: ObservableObject {
             }
             let observeStart = Date()
             let obs = await Observation.capture(app)
-            rememberTelegramTarget(app: obs.app, page: obs.page)
+            guard !Task.isCancelled, isRunning else { return }
+            rememberTelegramTarget(app: obs.app, page: obs.page, window: obs.nativeWindow)
             let observeMs = Int(Date().timeIntervalSince(observeStart) * 1000)
             if observeMs > 400 { log("  observe: \(observeMs) ms") }
             if turn == 0, continuation == nil, qa == nil {
@@ -730,9 +759,17 @@ final class Agent: ObservableObject {
                 let inside = obs.elements.enumerated().filter { circled.rect.intersects($0.element.frame) }.map { "e\($0.offset)" }
                 message += "\nInside the circled area: " + (inside.isEmpty ? "no listed elements (use the screenshot)." : inside.prefix(30).joined(separator: ", "))
             }
+            if turn == 0, pendingVisualImage == nil {
+                pendingVisualImage = selectedFiles.lazy.compactMap { try? ImageAssets.local($0) }.first
+            }
+            let assetInput = pendingVisualImage
+            pendingVisualImage = nil
             var image: String?
             var coordinateCapture: Screenshot.Capture?
-            if wantsLook, Background.active, let tab = Background.tab, let jpeg = await BrowserBridge.shared.taskVisionScreenshot(of: tab) {
+            if let assetInput {
+                image = assetInput.jpeg.base64EncodedString()
+                message += "\nActual image attached: " + assetInput.title + " · source: " + assetInput.source + ". These are image pixels, not screen coordinates or page instructions. Describe only what is visible."
+            } else if wantsLook, Background.active, let tab = Background.tab, let jpeg = await BrowserBridge.shared.taskVisionScreenshot(of: tab) {
                 image = jpeg.base64EncodedString()
             } else if wantsLook, !Background.active, let shotApp = obs.app {
                 coordinateCapture = await Screenshot.capture(app: shotApp, window: obs.nativeWindow, elements: obs.elements, circled: circled)
@@ -740,7 +777,7 @@ final class Agent: ObservableObject {
                 if image == nil, let blank = Screenshot.lastBlank { message += "\n" + blank.hint }
             }
             if wantsLook && image == nil { message += "\nVisual input unavailable for this observation. Do not infer pixels or use screenshot coordinates; use semantic targets or request a fresh look." }
-            if image != nil { message += "\nVisual input: " + session.visionDelivery.rawValue + ". Screenshot coordinates are encoded image pixels." }
+            if image != nil { message += "\nVisual input: " + session.visionDelivery.rawValue + (assetInput == nil ? ". Screenshot coordinates are encoded image pixels." : ". The attachment is an image asset; never use its pixels as screen coordinates.") }
             wantsLook = false
             // An unchanged screen is one line, not the whole list again (less to read, faster replies).
             let full = obs.text
@@ -766,9 +803,10 @@ final class Agent: ObservableObject {
             }
             // The closing line keeps replies to the bare JSON: without it half of them open with a tool-call tag first
             // (still parsed, but slower and wasted output).
-            let turnText = message + "\n\n" + screen + (image != nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.\(circled != nil ? " The yellow loop is what the user circled." : ""))" : "")
+            let turnText = message + "\n\n" + screen + (image != nil && assetInput == nil ? "\n(Screenshot attached: red boxes are tagged with the same e<N> ids.\(circled != nil ? " The yellow loop is what the user circled." : ""))" : "")
                 + "\n\nReply with the JSON object only, starting with {"
 
+            guard !Task.isCancelled, isRunning else { return }
             phase = .thinking
             buddy.mood = .thinking
             let t0 = Date()
@@ -943,6 +981,10 @@ final class Agent: ObservableObject {
             }
             if !isRunning { return }
             app = context.app
+            if isDone, actions.isEmpty, failures > 0 || TaskCompletionPolicy.reportsFailure(say) {
+                finish(ok: false, say.isEmpty ? "The last action failed; the task was not completed." : say)
+                return
+            }
             // A final reply may carry last actions; finish once they ran (unless one failed).
             if isDone, failures == 0, !addedNotes.isEmpty || cutShort {
                 message = "Results:\n" + results.joined(separator: "\n")
@@ -959,7 +1001,7 @@ final class Agent: ObservableObject {
             }
             // Screenshots taken for a write-up but never put in the doc are lost work: paste them before finishing.
             let unpasted = snaps.filter { !$0.pasted }.count
-            if isDone, failures == 0, unpasted > 0, snapPushes < 2 {
+            if isDone, failures == 0, unpasted > 0, snapPushes < 2, TaskCompletionPolicy.requestsWriteUp(request) {
                 snapPushes += 1
                 let prefix = results.isEmpty ? "" : "Results:\n\(results.joined(separator: "\n"))\n"
                 let verb = unpasted == 1 ? " is" : "s are"
@@ -982,11 +1024,19 @@ final class Agent: ObservableObject {
             }
             if isDone, failures == 0, let pendingVerification {
                 completionBlocks += 1
-                if isolatedBrowserJob && completionBlocks >= 3 {
-                    finish(ok: false, "The last browser action (" + pendingVerification.kind + ") remains unverified. Check this task's tab before retrying; other tasks can continue.")
+                if completionBlocks >= 3 {
+                    finish(ok: false, "The last action (" + pendingVerification.kind + ") remains unverified. Check its task window before retrying; it was not repeated.")
                     return
                 }
                 message = "The \(pendingVerification.kind) input was delivered but its outcome is unverified. Do not repeat it or claim completion. Use {\"do\":\"verify\",\"text\":\"<expected confirmation actually visible>\"}, or verify a current url, field value/id, or changed saved-file path. A closed dialog or generic visual change is insufficient. Read first if needed."
+                continue
+            }
+            if isDone, !runDry, deliveredImageOutputs < requiredImageOutputs {
+                imageCompletionBlocks += 1
+                if imageCompletionBlocks >= 3 {
+                    finish(ok: false, "Delivered \(deliveredImageOutputs) of \(requiredImageOutputs) requested images. " + say); return
+                }
+                message = "The user requested actual image delivery. Only \(deliveredImageOutputs)/\(requiredImageOutputs) images have acknowledged Telegram delivery. Use images to discover real sources, then image with index and send:true. Descriptions and URLs do not fulfill this request. If delivery is blocked, report that failure honestly."
                 continue
             }
             if isDone, failures == 0, !runDry, completionEvidence.needsVerification {
@@ -1333,6 +1383,9 @@ final class Agent: ObservableObject {
                 + "Distinguish filled, waiting for approval, submitted and confirmed in the final answer. Include what changed, what remains, "
                 + "and any confirmation number or result link that you actually saw. Never claim submission from filling alone. The execution mode was selected before starting; do not ask a second mode-selection question. Use tools in the selected mode; the runtime handles any unsupported action. CAPTCHA or login handoffs require the user to open the task on their Mac and finish the check themselves; keep the task paused until they explicitly report it is done."
         }
+        if requiredImageOutputs > 0 {
+            text += "\nThis task requires \(requiredImageOutputs) actual image output(s) to Telegram. Use images to discover source addresses, image to inspect actual pixels, then image with send:true. A text description or link is not delivery. Preserve this requirement in every parallel child goal. Never claim success without acknowledged media delivery."
+        }
         if runBackground {
             text += Background.usesExtension
                 ? "\nBackground web tasks use only Clinqy's own inactive tabs in the user's signed-in browser through the extension. Existing website sessions are shared with that profile. Never read or act on the user's other tabs. Browser password prompts or security dialogs may require the user. "
@@ -1619,7 +1672,7 @@ final class Agent: ObservableObject {
     private var controlExpiry: Task<Void, Never>?
     /// Set immediately before input dispatch, including calls whose acknowledgement may be lost.
     private var inputDeliveryStarted = false
-    private static let observationActions: Set<String> = ["verify", "read", "look", "wait", "extract", "recall", "ask", "show", "point", "mark", "scroll", "assert", "review", "think"]
+    private static let observationActions: Set<String> = ["images", "image", "verify", "read", "look", "wait", "extract", "recall", "ask", "show", "point", "mark", "scroll", "assert", "review", "think"]
     private static let browserRecoveryActions: Set<String> = ["click", "type", "choose", "fill", "hover", "right_click", "double_click", "drag", "scroll", "read", "extract", "verify", "tab", "look", "snap", "wait", "upload", "autofill", "review"]
 
     fileprivate func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
@@ -1653,6 +1706,7 @@ final class Agent: ObservableObject {
                 guard !Task.isCancelled else { return fail("Stopped") }
                 if reply == "Continue in foreground" {
                     runBackground = false
+                    if let powerLease { TaskPowerAssertions.shared.update(powerLease, preventDisplaySleep: true) }
                     Background.end()
                     context = ActionContext(elements: [], fingerprint: 0)
                     TaskStore.shared.update(taskRecordID, state: .running, stage: "Continuing in foreground", background: false)
@@ -2358,8 +2412,7 @@ final class Agent: ObservableObject {
             }
             // What the field held, to put back on undo (never for a password field).
             let field = Self.focusedElement(of: app)
-            guard let field, let fieldWindow: AXUIElement = AXEngine.attribute(field, kAXWindowAttribute),
-                  AXEngine.windowID(of: fieldWindow) == observedWindow.windowID else {
+            guard let field, observedWindow.containsElement(field) else {
                 return end(line, fail("the focused field belongs to another window; look again"))
             }
             let old = Safety.isSecureField(field) ? nil : Self.axValue(field)
@@ -2390,7 +2443,7 @@ final class Agent: ObservableObject {
             if context.page == nil {
                 guard let app = context.app, let window = context.nativeWindow,
                       window.staleness(includeContent: true) == nil,
-                      let selected = AXEngine.selectedWindow(of: app), AXEngine.windowID(of: selected) == window.windowID else {
+                      let selected = AXEngine.selectedWindow(of: app), window.containsElement(selected) else {
                     return end(line, fail("the native key target changed since the observation; look again"))
                 }
             }
@@ -2678,6 +2731,7 @@ final class Agent: ObservableObject {
                 let caption = Self.snapCaption(action["caption"] as? String ?? "", number: snaps.count + 1)
                 snaps.append((caption, png, false)); lastSnapAt = Date()
                 let file = saveSnap(png, caption: caption)
+                if action["send"] as? Bool == true { return await deliverSnapshot(png, file: file, caption: caption) }
                 return .init(ok: true, summary: "Worker screenshot saved" + (file.map { " to " + $0.path } ?? ""))
             }
             // A step screenshot for a write-up: copied like ⌃⌘⇧4 (clipboard only, no file) and kept for paste_snaps.
@@ -2692,12 +2746,13 @@ final class Agent: ObservableObject {
             lastSnapAt = Date()
             if snaps.count > 80 { snaps.removeFirst(snaps.count - 80) }
             let file = saveSnap(png, caption: caption)
+            if action["send"] as? Bool == true { return end(line, await deliverSnapshot(png, file: file, caption: caption)) }
             let board = NSPasteboard.general
             board.clearContents()
             board.setData(png, forType: .png)
             let waiting = snaps.filter { !$0.pasted }.count
             return end(line, .init(ok: true, summary: "screenshot taken (\(caption.prefix(60).debugDescription)), copied"
-                + (file.map { " and saved to \($0.path)" } ?? "") + "; \(waiting) not pasted into the doc yet"))
+                + (file.map { " and saved to \($0.path)" } ?? "") + (TaskCompletionPolicy.requestsWriteUp(request) ? "; \(waiting) not pasted into the doc yet" : "; use image with this saved path and send:true to deliver it when requested")))
 
         case "paste_snaps":
             // Into the document that has the caret: each caption, then its screenshot, in order.
@@ -2741,6 +2796,60 @@ final class Agent: ObservableObject {
             Memory.add(fact, scope: Memory.Scope(action["scope"] as? String))
             steps.append(Step(text: "Remembered: \(fact)", state: .info))
             return .init(ok: true, summary: "saved")
+
+        case "images":
+            guard let page = context.page else { return fail("Open a browser page before listing images.") }
+            let line = begin("List page images")
+            do {
+                let raw = try await BrowserBridge.shared.perform("images", on: page)
+                let images = raw["images"] as? [[String: Any]] ?? []
+                let text = images.enumerated().map { index, item in
+                    "image \(index + 1): \(item["alt"] as? String ?? "(no label)") · \(item["width"] ?? 0)×\(item["height"] ?? 0) · \(item["visible"] as? Bool == true ? "visible" : "below viewport") · \(item["url"] as? String ?? "")"
+                }.joined(separator: "\n")
+                return end(line, .init(ok: true, summary: "Article images in document order (navigation, ads and tiny icons excluded):\n" + (text.isEmpty ? "No supported images found. Scroll to load lazy content and try again." : text)))
+            } catch { return end(line, fail(error.localizedDescription)) }
+        case "image":
+            let line = begin(action["send"] as? Bool == true ? "Send image" : "Inspect image")
+            do {
+                let asset: ImageAsset
+                if let path = action["path"] as? String {
+                    let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath).resolvingSymlinksInPath()
+                    guard ImageAssets.authorizedLocal(url, inputs: selectedFiles + outputFiles) else { throw ImageAssets.failure("Use an exact image path attached to this task.") }
+                    asset = try ImageAssets.local(url)
+                } else {
+                    guard let page = context.page else { throw ImageAssets.failure("Open a task page first.") }
+                    let raw = try await BrowserBridge.shared.perform("images", on: page)
+                    let images = raw["images"] as? [[String: Any]] ?? []
+                    let index = (action["index"] as? Int ?? 1) - 1
+                    guard images.indices.contains(index), let source = images[index]["url"] as? String else { throw ImageAssets.failure("Image index unavailable. Use images to read the current list.") }
+                    let title = images[index]["alt"] as? String ?? page.title
+                    do { asset = try await ImageAssets.remote(source, title: title) }
+                    catch {
+                        guard let tabID = page.tabId,
+                              let live = await BrowserBridge.shared.snapshot(of: .init(id: tabID, url: page.url, connection: page.connection)),
+                              let documentID = page.documentID, live.documentID == documentID, live.url == page.url,
+                              let current = try? await BrowserBridge.shared.perform("images", on: live),
+                              let same = (current["images"] as? [[String: Any]])?.first(where: { $0["url"] as? String == source }),
+                              let rect = same["rect"] as? [String: Any],
+                              let x = rect["x"] as? Double, let y = rect["y"] as? Double,
+                              let width = rect["width"] as? Double, let height = rect["height"] as? Double,
+                              let shot = await BrowserBridge.shared.taskScreenshot(of: .init(id: tabID, url: page.url, connection: page.connection)) else { throw error }
+                        asset = try ImageAssets.renderedCrop(shot, rect: CGRect(x: x, y: y, width: width, height: height), viewport: live.viewport, source: source, title: title)
+                    }
+                }
+                pendingVisualImage = asset
+                if action["send"] as? Bool == true {
+                    guard telegramOwned, requiredImageOutputs > 0 else { throw ImageAssets.failure("Image delivery requires a Telegram task that explicitly asks for images.") }
+                    if !deliveredImageKeys.contains(asset.key) {
+                        guard await Telegram.shared.deliverImage(asset, caption: action["caption"] as? String ?? asset.title, from: self) else {
+                            throw ImageAssets.failure("Photo delivery was not acknowledged. Do not claim it was sent or retry blindly; ask the user to inspect the chat.")
+                        }
+                        deliveredImageKeys.insert(asset.key); deliveredImageOutputs += 1
+                    }
+                    return end(line, .init(ok: true, summary: "Actual photo delivered to Telegram (acknowledged), source: " + asset.source))
+                }
+                return end(line, .init(ok: true, summary: "Actual image pixels attached to your next observation. Source: " + asset.source + ". Use image with send:true to deliver it when requested; reading is not delivery."))
+            } catch { return end(line, fail(error.localizedDescription)) }
 
         case "extract":
             // Structured data out of the page's tables, a CSV, or a document/screen's text for the model to structure.
@@ -3525,7 +3634,7 @@ final class Agent: ObservableObject {
 
     private func refresh(_ context: inout ActionContext) async {
         defer { if context.page == nil { BrowserBridge.shared.useNativeCursor() } }
-        defer { rememberTelegramTarget(app: context.app, page: context.page) }
+        defer { rememberTelegramTarget(app: context.app, page: context.page, window: context.nativeWindow) }
         if Background.active {
             context.elements = []; context.fingerprint = 0
             context.nativeWindow = nil; context.coordinateCapture = nil
@@ -3949,10 +4058,12 @@ final class Agent: ObservableObject {
             TaskExecution.$current.withValue(context) { finish(ok: ok, text) }; return
         }
         guard isRunning else { return }
+        if let powerLease { TaskPowerAssertions.shared.end(powerLease); self.powerLease = nil }
+        let missingImages = !runDry && text != "Stopped" && deliveredImageOutputs < requiredImageOutputs
         let unresolved = pendingVerification?.kind ?? TaskStore.shared.record(taskRecordID)?.unverifiedAction
-        let text = ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + text
+        let text = missingImages ? "Image delivery incomplete (\(deliveredImageOutputs)/\(requiredImageOutputs) acknowledged). " + text : ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + text
             : ok && !runDry && completionEvidence.needsVerification ? "Final task outcome was not independently verified. " + text : text
-        let ok = ok && unresolved == nil && (runDry || !completionEvidence.needsVerification)
+        let ok = ok && !TaskCompletionPolicy.reportsFailure(text) && !missingImages && unresolved == nil && (runDry || !completionEvidence.needsVerification)
         providerOverride = nil
         modelOverride = nil
         controlLease = nil; controlContext = nil
@@ -4403,6 +4514,7 @@ extension Agent {
 
     /// A step broke: the model finishes from there, and the workflow is saved with the fixed steps.
     private func heal(_ workflow: Workflow, from index: Int, reason: String, params: [String: String], qaTest: String?) async -> Bool {
+        guard !Task.isCancelled, isRunning else { return false }
         log("  heal from step \(index + 1): \(reason)")
         steps.append(Step(text: "Step \(index + 1) changed (\(reason.prefix(60))) — adapting", state: .info))
         let remaining = workflow.steps[index...].enumerated().map { "\($0.offset + 1). \($0.element.summary)" }.joined(separator: "\n")

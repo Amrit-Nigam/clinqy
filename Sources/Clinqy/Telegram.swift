@@ -39,6 +39,11 @@ final class Telegram {
         let id: UUID
         let request: Request
         var background: Bool
+        var parentID: UUID?
+        var fullSummary: String?
+        var outputFiles: [URL] = []
+        var attemptedImages: Set<String> = []
+        var deliveredImages: Set<String> = []
         weak var worker: Agent?
         var ended = false
         var summary: String?
@@ -303,7 +308,7 @@ final class Telegram {
         let reply = (message["reply_to_message"] as? [String: Any])?["message_id"] as? Int
         let run = reply.flatMap { messageRuns[$0] }.flatMap { runs[$0] } ?? selected.flatMap { runs[$0] }
         if ["/runs", "/tasks", "/recovery"].contains(command) {
-            let items = store.records.filter { $0.source == .telegram && $0.conversationID == chatID }.suffix(12)
+            let items = store.records.filter { $0.source == .telegram && $0.conversationID == chatID && $0.parentID == nil && !["/runs", "/tasks", "/status", "/result"].contains($0.request.trimmingCharacters(in: .whitespacesAndNewlines)) }.suffix(12)
             send(items.isEmpty ? "No Telegram tasks yet." : items.map {
                 "[" + $0.shortID + "] " + $0.state.label + " · " + ($0.background ? "Background" : "Normal") + "\n" + Self.title($0.request)
             }.joined(separator: "\n\n") + "\n\n/task <id> selects a task. /run <id> resumes a reviewed queued request; interrupted work is never replayed.")
@@ -397,7 +402,7 @@ final class Telegram {
         let newBrowserRequest = BrowserTaskRouting.isBrowserTask(request.text) && request.text.range(of: #"https?://"#, options: .regularExpression) != nil
         let target = explicitRun ?? (!forceNew && !newModeRequest && !newBrowserRequest && waiting.count == 1 ? waiting.first : nil)
         if !forceNew, let target, !target.ended, let worker = target.worker {
-            selected = target.id
+            selected = rootRun(target).id
             if let question = worker.question {
                 if question.sensitive { return send("That one's private — answer it on your Mac.") }
                 if Self.questionHelp(request.text) {
@@ -421,6 +426,7 @@ final class Telegram {
             }
             if let completed = previous.completedAt, Date().timeIntervalSince(completed) < 1800, let summary = previous.summary {
                 request.context = "Task: " + previous.request.text + "\n" + summary
+                for file in previous.outputFiles where !request.files.contains(file) { request.files.append(file) }
             }
         }
         if let background = explicitMode {
@@ -493,11 +499,18 @@ final class Telegram {
         startReporting()
         prune()
     }
+    func registerBrowserTask(_ taskID: UUID) {
+        guard runs[taskID] == nil, let item = store.record(taskID), item.source == .telegram, item.conversationID == chatID else { return }
+        let run = Run(id: taskID, request: Request(text: item.request, files: item.files.map { URL(fileURLWithPath: $0) }), background: item.background)
+        run.parentID = item.parentID; runs[taskID] = run
+        updateCard(run)
+    }
     func attach(_ worker: Agent, taskID: UUID) {
-        if runs[taskID] == nil, let item = store.record(taskID), item.source == .telegram, item.conversationID == chatID {
-            runs[taskID] = Run(id: taskID, request: Request(text: item.request, files: item.files.map { URL(fileURLWithPath: $0) }), background: item.background)
-        }
+        registerBrowserTask(taskID)
         guard let run = runs[taskID], !run.ended else { return }
+        run.parentID = store.record(taskID)?.parentID
+        let root = rootRun(run)
+        worker.imageOutputRequirement = ImageRequest.count(root.request.text) > 0 ? (run.parentID == nil ? ImageRequest.count(root.request.text) : 1) : 0
         run.worker = worker
         updateCard(run)
     }
@@ -523,6 +536,7 @@ final class Telegram {
             return
         }
         run.worker = agent
+        agent.imageOutputRequirement = ImageRequest.count(run.request.text)
         agent.continuation = nil; agent.targetApp = nil; agent.selectedText = nil; agent.copied = nil; agent.annotation = nil
         agent.selectedFiles = run.request.files
         agent.submit(run.request.prompt, background: run.background, taskID: run.id)
@@ -534,12 +548,34 @@ final class Telegram {
         updateCard(run)
     }
     private func prune() {
-        let old = runs.values.filter(\.ended).sorted { ($0.completedAt ?? .distantPast) > ($1.completedAt ?? .distantPast) }.dropFirst(12)
-        for run in old where run.id != selected {
-            runs.removeValue(forKey: run.id)
-            let messages = messageRuns.filter { $0.value == run.id }.map(\.key)
-            for message in messages { messageRuns.removeValue(forKey: message); messageQuestions.removeValue(forKey: message) }
+        let old = runs.values.filter { $0.ended && $0.parentID == nil }.sorted { ($0.completedAt ?? .distantPast) > ($1.completedAt ?? .distantPast) }.dropFirst(12)
+        for root in old where root.id != selected {
+            let family = children(root) + [root]
+            for run in family {
+                runs.removeValue(forKey: run.id)
+                let messages = messageRuns.filter { $0.value == run.id }.map(\.key)
+                for message in messages { messageRuns.removeValue(forKey: message); messageQuestions.removeValue(forKey: message) }
+            }
         }
+    }
+
+    private func rootRun(_ run: Run) -> Run {
+        var root = run
+        for _ in 0..<32 {
+            guard let parent = root.parentID.flatMap({ runs[$0] }), parent !== root else { break }
+            root = parent
+        }
+        return root
+    }
+    private func children(_ run: Run) -> [Run] {
+        runs.values.filter { $0.parentID == run.id }.sorted { (store.record($0.id)?.createdAt ?? .distantPast) < (store.record($1.id)?.createdAt ?? .distantPast) }
+    }
+    private func visualChild(_ run: Run) -> Run? {
+        let jobs = children(run).filter { $0.worker != nil && $0.worker?.question?.sensitive != true }
+        return jobs.first { !$0.ended && $0.worker?.question != nil } ?? jobs.first { !$0.ended } ?? jobs.last
+    }
+    private func imageCount(_ run: Run) -> Int {
+        run.deliveredImages.count + children(run).reduce(0) { $0 + $1.deliveredImages.count }
     }
 
     // MARK: - One status card per task
@@ -554,6 +590,16 @@ final class Telegram {
     }
     private func statusText(_ run: Run) -> String {
         if let summary = run.summary { return summary }
+        let childJobs = children(run)
+        if !childJobs.isEmpty {
+            let complete = childJobs.filter(\.ended).count
+            let rows = childJobs.map { child in
+                let state = child.ended ? (child.deliveredImages.isEmpty && ImageRequest.count(run.request.text) > 0 ? "Image not delivered" : store.record(child.id)?.state.label ?? "Finished") : child.worker?.question != nil ? "Needs input" : child.worker?.narration.isEmpty == false ? String(child.worker!.narration.prefix(100)) : "Working"
+                return "• " + Self.title(child.request.text).prefix(70) + " — " + state
+            }.joined(separator: "\n")
+            let output = ImageRequest.count(run.request.text) > 0 ? " · \(imageCount(run)) images delivered" : ""
+            return "[\(run.shortID)] Working · Background\n" + Self.title(run.request.text) + "\n\n\(complete)/\(childJobs.count) tasks finished" + output + "\n" + rows
+        }
         let record = store.record(run.id)
         let worker = run.worker
         let mode = (record?.background ?? run.background) ? "Background" : "Normal"
@@ -566,6 +612,7 @@ final class Telegram {
         return "[\(run.shortID)] \(state) · \(mode)\n\(title)\n\n\(stage)\n\(record?.completedSteps ?? 0) steps completed"
     }
     private func updateCard(_ run: Run) {
+        if run.parentID != nil { updateCard(rootRun(run)); return }
         guard let chatID else { return }
         enqueue { [weak self, weak run] in
             guard let self, let run, self.runs[run.id] === run else { return }
@@ -593,7 +640,7 @@ final class Telegram {
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(15))
                 guard !Task.isCancelled, let self else { return }
-                let active = self.runs.values.filter { !$0.ended }
+                let active = self.runs.values.filter { !$0.ended && $0.parentID == nil }
                 if active.isEmpty { self.reporting = nil; return }
                 for run in active { self.updateCard(run) }
             }
@@ -613,6 +660,7 @@ final class Telegram {
         if targets.isEmpty { send("No active Telegram task selected. Pending attachments cleared; Mac tasks were left alone.") }
     }
     private func reveal(_ run: Run) {
+        if let child = visualChild(run), !child.ended { reveal(child); return }
         guard !run.ended, let worker = run.worker, worker.taskRecordID == run.id else { return send("This task has no active page yet. Check /status " + run.shortID) }
         Task { await worker.revealTelegramTarget() }
     }
@@ -637,7 +685,7 @@ final class Telegram {
             if parts[2] == "bg" || parts[2] == "fg" { valid = true; chooseMode(parts[1], background: parts[2] == "bg") }
             else if parts[2] == "cancel" { valid = true; cancelMode(parts[1]) }
         } else if parts.count == 3, parts[0] == "c", let run = runs.values.first(where: { $0.shortID == parts[1] }) {
-            selected = run.id; valid = true
+            selected = rootRun(run).id; valid = true
             switch parts[2] {
             case "status": send(statusText(run), extra: controls(run))
             case "result": sendResult(run)
@@ -649,7 +697,7 @@ final class Telegram {
         } else if parts.count == 3, parts[0] == "a", let run = runs.values.first(where: { $0.questionID == parts[1] && !$0.ended }),
                   let worker = run.worker, worker.question?.sensitive == false, worker.taskRecordID == run.id,
                   let index = Int(parts[2]), run.options.indices.contains(index) {
-            valid = true; selected = run.id
+            valid = true; selected = rootRun(run).id
             let answer = run.options[index]
             dismissQuestion(run); worker.answer(answer); updateCard(run)
         }
@@ -697,7 +745,7 @@ final class Telegram {
     }
     private func sendResult(_ run: Run?) {
         guard let run else { return send("No task selected. Use /runs.") }
-        var text = run.summary ?? statusText(run)
+        var text = run.fullSummary ?? run.summary ?? statusText(run)
         if let result = run.result {
             let plain = result.plain
             if !text.contains(plain) {
@@ -708,6 +756,7 @@ final class Telegram {
         send(text, extra: controls(run))
     }
     private func requestScreenshot(_ run: Run) {
+        if let child = visualChild(run) { requestScreenshot(child); return }
         guard !run.takingScreenshot else { return }
         guard run.worker?.question?.sensitive != true else { return send("I'm waiting for private input; screenshots are paused until that's answered on the Mac.") }
         guard let worker = run.worker, worker.taskRecordID == run.id else {
@@ -737,7 +786,14 @@ final class Telegram {
     private func finish(_ run: Run, answer: String, ok: Bool, result: ResultCard?) {
         guard !run.ended else { return }
         run.ended = true; run.completedAt = Date(); run.result = result ?? run.result
+        run.outputFiles = Array(Set((run.worker?.outputFiles ?? []) + run.request.files))
         dismissQuestion(run)
+        let expected = ImageRequest.count(rootRun(run).request.text) > 0 ? (run.parentID == nil ? ImageRequest.count(run.request.text) : 1) : 0
+        let delivered = imageCount(run)
+        let ok = ok && delivered >= expected
+        if delivered < expected && answer != "Stopped" {
+            store.finish(run.id, ok: false, answer: "Image delivery incomplete: \(delivered)/\(expected). " + answer)
+        }
         let head = ok ? "✅ Done" : answer == "Stopped" ? "⏹ Stopped" : "⚠️ Couldn't finish"
         let mode = (store.record(run.id)?.background ?? run.background) ? "Background" : "Normal"
         run.summary = "\(head) [\(run.shortID)] · \(mode)\n" + Self.title(run.request.text) + "\n\n" + answer
@@ -746,6 +802,17 @@ final class Telegram {
             else if let detail = result.text, !detail.isEmpty, !answer.contains(detail) { run.summary! += "\n\n" + detail }
         }
         if let url = run.worker?.telegramPageURL, !answer.contains(url) { run.summary! += "\n\nPage: " + url }
+        run.fullSummary = run.summary
+        if !children(run).isEmpty {
+            let rows = children(run).map { child in
+                "• " + Self.title(child.request.text).prefix(80) + " — " + (child.deliveredImages.isEmpty && expected > 0 ? "image not delivered" : store.record(child.id)?.state.label ?? "Finished")
+            }.joined(separator: "\n")
+            let output = expected > 0 ? "\(delivered)/\(expected) requested images delivered" : "\(children(run).filter(\.ended).count)/\(children(run).count) tasks finished"
+            run.summary = "\(head) [\(run.shortID)]\n" + Self.title(run.request.text) + "\n\n" + output + "\n" + rows + "\n\nFull details: /result " + run.shortID
+        } else if expected > 0 && delivered < expected {
+            run.summary = "\(head) [\(run.shortID)]\n" + Self.title(run.request.text) + "\n\nImage delivery incomplete: \(delivered)/\(expected).\n" + answer
+            run.fullSummary = run.summary
+        }
         updateCard(run) // One terminal edit. No second review message, automatic photo, or image-error message.
     }
     // MARK: - Bot API
@@ -779,28 +846,50 @@ final class Telegram {
         }
     }
 
-    private func sendPhoto(_ image: Data, caption: String) {
-        guard let chatID, image.count < 10_000_000 else { return send("The task image is too large to send. Ask for the text review with /result.") }
-        enqueue { [weak self] in
-            guard let self, let token = self.token,
-                  let url = URL(string: "https://api.telegram.org/bot\(token)/sendPhoto") else { return }
-            let boundary = "Clinqy-" + UUID().uuidString
-            var body = Data()
-            for (name, value) in [("chat_id", String(chatID)), ("caption", Self.chunks(Secrets.mask(caption), limit: 1000).first ?? "Task view")] {
-                body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
-            }
-            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"task.png\"\r\nContent-Type: image/png\r\n\r\n".utf8))
-            body.append(image)
-            body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-            var request = URLRequest(url: url, timeoutInterval: 30)
-            request.httpMethod = "POST"
-            request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type")
-            request.httpBody = body
-            guard let (data, _) = try? await self.session.data(for: request),
-                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], json["ok"] as? Bool == true else {
-                return self.send("The task screenshot couldn't be delivered. Try /screenshot again, or use /result for the text review.")
-            }
+    /// Only an explicit image-output request can authorize media output. An uncertain upload is never replayed.
+    func deliverImage(_ asset: ImageAsset, caption: String, from worker: Agent) async -> Bool {
+        guard let run = run(for: worker), !run.ended, worker.question?.sensitive != true else { return false }
+        let root = rootRun(run)
+        guard ImageRequest.wantsOutput(root.request.text) else { return false }
+        if run.deliveredImages.contains(asset.key) { return true }
+        let limit = worker.imageOutputRequirement ?? ImageRequest.count(root.request.text)
+        guard run.deliveredImages.count < max(1, limit), !run.attemptedImages.contains(asset.key) else { return false }
+        run.attemptedImages.insert(asset.key)
+        let previous = sending
+        let upload = Task { @MainActor [weak self] in
+            await previous?.value
+            guard let self, !run.ended, worker.taskRecordID == run.id else { return false }
+            return await self.uploadPhoto(asset.jpeg, caption: "[" + root.shortID + "] " + caption)
         }
+        sending = Task { _ = await upload.value }
+        let delivered = await upload.value
+        if delivered { run.deliveredImages.insert(asset.key); updateCard(root) }
+        return delivered
+    }
+    private func sendPhoto(_ image: Data, caption: String) {
+        enqueue { [weak self] in
+            guard let self else { return }
+            if await self.uploadPhoto(image, caption: caption) == false { self.send("Couldn't deliver that task image. Use /result for text, or request a fresh screenshot.") }
+        }
+    }
+    private func uploadPhoto(_ image: Data, caption: String) async -> Bool {
+        guard let chatID, !image.isEmpty, image.count < 10_000_000, let token,
+              let url = URL(string: "https://api.telegram.org/bot\(token)/sendPhoto") else { return false }
+        let boundary = "Clinqy-" + UUID().uuidString
+        var body = Data()
+        for (name, value) in [("chat_id", String(chatID)), ("caption", Self.chunks(Secrets.mask(caption), limit: 1000).first ?? "Task image")] {
+            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
+        }
+        let png = image.starts(with: [137, 80, 78, 71, 13, 10, 26, 10])
+        let filename = png ? "image.png" : "image.jpg", mime = png ? "image/png" : "image/jpeg"
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"\(filename)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
+        body.append(image)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        var request = URLRequest(url: url, timeoutInterval: 30)
+        request.httpMethod = "POST"; request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type"); request.httpBody = body
+        guard let (data, response) = try? await session.data(for: request), (response as? HTTPURLResponse)?.statusCode == 200,
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], json["ok"] as? Bool == true else { return false }
+        return true
     }
 
     private func call(_ method: String, _ body: [String: Any], wait: TimeInterval = 20) async -> Any? {

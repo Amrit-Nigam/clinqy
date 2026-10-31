@@ -73,6 +73,8 @@ clinqy doctor             # what's ready
 
 API keys go in the settings file (`clinqy settings` opens it); all the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration). Building from source instead? See [Build & run](#build--run).
 
+While a task runs, Clinqy uses an IOKit `PreventUserIdleSystemSleep` assertion to keep the Mac awake. Foreground tasks also prevent idle display sleep. Overlapping tasks share reference-counted assertions; finishing, failing, stopping, or quitting releases the relevant leases. Queued tasks hold none. This prevents idle sleep, not manual locking, lid-close sleep, or shutdown.
+
 ## Telegram tasks and attachments (Mac)
 
 Open **Telegram…** from Clinqy's menu to connect your bot and pair your private chat. Send a photo or file with a caption such as “send this image to Onik on WhatsApp” or “summarize this PDF”. Clinqy downloads the attachment to your Mac and gives the task its exact local path.
@@ -85,7 +87,7 @@ Each file must fit Telegram's 20 MB download limit. Failed or missing attachment
 
 Questions have task-specific reply buttons that expire after answering. Reply to the question itself when several tasks need input. Passwords and codes stay on the Mac. Asking “how can I do it?” keeps the task paused. **Open task on Mac** or `/open` reveals its pinned tab/window; solve a CAPTCHA yourself there, then reply when done.
 
-`/status` or “how far along?” shows the selected task's mode, stage and completed steps. Automatic progress edits the existing card rather than posting new messages. `/screenshot` captures only the task's pinned tab/window, without selecting unrelated windows, and pauses during private input. Images are sent on request; completion sends no automatic photo or image-error message.
+`/status` or “how far along?” shows the selected task's mode, stage and completed steps. Automatic progress edits the existing card rather than posting new messages. `/screenshot` captures only the task's pinned tab/window, without selecting unrelated windows, and pauses during private input. Images are sent on request; completion sends no automatic photo or image-error message. Attached images reach the model as actual visual input. For requested page images, Clinqy discovers article sources and sends actual photos; blocked downloads can use a crop of the fully visible image in the owned task tab. Media requests require acknowledged photo delivery before reporting success. Grouped browser work uses one parent card, with child questions routed to the correct task and detailed results available on demand.
 
 `/result` or “what did you fill?” shows the full output, including every form field, warnings and links; long output spans message chunks. Form submission still requires a review of the actual answers with **Submit** or **Edit**. Changed answers or another form require a new review. Completion distinguishes filling from submission and avoids repeating an automatically generated result card. Follow-ups such as “change the location to Pune” retain the previous task's output as context for 30 minutes. Saved text outcomes remain available after restarting.
 

@@ -19,6 +19,8 @@ enum Background { static func choice(_ text: inout String) -> Bool? { ExecutionM
     struct Step { enum State { case running, ok, failed, info }; var text: String; var state: State = .ok }
     var store: TaskStore!
     var taskRecordID: UUID?
+    var imageOutputRequirement: Int?
+    var outputFiles: [URL] = []
     var isRunning = false
     var question: Question?
     var steps: [Step] = []
@@ -57,6 +59,7 @@ final class TelegramAPI: URLProtocol {
     static var requests: [(String, [String: Any])] = []
     static var rawRequests: [(String, Data)] = []
     static var nextMessage = 100
+    static var failPhotos = false
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -81,7 +84,8 @@ final class TelegramAPI: URLProtocol {
             payload = try! JSONSerialization.data(withJSONObject: ["ok": true, "result": ["file_path": "files/\(file).jpg", "file_size": 4]])
         } else if request.url!.path.contains("/file/") {
             payload = Data("file".utf8); if method == "broken.jpg" { status = 500 }
-        } else { payload = try! JSONSerialization.data(withJSONObject: ["ok": true, "result": ["message_id": body["message_id"] as? Int ?? id]]) }
+        } else if method == "sendPhoto", Self.lock.withLock({ Self.failPhotos }) { payload = Data("{\"ok\":false}".utf8) }
+        else { payload = try! JSONSerialization.data(withJSONObject: ["ok": true, "result": ["message_id": body["message_id"] as? Int ?? id]]) }
         client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: status, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
         client?.urlProtocol(self, didLoad: payload); client?.urlProtocolDidFinishLoading(self)
     }
@@ -342,6 +346,90 @@ final class TelegramAPI: URLProtocol {
         check(Telegram.formKey(url: "a", answers: [("City", "Delhi")]) != Telegram.formKey(url: "a", answers: [("City", "Pune")]), "changed answers invalidate form approval")
         check(Telegram.formKey(url: "a", answers: []) != Telegram.formKey(url: "b", answers: []), "form approval cannot cross pages")
         check(Telegram.intent("Can you send me an image of what you're doing right now?") == .screenshot && Telegram.intent("set the status to available") == nil, "conversational controls do not hijack ordinary task text")
+        // A grouped image request has one status card and three requested photos, not four completion messages.
+        let (media, coordinator, mediaStore) = bridge()
+        media.handle(message("foreground: open 3 tabs and send the first image from each"))
+        try await wait { coordinator.submitted.count == 1 }
+        let rootID = coordinator.taskRecordID!
+        mediaStore.coordinate(rootID)
+        var imageWorkers: [Agent] = []
+        try await settle()
+        let beforeChildren = TelegramAPI.texts().count
+        for index in 0..<3 {
+            let id = mediaStore.enqueue("Child image goal \(index)", source: .telegram, background: true, conversationID: 42, parentID: rootID)!
+            media.registerBrowserTask(id)
+            check(mediaStore.start(id), "image child admitted independently")
+            let child = Agent(); child.store = mediaStore
+            child.onFinish = { [weak media, weak child] text, ok in if let child { media?.finished(answer: text, ok: ok, result: nil, from: child) } }
+            media.attach(child, taskID: id); child.submit("Child image goal \(index)", background: true, taskID: id)
+            imageWorkers.append(child)
+        }
+        try await settle()
+        check(TelegramAPI.texts().count == beforeChildren, "parallel children never create separate status or completion cards")
+        check(imageWorkers.allSatisfy { $0.imageOutputRequirement == 1 }, "parent image delivery requirement is preserved in every child")
+        let photosStart = TelegramAPI.bodies("sendPhoto").count
+        for (index, child) in imageWorkers.enumerated() {
+            let asset = ImageAsset(jpeg: Data("actual-image-\(index)".utf8), source: "https://example.com/\(index).jpg", title: "Image \(index)")
+            let delivered = await media.deliverImage(asset, caption: asset.title, from: child)
+            check(delivered, "actual image output requires an acknowledged Bot API upload")
+            let duplicate = await media.deliverImage(asset, caption: asset.title, from: child)
+            check(duplicate, "acknowledged image retry is deduplicated")
+            let extra = ImageAsset(jpeg: Data("extra-\(index)".utf8), source: "https://example.com/extra-\(index).jpg", title: "Extra")
+            let extraSent = await media.deliverImage(extra, caption: "Not requested", from: child)
+            check(!extraSent, "requested photo count prevents extra unsolicited output")
+            child.complete("Image \(index) delivered")
+        }
+        coordinator.complete("All child media returned")
+        try await settle()
+        check(TelegramAPI.bodies("sendPhoto").count == photosStart + 3 && TelegramAPI.texts().count == beforeChildren, "three requested images, one parent completion, zero child completion spam")
+        check(TelegramAPI.texts("editMessageText").contains { $0.contains("3/3 requested images delivered") && $0.contains("✅ Done") }, "group completion reports acknowledged image counts")
+        imageWorkers[0].screenshot = Data("group-task-view".utf8)
+        imageWorkers[1].screenshot = Data("group-task-view".utf8)
+        imageWorkers[2].screenshot = Data("group-task-view".utf8)
+        let screenshotCount = TelegramAPI.bodies("sendPhoto").count
+        media.handle(message("/screenshot"))
+        try await wait { TelegramAPI.bodies("sendPhoto").count == screenshotCount + 1 }
+        check(coordinator.captures == 0 && imageWorkers.reduce(0, { $0 + $1.captures }) == 1, "group screenshot targets a real child tab rather than an empty coordinator")
+        let recordCount = mediaStore.records.count
+        media.handle(message("What is the progress ?")); try await settle()
+        check(mediaStore.records.count == recordCount && TelegramAPI.texts().last!.contains("3/3 requested images delivered"), "natural progress reports parent group without starting another task")
+        media.handle(message("/runs")); try await settle()
+        check(!imageWorkers.contains { TelegramAPI.texts().last!.contains("[" + String($0.taskRecordID!.uuidString.prefix(8)).lowercased() + "]") }, "runs lists parent tasks rather than internal child jobs")
+
+        let (failedMedia, failedWorker, failedStore) = bridge()
+        failedMedia.handle(message("foreground: send the first image")); try await wait { failedWorker.submitted.count == 1 }
+        let failedAsset = ImageAsset(jpeg: Data("photo".utf8), source: "https://example.com/failure.jpg", title: "Failure fixture")
+        let failedStart = TelegramAPI.bodies("sendPhoto").count
+        TelegramAPI.lock.withLock { TelegramAPI.failPhotos = true }
+        let failedDelivery = await failedMedia.deliverImage(failedAsset, caption: "Fixture", from: failedWorker)
+        TelegramAPI.lock.withLock { TelegramAPI.failPhotos = false }
+        let uncertainRetry = await failedMedia.deliverImage(failedAsset, caption: "Fixture", from: failedWorker)
+        check(!failedDelivery && !uncertainRetry && TelegramAPI.bodies("sendPhoto").count == failedStart + 1, "unacknowledged photo delivery fails closed without blind retry")
+        failedWorker.complete("I described the image but did not send it")
+        try await settle()
+        check(failedStore.record(failedWorker.taskRecordID)?.state == .failed, "description without photo delivery cannot become Succeeded")
+        check(TelegramAPI.texts("editMessageText").contains { $0.contains("Image delivery incomplete: 0/1") && $0.contains("⚠️ Couldn't finish") }, "partial media results are labelled honestly")
+        let (analysisOnly, analysisWorker, _) = bridge()
+        analysisOnly.handle(message("foreground: describe this image")); try await wait { analysisWorker.submitted.count == 1 }
+        let unsolicited = await analysisOnly.deliverImage(failedAsset, caption: "Not requested", from: analysisWorker)
+        check(!unsolicited, "image analysis does not authorize unsolicited photo output")
+        analysisWorker.complete()
+        let (outputs, outputWorker, outputStore) = bridge()
+        let ownFile = root.appendingPathComponent("created-screenshot.png")
+        try Data("fixture".utf8).write(to: ownFile)
+        outputs.handle(message("foreground: capture a local screenshot without sending it"))
+        try await wait { outputWorker.submitted.count == 1 }
+        outputWorker.outputFiles = [ownFile]
+        outputStore.setOutputs(outputWorker.taskRecordID, files: [ownFile])
+        outputWorker.complete("Screenshot saved locally")
+        check(outputStore.record(outputWorker.taskRecordID)?.outputs == [ownFile.path], "created screenshot path is persisted with its exact task")
+        let offerBefore = TelegramAPI.texts().count
+        outputs.handle(message("send it on WhatsApp to my own chat"))
+        try await wait { TelegramAPI.texts().count > offerBefore }
+        tap(outputs, TelegramAPI.option("Normal · use my Mac")!)
+        try await wait { outputWorker.submitted.count == 2 }
+        check(outputWorker.selectedFiles == [ownFile] && outputWorker.submitted.last!.contains(ownFile.path), "forwarding follow-up inherits the actual generated screenshot")
+        outputWorker.complete("Forwarding test stopped", ok: false)
         print("All Telegram attachment, routing, concurrency and conversation tests passed.")
     }
 }

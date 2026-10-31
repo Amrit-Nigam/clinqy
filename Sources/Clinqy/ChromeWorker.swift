@@ -628,6 +628,7 @@ final class ChromeWorker {
             for k in ["x", "px"] { if let value = result[k] as? Double { result[k] = value + (element?.offset.x ?? 0) } }
             for k in ["y", "py"] { if let value = result[k] as? Double { result[k] = value + (element?.offset.y ?? 0) } }
             return result
+        case "images": return try await call(tab, frame: top, function: "images")
         case "review", "read", "tables":
             guard !tab.incomplete else { throw WorkerCDP.error("An embedded frame is unreadable; I won't present an incomplete form review.") }
             let function = command == "read" ? "readText" : command

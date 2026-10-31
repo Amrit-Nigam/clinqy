@@ -102,6 +102,18 @@ import Foundation
         check(SavedFileEvidence.check(path: dir.path, since: baseline) == nil, "directory isn't saved artifact")
         try Data().write(to: file)
         check(SavedFileEvidence.check(path: file.path, since: baseline) == nil, "empty artifact refused")
+        let graph = ["field": ["sheet"], "sheet": ["main"], "main": ["app"], "otherField": ["otherWindow"], "otherWindow": ["app"], "cycle": ["cycle"]]
+        check(NativeWindowHierarchy.contains("field", root: "main", parents: { graph[$0] ?? [] }, equal: ==), "field inside attached sheet belongs to the exact observed window")
+        check(!NativeWindowHierarchy.contains("otherField", root: "main", parents: { graph[$0] ?? [] }, equal: ==), "another window in the same app is still rejected")
+        check(!NativeWindowHierarchy.contains("cycle", root: "main", parents: { graph[$0] ?? [] }, equal: ==), "cyclic accessibility parents fail safely")
+        check(NativeWindowHierarchy.contains("main", root: "main", parents: { graph[$0] ?? [] }, equal: ==), "exact observed root remains valid")
+        check(TaskCompletionPolicy.reportsFailure("I couldn't send the screenshot to WhatsApp."), "explicit failed send cannot be labelled successful")
+        check(TaskCompletionPolicy.reportsFailure("Unable to attach the image."), "blocked attachment is a failed result")
+        check(!TaskCompletionPolicy.reportsFailure("Sent the photo and verified it in the chat."), "verified successful send remains successful")
+        check(!TaskCompletionPolicy.requestsWriteUp("Send me a screenshot of Cursor app"), "standalone screenshot does not force a document")
+        check(!TaskCompletionPolicy.requestsWriteUp("Send it on WhatsApp\n\nPrevious Telegram task: Create a doc and paste screenshots"), "follow-up context cannot force a new write-up")
+        check(TaskCompletionPolicy.requestsWriteUp("Create a guide with the screenshots in a Google Doc"), "actual write-up still requires screenshot insertion")
+        check(!TaskCompletionPolicy.requestsWriteUp("Do not create a document; send the screenshot"), "explicit no-document request respected")
         print("PASS \(checks) gesture, ownership, replay refusal, vision and final artifact checks")
     }
 }

@@ -141,12 +141,13 @@ final class BrowserJobs: ObservableObject {
         var childIDs: [UUID] = []
         for request in requests {
             let owner = TaskStore.shared.record(parent.id)
-            let id = parent.test ? UUID() : TaskStore.shared.enqueue(request, source: owner?.source ?? .mac, background: true, conversationID: owner?.conversationID)
+            let id = parent.test ? UUID() : TaskStore.shared.enqueue(request, source: owner?.source ?? .mac, background: true, conversationID: owner?.conversationID, parentID: parent.id)
             guard let id else { continue }
             let child = Job(id: id, request: request, test: parent.test, model: parent.model, provider: parent.provider, files: parent.files,
                             browser: BrowserTaskRouting.browser(in: request) ?? parent.browser, parent: parent.id, receipt: nil,
                             color: color(at: jobs.count))
             jobs.append(child); childIDs.append(id)
+            Telegram.shared.registerBrowserTask(id)
         }
         guard childIDs.count == requests.count else {
             for id in childIDs { cancel(id) }
@@ -163,6 +164,7 @@ final class BrowserJobs: ObservableObject {
             Task { @MainActor [weak self] in self?.cancel(parent.id) }
         }
         let children = childIDs.compactMap { id in jobs.first { $0.id == id } }
+        parent.agent?.deliveredImageOutputs = children.reduce(0) { $0 + ($1.agent?.deliveredImageOutputs ?? 0) }
         let text = children.enumerated().map { "Task \($0.offset + 1) — \($0.element.ok ? "Done" : "Needs checking"): \($0.element.answer)" }.joined(separator: "\n\n")
         return (children.count == requests.count && children.allSatisfy(\.ok), text)
     }

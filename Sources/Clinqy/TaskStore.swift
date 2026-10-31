@@ -40,6 +40,8 @@ final class TaskStore: ObservableObject {
         var conversationID: Int64?
         var reviewReason: String?
         var coordinating: Bool?
+        var parentID: UUID?
+        var outputs: [String]?
 
         var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
         var status: String {
@@ -101,7 +103,7 @@ final class TaskStore: ObservableObject {
     var recovery: [Record] { records.filter { $0.state == .interrupted || ($0.state == .queued && $0.requiresReview) } }
 
     @discardableResult
-    func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil, idempotencyKey: String? = nil) -> UUID? {
+    func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil, idempotencyKey: String? = nil, parentID: UUID? = nil) -> UUID? {
         if let idempotencyKey, let existing = records.first(where: { $0.dispatchKey == idempotencyKey }) { return existing.id }
         let clean = redact(request)
         let item = Record(request: clean, files: files.map(\.path), source: source, background: background,
@@ -109,6 +111,7 @@ final class TaskStore: ObservableObject {
                           reviewReason: clean != request ? "Private values were removed from this request. Rewrite it without secrets before running it." : nil)
         var scheduled = item
         scheduled.dispatchKey = idempotencyKey
+        scheduled.parentID = parentID
         guard mutate({ $0.append(scheduled) }) else { return nil }
         return item.id
     }
@@ -172,6 +175,10 @@ final class TaskStore: ObservableObject {
             if let action = $0.unverifiedAction { $0.lastConfirmedStep = action + " (" + redact(evidence) + ")" }
             $0.unverifiedAction = nil
         }
+    }
+    func setOutputs(_ id: UUID?, files: [URL]) {
+        guard let id else { return }
+        _ = change(id) { $0.outputs = files.map(\.path) }
     }
     func finish(_ id: UUID?, ok: Bool, answer: String) {
         guard let id else { return }
