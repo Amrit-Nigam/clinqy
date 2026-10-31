@@ -2,7 +2,8 @@
 //! model family the Mac app runs). The first use downloads whisper.cpp and the model into
 //! %LOCALAPPDATA%\Clinqy\voice. Each request is transcribed with Whisper's audio window sized to what was said (a
 //! 3-second request costs a tenth of the usual 30-second window), so it takes a second or two on a laptop CPU.
-//! Nothing leaves the PC.
+//! Nothing leaves the PC. VOICE_ENGINE=windows uses Windows' own speech service instead (`winspeech.rs`), with Whisper
+//! as the fallback.
 
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use parking_lot::Mutex;
@@ -28,6 +29,14 @@ struct Inner {
 
 #[derive(Clone)]
 pub struct Voice(Arc<Inner>);
+
+/// "windows" for Windows' speech service, else "whisper".
+pub fn engine() -> String {
+    match clinqy_core::config::value("VOICE_ENGINE").as_deref() {
+        Some("windows") => "windows".into(),
+        _ => "whisper".into(),
+    }
+}
 
 fn dir() -> PathBuf {
     let d = clinqy_core::paths::local_dir().join("voice");
@@ -196,9 +205,19 @@ impl Voice {
                 let _ = m.prepare().await;
             });
         }
+        let windows_speech = (engine() == "windows").then(|| {
+            let m = self.clone();
+            std::thread::spawn(move || crate::winspeech::listen(&|| m.0.stop.load(Ordering::Relaxed)))
+        });
         std::thread::spawn(move || {
             let samples = me.record(auto);
             me.0.listening.store(false, Ordering::Relaxed);
+            me.0.stop.store(true, Ordering::Relaxed);
+            match windows_speech.map(|h| h.join().unwrap_or_else(|_| Err("it stopped unexpectedly".into()))) {
+                Some(Ok(text)) if !text.is_empty() && !me.0.cancel.load(Ordering::Relaxed) => return me.set_transcript(&text, true),
+                Some(Err(e)) => clinqy_core::log::write(&format!("voice: Windows speech: {e}. Using Whisper.")),
+                _ => {}
+            }
             let samples = match samples {
                 Some(s) if !me.0.cancel.load(Ordering::Relaxed) && s.len() >= 16_000 / 3 => s,
                 _ => {

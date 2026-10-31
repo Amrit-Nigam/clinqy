@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.7";
+const SCRIPT_VERSION = "1.9.9";
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
@@ -292,17 +292,90 @@ async function backgroundTab(url, at) {
   return { id: t.id, windowId: t.windowId, bounds: { x: w.left, y: w.top, w: w.width, h: w.height } };
 }
 
+// A task in the user's own browser works in a tab of its own, in a "Clinqy" group beside theirs. It's never made active,
+// so they keep the tab and window they're in. Metrics and focus are emulated because a tab out of sight has no size and
+// counts as hidden. Only tabs Clinqy opened are touched, and it lets go of them when the task ends.
+async function workTabs() {
+  try { return (await chrome.storage.session.get("workTabs")).workTabs || []; } catch { return []; }
+}
+
+async function clinqyGroup(tabId, windowId) {
+  if (!chrome.tabGroups) return;
+  const [group] = await chrome.tabGroups.query({ title: "Clinqy", windowId });
+  const id = await chrome.tabs.group(group ? { tabIds: tabId, groupId: group.id } : { tabIds: tabId, createProperties: { windowId } });
+  if (!group) await chrome.tabGroups.update(id, { title: "Clinqy", color: "blue", collapsed: false });
+}
+
+async function clinqyTab(url, width, height) {
+  const [front] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const t = await chrome.tabs.create({ ...(front ? { windowId: front.windowId } : {}), url, active: false });
+  const mine = await openedTabs();
+  mine.add(t.id);
+  await setOpened(mine);
+  try { await clinqyGroup(t.id, t.windowId); } catch {}
+  try { await chrome.storage.session.set({ workTabs: [...await workTabs(), t.id], workSize: { width, height } }); } catch {}
+  await cdp(t.id, "Page.enable");
+  return { id: t.id };
+}
+
+async function prepareWorkTab(tabId) {
+  const target = { tabId };
+  const { workSize } = await chrome.storage.session.get("workSize");
+  await chrome.debugger.sendCommand(target, "Page.enable");
+  await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
+  await chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", { ...(workSize || { width: 1280, height: 900 }), deviceScaleFactor: 1, mobile: false });
+}
+
+// The task ended: Chrome's debugging bar goes, and the tab behaves normally if the user looks at it.
+async function clinqyDone() {
+  for (const tabId of await workTabs()) {
+    try { await chrome.debugger.detach({ tabId }); } catch {}
+    attached.delete(tabId);
+  }
+  return { done: true };
+}
+
+// The next task starts: the last one's tabs go, except one the user is on, which is theirs now.
+async function clinqyClear() {
+  const keep = [];
+  for (const tabId of await workTabs()) {
+    try {
+      const t = await chrome.tabs.get(tabId);
+      if (t.active) {
+        const mine = await openedTabs();
+        mine.delete(tabId);
+        await setOpened(mine);
+      } else {
+        await chrome.tabs.remove(tabId);
+      }
+    } catch {}
+  }
+  try { await chrome.storage.session.set({ workTabs: keep }); } catch {}
+  return { cleared: true };
+}
+
 const attached = new Set();
 
-chrome.debugger.onDetach.addListener((source) => attached.delete(source.tabId));
+// Chrome can run this script with an older manifest's permissions until the extension is reloaded: without the
+// debugger permission only the debugger-based actions are unavailable, and everything else has to keep working.
+if (chrome.debugger) {
+  chrome.debugger.onDetach.addListener((source) => attached.delete(source.tabId));
+  // A dialog would hold a tab nobody is looking at forever.
+  chrome.debugger.onEvent.addListener((source, method, params) => {
+    if (method !== "Page.javascriptDialogOpening") return;
+    chrome.debugger.sendCommand(source, "Page.handleJavaScriptDialog", { accept: params.type === "beforeunload" }).catch(() => {});
+  });
+}
 
 async function cdp(tabId, method, params = {}) {
   if (!attached.has(tabId)) {
     const mine = await openedTabs();
     if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
+    if (!chrome.debugger) throw new Error("reload the Clinqy extension to allow this action");
     try { await chrome.debugger.attach({ tabId }, "1.3"); }
     catch (e) { if (!/already attached/i.test(String(e && e.message || e))) throw e; }
     attached.add(tabId);
+    if ((await workTabs()).includes(tabId)) await prepareWorkTab(tabId);
   }
   return await chrome.debugger.sendCommand({ tabId }, method, params);
 }
@@ -390,6 +463,9 @@ async function tabCommand(msg) {
 async function handle(msg) {
   if (/^(tabs|switchTab|closeTab)$/.test(msg.cmd)) return await tabCommand(msg);
   if (msg.cmd === "backgroundTab") return await backgroundTab(msg.url, msg.at);
+  if (msg.cmd === "clinqyTab") return await clinqyTab(msg.url, Number(msg.width) || 1280, Number(msg.height) || 900);
+  if (msg.cmd === "clinqyDone") return await clinqyDone();
+  if (msg.cmd === "clinqyClear") return await clinqyClear();
   // A window Clinqy left behind (it quit without closing it) goes; one the user took over is only forgotten.
   if (msg.cmd === "closeAgentWindow" || msg.cmd === "releaseAgentWindow") {
     const win = await agentWindow();
@@ -411,13 +487,13 @@ async function handle(msg) {
     // The debugger helper only accepts tabs opened by Clinqy. Never activate a tab or capture the user's display.
     if (msg.tabId == null) throw new Error("task screenshot requires an explicit tab");
     const captured = await cdp(tab.id, "Page.captureScreenshot", {
-      format: "png", fromSurface: true, captureBeyondViewport: false
+      format: msg.format || "png", ...(msg.quality ? { quality: Number(msg.quality) } : {}), fromSurface: true, captureBeyondViewport: false
     });
     return { image: captured.data, tabId: tab.id };
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
-    return { id: tab.id, url: tab.url || tab.pendingUrl || "", focused: !!win.focused };
+    return { id: tab.id, url: tab.url || tab.pendingUrl || "", title: tab.title || "", focused: !!win.focused };
   }
   if (msg.cmd === "newTab") {
     const t = await chrome.tabs.create({ url: msg.url, active: true });

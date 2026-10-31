@@ -77,7 +77,7 @@
   .del { font-size: 10px; color: var(--tertiary); }
   .sect { font-size: 10px; font-weight: 600; color: var(--tertiary); letter-spacing: .02em; }
   .empty { font-size: 13px; color: var(--tertiary); }
-  .foot { display: flex; align-items: center; gap: 11px; padding: 9px 16px; white-space: nowrap; background: rgba(255,255,255,0.03); color: var(--tertiary); font-size: 11px; }
+  .foot { display: flex; align-items: center; gap: 9px; padding: 9px 14px; white-space: nowrap; background: rgba(255,255,255,0.03); color: var(--tertiary); font-size: 11px; }
   .hint { display: flex; align-items: center; gap: 4px; flex: none; }
   .keys { font: 500 10px var(--rounded); padding: 2px 5px; border-radius: 4px; background: rgba(255,255,255,0.08); }
   .fb { display: flex; align-items: center; gap: 4px; color: var(--tertiary); flex: none; white-space: nowrap; }
@@ -107,6 +107,10 @@
 <script>
 const $ = (s) => document.querySelector(s);
 const send = (o) => window.ipc.postMessage(JSON.stringify(o));
+// Anything that isn't a control drags the bar; it's centred again the next time it opens.
+document.addEventListener("mousedown", (e) => {
+  if (e.button === 0 && !e.target.closest("input, textarea, select, button, a, .row, [contenteditable]")) send({ type: "drag" });
+});
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const O = orb($("#orb"));
 let S = { snap: {}, history: [], workflows: [], skills: [], listening: false, transcript: "", status: "", hotkey: "Ctrl+Alt", talkKey: "Ctrl+H",
@@ -228,6 +232,7 @@ function render() {
       body += `<div class="sugg">${suggestions.map(([ic, t]) => `<button class="srow" data-suggest="${esc(t)}"><span class="ic">${icon(ic)}</span><span class="t" style="text-align:left">${esc(t)}</span><span class="ret">${icon("return")}</span></button>`).join("")}</div>`;
     } else {
       body += `<div class="steps">`;
+      if (s.running && s.background) body += `<div class="label" style="color:var(--text)">${icon("square.stack.fill")} Working in the background. Keep using your PC.</div>`;
       if (s.running && s.paused) body += `<div class="label" style="color:var(--text)">${icon("pause.fill")} Paused — press Resume to carry on, or Stop</div>`;
       if (s.answer) body += `<div class="answer">${esc(s.answer)}</div>`;
       body += (s.steps || []).slice(-7).map((st) => `<div class="step ${st.state}"><span class="m">${st.state === "running" ? `<span class="spin"></span>` : st.state === "ok" ? icon("checkmark") : st.state === "failed" ? icon("xmark") : icon("sparkle", "f")}</span><span class="t">${esc(st.text)}</span></div>`).join("");
@@ -240,11 +245,12 @@ function render() {
   $("#foot").innerHTML = `<span class="hint"><span class="keys">${esc(S.hotkey)}</span>open</span><span class="hint">hold <span class="keys">${esc(S.talkKey)}</span>talk</span>
     <span class="spacer"></span>
     <button class="fb ${s.dry_run ? "acc" : ""}" data-act="dry" title="Dry run: Clinqy points at everything it would click and type, without doing it"><span class="ic">${icon(s.dry_run ? "eye.fill" : "eye")}</span>Dry run</button>
+    <button class="fb ${S.backgroundMode ? "acc" : ""}" data-act="backgroundMode" title="Background: tasks run in a hidden browser while you keep working"><span class="ic">${icon(S.backgroundMode ? "square.stack.fill" : "square.stack")}</span>Background</button>
     <button class="fb" data-act="circle" title="Circle something on screen to point Clinqy at it"><span class="ic">${icon("lasso")}</span>Circle</button>
-    <button class="fb" data-act="watch" title="Show Clinqy how to do something: it watches, then learns it as a skill"><span class="rec"></span>${S.recording ? "Stop watching" : "Watch &amp; learn"}</button>
+    <button class="fb" data-act="watch" title="Show Clinqy how to do something: it watches, then learns it as a skill"><span class="rec"></span>${S.recording ? "Stop" : "Watch"}</button>
     <button class="fb ${S.tab === "skills" ? "on" : ""}" data-tab="skills"><span class="ic">${icon("graduationcap")}</span>${S.tab === "skills" ? "Back" : "Skills"}</button>
     <button class="fb ${S.tab === "history" ? "on" : ""}" data-tab="history"><span class="ic">${icon("clock.arrow.circlepath")}</span>${S.tab === "history" ? "Back" : "History"}</button>
-    <span class="hint"><span class="keys">esc</span>close</span>`;
+    <button class="fb" data-act="settings" title="Settings: models, background, shortcuts and more"><span class="ic">${icon("gearshape")}</span></button>`;
   requestAnimationFrame(() => send({ type: "resize", height: $("#card").getBoundingClientRect().height }));
 }
 

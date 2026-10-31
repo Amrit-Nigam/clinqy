@@ -888,9 +888,9 @@ final class Agent: ObservableObject {
             let unpasted = snaps.filter { !$0.pasted }.count
             if isDone, failures == 0, unpasted > 0, snapPushes < 2 {
                 snapPushes += 1
-                log("  \(unpasted) screenshots not in the doc yet — pasting before finishing")
-                message = (results.isEmpty ? "" : "Results:\n" + results.joined(separator: "\n") + "\n")
-                    + "You were about to finish, but \(unpasted) screenshot\(unpasted == 1 ? " is" : "s are") not in the write-up doc yet. "
+                let prefix = results.isEmpty ? "" : "Results:\n\(results.joined(separator: "\n"))\n"
+                let verb = unpasted == 1 ? " is" : "s are"
+                message = "\(prefix)You were about to finish, but \(unpasted) screenshot\(verb) not in the write-up doc yet. "
                     + "Go to the doc (open_app its browser, switch to its tab, or open_url https://docs.new if there is none), "
                     + "click at the end of the document body, key cmd+down, then paste_snaps; check with look that they went in. "
                     + "Then carry on with any steps of the task that remain; finish only when everything is done."
@@ -1258,10 +1258,10 @@ final class Agent: ObservableObject {
         // tabs nor thinks there's nothing to paste.
         if !snaps.isEmpty {
             let waiting = snaps.filter { !$0.pasted }
-            text += "\nWrite-up screenshots so far in this task: \(snaps.count) (\(snaps.count - waiting.count) already pasted in the doc"
-                + (waiting.isEmpty ? ")" : "; not pasted yet: " + waiting.map { $0.caption.prefix(60).debugDescription }.joined(separator: ", ") + " — paste_snaps puts them in)")
-                + (snapFolder.map { "; saved in \($0.path)" } ?? "")
-                + ". Last captioned: \(snaps.last!.caption.prefix(80).debugDescription)."
+            let pending = waiting.isEmpty ? ")" : "; not pasted yet: " + waiting.map { $0.caption.prefix(60).debugDescription }.joined(separator: ", ") + " — paste_snaps puts them in)"
+            let saved = snapFolder.map { "; saved in \($0.path)" } ?? ""
+            let last = snaps.last!.caption.prefix(80).debugDescription
+            text += "\nWrite-up screenshots so far in this task: \(snaps.count) (\(snaps.count - waiting.count) already pasted in the doc\(pending)\(saved). Last captioned: \(last)."
         }
         if let selected = selectedText, !selected.isEmpty {
             text += "\nSelected text (the user highlighted this before asking; \"this\", \"it\", \"that\" usually mean it):\n\"\"\"\n\(selected.prefix(4000))\n\"\"\""

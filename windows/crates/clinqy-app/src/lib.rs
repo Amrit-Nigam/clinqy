@@ -11,4 +11,6 @@ pub mod recorder;
 pub mod server;
 pub mod setup;
 pub mod ui;
+pub mod update;
 pub mod voice;
+pub mod winspeech;

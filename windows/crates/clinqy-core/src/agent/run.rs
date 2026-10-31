@@ -26,8 +26,32 @@ pub(crate) struct Ctx {
 }
 
 /// Per-run state the actions read and write.
+/// What a turn's reply means for the task.
+#[derive(Debug, PartialEq)]
+enum Ending {
+    NotYet,
+    Finish,
+    /// It says it's done, right after an action failed: it gets one chance to show that.
+    Check,
+    Failed,
+}
+
+fn ending(done: bool, gave_up: bool, last_action_failed: bool, warned: bool) -> Ending {
+    match (done, gave_up, last_action_failed, warned) {
+        (false, ..) => Ending::NotYet,
+        (true, true, ..) => Ending::Failed,
+        (true, false, false, _) => Ending::Finish,
+        (true, false, true, false) => Ending::Check,
+        (true, false, true, true) => Ending::Failed,
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct RunState {
+    /// The last action that ran failed, and nothing has worked since: what it said.
+    pub last_failed: Option<String>,
+    /// Told once to check for itself before claiming the task is done.
+    pub warned_of_failure: bool,
     pub request: String,
     pub dry: bool,
     pub test: bool,
@@ -172,7 +196,7 @@ impl Agent {
         // The next request's session starts warming now.
         self.prewarm();
 
-        let target = self.current.lock().target.clone();
+        let target = self.current.lock().target.clone().filter(|_| !self.hands.hidden());
         let mut app = target.clone().or_else(|| self.platform.front_app());
         let mut message = self.intro(&request, &mut rs);
         let mut wants_look = false;
@@ -509,6 +533,7 @@ impl Agent {
                     wants_look = true;
                 }
                 results.push(format!("{}. {}", i + 1, result.summary));
+                rs.last_failed = (!result.ok).then(|| result.summary.clone());
                 if !result.ok {
                     failures += 1;
                     break;
@@ -579,6 +604,21 @@ impl Agent {
                 );
                 continue;
             }
+            let gave_up = json.get("failed").and_then(|v| v.as_bool()).unwrap_or(false);
+            match ending(is_done && failures == 0, gave_up, rs.last_failed.is_some() && !qa, rs.warned_of_failure) {
+                Ending::Failed => return self.finish(false, if say.is_empty() { "I couldn't do that" } else { &say }),
+                Ending::Check => {
+                    rs.warned_of_failure = true;
+                    self.log("  said done after a failed action — checking");
+                    message = format!(
+                        "{}You were about to finish, but your last action failed ({}). Don't answer from what you already know as if it had worked. Try another way, or check with a read or look that it's really done. If you can't, finish with done:true and failed:true and say what stopped you.",
+                        results_text(&results),
+                        rs.last_failed.as_deref().unwrap_or("").chars().take(200).collect::<String>()
+                    );
+                    continue;
+                }
+                Ending::Finish | Ending::NotYet => {}
+            }
             if is_done && failures == 0 {
                 self.finish(true, if say.is_empty() { "Done" } else { &say });
                 if !dry && !test {
@@ -623,6 +663,9 @@ impl Agent {
             running.join(", "),
             self.platform.default_browser().unwrap_or_else(|| "unknown".into())
         );
+        if self.hands.hidden() {
+            text += crate::prompt::BACKGROUND;
+        }
         {
             let s = self.snaps.lock();
             if !s.0.is_empty() {
@@ -849,6 +892,11 @@ mod tests {
         assert!(looks_like_label("Your roll number"));
         assert!(!looks_like_label("Your roll number is 1601"));
         assert!(says_unfinished("Steps 1-6 done. Still to do: step 7"));
+    assert_eq!(ending(false, false, true, false), Ending::NotYet);
+    assert_eq!(ending(true, false, false, false), Ending::Finish);
+    assert_eq!(ending(true, false, true, false), Ending::Check);
+    assert_eq!(ending(true, false, true, true), Ending::Failed);
+    assert_eq!(ending(true, true, false, false), Ending::Failed);
         assert!(!says_unfinished("Done. You need to log in to continue, the rest remains"));
         assert!(!says_unfinished("Settings remain unchanged"));
         assert!(keeps_front_app("open spotify"));

@@ -415,11 +415,11 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                     <div className="step-cta">{download('windows', true)}</div>
                   </li>
                   <li>
-                    <h3>Paste one prompt into your coding agent</h3>
+                    <h3>Paste one prompt into any AI you use</h3>
                     <p>
-                      Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf. Nothing to fill in: it uses the AI you already have (Claude
-                      Code, then Codex, then agy, then Ollama), adds the browser extension and connects your agent. It only stops when it
-                      needs you.
+                      Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, or even a chat. Nothing to fill in: it uses the AI you already
+                      have (Claude Code, then Codex, then agy, then Ollama), connects your coding agents and adds the browser extension. It
+                      only stops when it needs you.
                     </p>
                     <div className="step-cta">
                       <button type="button" className="btn btn-primary" onClick={() => copyPrompt('windows')} data-buddy data-tour="copy">
@@ -437,9 +437,8 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
               <div className="setup-alt">
                 <h3>The prompt</h3>
                 <p>
-                  Want a particular AI? Change the first line to <code>claude cli</code>, <code>codex cli</code>, <code>agy cli</code>,{' '}
-                  <code>ollama qwen3-vl</code> or <code>anthropic api key</code>. No coding agent? After installing, use the tray icon’s
-                  Model menu and Browser extension… instead.
+                  Want a particular AI? Change the first line to <code>claude</code>, <code>codex</code>, <code>agy</code>, <code>ollama</code>{' '}
+                  or <code>anthropic</code>. No AI to paste it into? After installing, run <code>clinqy setup</code> in a new terminal.
                 </p>
                 <div className="term">
                   <div className="term-bar">
