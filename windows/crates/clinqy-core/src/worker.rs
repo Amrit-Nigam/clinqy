@@ -280,6 +280,11 @@ impl Worker {
         self.st.lock().selected
     }
 
+    /// This run works in a tab of the user's own browser, not the hidden one.
+    pub fn in_user_browser(&self) -> bool {
+        self.own().is_some() || (self.st.lock().run_active && in_own_browser() && crate::bridge::bridge().own_browser().is_none())
+    }
+
     pub fn has_tab(&self) -> bool {
         let s = self.st.lock();
         if s.own.is_some() {

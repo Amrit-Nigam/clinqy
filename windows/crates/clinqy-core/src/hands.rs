@@ -19,7 +19,8 @@ fn block<T>(f: impl Future<Output = T>) -> T {
 
 /// The background browser, where an app goes.
 pub fn worker_app() -> AppRef {
-    AppRef { pid: worker().pid(), hwnd: 0, name: "the background browser".into(), exe: worker::EXE.into(), started: 0 }
+    let name = if worker().in_user_browser() { "your browser's Clinqy tab" } else { "the background browser" };
+    AppRef { pid: worker().pid(), hwnd: 0, name: name.into(), exe: worker::EXE.into(), started: 0 }
 }
 
 pub struct Hands {

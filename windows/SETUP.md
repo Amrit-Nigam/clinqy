@@ -148,7 +148,7 @@ can't ask, so it denies the tool and produces no output. To run it that way, add
 automation on your everyday one. You have two options, both in the Clinqy window under **Background**:
 
 - Turn on **Work in a tab in my browser**. Tasks use your own browser and sign-ins, in a blue Clinqy tab group, while you
-  carry on elsewhere. They act in your real accounts, and your browser shows a debugging bar while a task runs.
+  carry on elsewhere. Sound and video play for you, and a tab playing sound stays open when the next task starts. They act in your real accounts, and your browser shows a debugging bar while a task runs.
 - Or click **Sign in…**, sign in to the site in the window that opens, then click **Finish sign-in**. You only do this
   once per site. To keep those sign-ins somewhere else, change **Profile folder** on the same page.
 

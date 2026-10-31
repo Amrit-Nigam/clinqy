@@ -148,6 +148,10 @@ How to work:
 "#;
 
 /// The closing line that keeps replies to bare JSON.
+/// Added to the first message of a background run that works in a tab of the user's own browser.
+pub const BACKGROUND_TAB: &str = "
+Background mode works in a tab of the user's own browser, in a Clinqy tab group, so they keep working in their other tabs and windows while you do. It has their sign-ins, and sound and video in it play for them, so \"play this song\" is finished once it's playing: never tell them to open a link themselves. Use open_url to open a page in it. Prefer files, PDF, media and other supported actions without opening apps. No File Explorer, desktop app input, clipboard or shell is permitted in background mode. Use ask for missing input. Work that needs a desktop app requires an explicit switch to the foreground.";
+
 /// Added to a background run's first message.
 pub const BACKGROUND: &str = "\nBackground mode uses a separate headless browser with its own profile, never the user's browser or desktop apps, so they keep working while you do. Use open_url to open a page in it. Prefer files, PDF, media and other supported actions without opening apps. No File Explorer, desktop app input, clipboard or shell is permitted in background mode. The background browser has separate sign-ins; if a site needs a login, ask the user to sign in through Clinqy's Background settings and finish signing in. Use ask for missing input. Work that needs a desktop app requires an explicit switch to the foreground.";
 

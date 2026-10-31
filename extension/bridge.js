@@ -335,13 +335,13 @@ async function clinqyDone() {
   return { done: true };
 }
 
-// The next task starts: the last one's tabs go, except one the user is on, which is theirs now.
+// The next task starts: the last one's tabs go, except one the user is on or one playing sound, which are theirs now.
 async function clinqyClear() {
   const keep = [];
   for (const tabId of await workTabs()) {
     try {
       const t = await chrome.tabs.get(tabId);
-      if (t.active) {
+      if (t.active || t.audible) {
         const mine = await openedTabs();
         mine.delete(tabId);
         await setOpened(mine);
