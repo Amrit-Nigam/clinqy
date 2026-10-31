@@ -39,6 +39,9 @@ final class TaskStore: ObservableObject {
         var requiresReview = false
         var conversationID: Int64?
         var reviewReason: String?
+        var coordinating: Bool?
+        var parentID: UUID?
+        var outputs: [String]?
 
         var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
         var status: String {
@@ -90,12 +93,17 @@ final class TaskStore: ObservableObject {
         let matches = records.filter { $0.id.uuidString.lowercased().hasPrefix(shortID.lowercased()) }
         return matches.count == 1 ? matches[0] : nil
     }
+    var backgroundLimit = 3
+    var activeForeground: Record? { records.last { !$0.background && [.running, .waiting, .needsAttention].contains($0.state) } }
+    var activeBackground: [Record] { records.filter { $0.background && $0.coordinating != true && [.running, .waiting, .needsAttention].contains($0.state) } }
+    func coordinate(_ id: UUID) { _ = change(id) { $0.coordinating = true; $0.stage = "Waiting for parallel browser tasks" } }
+
     var active: Record? { records.last { [.running, .waiting, .needsAttention].contains($0.state) } }
     var queued: [Record] { records.filter { $0.state == .queued }.sorted { $0.createdAt < $1.createdAt } }
     var recovery: [Record] { records.filter { $0.state == .interrupted || ($0.state == .queued && $0.requiresReview) } }
 
     @discardableResult
-    func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil, idempotencyKey: String? = nil) -> UUID? {
+    func enqueue(_ request: String, files: [URL] = [], source: Source, background: Bool = true, conversationID: Int64? = nil, idempotencyKey: String? = nil, parentID: UUID? = nil) -> UUID? {
         if let idempotencyKey, let existing = records.first(where: { $0.dispatchKey == idempotencyKey }) { return existing.id }
         let clean = redact(request)
         let item = Record(request: clean, files: files.map(\.path), source: source, background: background,
@@ -103,6 +111,7 @@ final class TaskStore: ObservableObject {
                           reviewReason: clean != request ? "Private values were removed from this request. Rewrite it without secrets before running it." : nil)
         var scheduled = item
         scheduled.dispatchKey = idempotencyKey
+        scheduled.parentID = parentID
         guard mutate({ $0.append(scheduled) }) else { return nil }
         return item.id
     }
@@ -110,12 +119,22 @@ final class TaskStore: ObservableObject {
     @discardableResult
     func start(_ id: UUID, explicitlyReviewed: Bool = false) -> Bool {
         guard let item = record(id), item.state == .queued, !item.requiresReview || explicitlyReviewed,
-              item.reviewReason?.contains("Private values") != true, active == nil else { return false }
+              item.reviewReason?.contains("Private values") != true,
+              TaskCapacity.canStart(background: item.background, foregroundRunning: activeForeground != nil,
+                  backgroundRunning: activeBackground.count, limit: backgroundLimit) else { return false }
         guard item.files.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
             update(id, state: .failed, stage: "An attached file is missing. Reattach it and send a new task.")
             return false
         }
         return change(id) { $0.state = .running; $0.stage = "Getting started"; $0.requiresReview = false; $0.reviewReason = nil }
+    }
+
+    /// Explicitly review a restored queued request without consuming a slot before it can run.
+    @discardableResult
+    func reviewQueued(_ id: UUID) -> Bool {
+        guard let item = record(id), item.state == .queued,
+              item.reviewReason?.contains("Private values") != true else { return false }
+        return change(id) { $0.requiresReview = false; $0.reviewReason = nil }
     }
 
     @discardableResult
@@ -156,6 +175,10 @@ final class TaskStore: ObservableObject {
             if let action = $0.unverifiedAction { $0.lastConfirmedStep = action + " (" + redact(evidence) + ")" }
             $0.unverifiedAction = nil
         }
+    }
+    func setOutputs(_ id: UUID?, files: [URL]) {
+        guard let id else { return }
+        _ = change(id) { $0.outputs = files.map(\.path) }
     }
     func finish(_ id: UUID?, ok: Bool, answer: String) {
         guard let id else { return }

@@ -129,6 +129,39 @@ if SetupCommands.names.contains(command) { MainActor.assumeIsolated { SetupComma
 // `Clinqy mcp`: an MCP server on stdio for other agents (`agy mcp add clinqy -- …/Clinqy mcp`).
 if command == "mcp" { MCPServer.serve() }
 
+// `clinqy control observe|act|verify|wait|release '<JSON>' [--image-out /path.jpg]`.
+// The CLI and MCP share the app relay; it never starts a model for precise actions.
+if command == "control" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    guard args.count >= 2, let data = args[1].data(using: .utf8),
+          var body = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        fputs("usage: clinqy control observe|act|verify|wait|release '<JSON>' [--image-out /path.jpg]\n", stderr); exit(2)
+    }
+    body["op"] = args[0]
+    let imagePath = args.firstIndex(of: "--image-out").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+    if args[0] == "observe" && imagePath == nil { body["image"] = false }
+    Task {
+        var result = await MCPServer.control(body)
+        if let imagePath, var content = result["content"] as? [[String: Any]],
+           let index = content.firstIndex(where: { $0["type"] as? String == "image" }),
+           let encoded = content[index]["data"] as? String, let image = Data(base64Encoded: encoded) {
+            do {
+                let url = URL(fileURLWithPath: (imagePath as NSString).expandingTildeInPath)
+                try image.write(to: url, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                content[index] = ["type": "text", "text": "Screenshot saved to " + url.path]
+                result["content"] = content
+            } catch { result["isError"] = true; result["content"] = [["type": "text", "text": "Couldn't save screenshot: " + error.localizedDescription]] }
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.withoutEscapingSlashes, .sortedKeys]) {
+            FileHandle.standardOutput.write(data + Data("\n".utf8))
+        }
+        exit(result["isError"] as? Bool == true ? 1 : 0)
+    }
+    RunLoop.main.run()
+    exit(1)
+}
+
 // `Clinqy stats [days] [--last]`: success rate, model vs action time per turn, top failure reasons.
 if command == "stats" {
     let rest = CommandLine.arguments.dropFirst(2)

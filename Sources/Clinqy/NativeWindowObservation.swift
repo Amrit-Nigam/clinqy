@@ -16,15 +16,15 @@ struct NativeWindowObservation: @unchecked Sendable {
     func containsVerificationWindow(_ current: NativeWindowObservation) -> Bool {
         guard identity == current.identity else { return false }
         if windowID == current.windowID { return true }
-        let children: [AXUIElement] = AXEngine.attribute(element, kAXChildrenAttribute) ?? []
-        if children.contains(where: { CFEqual($0, current.element) }) { return true }
-        var parent: AXUIElement? = current.element
-        for _ in 0..<8 {
-            guard let item = parent else { break }
-            if CFEqual(item, element) { return true }
-            parent = AXEngine.attribute(item, kAXParentAttribute)
-        }
-        return false
+        return containsElement(current.element) || current.containsElement(element)
+    }
+
+    func containsElement(_ target: AXUIElement) -> Bool {
+        NativeWindowHierarchy.contains(target, root: element, parents: { node in
+            let parent: AXUIElement? = AXEngine.attribute(node, kAXParentAttribute)
+            let window: AXUIElement? = AXEngine.attribute(node, kAXWindowAttribute)
+            return [parent, window].compactMap { $0 }
+        }, equal: { CFEqual($0, $1) })
     }
 
     static func capture(_ app: NSRunningApplication, windowID: CGWindowID? = nil) -> NativeWindowObservation? {

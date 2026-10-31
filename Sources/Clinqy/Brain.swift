@@ -158,6 +158,8 @@ final class AgySession: @unchecked Sendable {
     /// Sends one user turn (text plus an optional JPEG) and returns the reply text. `partial` sees the reply text so
     /// far each time it grows (on a background thread). The HTTP and one-shot CLI providers don't stream, so it isn't
     /// called for them.
+    var visionDelivery: VisionPolicy.Delivery { api == nil && isAgy ? .fileReference : .embedded }
+
     func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         if let api { return try await api.send(text, image: image) }
 
@@ -170,8 +172,8 @@ final class AgySession: @unchecked Sendable {
             }
             if let image, let imgData = Data(base64Encoded: image), let dir = sessionDir {
                 let screenURL = dir.appendingPathComponent("screen.jpg")
-                try? imgData.write(to: screenURL)
-                promptText += "\n(Screenshot saved at \(screenURL.path). You can view it with view_file if needed.)"
+                try imgData.write(to: screenURL, options: .atomic)
+                promptText += "\nVisual input (file reference): the current screenshot is \(screenURL.path). Open this exact file with view_file before choosing any visual action or screenshot coordinates. If you cannot inspect it, use semantic ids only and report that visual input is unavailable."
             }
             let payload: [String: Any] = [
                 "event": "user",

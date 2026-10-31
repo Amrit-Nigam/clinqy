@@ -467,7 +467,11 @@ final class OnboardingModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([extensionFolder])
     }
 
-    var extensionConnected: Bool { BrowserBridge.shared.isConnected }
+    var extensionConnected: Bool {
+        guard let browser = browsers.first(where: { $0.id == browserID }),
+              let app = NSRunningApplication.runningApplications(withBundleIdentifier: browser.id).first else { return false }
+        return BrowserBridge.shared.isConnected(app)
+    }
 
     var canAutoLoad: Bool { AXIsProcessTrusted() && CGPreflightPostEventAccess() && !browsers.isEmpty }
 
@@ -475,7 +479,7 @@ final class OnboardingModel: ObservableObject {
     /// Load unpacked and picks the folder. Setup steps aside while it works and comes back when it's done.
     func letClinqyLoadExtension() {
         guard prepareExtension(), let b = browsers.first(where: { $0.id == browserID }) ?? browsers.first else { return }
-        let task = "Open \(b.name) and go to \(b.page). If Developer mode (top right) is off, turn it on. "
+        let task = "foreground: Open \(b.name) and go to \(b.page). If Developer mode (top right) is off, turn it on. "
             + "Click Load unpacked. In the folder dialog press Command+Shift+G, type \(extensionFolder.path), "
             + "press Return, then click Select. Stop when the Clinqy extension shows in the list. Don't change any other setting."
         autoLoad = .working

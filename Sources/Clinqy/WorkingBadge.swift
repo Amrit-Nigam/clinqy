@@ -4,12 +4,14 @@ import AppKit
 /// Clinqy's hidden one, so they know it's still busy. It never takes focus; a click opens the live view.
 @MainActor
 final class WorkingBadge {
-    static let shared = WorkingBadge()
+    private static let primary = WorkingBadge()
+    static var shared: WorkingBadge { TaskExecution.current?.service(WorkingBadge.self, make: WorkingBadge.init) ?? primary }
 
     private var panel: NSPanel?
     private let spinner = NSProgressIndicator()
 
     func show() {
+        if TaskExecution.current != nil { return } // Parallel jobs have their own colored task dock.
         if panel == nil { build() }
         guard let panel, let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main else { return }
         let visible = screen.visibleFrame

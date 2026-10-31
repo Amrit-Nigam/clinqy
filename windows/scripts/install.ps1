@@ -7,7 +7,7 @@
 # Or in one line:             irm <release-url>/install.ps1 | iex      (downloads the latest zip itself)
 param(
     [string]$Zip = '',
-    [string]$Url = 'https://github.com/Amrit-Nigam/clinqy/releases/latest/download/Clinqy-windows-x64.zip',
+    [string]$Url = 'https://clinqy.vercel.app/api/windows-download',
     [switch]$NoStart,
     [switch]$Login
 )

@@ -1,7 +1,7 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  if (window.__clinqy && window.__clinqy.protocolVersion === 2) return;
+  if (window.__clinqy && window.__clinqy.protocolVersion === 4) return;
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
     : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
   let snapshotID = null;
@@ -249,7 +249,7 @@ function candidates() {
   const walk = (root) => {
     root.querySelectorAll(SEL).forEach((el) => nodes.push(el));
     const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    for (let n = tw.nextNode(); n; n = tw.nextNode()) { const s = shadowOf(n); if (s) walk(s); }
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) { if (n.hasAttribute("data-clinqy-overlay")) continue; const s = shadowOf(n); if (s) walk(s); }
   };
   walk(document);
   return nodes;
@@ -435,7 +435,7 @@ function snapshot() {
   try { frames = frameBoxes().frames; } catch {}
   return {
     documentID, snapshotID,
-    url: location.href, title: document.title, focused: document.hasFocus(), ready: document.readyState,
+    url: location.href, title: window.__clinqyActivity?.pageTitle() || document.title, focused: document.hasFocus(), ready: document.readyState,
     viewport: { w: vw, h: vh },
     // Where the viewport sits on screen (for browsers that don't expose it to Accessibility).
     screen: { x: screenX, y: screenY, ow: outerWidth, oh: outerHeight, zoom: devicePixelRatio },
@@ -470,12 +470,12 @@ async function invoke(name, args, expected) {
 // Where the element is right now (brought into view first), and whether a real mouse click at its centre would
 // land on it — not on a popup's backdrop, which on LinkedIn/Indeed closes the popup instead.
 // `px`/`py` is the point to click: the centre, or another uncovered spot on it. Waits for it to stop moving first.
-async function locate(index) {
+async function locate(index, shouldReveal = true) {
   let el = target(index);
-  reveal(el);
+  if (shouldReveal) reveal(el);
   const still = await settle(el);
   // Re-rendered while it settled: aim at the new one.
-  if (!el.isConnected) { el = target(index); reveal(el); }
+  if (!el.isConnected) { el = target(index); if (shouldReveal) reveal(el); }
   const r = el.getBoundingClientRect();
   const p = hitPoint(el);
   return { x: r.left, y: r.top, w: r.width, h: r.height, hit: !!p, px: p ? p.x : r.left + r.width / 2, py: p ? p.y : r.top + r.height / 2, still };
@@ -487,6 +487,11 @@ function alive(index) {
 }
 
 // Focuses an element so a key press acts on it (the last fallback when clicks don't take).
+function activityPoint(index) {
+  const rect = target(index).getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
 function focusFor(index) {
   const el = target(index);
   reveal(el);
@@ -886,6 +891,29 @@ function readText() {
     return text + "\n\nLinks in the selection:\n" + [...links].map(([href, label]) => `- ${label ? label + " → " : ""}${href}`).join("\n");
   }
 
+  // Document order within article content, then other visible content. Skip chrome, trackers and tiny icons.
+  function images() {
+    const root = document.querySelector("#mw-content-text, article, main, [role=main]") || document.body;
+    const found = [], seen = new Set();
+    for (const el of (root ? root.querySelectorAll("img") : [])) {
+      if (el.closest("nav, header, footer, [role=navigation], .advertisement, .ad-slot, [aria-hidden=true]")) continue;
+      const r = el.getBoundingClientRect(), style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) <= 0.05) continue;
+      const width = Math.max(el.naturalWidth || 0, r.width), height = Math.max(el.naturalHeight || 0, r.height);
+      if (width < 64 || height < 48 || r.width < 48 || r.height < 32) continue;
+      const lazy = el.getAttribute("data-src") || el.getAttribute("data-original");
+      const raw = el.naturalWidth > 16 ? (el.currentSrc || el.src) : (lazy || el.currentSrc || el.src);
+      let url; try { url = new URL(raw, document.baseURI).href; } catch { continue; }
+      if (!/^https?:/.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      found.push({url, alt: squash(el.alt || el.title || "").slice(0, 200), width, height,
+        visible: visible(el), loaded: el.naturalWidth > 16, page: location.href,
+        rect: el.naturalWidth > 16 ? {x:r.left,y:r.top,width:r.width,height:r.height} : null});
+      if (found.length === 40) break;
+    }
+    return {images: found, url: location.href, title: document.title};
+  }
+
   // Resolves as soon as `want` shows in the page's text or title — or, with gone, has stayed gone for half a second —
   // woken by the page's own changes (a MutationObserver) rather than polled; { met: false } at the timeout.
   function waitText(want, gone, ms) {
@@ -917,7 +945,7 @@ function readText() {
     });
   }
 
-  window.__clinqy = { protocolVersion: 2, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { protocolVersion: 4, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, locate, alive, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();

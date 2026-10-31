@@ -1,0 +1,47 @@
+name: Publish staged Mac release
+on:
+  workflow_run:
+    workflows: [Mac checks]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: mac-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    if: (github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main') || (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && github.event.workflow_run.head_branch == 'main' && github.event.workflow_run.head_repository.full_name == github.repository)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+      - name: Verify staged source and signed DMG, then publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION=$(tr -d '[:space:]' < MAC_VERSION)
+          [[ "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          TAG="mac-v$VERSION"
+          DRAFT=$(gh release view "$TAG" --json isDraft --jq .isDraft)
+          if [[ "$DRAFT" == false ]]; then echo "$TAG is already published"; exit 0; fi
+          WORK=$(mktemp -d)
+          trap 'rm -rf "$WORK"' EXIT
+          gh release download "$TAG" --dir "$WORK" --pattern Clinqy.dmg --pattern Clinqy.dmg.sha256 --pattern Clinqy.source-commit.txt
+          SOURCE=$(tr -d '[:space:]' < "$WORK/Clinqy.source-commit.txt")
+          [[ "$SOURCE" =~ ^[0-9a-f]{40}$ ]]
+          git fetch origin "$SOURCE" --depth=1
+          git cat-file -e "$SOURCE^{commit}"
+          git diff --exit-code "$SOURCE" HEAD -- MAC_VERSION Package.swift Sources extension assets bin skills env.example build.sh make-dmg.sh website/public/fonts
+          ./scripts/verify-mac-release.sh "$WORK"
+          if [[ "$GITHUB_EVENT_NAME" == workflow_dispatch ]]; then
+            PASSED=$(gh run list --workflow mac-checks.yml --branch main --commit "$(git rev-parse HEAD)" --event push --json conclusion --jq '[.[] | select(.conclusion == "success")] | length')
+            [[ "$PASSED" -gt 0 ]] || { echo "Mac checks must pass on this main commit before publishing." >&2; exit 1; }
+          fi
+          gh release edit "$TAG" --draft=false --latest=false --target "$(git rev-parse HEAD)"

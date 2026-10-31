@@ -219,6 +219,52 @@ final class Hand {
     }
 
     /// A real click, with the user's pointer put back afterwards.
+    /// Foreground gestures use the same window provenance and hit checks as clicks. Always release a
+    /// possibly delivered down event, including cancellation and failure during a drag.
+    func gesture(_ plan: PointerGesture, in app: NSRunningApplication, window: WindowSnapshot) async -> String? {
+        guard !Background.active else { return refuse("Native pointer gestures require foreground mode") }
+        let start = CGPoint(x: plan.start.x, y: plan.start.y), end = CGPoint(x: plan.end.x, y: plan.end.y)
+        guard app.processIdentifier == window.pid, window.frame.contains(start), window.frame.contains(end) else {
+            return refuse("gesture endpoints must belong to the observed window")
+        }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        for point in [start, end] {
+            if let why = hitCheck(point, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        }
+        await buddy.travel(to: start)
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        for point in [start, end] {
+            if let why = hitCheck(point, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        }
+        let source = CGEventSource(stateID: .hidSystemState)
+        var held = false, last = start
+        defer {
+            if held {
+                CGEvent(mouseEventSource: source, mouseType: plan.kind == .right_click ? .rightMouseUp : .leftMouseUp,
+                        mouseCursorPosition: last, mouseButton: plan.kind == .right_click ? .right : .left)?.post(tap: .cghidEventTap)
+            }
+            cursorLeftAt = last
+        }
+        for step in plan.events {
+            guard !Task.isCancelled, NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
+                return refuse("gesture interrupted; inspect the result before repeating input")
+            }
+            let point = CGPoint(x: step.point.x, y: step.point.y)
+            let type: CGEventType = step.phase == .move ? (held ? .leftMouseDragged : .mouseMoved)
+                : step.phase == .down ? (step.right ? .rightMouseDown : .leftMouseDown) : (step.right ? .rightMouseUp : .leftMouseUp)
+            guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point,
+                                      mouseButton: step.right ? .right : .left) else { return refuse("couldn't construct pointer event") }
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(step.count))
+            // Treat delivery as possible before posting; cancellation must still release the button.
+            if step.phase == .down { held = true }
+            last = point
+            event.post(tap: .cghidEventTap)
+            if step.phase == .up { held = false }
+            try? await Task.sleep(for: .milliseconds(plan.kind == .drag ? 20 : 35))
+        }
+        return nil
+    }
+
     private func realClick(at point: CGPoint) {
         let saved = Buddy.mouse()
         Self.postRealClick(at: point)

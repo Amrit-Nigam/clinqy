@@ -39,9 +39,9 @@ enum Screenshot {
     /// so the caller can tell the model why there's no screenshot rather than send a useless one.
     nonisolated(unsafe) static var lastBlank: Blankness?
 
-    /// Longest side and byte budget for images sent to the model: bigger costs tokens and latency, not accuracy.
-    static let maxSide: CGFloat = 1280
-    static let maxBytes = 450_000
+    /// Bounded image budget; Capture geometry always reflects the actual encoded dimensions.
+    static var maxSide: CGFloat { CGFloat(min(3840, max(640, Int(Config.value("VISION_MAX_SIDE") ?? "1920") ?? 1920))) }
+    static var maxBytes: Int { min(2_000_000, max(100_000, Int(Config.value("VISION_MAX_BYTES") ?? "800000") ?? 800_000)) }
 
     /// A capture with no visual detail. All black almost always means Screen Recording permission is
     /// missing (macOS hands back empty frames instead of failing) or the window is covered/minimized.
@@ -197,6 +197,16 @@ enum Screenshot {
     }
 
     /// JPEG within `maxBytes`, returning the dimensions of the encoded image alongside its bytes.
+    static func visionJPEG(_ data: Data) -> Data? {
+        guard let bitmap = NSBitmapImageRep(data: data), var image = bitmap.cgImage else { return nil }
+        let factor = min(1, maxSide / CGFloat(max(image.width, image.height)))
+        if factor < 1 {
+            guard let scaled = resized(image, by: factor) else { return nil }
+            image = scaled
+        }
+        return budgeted(image)?.data
+    }
+
     private static func budgeted(_ image: CGImage) -> (data: Data, size: CGSize)? {
         var image = image
         for _ in 0..<3 {
@@ -208,7 +218,8 @@ enum Screenshot {
             guard let smaller = resized(image, by: 0.75) else { return nil }
             image = smaller
         }
-        guard let data = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.3]) else { return nil }
+        guard let data = NSBitmapImageRep(cgImage: image).representation(using: .jpeg, properties: [.compressionFactor: 0.3]),
+              data.count <= maxBytes else { return nil }
         return (data, CGSize(width: image.width, height: image.height))
     }
 

@@ -12,10 +12,11 @@ import { Tour, TourOffer } from './Tour'
 import { AgentCycle, BrandIcon } from './BrandIcons'
 
 const GITHUB = 'https://github.com/Amrit-Nigam/clinqy'
-const MAC_DMG = `${GITHUB}/releases/download/mac-v0.2.3/Clinqy.dmg`
-// Windows releases are the repo's "latest", so this link follows each new one.
-const WIN_ZIP = `${GITHUB}/releases/latest/download/Clinqy-windows-x64.zip`
-const WIN_INSTALL = `irm ${GITHUB}/releases/latest/download/install.ps1 | iex`
+// Resolves the newest published Mac release independently of Windows' "latest" release.
+const MAC_DMG = '/api/mac-download'
+// Each platform resolves its own latest published assets, regardless of GitHub's global Latest flag.
+const WIN_ZIP = '/api/windows-download'
+const WIN_INSTALL = `& ([scriptblock]::Create((irm 'https://clinqy.vercel.app/api/windows-download?asset=installer'))) -Url 'https://clinqy.vercel.app/api/windows-download'`
 
 type Platform = 'mac' | 'windows'
 const detected: Platform = /Windows/i.test(navigator.userAgent) ? 'windows' : 'mac'
@@ -110,6 +111,20 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
   const [winCopied, setWinCopied] = useState(false)
   const [tour, setTour] = useState<'offer' | 'on' | 'off' | null>(null)
   const [toast, setToast] = useState('')
+  const [versions, setVersions] = useState<Partial<Record<Platform, string>>>({})
+  useEffect(() => {
+    const controller = new AbortController()
+    for (const p of ['mac', 'windows'] as const) {
+      fetch(`/api/${p}-download?format=json`, { signal: controller.signal })
+        .then(response => response.ok ? response.json() : null)
+        .then(release => {
+          if (release?.platform === p && /^\d+\.\d+\.\d+$/.test(release.version)) {
+            setVersions(previous => ({ ...previous, [p]: release.version }))
+          }
+        }).catch(() => {})
+    }
+    return () => controller.abort()
+  }, [])
 
   // The nav hides once you scroll down, and comes back when the pointer nears the top (or you scroll back up).
   const [navHidden, setNavHidden] = useState(false)
@@ -181,7 +196,7 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
   const download = (p: Platform, primary: boolean) => (
     <a className={'btn ' + (primary ? 'btn-primary' : 'btn-outline')} href={DOWNLOAD[p].href} data-buddy>
       <BrandIcon name={p === 'mac' ? 'apple' : 'windows'} />
-      {DOWNLOAD[p].label}
+      {DOWNLOAD[p].label}{versions[p] ? ` · ${versions[p]}` : ''}
     </a>
   )
 
@@ -412,6 +427,8 @@ export function Site({ live, onReplay }: { live: boolean; onReplay: () => void }
                       Unzip it and double-click <code>Install Clinqy.bat</code>. No admin rights needed. If SmartScreen warns you, click
                       More info → Run anyway. (You can skip this: the prompt installs Clinqy too.)
                     </p>
+                    <p>Already on Windows 0.3.1 or newer? Run <code>clinqy update</code>. On 0.3.0 or older, reinstall from the ZIP; your settings, memory and history stay in place.</p>
+                    <p>The Windows update keeps music-playing browser tabs open, reports browser tasks correctly, and rechecks pages before acting. Windows currently runs one task at a time.</p>
                     <div className="step-cta">{download('windows', true)}</div>
                   </li>
                   <li>

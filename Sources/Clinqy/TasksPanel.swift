@@ -48,7 +48,7 @@ private struct TasksView: View {
                         if item.state == .queued {
                             HStack {
                                 Button(item.requiresReview ? "Reviewed — start task" : "Start task") { store.requestStart(item.id) }
-                                    .disabled(store.active != nil || item.reviewReason?.contains("Private values") == true)
+                                    .disabled((!item.background && store.activeForeground != nil) || item.reviewReason?.contains("Private values") == true)
                                 Button("Cancel task") { store.cancelQueued(item.id) }
                             }
                         }
