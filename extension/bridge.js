@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.8";
+const SCRIPT_VERSION = "1.9.9";
 let socket = null;
 let retry = 1000;
 
@@ -311,13 +311,13 @@ async function clinqyDone() {
   return { done: true };
 }
 
-// The next task starts: the last one's tabs go, except one the user is on, which is theirs now.
+// The next task starts: the last one's tabs go, except one the user is on or one playing sound, which are theirs now.
 async function clinqyClear() {
   const keep = [];
   for (const tabId of await workTabs()) {
     try {
       const t = await chrome.tabs.get(tabId);
-      if (t.active) {
+      if (t.active || t.audible) {
         const mine = await openedTabs();
         mine.delete(tabId);
         await setOpened(mine);

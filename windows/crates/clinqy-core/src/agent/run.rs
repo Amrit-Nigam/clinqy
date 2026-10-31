@@ -664,7 +664,7 @@ impl Agent {
             self.platform.default_browser().unwrap_or_else(|| "unknown".into())
         );
         if self.hands.hidden() {
-            text += crate::prompt::BACKGROUND;
+            text += if crate::worker::worker().in_user_browser() { crate::prompt::BACKGROUND_TAB } else { crate::prompt::BACKGROUND };
         }
         {
             let s = self.snaps.lock();
