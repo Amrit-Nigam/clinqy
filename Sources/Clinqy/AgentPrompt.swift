@@ -15,6 +15,11 @@ enum AgentPrompt {
     {"say":"<2-6 word status>","actions":[...],"done":false}
     and to finish: {"say":"<the result or answer as a full sentence>","actions":[],"done":true} (see below)
 
+    After edits, scripts or other mutations, verify the final user-requested result with an independent verify
+    action after the last edit before done:true. A delivered input or script exit zero is not evidence the task
+    succeeded. Prefer field readback for edits, new confirmation text for submissions, and saved-file contents
+    for generated text artifacts. Look alone supplies visual context and does not clear uncertain input.
+
     Actions (run in order, results come back next turn):
     {"do":"open_app","name":"WhatsApp"}                   open an app the way a person does (clicks its Dock icon, or Spotlight)
     {"do":"open_url","url":"https://google.com"}           go to a website: opens a new tab in the browser and types the address
@@ -22,6 +27,12 @@ enum AgentPrompt {
     {"do":"click","text":"Archive"}                        click text shown on the window (found by text recognition) when it has no id —
                                                            steadier than x/y in apps that list few elements (WhatsApp, Electron apps); "nth":2 for the 2nd match
     {"do":"click","x":640,"y":210}                         click a spot on the last screenshot (pixels) — only when there's no id or text for it
+    {"do":"hover","id":"w7"}                             move over a control (real hover, not a highlight); verify the tooltip or revealed content
+    {"do":"right_click","id":"e12"}                        open a context menu; verify its visible contents
+    {"do":"double_click","id":"e12"}                       double-click a control; verify what opened or changed
+    {"do":"drag","id":"w3","to_id":"w8"}                  drag between two observed controls in the same page/window
+                                                           Native gestures also accept screenshot x/y; drag accepts to_x/to_y. Browser gestures require w-ids.
+                                                           After a gesture, look/read and verify the actual intended result before more input.
     {"do":"type","id":"e7","text":"...","submit":true}     click into e7 and type (replaces its text); submit presses Return. Omit id to type where the caret is —
                                                            that also reaches native dialogs over the browser (the file picker's cmd+shift+g "Go to folder" box)
                                                            and focused controls that aren't text boxes (an open listbox, a date part)
@@ -47,6 +58,7 @@ enum AgentPrompt {
     {"do":"verify","text":"Application submitted"}          check an actual new visible confirmation after uncertain input; optional seconds:0–15 (default 2)
     {"do":"verify","url":"https://example.com/receipt"}     verify an exact changed page URL
     {"do":"verify","id":"w7","value":"October Review"}     read back a field value; this verifies the field, not that a document was saved
+    {"do":"verify","path":"~/Documents/report.txt","contains":"Expected paragraph"}  verify file contents after writing (contains optional for binary artifacts)
     {"do":"verify","path":"~/Documents/report.pdf"}          verify a nonempty saved file modified during this action/run
     {"do":"assert","text":"Welcome back","pass":true,"note":"…"}  QA tests only: report whether an expectation holds
     {"do":"snap","caption":"Chose t2.micro instance type"}   screenshot the current window for a write-up (copied to clipboard and kept)

@@ -14,6 +14,10 @@ enum BackgroundPolicy {
             if ["chrome", "google chrome", "browser"].contains(name) { return .browser }
             if name.contains("finder") { return .attention("Use the files action to find, list, rename or move files without opening Finder.") }
             return .attention("This task needs a native app. Its input cannot be isolated safely in background mode.")
+        case "hover", "right_click", "double_click", "drag":
+            let destinationIsWeb = (action["to_id"] as? String)?.hasPrefix("w") == true
+            return hasWorkerPage && webID && (kind != "drag" || destinationIsWeb) ? .browser
+                : .attention("Gestures need current element ids on the owned browser page; native gestures require foreground mode.")
         case "click", "type", "choose", "fill":
             return hasWorkerPage && (webID || (action["id"] == nil && kind == "type")) ? .browser
                 : .attention("No owned browser page target is available. I won't use your active window.")

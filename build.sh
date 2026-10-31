@@ -15,6 +15,7 @@ cp .build/release/Clinqy "$APP/Contents/MacOS/Clinqy"
 cp -R extension "$APP/Contents/Resources/extension"
 cp bin/clinqy "$APP/Contents/Resources/clinqy"
 cp env.example "$APP/Contents/Resources/env.example"
+cp -R skills "$APP/Contents/Resources/skills"
 cp website/public/fonts/GeistPixel-Square.woff2 website/public/fonts/GeistMono-Variable.woff2 "$APP/Contents/Resources/"
 
 cat > "$APP/Contents/Info.plist" <<'PLIST'

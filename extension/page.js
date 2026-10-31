@@ -470,12 +470,12 @@ async function invoke(name, args, expected) {
 // Where the element is right now (brought into view first), and whether a real mouse click at its centre would
 // land on it — not on a popup's backdrop, which on LinkedIn/Indeed closes the popup instead.
 // `px`/`py` is the point to click: the centre, or another uncovered spot on it. Waits for it to stop moving first.
-async function locate(index) {
+async function locate(index, shouldReveal = true) {
   let el = target(index);
-  reveal(el);
+  if (shouldReveal) reveal(el);
   const still = await settle(el);
   // Re-rendered while it settled: aim at the new one.
-  if (!el.isConnected) { el = target(index); reveal(el); }
+  if (!el.isConnected) { el = target(index); if (shouldReveal) reveal(el); }
   const r = el.getBoundingClientRect();
   const p = hitPoint(el);
   return { x: r.left, y: r.top, w: r.width, h: r.height, hit: !!p, px: p ? p.x : r.left + r.width / 2, py: p ? p.y : r.top + r.height / 2, still };

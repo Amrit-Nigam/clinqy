@@ -40,6 +40,24 @@ enum AgentConnect {
         }
     }
 
+    /// Explicit --skill installs the bundled entrypoint. Preserve an existing customized skill unless
+    /// --replace-skill was requested; MCP connection itself never overwrites personal instructions.
+    static func installSkill(_ id: String, replace: Bool) throws -> String {
+        let directory: String
+        switch id {
+        case "claude", "claude-code", "claudecode": directory = ".claude/skills/clinqy"
+        case "codex": directory = ".codex/skills/clinqy"
+        default: throw fail("Skill installation supports claude and codex")
+        }
+        let file = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(directory + "/SKILL.md")
+        if FileManager.default.fileExists(atPath: file.path) && !replace { return "Existing skill preserved at " + file.path + " (use --replace-skill to update it)" }
+        let source = Bundle.main.resourceURL?.appendingPathComponent("skills/clinqy/SKILL.md")
+        guard let source, let data = try? Data(contentsOf: source) else { throw fail("Bundled skill is unavailable; build the app with ./build.sh --bundle-only") }
+        try FileManager.default.createDirectory(at: file.deletingLastPathComponent(), withIntermediateDirectories: true)
+        try data.write(to: file, options: .atomic)
+        return "Installed skill at " + file.path
+    }
+
     private static func fail(_ s: String) -> NSError { NSError(domain: "Clinqy", code: 1, userInfo: [NSLocalizedDescriptionKey: s]) }
 
     private static func run(_ path: String, _ args: [String], okIfContains: String) throws {
@@ -231,16 +249,21 @@ enum SetupCommands {
     // ── Coding agents ──
 
     private static func connect(_ args: [String]) -> Int32 {
-        let ids = args.flatMap { $0.split(separator: ",") }.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
+        let ids = args.filter { !$0.hasPrefix("--") }.flatMap { $0.split(separator: ",") }.map { $0.trimmingCharacters(in: .whitespaces).lowercased() }.filter { !$0.isEmpty }
         guard !ids.isEmpty else { return failed("usage: Clinqy connect <\(AgentConnect.ids.joined(separator: "|"))> ...") }
         var code: Int32 = 0
         for id in ids {
-            do { print("✓ \(try AgentConnect.connect(id))") } catch {
+            do {
+                print("✓ \(try AgentConnect.connect(id))")
+                if args.contains("--skill") || args.contains("--replace-skill") {
+                    print("✓ \(try AgentConnect.installSkill(id, replace: args.contains("--replace-skill")))")
+                }
+            } catch {
                 print("✗ \(id): \(error.localizedDescription)")
                 code = 1
             }
         }
-        if code == 0 { print("Restart those agents to see Clinqy's tools (clinqy_run, clinqy_look, clinqy_stats).") }
+        if code == 0 { print("Restart those agents to see Clinqy’s task and direct control tools (observe, act, wait, verify, release).") }
         return code
     }
 

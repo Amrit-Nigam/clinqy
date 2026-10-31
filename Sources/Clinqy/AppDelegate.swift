@@ -283,6 +283,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return true
         }
         for url in urls where url.host == "browser" { Task { await answerBrowserQuery(url) } }
+        for url in urls where url.host == "control-cancel" {
+            if let session = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "session" })?.value {
+                agent.cancelControl(session: session)
+            }
+        }
+        for url in urls where url.host == "control" { Task { await answerControlQuery(url) } }
         for url in urls where url.host == "status" { answerStatus(url) }
         for url in urls where url.host == "permissions" { askForPermissions() }
         for url in urls where url.host == "extension-install" {
@@ -329,6 +335,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
             agent.submit(dry ? "dry run: " + task : task, test: test, provider: runProvider)
         }
+    }
+
+    /// The authenticated URL names only an app-owned request file; callers cannot choose an output path.
+    private func answerControlQuery(_ url: URL) async {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard let id = items.first(where: { $0.name == "id" })?.value, UUID(uuidString: id) != nil else { return }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/cli", isDirectory: true)
+        let request = dir.appendingPathComponent(id + ".request.json")
+        guard let values = try? request.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey]),
+              values.isSymbolicLink != true, (values.fileSize ?? 0) <= 200_000,
+              let data = try? Data(contentsOf: request), let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        // Claim before the first await; duplicate URL delivery cannot execute a second request.
+        try? FileManager.default.removeItem(at: request)
+        guard let deadline = body["deadline"] as? Double, deadline >= Date().timeIntervalSince1970 else { return }
+        let result = await agent.control(body)
+        guard let response = try? JSONSerialization.data(withJSONObject: result, options: [.withoutEscapingSlashes]) else { return }
+        let file = dir.appendingPathComponent(id + ".response.json")
+        do {
+            try response.write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        } catch { Agent.writeLog("couldn't deliver control response; inspect task state before retrying input") }
     }
 
     /// `clinqy://browser?cmd=page|read|url&id=…`: what's in the focused browser tab, for the `clinqy page` command

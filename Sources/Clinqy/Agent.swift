@@ -463,13 +463,15 @@ final class Agent: ObservableObject {
     static var workflowFirstOn: Bool { !["off", "0", "no", "false"].contains((Config.value("WORKFLOW_FIRST") ?? "on").lowercased()) }
 
     /// Resets per-run state; shared by requests, workflow replays and QA runs.
-    fileprivate func prepare(_ request: String, test: Bool, dry: Bool = false, background: Bool = false) {
+    fileprivate func prepare(_ request: String, test: Bool, dry: Bool = false, background: Bool = false, external: Bool = false) {
+        externalRun = external
         providerOverride = nil
         modelOverride = nil
         isTest = test || echo
         if isTest { taskRecordID = nil }
         runDry = dry
         pendingVerification = nil
+        completionEvidence = CompletionEvidence()
         started = Date()
         trace = []
         lastTarget = nil
@@ -529,6 +531,7 @@ final class Agent: ObservableObject {
         UI.cancelReview()
         answer(nil)
         task?.cancel()
+        controlOperation?.cancel()
         session?.close()
         if isRunning { finish(ok: false, "Stopped") }
     }
@@ -646,7 +649,11 @@ final class Agent: ObservableObject {
             // Auto-screenshot when there's little to go on. With the extension, the page's own list counts
             // (the browser's toolbar controls alone say nothing about the page).
             let known = obs.page.map { $0.elements.count } ?? obs.elements.count
-            if known < 6 || failures >= 2 { wantsLook = true }
+            let visionMode = VisionPolicy.Mode(rawValue: Config.value("VISION_POLICY") ?? "auto") ?? .auto
+            wantsLook = VisionPolicy.capture(mode: visionMode, explicit: wantsLook, first: turn == 0,
+                native: obs.page == nil, changed: obs.text != lastScreen,
+                documentChanged: shown?.page?.documentID != obs.page?.documentID,
+                knownElements: known, failures: failures)
             // The first look shows what the user circled; after that it's just in the request text.
             let circled = turn == 0 ? annotation : nil
             if let circled {
@@ -663,6 +670,8 @@ final class Agent: ObservableObject {
                 image = coordinateCapture?.base64
                 if image == nil, let blank = Screenshot.lastBlank { message += "\n" + blank.hint }
             }
+            if wantsLook && image == nil { message += "\nVisual input unavailable for this observation. Do not infer pixels or use screenshot coordinates; use semantic targets or request a fresh look." }
+            if image != nil { message += "\nVisual input: " + session.visionDelivery.rawValue + ". Screenshot coordinates are encoded image pixels." }
             wantsLook = false
             // An unchanged screen is one line, not the whole list again (less to read, faster replies).
             let full = obs.text
@@ -829,13 +838,6 @@ final class Agent: ObservableObject {
                         action["id"] = "w\(id)"
                     }
                 }
-                // Trailing look after page actions: the page list the next turn brings is exact and fresh, so a
-                // screenshot adds time, not information. A look on its own is always honoured.
-                if kind == "look", i > 0, Self.pageListSuffices(context, after: actions[..<i]) {
-                    results.append("\(i + 1). look skipped — the fresh page list below shows the result (send look on its own "
-                                   + "if you need pixels: pictures, canvas, iframes, a native dialog)")
-                    continue
-                }
                 let result: ActionResult
                 if i == 0, earlyIsFirst, let e = early {
                     result = e.result
@@ -912,6 +914,10 @@ final class Agent: ObservableObject {
                 message = "The \(pendingVerification.kind) input was delivered but its outcome is unverified. Do not repeat it or claim completion. Use {\"do\":\"verify\",\"text\":\"<expected confirmation actually visible>\"}, or verify a current url, field value/id, or changed saved-file path. A closed dialog or generic visual change is insufficient. Read first if needed."
                 continue
             }
+            if isDone, failures == 0, !runDry, completionEvidence.needsVerification {
+                message = "Before claiming the task is complete, independently verify its final result with a verify action: expected visible text, exact URL, a field value/id, or saved-file path (with contains for expected file contents). Check the user's actual objective after the last edit. Process exit zero, a delivered gesture, or your own done:true is not completion evidence. Do not repeat an input to obtain evidence."
+                continue
+            }
             if isDone, failures == 0 {
                 finish(ok: true, say.isEmpty ? "Done" : say)
                 if !runDry, !isTest {
@@ -975,6 +981,8 @@ final class Agent: ObservableObject {
             "date": ISO8601DateFormatter().string(from: started), "request": String(request.prefix(160)), "ok": ok,
             "stopped": !ok && answer == "Stopped", "seconds": (Date().timeIntervalSince(started) * 10).rounded() / 10,
             "turns": turnCount, "fast_turns": fastTurnCount, "screenshots": lookCount,
+            "vision_policy": Config.value("VISION_POLICY") ?? "auto", "vision_delivery": session?.visionDelivery.rawValue ?? "unknown",
+            "goal_verified": !completionEvidence.needsVerification,
             "steps": steps.count, "failed_steps": steps.filter { $0.state == .failed }.count, "app": targetApp?.cleanName ?? "",
         ]
         guard let data = try? JSONSerialization.data(withJSONObject: row, options: [.sortedKeys]),
@@ -1372,6 +1380,138 @@ final class Agent: ObservableObject {
         }
     }
 
+    /// Direct host-agent control uses the same executor and safety checks as standalone tasks, without
+    /// starting an inner model. Requests are serialized across awaits and observations are single use.
+    func control(_ body: [String: Any]) async -> [String: Any] {
+        if let why = ControlProtocol.validateRequest(body) { return Self.controlError(why) }
+        guard !controlBusy else { return Self.controlError("Another control request is in flight") }
+        controlBusy = true
+        defer { controlBusy = false; controlOperation = nil }
+        let operation = Task { await self.executeControl(body) }
+        controlOperation = operation
+        return await operation.value
+    }
+
+    func cancelControl(session: String) {
+        guard controlLease?.session == session else { return }
+        cancel()
+    }
+
+    private static func controlError(_ message: String) -> [String: Any] {
+        ["content": [["type": "text", "text": message]], "isError": true]
+    }
+
+    private func renewControlExpiry() {
+        controlExpiry?.cancel()
+        controlExpiry = Task { @MainActor [weak self] in
+            do { try await Task.sleep(for: .seconds(120)) } catch { return }
+            guard let self, self.controlLease != nil else { return }
+            if self.controlBusy { self.renewControlExpiry(); return }
+            self.finish(ok: false, "External control session expired. Inspect the application before starting another task.")
+        }
+    }
+
+    private func executeControl(_ body: [String: Any]) async -> [String: Any] {
+        let op = body["op"] as? String ?? "observe"
+        if op == "observe", body["session"] == nil {
+            guard !isRunning else { return Self.controlError("Clinqy is busy; finish the current task or release its control session") }
+            guard let goal = body["task"] as? String, !goal.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                  goal.utf8.count <= 8000 else { return Self.controlError("Start observe with the user's task (up to 8000 bytes)") }
+            guard AXEngine.isTrusted else { return Self.controlError("Clinqy needs Accessibility permission") }
+            guard let record = TaskStore.shared.enqueue(goal, files: [], source: .mac, background: false), TaskStore.shared.start(record) else {
+                return Self.controlError("Couldn't save external task state")
+            }
+            taskRecordID = record
+            prepare(goal, test: false, dry: false, background: false, external: true)
+            controlLease = ControlLease()
+            controlContext = nil
+        }
+        guard let lease = controlLease else { return Self.controlError("No control session; start with observe and a task") }
+        // Only initial observe can omit the session; all later operations must present it.
+        let session = body["session"] as? String ?? (op == "observe" && controlContext == nil ? lease.session : "")
+        guard lease.accepts(session: session) else { return Self.controlError("Wrong or expired control session") }
+        renewControlExpiry()
+        lastProgress = Date()
+        if op == "release" {
+            let complete = body["complete"] as? Bool == true
+            if complete && (pendingVerification != nil || completionEvidence.needsVerification) {
+                return Self.controlError("The final outcome is unverified. Observe and verify before completing, or release with complete:false to stop.")
+            }
+            finish(ok: complete, complete ? "External task result verified" : "External task stopped; inspect any unverified outcome before retrying")
+            return ["content": [["type": "text", "text": complete ? "Completed" : "Released without claiming completion"]], "isError": false]
+        }
+        if op == "observe" {
+            let obs: Observation
+            if var context = controlContext {
+                let pinned = context.page.map { BrowserBridge.TabInfo(id: $0.tabId ?? -1, url: $0.url, connection: $0.connection) }
+                await refresh(&context)
+                if let pinned {
+                    guard let page = await BrowserBridge.shared.snapshot(of: pinned) else { return Self.controlError("The task tab is unavailable; it was not replaced by another tab") }
+                    context.page = page
+                }
+                obs = Observation(app: context.app, elements: context.elements, fingerprint: context.fingerprint,
+                    page: context.page, webArea: context.webArea, nativeWindow: context.nativeWindow)
+            } else { obs = await Observation.capture(targetApp) }
+            guard !Task.isCancelled, isRunning, obs.app != nil else { return Self.controlError("No target application is available") }
+            var context = ActionContext(app: obs.app, elements: obs.elements, fingerprint: obs.fingerprint, page: obs.page, webArea: obs.webArea)
+            context.seen = obs.page; context.nativeWindow = obs.nativeWindow
+            context.identity = obs.app.flatMap(AXEngine.identity(of:))
+            var image: String?
+            let activeTab = obs.page == nil ? nil : await BrowserBridge.shared.activeTab(in: obs.app)
+            let imageMatchesPage = obs.page == nil || (activeTab?.id == obs.page?.tabId && activeTab?.connection == obs.page?.connection)
+            if body["image"] as? Bool != false, imageMatchesPage, let app = obs.app {
+                context.coordinateCapture = await Screenshot.capture(app: app, window: obs.nativeWindow, elements: obs.elements)
+                image = context.coordinateCapture?.base64
+            }
+            guard !Task.isCancelled, isRunning else { return Self.controlError("Stopped") }
+            let token = controlLease!.observe()
+            renewControlExpiry()
+            controlContext = context
+            var state: [String: Any] = ["session": lease.session, "observation": token, "expiresInSeconds": 120,
+                "screen": obs.text, "pendingVerification": pendingVerification?.kind ?? "", "needsGoalVerification": completionEvidence.needsVerification,
+                "imageAvailable": image != nil, "coordinateSpace": "annotated image pixels; browser gestures use w-ids"]
+            if let capture = context.coordinateCapture { state["imageWidth"] = capture.imageSize.width; state["imageHeight"] = capture.imageSize.height }
+            let encoded = (try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? ""
+            var content: [[String: Any]] = [["type": "text", "text": encoded]]
+            if let image { content.append(["type": "image", "mimeType": "image/jpeg", "data": image]) }
+            phase = .acting
+            return ["content": content, "structuredContent": state, "isError": false]
+        }
+        guard op == "act" || op == "verify" || op == "wait", var action = body["action"] as? [String: Any] else {
+            return Self.controlError("Use observe, act, verify, wait or release")
+        }
+        if op != "act" { action["do"] = op }
+        if let why = ControlProtocol.validate(action) { return Self.controlError(why) }
+        guard let token = body["observation"] as? String, var context = controlContext,
+              controlLease?.consume(token) == true else { return Self.controlError("Stale or already consumed observation; observe before acting") }
+        if !["verify", "wait", "read", "look", "open_app", "open_url"].contains(action["do"] as? String ?? "") {
+            guard NSWorkspace.shared.frontmostApplication?.processIdentifier == context.app?.processIdentifier else {
+                return Self.controlError("The foreground application changed; observe and return to the target before input")
+            }
+            if let page = context.page {
+                let active = await BrowserBridge.shared.activeTab(in: context.app)
+                guard active?.id == page.tabId, active?.connection == page.connection else {
+                    return Self.controlError("The active tab changed; return to the observed task tab before input")
+                }
+            }
+        }
+        // Reset broad confirmation reuse for each host action. Normal approval/review still runs in execute.
+        userConfirmed = false; reviewedForm = false
+        phase = .acting
+        let result = await perform(action, context: &context)
+        guard !Task.isCancelled, controlLease != nil, isRunning else { return Self.controlError("Stopped; inspect the actual outcome before retrying") }
+        controlLease?.touch()
+        renewControlExpiry()
+        controlContext = context
+        phase = .acting
+        let state: [String: Any] = ["session": session, "delivery": result.outcome.delivery.rawValue,
+            "status": result.outcome.status.rawValue, "summary": result.summary, "needsGoalVerification": completionEvidence.needsVerification,
+            "pendingVerification": pendingVerification?.kind ?? "", "observeBeforeNextAction": true]
+        let encoded = (try? JSONSerialization.data(withJSONObject: state, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? result.summary
+        return ["content": [["type": "text", "text": encoded]], "structuredContent": state,
+                "isError": result.outcome.status == .failed || result.outcome.status == .refused]
+    }
+
     /// An input may have landed despite a timeout. Keep it unresolved until an explicit independent check succeeds.
     private struct PendingVerification {
         let kind: String
@@ -1391,6 +1531,13 @@ final class Agent: ObservableObject {
         let documentID: String?
     }
     private var pendingVerification: PendingVerification?
+    private var completionEvidence = CompletionEvidence()
+    private var controlLease: ControlLease?
+    private var controlContext: ActionContext?
+    private var controlBusy = false
+    private var externalRun = false
+    private var controlOperation: Task<[String: Any], Never>?
+    private var controlExpiry: Task<Void, Never>?
     /// Set immediately before input dispatch, including calls whose acknowledgement may be lost.
     private var inputDeliveryStarted = false
     private static let observationActions: Set<String> = ["verify", "read", "look", "wait", "extract", "recall", "ask", "show", "point", "mark", "scroll", "assert", "review", "think"]
@@ -1433,7 +1580,8 @@ final class Agent: ObservableObject {
         let priorText: String?
         if !Self.observationActions.contains(kind), let page = priorPage,
            let read = try? await BrowserBridge.shared.perform("read", on: page) {
-            priorText = (read["title"] as? String ?? "") + "\n" + (read["text"] as? String ?? "")
+            priorText = (read["title"] as? String ?? "") + "\n" + (read["text"] as? String ?? "") + "\n"
+                + context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
         } else if !Self.observationActions.contains(kind), priorPage == nil {
             // OCR is part of the baseline too: canvas text absent from AX must not become false "new" evidence.
             let axText = context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
@@ -1464,8 +1612,9 @@ final class Agent: ObservableObject {
         // Return, Save and deletion keys have no application acknowledgement in the input API.
         let keys = (action["keys"] as? String ?? "").lowercased()
         let submitting = kind == "type" && action["submit"] as? Bool == true
+        let scriptInput = kind == "shell" || kind == "applescript"
         let riskyKey = kind == "key" && (keys.contains("return") || keys.contains("enter") || keys.contains("delete") || keys.contains("backspace") || keys == "cmd+s" || keys == "command+s")
-        if result.ok, !runDry, submitting || riskyKey {
+        if result.ok, !runDry, submitting || riskyKey || scriptInput {
             result = .init(outcome: .unverified, summary: "UNVERIFIED: " + result.summary + ". Input was sent once. Verify the intended application outcome before repeating it.", effect: .look)
         }
         if result.outcome.needsVerification {
@@ -1474,6 +1623,7 @@ final class Agent: ObservableObject {
                 fieldInput: ["type", "fill", "choose"].contains(kind) && !submitting,
                 webTarget: priorWebTarget, webTargetUnique: priorWebUnique, nativeTarget: priorNativeTarget, beforeFieldValue: beforeFieldValue, documentID: priorPage?.documentID)
         }
+        completionEvidence.record(kind: kind, outcome: result.outcome, op: action["op"] as? String ?? "")
         guard TaskStore.shared.endAction(taskRecordID, kind: kind, outcome: result.outcome, completedSteps: steps.filter { $0.state == .ok }.count) else {
             cancel(); return fail("Couldn't persist the action outcome. Check the real application state before retrying.")
         }
@@ -1571,6 +1721,9 @@ final class Agent: ObservableObject {
             openedLast = true
             registerNavigationUndo(line, label: "Leave \(url.host ?? raw)", closing: reuse ? nil : ownedTab, app: context.app)
             return end(line, .init(ok: true, summary: "opened \(url.absoluteString) in \(context.app?.cleanName ?? "the browser")"))
+
+        case "hover", "right_click", "double_click", "drag":
+            return await pointerGesture(action, context: &context)
 
         case "click" where Self.isWebRef(action["id"]):
             guard let (el, rect) = await liveWebTarget(action["id"], &context), let page = context.page else { return fail(goneMessage(action["id"])) }
@@ -2160,6 +2313,7 @@ final class Agent: ObservableObject {
             let quiet = Background.active ? script
                 .replacingOccurrences(of: #"(?im)^(\s*)activate\s*$"#, with: "$1launch", options: .regularExpression)
                 .replacingOccurrences(of: #"(?i)\bto activate\b"#, with: "to launch", options: .regularExpression) : script
+            inputDeliveryStarted = true
             let r = await Shell.run("/usr/bin/osascript", ["-e", quiet], timeout: 280)
             Background.sweep()
             log("    script result (\(r.status)): \(r.output.prefix(600))")
@@ -2174,6 +2328,7 @@ final class Agent: ObservableObject {
             // No pager: git log/diff would otherwise wait on `less` until the timeout. In a background run, `open` opens
             // things without bringing their app forward (the run's sweep then moves the window to the hidden screen).
             let run = Background.active ? Self.openQuietly(cmd) : cmd
+            inputDeliveryStarted = true
             let r = await Shell.run("/bin/zsh", ["-lc", "setopt no_nomatch 2>/dev/null\nexport GIT_PAGER=cat PAGER=cat\n" + run], timeout: 20)
             Background.sweep()
             let hint = r.status == 0 ? "" : Self.shellHint(r.output)
@@ -2372,7 +2527,7 @@ final class Agent: ObservableObject {
         case "wait" where action["for"] is String:
             return await waitFor(action["for"] as! String, gone: action["gone"] as? Bool == true,
                                  // Up to 2 minutes: a deploy or a database coming up is one long wait, not ten turns of 30 s ones.
-                                 seconds: min(120, max(1, (action["timeout"] as? NSNumber)?.doubleValue ?? 10)), context: &context)
+                                 seconds: min(120, max(1, (action["seconds"] as? NSNumber)?.doubleValue ?? (action["timeout"] as? NSNumber)?.doubleValue ?? 10)), context: &context)
 
         case "wait" where Background.active:
             let ms = min(5000, max(0, action["ms"] as? Int ?? 600))
@@ -2967,6 +3122,83 @@ final class Agent: ObservableObject {
         return (el, rect.intersection(web).isNull ? rect : rect.intersection(web))
     }
 
+    /// Semantic browser targets are revalidated by the driver immediately before delivery. Native
+    /// coordinates refer to the exact annotated screenshot, never global screen coordinates.
+    private func pointerGesture(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
+        guard let raw = action["do"] as? String, let kind = PointerGesture.Kind(rawValue: raw) else { return fail("unknown gesture") }
+        let line = begin(raw.replacingOccurrences(of: "_", with: " "))
+        if Self.isWebRef(action["id"]) {
+            guard let (element, sourceRect) = await liveWebTarget(action["id"], &context), let page = context.page else {
+                return end(line, fail("gesture target is stale; observe again"))
+            }
+            if kind != .hover, let why = await approve(element.text, role: element.role, page: page) {
+                return end(line, .init(outcome: .refused, summary: why))
+            }
+            // The driver resolves both endpoints again, including embedded-frame provenance.
+            var args: [String: Any] = ["gesture": raw, "index": element.index]
+            var destinationRect: CGRect?
+            if kind == .drag {
+                guard let ref = action["to_id"], let (destination, rect) = await liveWebTarget(ref, &context) else {
+                    return end(line, fail("drag needs a current to_id in the same browser page"))
+                }
+                args["toIndex"] = destination.index
+                destinationRect = rect
+            }
+            if Background.active {
+                do { _ = try await pageMutation("cdpGesture", on: page, args) }
+                catch { return end(line, .init(outcome: .uncertain, summary: "Gesture may have been delivered: " + error.localizedDescription, effect: .look)) }
+            } else {
+                // Debugger input is reserved for owned background tabs. Personal foreground tabs keep
+                // native hit-checked input, with endpoint geometry checked against the live DOM first.
+                guard let app = context.app, let window = context.nativeWindow, let web = context.webArea,
+                      page.viewport.width > 0, page.viewport.height > 0 else { return end(line, fail("No observed foreground browser window")) }
+                func point(_ index: Int, rect: CGRect) async -> CGPoint? {
+                    guard let spot = try? await BrowserBridge.shared.perform("locate", on: page, ["index": index, "reveal": false]),
+                          spot["hit"] as? Bool == true, spot["still"] as? Bool == true,
+                          let x = (spot["px"] as? NSNumber)?.doubleValue, let y = (spot["py"] as? NSNumber)?.doubleValue else { return nil }
+                    let p = CGPoint(x: web.minX + x * web.width / page.viewport.width, y: web.minY + y * web.height / page.viewport.height)
+                    return rect.insetBy(dx: -2, dy: -2).contains(p) && web.contains(p) ? p : nil
+                }
+                let destination: CGPoint?
+                if let index = args["toIndex"] as? Int, let rect = destinationRect { destination = await point(index, rect: rect) }
+                else { destination = nil }
+                guard kind != .drag || destination != nil, let source = await point(element.index, rect: sourceRect),
+                      let plan = PointerGesture(kind: kind, start: .init(x: source.x, y: source.y), end: destination.map { .init(x: $0.x, y: $0.y) }) else {
+                    return end(line, fail("Gesture endpoints moved or are covered; observe again"))
+                }
+                await Launcher.bringToFront(app)
+                inputDeliveryStarted = true
+                if let why = await hand.gesture(plan, in: app, window: window) { return end(line, fail(why)) }
+            }
+        } else {
+            guard !Background.active, let app = context.app, let window = context.nativeWindow else {
+                return end(line, fail("native gestures require an observed foreground window"))
+            }
+            var start: CGPoint?, destination: CGPoint?
+            if let ref = action["id"], let el = await resolve(ref, context: &context) {
+                if kind != .hover, let why = await approve(el.label, role: el.role, page: nil) { return end(line, .init(outcome: .refused, summary: why)) }
+                start = el.center
+            } else if action["id"] == nil, let x = (action["x"] as? NSNumber)?.doubleValue, let y = (action["y"] as? NSNumber)?.doubleValue {
+                start = await context.coordinateCapture?.validatedScreenPoint(x: x, y: y)
+            }
+            if kind == .drag {
+                if let ref = action["to_id"], !Self.isWebRef(ref), let el = await resolve(ref, context: &context) { destination = el.center }
+                else if action["to_id"] == nil, let x = (action["to_x"] as? NSNumber)?.doubleValue, let y = (action["to_y"] as? NSNumber)?.doubleValue {
+                    destination = await context.coordinateCapture?.validatedScreenPoint(x: x, y: y)
+                }
+                guard destination != nil else { return end(line, fail("drag needs a fresh to_id or screenshot to_x/to_y")) }
+            }
+            guard let start, let plan = PointerGesture(kind: kind, start: .init(x: start.x, y: start.y),
+                                                      end: destination.map { .init(x: $0.x, y: $0.y) }) else {
+                return end(line, fail("gesture needs a current id or fresh screenshot x/y"))
+            }
+            await Launcher.bringToFront(app)
+            inputDeliveryStarted = true
+            if let why = await hand.gesture(plan, in: app, window: window) { return end(line, fail(why)) }
+        }
+        return end(line, .init(outcome: .unverified, summary: "UNVERIFIED: " + raw + " input sent once. Observe and verify its intended result before more input.", effect: .look))
+    }
+
     /// A stale or uncheckable reference is not permission to substitute another control.
     private func liveWebTarget(_ ref: Any?, _ context: inout ActionContext) async -> (BrowserBridge.PageElement, CGRect)? {
         guard let target = webTarget(ref, context), let page = context.page else { return nil }
@@ -3191,7 +3423,12 @@ final class Agent: ObservableObject {
         context.nativeWindow = scan.nativeWindow
         context.coordinateCapture = nil
         // Keep the web page current too, so page actions in the same turn see what's actually there.
-        if Launcher.isBrowser(app), BrowserBridge.shared.isConnected, let page = await Self.pageSnapshot(app) {
+        let pinned = controlLease != nil ? context.page.flatMap { page in page.tabId.map { BrowserBridge.TabInfo(id: $0, url: page.url, connection: page.connection) } } : nil
+        var currentPage: BrowserBridge.Page?
+        if Launcher.isBrowser(app), BrowserBridge.shared.isConnected {
+            currentPage = pinned != nil ? await BrowserBridge.shared.snapshot(of: pinned!) : await Self.pageSnapshot(app)
+        }
+        if let page = currentPage {
             adopt(page, into: &context)
             // Clinqy's own window in a background run isn't the one Accessibility calls the browser's main window.
             context.webArea = Background.active ? page.estimatedArea
@@ -3203,7 +3440,11 @@ final class Agent: ObservableObject {
 
     /// Lists the page again mid-turn (cheaper than a full refresh: no Accessibility scan).
     private func relist(_ context: inout ActionContext) async {
-        guard let app = context.app, let old = context.page, let page = await Self.pageSnapshot(app) else { return }
+        guard let app = context.app, let old = context.page else { return }
+        let next = controlLease != nil && old.tabId != nil
+            ? await BrowserBridge.shared.snapshot(of: .init(id: old.tabId!, url: old.url, connection: old.connection))
+            : await Self.pageSnapshot(app)
+        guard let page = next else { return }
         if Self.signatures(old) != Self.signatures(page) {
             log("    page re-listed: \(old.elements.count) → \(page.elements.count) elements")
         }
@@ -3432,12 +3673,8 @@ final class Agent: ObservableObject {
                 }
             }
             if let path = action["path"] as? String {
-                let url = URL(fileURLWithPath: (path as NSString).expandingTildeInPath)
-                if let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]),
-                   values.isRegularFile == true, (values.fileSize ?? 0) > 0,
-                   let modified = values.contentModificationDate, modified >= (pendingVerification?.startedAt ?? started) {
-                    evidence = "saved file exists and was modified during this run: " + url.lastPathComponent
-                }
+                evidence = SavedFileEvidence.check(path: path, since: pendingVerification?.startedAt ?? started,
+                                                    contains: action["contains"] as? String)
             } else if let expected = action["url"] as? String, !expected.isEmpty,
                       context.page?.url == expected,
                       pendingVerification == nil || pendingVerification?.url != expected {
@@ -3475,6 +3712,12 @@ final class Agent: ObservableObject {
                 if let page = context.page {
                     if let result = try? await BrowserBridge.shared.perform("read", on: page) {
                         actual = (result["title"] as? String ?? "") + "\n" + (result["text"] as? String ?? "")
+                        // The host may inspect a pinned task tab while another tab is active. Native
+                        // toolbar/menu evidence must never come from that unrelated active page.
+                        let active = await BrowserBridge.shared.activeTab(in: context.app)
+                        if active?.id == page.tabId, active?.connection == page.connection {
+                            actual = (actual ?? "") + "\n" + context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
+                        }
                     }
                 } else if let app = context.app, let window = context.nativeWindow, window.staleness() == nil {
                     actual = context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
@@ -3581,10 +3824,13 @@ final class Agent: ObservableObject {
     fileprivate func finish(ok: Bool, _ text: String) {
         guard isRunning else { return }
         let unresolved = pendingVerification?.kind ?? TaskStore.shared.record(taskRecordID)?.unverifiedAction
-        let text = ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + text : text
-        let ok = ok && unresolved == nil
+        let text = ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + text
+            : ok && !runDry && completionEvidence.needsVerification ? "Final task outcome was not independently verified. " + text : text
+        let ok = ok && unresolved == nil && (runDry || !completionEvidence.needsVerification)
         providerOverride = nil
         modelOverride = nil
+        controlLease = nil; controlContext = nil
+        controlExpiry?.cancel(); controlExpiry = nil
         phase = ok ? .done : .failed
         narration = text
         answer = text
@@ -3636,7 +3882,7 @@ final class Agent: ObservableObject {
         // A run that got real work done (a long lab, a big form) keeps going longer than one that's flailing.
         let progressed = steps.filter { $0.state == .ok }.count >= 10
         let limit = progressed ? 12 : 3
-        let continues = !ok && !isTest && !runDry && qa == nil && autoContinues < limit
+        let continues = !externalRun && !ok && !isTest && !runDry && qa == nil && autoContinues < limit
             && (text.hasPrefix("Ran out of steps") || text.hasPrefix("I got stuck on"))
         // A background run tells the user when it's through (not at a pause it carries on from by itself).
         if wasBackground, !isTest, !continues { Notifier.finished(request: request, answer: text, ok: ok, result: runResult) }
@@ -3662,6 +3908,7 @@ final class Agent: ObservableObject {
         watchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
             MainActor.assumeIsolated {
                 guard let self, self.isRunning else { timer.invalidate(); return }
+                if self.externalRun { return } // Host-agent idle expiry is owned by the control lease, never auto-continue.
                 // A model reply with a screenshot and a long history can take well over 30 s; that's slow, not stuck.
                 let limit: TimeInterval = self.phase == .thinking ? 180 : 30
                 guard self.phase != .waiting, Date().timeIntervalSince(self.lastProgress) > limit else { return }

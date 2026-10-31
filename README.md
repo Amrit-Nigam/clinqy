@@ -557,3 +557,10 @@ tests/qa/            example plain-English QA tests (compiled scripts in tests/q
 ## Privacy
 
 Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), or Codex CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
+
+### Direct controls for coding agents
+
+Connect with `clinqy connect claude --skill` or `clinqy connect codex --skill`, then restart the agent.
+The [Clinqy skill](skills/clinqy/SKILL.md) explains `/clinqy`, task delegation, and the direct observe/act/wait/verify/release tools.
+Existing personal skills are preserved; `--replace-skill` explicitly updates one.
+Run local workflow benchmarks with `python3 tests/benchmarks/run.py` (`--help` for options).

@@ -226,6 +226,35 @@ import AppKit
             let uploadItems = uploadReview["items"] as! [[String: Any]]
             try check(uploadItems.first { ($0["q"] as? String ?? "").contains("First") }?["answer"] as? String == "", "unrelated file input remains empty")
             try check((uploadItems.first { ($0["q"] as? String ?? "").contains("Second") }?["answer"] as? String ?? "").contains("exact.txt"), "upload reaches exact selected file input")
+            let gesturesHTML = """
+            <title>Pointer gestures</title><style>button{padding:20px;margin:10px}#drop{display:inline-block;padding:30px;border:1px solid}</style>
+            <button id='hover' onmouseenter="document.querySelector('#result').textContent='Hint revealed'">Hover target</button>
+            <button oncontextmenu="event.preventDefault();document.querySelector('#result').textContent='Context opened'">Context target</button>
+            <button ondblclick="document.querySelector('#result').textContent='Details opened'">Double target</button>
+            <button onmousedown="window.dragging=true">Drag source</button><div id='drop' role='button' aria-label='Drop target'
+            onmouseup="if(window.dragging)document.querySelector('#result').textContent='Card dropped';window.dragging=false">Drop target</div><p id='result'></p>
+            """
+            let gestureID = try await worker.newTab("data:text/html;base64," + Data(gesturesHTML.utf8).base64EncodedString())
+            try await Task.sleep(for: .milliseconds(300))
+            for (kind, label, expected) in [("hover", "Hover target", "Hint revealed"), ("right_click", "Context target", "Context opened"),
+                                             ("double_click", "Double target", "Details opened"), ("drag", "Drag source", "Card dropped")] {
+                let observed = try await command(worker, "snapshot", tabID: gestureID)
+                let items = observed["elements"] as! [[String: Any]]
+                let source = items.first { $0["text"] as? String == label }!["i"] as! Int
+                var args: [String: Any] = ["gesture": kind, "index": source]
+                if kind == "drag" { args["toIndex"] = items.first { $0["text"] as? String == "Drop target" }!["i"] as! Int }
+                let delivered = try await command(worker, "cdpGesture", tabID: gestureID, args: args)
+                try check(delivered["verified"] as? Bool == false, "driver delivery never claims goal verification")
+                let result = try await command(worker, "read", tabID: gestureID)
+                try check((result["text"] as? String ?? "").contains(expected), "real Chromium " + kind + " produces intended page result")
+            }
+            let staleGesture = try await command(worker, "snapshot", tabID: gestureID)
+            _ = try await command(worker, "snapshot", tabID: gestureID)
+            do {
+                _ = try await worker.command("cdpGesture", tabID: gestureID, args: token(staleGesture, ["gesture": "hover", "index": 0]))
+                try check(false, "stale gesture refused")
+            } catch { checks += 1 }
+            _ = try await command(worker, "closeTab", tabID: gestureID)
             let disposable = try await worker.newTab(page("Disposable"))
             let completedRun = worker.generation
             await worker.runEnded(keep: id, generation: completedRun)

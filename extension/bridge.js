@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.11";
+const SCRIPT_VERSION = "1.9.12";
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
@@ -500,6 +500,53 @@ async function cdpClick(tabId, x, y, count = 1) {
   return { clicked: at };
 }
 
+// Endpoint identity is checked before any pointer input. A lost acknowledgement never triggers a retry.
+async function cdpGesture(tabId, msg) {
+  if (!["hover", "right_click", "double_click", "drag"].includes(msg.gesture)) throw Error("unknown gesture");
+  const map = await mapFor(tabId);
+  async function point(index) {
+    if (!Number.isInteger(index)) throw Error("gesture needs element ids");
+    const { frameId, local } = await route(tabId, index);
+    if (frameId !== 0) {
+      const observed = map.frameBoxes?.[frameId];
+      const live = (await call(tabId, 0, "frameBoxes")).frames || [];
+      const current = observed && live.find(box => box.nodeToken === observed.nodeToken);
+      if (!current || ["x", "y", "w", "h"].some(key => Math.abs(current[key] - observed[key]) > 0.5))
+        throw Error("gesture frame moved; observe again");
+    }
+    const spot = await call(tabId, frameId, "locate", [local, false]);
+    const offset = map.offsets[frameId];
+    if (!offset || !spot.hit || !spot.still) throw Error("gesture target moved or is covered; observe again");
+    const result = { x: Number(spot.px) + offset.x, y: Number(spot.py) + offset.y };
+    if (!Number.isFinite(result.x) || !Number.isFinite(result.y)) throw Error("invalid gesture point");
+    return result;
+  }
+  const destination = msg.gesture === "drag" ? await point(msg.toIndex) : null;
+  const start = await point(msg.index);
+  const button = msg.gesture === "right_click" ? "right" : "left", buttons = button === "right" ? 2 : 1;
+  let held = false, last = start;
+  const post = args => cdp(tabId, "Input.dispatchMouseEvent", args);
+  try {
+    await post({ type: "mouseMoved", ...start, button: "none", buttons: 0 });
+    if (msg.gesture !== "hover") {
+      for (let count = 1; count <= (msg.gesture === "double_click" ? 2 : 1); count++) {
+        held = true;
+        await post({ type: "mousePressed", ...start, button, buttons, clickCount: count });
+        if (destination) for (let step = 1; step <= 12; step++) {
+          last = { x: start.x + (destination.x - start.x) * step / 12, y: start.y + (destination.y - start.y) * step / 12 };
+          await post({ type: "mouseMoved", ...last, button, buttons });
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        await post({ type: "mouseReleased", ...last, button, buttons: 0, clickCount: count });
+        held = false;
+      }
+    }
+  } finally {
+    if (held) await post({ type: "mouseReleased", ...last, button, buttons: 0, clickCount: 1 }).catch(() => {});
+  }
+  return { delivered: true, verified: false };
+}
+
 function queueActivity(update) {
   const next = commandQueue.then(update);
   commandQueue = next.catch(() => {});
@@ -659,6 +706,7 @@ async function handle(msg) {
         throw new Error("the click target moved or was covered; take a new look");
     }
   }
+  if (msg.cmd === "cdpGesture") return await cdpGesture(tab.id, msg);
   if (msg.cmd === "cdpClick") return await cdpClick(tab.id, msg.x, msg.y, Number(msg.count) || 1);
   if (msg.cmd === "cdpKey") return await cdpKey(tab.id, msg.keys);
   if (msg.cmd === "cdpType") { await cdp(tab.id, "Input.insertText", { text: String(msg.text) }); return { typed: true }; }
@@ -713,7 +761,7 @@ async function handle(msg) {
     case "locate": {
       // In top-page coordinates, so a frame's element (LinkedIn's Easy Apply form) is placed right too.
       const { frameId, local } = await route(tab.id, msg.index);
-      const r = await call(tab.id, frameId, "locate", [local]);
+      const r = await call(tab.id, frameId, "locate", [local, msg.reveal !== false]);
       const o = ((await mapFor(tab.id)).offsets || {})[frameId];
       if (!o) return { ...r, hit: frameId === 0 && r.hit };
       return { ...r, x: r.x + o.x, y: r.y + o.y, px: r.px + o.x, py: r.py + o.y };

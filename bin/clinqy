@@ -13,6 +13,9 @@
 #                                    use Antigravity CLI / Claude Code CLI for this run.
 #   clinqy workflow <name> [k=v ...] Replay a saved workflow with parameters, no model.
 #   clinqy workflows                 List saved workflows.
+#   clinqy control observe|act|verify|wait|release '<JSON>' [--image-out /path.jpg]
+#                                    Precise controls for agents; observe returns session/observation tokens.
+#                                    Use --image-out to inspect the annotated screenshot; no nested model.
 #   clinqy stats [days] [--last]     Success rate, model vs action time per turn, top failure reasons (default: 7 days).
 #   clinqy mcp                       Serve Clinqy as an MCP server on stdio (agy mcp add clinqy -- clinqy mcp).
 #   clinqy watch <app> <text> [--gone] [--timeout s]   Wait for text to appear in (or vanish from) an app.
@@ -156,7 +159,7 @@ PY
     if [[ ${1:-} == install ]]; then exec /Applications/Clinqy.app/Contents/MacOS/Clinqy extension "$@"; fi
     ensure_app
     open -g "clinqy://reload-extension?token=$TOKEN"; echo "Asked the browser(s) to reload the Clinqy extension." ;;
-  stats|mcp|watch|replay|memory|model|models|connect|settings|permissions|doctor|update)
+  control|stats|mcp|watch|replay|memory|model|models|connect|settings|permissions|doctor|update)
     # Handled by the app binary itself: stats [days] [--last], mcp, watch <app> <text>, replay <fixtures>, memory,
     # and the setup commands (model, connect, settings, permissions, doctor).
     APP=/Applications/Clinqy.app/Contents/MacOS/Clinqy

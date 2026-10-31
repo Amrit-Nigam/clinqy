@@ -442,6 +442,49 @@ final class ChromeWorker {
                            "optimizeForSpeed": true, "captureBeyondViewport": false])["data"] ?? "", "tabId": id]
         case "snapshot": return try await snapshot(tab, id: id)
         case "cdpType": _ = try await tab.cdp.call("Input.insertText", ["text": args["text"] as? String ?? ""]); return ["typed": true]
+        case "cdpGesture":
+            guard let raw = args["gesture"] as? String, let kind = PointerGesture.Kind(rawValue: raw),
+                  let index = args["index"] as? Int else { throw WorkerCDP.error("gesture and source index are required") }
+            func point(_ index: Int) async throws -> PointerGesture.Point {
+                guard let element = tab.elements[index] else { throw WorkerCDP.error("Gesture target is stale") }
+                let liveOffset = try await offset(element.frame, tab: tab)
+                guard abs(liveOffset.x - element.offset.x) <= 0.5, abs(liveOffset.y - element.offset.y) <= 0.5 else {
+                    throw WorkerCDP.error("Gesture frame moved; observe again")
+                }
+                let spot = try await call(tab, frame: element.frame, function: "locate", args: [element.local, false])
+                guard spot["hit"] as? Bool == true, spot["still"] as? Bool == true,
+                      let x = (spot["px"] as? NSNumber)?.doubleValue, let y = (spot["py"] as? NSNumber)?.doubleValue else {
+                    throw WorkerCDP.error("Gesture target moved or is covered; observe again")
+                }
+                return .init(x: x + liveOffset.x, y: y + liveOffset.y)
+            }
+            // Resolve the destination first: locating it must never invalidate the source by scrolling.
+            let destination: PointerGesture.Point?
+            if kind == .drag {
+                guard let index = args["toIndex"] as? Int else { throw WorkerCDP.error("drag needs a destination index") }
+                destination = try await point(index)
+            } else { destination = nil }
+            let source = try await point(index)
+            guard let plan = PointerGesture(kind: kind, start: source, end: destination) else { throw WorkerCDP.error("Invalid gesture coordinates") }
+            var held = false
+            var last = source
+            do {
+                for event in plan.events {
+                    try Task.checkCancellation()
+                    if event.phase == .down { held = true }
+                    last = event.point
+                    _ = try await tab.cdp.call("Input.dispatchMouseEvent", event.cdp)
+                    if event.phase == .up { held = false }
+                    if kind == .drag { try await Task.sleep(for: .milliseconds(20)) }
+                }
+            } catch {
+                if held {
+                    _ = try? await tab.cdp.call("Input.dispatchMouseEvent", ["type": "mouseReleased", "x": last.x, "y": last.y,
+                        "button": kind == .right_click ? "right" : "left", "buttons": 0, "clickCount": 1])
+                }
+                throw error
+            }
+            return ["delivered": true, "verified": false]
         case "cdpClick":
             for count in 1...max(1, args["count"] as? Int ?? 1) {
                 _ = try await tab.cdp.call("Input.dispatchMouseEvent", ["type": "mousePressed", "button": "left", "buttons": 1, "x": args["x"] ?? 0, "y": args["y"] ?? 0, "clickCount": count])
@@ -574,7 +617,7 @@ final class ChromeWorker {
         case "activeOption": return try await indexed(command, [args["want"] ?? ""])
         case "fill": return try await indexed(command, [args["text"] ?? ""])
         case "locate", "findOption":
-            var result = command == "locate" ? try await indexed(command) : try await call(tab, frame: element?.frame ?? top, function: command, args: [args["text"] ?? "", element?.local ?? -1])
+            var result = command == "locate" ? try await indexed(command, [args["reveal"] as? Bool ?? true]) : try await call(tab, frame: element?.frame ?? top, function: command, args: [args["text"] ?? "", element?.local ?? -1])
             if command == "findOption" { result["pointFrame"] = element?.frame ?? top }
             for k in ["x", "px"] { if let value = result[k] as? Double { result[k] = value + (element?.offset.x ?? 0) } }
             for k in ["y", "py"] { if let value = result[k] as? Double { result[k] = value + (element?.offset.y ?? 0) } }
