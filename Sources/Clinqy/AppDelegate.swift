@@ -60,7 +60,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         agent.enqueueNewRequest = { [weak self] text in self?.enqueueNewRequest(text) ?? false }
         agent.dispatchBrowserTask = { [weak self] request, test, model, provider, taskID in
             guard let self else { return false }
-            // Telegram retains its existing conversation controller; it does not receive another task's questions.
+            // Telegram dispatches its own requests to the pool and binds questions to their originating task.
             if let taskID, TaskStore.shared.record(taskID)?.source == .telegram { return false }
             let receipt = self.agent.runReceiptID
             let id = BrowserJobs.shared.submit(request, test: test, model: model, provider: provider, files: self.agent.selectedFiles,
@@ -87,7 +87,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         resultPanel = ResultPanel(agent: agent)
         agent.onResult = { [weak self] in
             guard let self, let result = self.agent.result else { return }
-            Telegram.shared.present(result)
+            Telegram.shared.present(result, from: self.agent)
             if !self.agent.runBackground { self.resultPanel.show() }
         }
         // Review before submit: the form's answers come up in the bar; it goes away once the user decides.
@@ -101,6 +101,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // A background run's notifications: answered there, or tapped to come here.
         Notifier.start()
         Telegram.shared.agent = agent
+        Telegram.shared.submitBrowserTask = { request, files, id in
+            BrowserJobs.shared.submit(request, files: files, taskID: id,
+                browser: BrowserTaskRouting.browser(in: request) ?? BrowserJobs.shared.running.compactMap(\.browser).first) != nil
+        }
+        Telegram.shared.cancelBrowserTask = { BrowserJobs.shared.cancel($0) }
         Telegram.shared.start()
         // Switching to an app whose windows are on the hidden screen gets the user a window they can see.
         Background.onBusyApp = { [weak self] text in self?.buddy.bubble(text, for: 4) }

@@ -126,6 +126,14 @@ final class TaskStore: ObservableObject {
         return change(id) { $0.state = .running; $0.stage = "Getting started"; $0.requiresReview = false; $0.reviewReason = nil }
     }
 
+    /// Explicitly review a restored queued request without consuming a slot before it can run.
+    @discardableResult
+    func reviewQueued(_ id: UUID) -> Bool {
+        guard let item = record(id), item.state == .queued,
+              item.reviewReason?.contains("Private values") != true else { return false }
+        return change(id) { $0.requiresReview = false; $0.reviewReason = nil }
+    }
+
     @discardableResult
     func update(_ id: UUID?, state: State? = nil, stage: String? = nil, completedSteps: Int? = nil, background: Bool? = nil) -> Bool {
         guard let id, let item = record(id), !item.state.terminal else { return id == nil }

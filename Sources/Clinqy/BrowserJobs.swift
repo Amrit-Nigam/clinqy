@@ -77,7 +77,13 @@ final class BrowserJobs: ObservableObject {
         for job in jobs where !job.started && !job.finished {
             guard running.count < limit else { break }
             if !job.test, TaskStore.shared.record(job.id)?.state != .running,
-               !TaskStore.shared.start(job.id) { continue }
+               !TaskStore.shared.start(job.id) {
+                if let record = TaskStore.shared.record(job.id), record.state.terminal {
+                    complete(job, answer: record.stage, ok: false)
+                    if record.source == .telegram { Telegram.shared.failedToStart(taskID: job.id, reason: record.stage) }
+                }
+                continue
+            }
             job.started = true
             start(job)
         }
@@ -92,6 +98,7 @@ final class BrowserJobs: ObservableObject {
         let worker = Agent(buddy: buddy, context: job.context)
         worker.isolatedBrowserJob = true
         worker.selectedFiles = job.files
+        if TaskStore.shared.record(job.id)?.source == .telegram { Telegram.shared.attach(worker, taskID: job.id) }
         job.buddy = buddy; job.agent = worker; job.status = "Starting"
         job.observer = worker.$phase.combineLatest(worker.$narration).sink { [weak self, weak job] phase, narration in
             guard let self, let job, !job.finished else { return }
@@ -103,7 +110,10 @@ final class BrowserJobs: ObservableObject {
             job.status = "Needs your answer — click to respond"
             self.objectWillChange.send()
         }
-        worker.onResult = { [weak self] in self?.objectWillChange.send() }
+        worker.onResult = { [weak self, weak worker] in
+            self?.objectWillChange.send()
+            if let worker, let result = worker.result { Telegram.shared.present(result, from: worker) }
+        }
         worker.onFinish = { [weak self, weak job] answer, ok in
             guard let self, let job else { return }
             self.complete(job, answer: answer, ok: ok)
@@ -118,7 +128,11 @@ final class BrowserJobs: ObservableObject {
             Background.chooseBrowser(job.browser)
             worker.submit(job.request, test: job.test, model: job.model, provider: job.provider, background: true, taskID: job.test ? nil : job.id)
         }
-        if !worker.isRunning { complete(job, answer: worker.answer.isEmpty ? "Couldn't start this task" : worker.answer, ok: false) }
+        if !worker.isRunning {
+            let reason = worker.answer.isEmpty ? "Couldn't start this task" : worker.answer
+            complete(job, answer: reason, ok: false)
+            if TaskStore.shared.record(job.id)?.source == .telegram { Telegram.shared.failedToStart(taskID: job.id, reason: reason) }
+        }
     }
 
     private func parallel(_ parent: Job, requests: [String]) async -> (ok: Bool, summary: String) {
@@ -126,7 +140,8 @@ final class BrowserJobs: ObservableObject {
         // Reserve all children before draining; a synchronous start/failure cannot finish an incomplete group.
         var childIDs: [UUID] = []
         for request in requests {
-            let id = parent.test ? UUID() : TaskStore.shared.enqueue(request, source: .mac, background: true)
+            let owner = TaskStore.shared.record(parent.id)
+            let id = parent.test ? UUID() : TaskStore.shared.enqueue(request, source: owner?.source ?? .mac, background: true, conversationID: owner?.conversationID)
             guard let id else { continue }
             let child = Job(id: id, request: request, test: parent.test, model: parent.model, provider: parent.provider, files: parent.files,
                             browser: BrowserTaskRouting.browser(in: request) ?? parent.browser, parent: parent.id, receipt: nil,

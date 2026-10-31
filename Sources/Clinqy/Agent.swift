@@ -36,9 +36,12 @@ final class Agent: ObservableObject {
 
     /// Captures the exact worker tab/window without selecting it or reading the user's foreground desktop.
     func telegramScreenshot() async -> Data? {
+        if let context = executionContext, TaskExecution.current !== context {
+            return await TaskExecution.$current.withValue(context) { await telegramScreenshot() }
+        }
         guard question?.sensitive != true else { return nil }
-        // finish() has already released Background.tab; Background.last is the exact tab it just released.
-        if let tab = telegramTab ?? (Background.active ? Background.tab : Background.last.tab) {
+        // Use only this agent's pinned target, including after completion. Never use another run's last tab.
+        if let tab = telegramTab ?? browserTab {
             return await BrowserBridge.shared.taskScreenshot(of: tab)
         }
         guard let window = telegramWindow, !window.app.isTerminated else {
@@ -46,6 +49,15 @@ final class Agent: ObservableObject {
             return nil
         }
         return await Screenshot.windowPNG(app: window.app, windowID: window.id)
+    }
+
+    /// Only an explicit Telegram Open task action reveals the pinned task on the user's Mac.
+    func revealTelegramTarget() async {
+        if let context = executionContext, TaskExecution.current !== context {
+            await TaskExecution.$current.withValue(context) { await revealTelegramTarget() }; return
+        }
+        if let tab = telegramTab ?? browserTab { await BrowserBridge.shared.revealTaskTab(tab) }
+        else if let window = telegramWindow, !window.app.isTerminated { await Launcher.bringToFront(window.app) }
     }
 
     private func rememberTelegramTarget(app: NSRunningApplication?, page: BrowserBridge.Page?) {
@@ -130,7 +142,7 @@ final class Agent: ObservableObject {
         if let context = executionContext { return TaskExecution.$current.withValue(context) { Background.tab ?? completedBrowserTab } }
         return Background.tab ?? completedBrowserTab
     }
-    private var telegramOwned: Bool { !isolatedBrowserJob && Telegram.shared.ownsRun }
+    private var telegramOwned: Bool { taskRecordID.flatMap { TaskStore.shared.record($0) }?.source == .telegram }
     var shouldDispatchBrowserInput: Bool { dispatchBrowserTask != nil && BrowserTaskRouting.isBrowserTask(input) }
     private let buddy: Buddy
     private let hand: Hand
@@ -209,7 +221,7 @@ final class Agent: ObservableObject {
         question = Question(text: text, options: options, sensitive: sensitive)
         onQuestion()
         if runBackground, !isolatedBrowserJob { Notifier.ask(text, options: options, sensitive: sensitive) }
-        if !isolatedBrowserJob { Telegram.shared.ask(text, options: options, sensitive: sensitive) }
+        if telegramOwned { Telegram.shared.ask(text, options: options, sensitive: sensitive, from: self) }
         let reply = await withCheckedContinuation { answerWaiter = $0 }
         buddy.bubble(nil)
         guard !Task.isCancelled, isRunning else { return nil }
@@ -371,7 +383,7 @@ final class Agent: ObservableObject {
             let card = ResultCard(title: "Review before submitting: " + String(page.title.prefix(70)),
                                   text: missing.isEmpty ? "Check these answers before submitting." : "Required answers missing: " + missing.joined(separator: "; "), items: cards)
             runResult = card; result = card; onResult()
-            if !isolatedBrowserJob { Telegram.shared.present(card) }
+            if telegramOwned { Telegram.shared.present(card, from: self) }
             let reply = await askUser("Please review the answers above. Submit this form, or tell me what to change?", options: ["Submit", "Edit"])
             guard let reply, !Task.isCancelled else { return false }
             let approve = reply.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "submit" || Safety.isYes(reply)
@@ -408,7 +420,7 @@ final class Agent: ObservableObject {
         }
         guard let waiter = answerWaiter else { return }
         answerWaiter = nil
-        if !isolatedBrowserJob { Telegram.shared.dismissQuestion() }
+        if telegramOwned { Telegram.shared.dismissQuestion(from: self) }
         if !isolatedBrowserJob { Notifier.clearQuestion() }
         lastProgress = Date()   // time spent answering isn't "stuck"
         question = nil
@@ -1319,7 +1331,7 @@ final class Agent: ObservableObject {
                 + "Use short, concrete say messages describing the current stage. For forms and applications, use review after filling each page "
                 + "and before finishing, so the user gets the actual field labels and answers. Use show for structured output. "
                 + "Distinguish filled, waiting for approval, submitted and confirmed in the final answer. Include what changed, what remains, "
-                + "and any confirmation number or result link that you actually saw. Never claim submission from filling alone."
+                + "and any confirmation number or result link that you actually saw. Never claim submission from filling alone. The execution mode was selected before starting; do not ask a second mode-selection question. Use tools in the selected mode; the runtime handles any unsupported action. CAPTCHA or login handoffs require the user to open the task on their Mac and finish the check themselves; keep the task paused until they explicitly report it is done."
         }
         if runBackground {
             text += Background.usesExtension
@@ -1618,6 +1630,10 @@ final class Agent: ObservableObject {
         guard !Task.isCancelled, isRunning else { return .init(outcome: .refused, summary: "Stopped") }
         let kind = (action["do"] as? String ?? "").lowercased()
         if runBackground && !runDry {
+            if kind == "ask", let question = action["question"] as? String,
+               question.range(of: #"(?i)\b(switch|change|continue|use|run|move)\b.{0,60}\b(foreground|normal mode)\b"#, options: .regularExpression) != nil {
+                return .init(outcome: .refused, summary: "Execution mode is controlled by Clinqy, not by a prose question. Try the required tool; Clinqy will handle foreground permission if it is unsupported. Do not ask another mode-selection question.")
+            }
             if case .attention(let reason) = BackgroundPolicy.route(action, hasWorkerPage: BrowserBridge.shared.ownsBackgroundPage(context.page)) {
                 if isolatedBrowserJob, kind == "key" {
                     return .init(outcome: .refused, summary: reason + " No shortcut was sent. Recover with open_url to navigate or create an owned task tab, tab actions to manage your own tabs, or a page field id to type. Do not ask the user to perform a browser navigation shortcut.", effect: .look)
@@ -4002,7 +4018,7 @@ final class Agent: ObservableObject {
             runReceiptID = nil
         }
         if !continues { TaskStore.shared.finish(taskRecordID, ok: ok, answer: journalText(text)) }
-        if !continues, !isolatedBrowserJob { Telegram.shared.finished(answer: text, ok: ok, result: runResult) }
+        if !continues, telegramOwned || !isolatedBrowserJob { Telegram.shared.finished(answer: text, ok: ok, result: runResult, from: self) }
         if continues {
             autoContinues += 1
             log("auto-continue \(autoContinues)/\(limit) after: \(text.prefix(60))")
