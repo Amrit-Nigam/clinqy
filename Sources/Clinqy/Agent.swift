@@ -4311,7 +4311,7 @@ extension AXEngine {
             enableManualAccessibility(app)
             let focus = focusSummary(of: app)
             let nativeWindow = NativeWindowObservation.capture(app)
-            let elements = nativeWindow.map { elements(of: app, window: $0, limit: 150) } ?? []
+            let elements = nativeWindow.map { AXEngine.elements(of: app, window: $0, limit: 150) } ?? []
             return Scan(elements: elements, fingerprint: fingerprint(of: app),
                         window: focus.window, focused: focus.focused, dialog: dialog(of: app), nativeWindow: nativeWindow)
         }.value
