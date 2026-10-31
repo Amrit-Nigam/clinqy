@@ -334,6 +334,7 @@ struct DashboardContentView: View {
 
     private let pages = ["Overview", "Usage", "AI & Model", "Background", "Shortcuts"]
     @AppStorage("backgroundMode") private var backgroundMode = false
+    @AppStorage("backgroundWebMode") private var backgroundWebMode = "extension"
     private let surface = Brand.text.opacity(0.035)
     private let text = Brand.text
     private let muted = Brand.soft
@@ -391,7 +392,7 @@ struct DashboardContentView: View {
                 Toggle(isOn: $backgroundMode) {
                     VStack(alignment: .leading, spacing: 3) {
                         Text("Work in the background").font(.system(size: 15, weight: .semibold))
-                        Text("Web tasks run in a separate Chrome profile. File and supported service tasks run directly; native app work asks before switching to foreground. "
+                        Text("Web tasks run in Clinqy’s own browser tabs while you keep browsing. File and supported service tasks run directly; native app work asks before switching to foreground. "
                              + "Either way, a request can choose: say or type “in the background” or “not in the background”.")
                             .font(.system(size: 11)).foregroundStyle(muted)
                     }
@@ -399,8 +400,14 @@ struct DashboardContentView: View {
                 .toggleStyle(.switch)
             }
             card {
-                Text("Worker Chrome").font(.system(size: 14, weight: .semibold))
-                Text("Background web tasks use their own Chrome session. Sign in here once, then finish sign-in to return to background work. Your usual browser stays separate.")
+                Picker("Web browser mode", selection: $backgroundWebMode) {
+                    Text("Signed-in browser tabs").tag("extension")
+                    Text("Separate headless Chrome").tag("headless")
+                }
+                Text("Signed-in browser tabs use the Clinqy extension in your connected browser profile. Tabs stay inactive and reuse website sessions, with a Clinqy group where supported. Other tabs stay yours. Password prompts and security dialogs may need your input. Changes apply to the next task.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                Text("Headless Chrome sign-in").font(.system(size: 14, weight: .semibold))
+                Text("The optional headless mode uses a separate Chrome profile. Sign in here once, then finish sign-in before running headless tasks.")
                     .font(.system(size: 11)).foregroundStyle(muted)
                 HStack {
                     Button("Sign in…") { (NSApp.delegate as? AppDelegate)?.workerLogin() }.brand()

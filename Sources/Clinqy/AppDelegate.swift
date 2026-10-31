@@ -223,7 +223,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak background] _ in
             MainActor.assumeIsolated { background?.state = Background.always ? .on : .off }
         }
-        background.toolTip = "Web tasks use a separate Chrome profile. File and supported service tasks run directly; native app tasks ask for foreground access."
+        background.toolTip = "Web tasks use Clinqy’s own signed-in browser tabs (or optional headless Chrome). File and supported service tasks run directly; native app tasks ask for foreground access."
         menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
         menu.addItem(withTitle: "Telegram…", action: #selector(setUpTelegram), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")

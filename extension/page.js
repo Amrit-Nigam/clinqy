@@ -1,7 +1,7 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  if (window.__clinqy && window.__clinqy.protocolVersion === 2) return;
+  if (window.__clinqy && window.__clinqy.protocolVersion === 3) return;
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
     : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
   let snapshotID = null;
@@ -249,7 +249,7 @@ function candidates() {
   const walk = (root) => {
     root.querySelectorAll(SEL).forEach((el) => nodes.push(el));
     const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    for (let n = tw.nextNode(); n; n = tw.nextNode()) { const s = shadowOf(n); if (s) walk(s); }
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) { if (n.hasAttribute("data-clinqy-overlay")) continue; const s = shadowOf(n); if (s) walk(s); }
   };
   walk(document);
   return nodes;
@@ -435,7 +435,7 @@ function snapshot() {
   try { frames = frameBoxes().frames; } catch {}
   return {
     documentID, snapshotID,
-    url: location.href, title: document.title, focused: document.hasFocus(), ready: document.readyState,
+    url: location.href, title: window.__clinqyActivity?.pageTitle() || document.title, focused: document.hasFocus(), ready: document.readyState,
     viewport: { w: vw, h: vh },
     // Where the viewport sits on screen (for browsers that don't expose it to Accessibility).
     screen: { x: screenX, y: screenY, ow: outerWidth, oh: outerHeight, zoom: devicePixelRatio },
@@ -487,6 +487,11 @@ function alive(index) {
 }
 
 // Focuses an element so a key press acts on it (the last fallback when clicks don't take).
+function activityPoint(index) {
+  const rect = target(index).getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
 function focusFor(index) {
   const el = target(index);
   reveal(el);
@@ -917,7 +922,7 @@ function readText() {
     });
   }
 
-  window.__clinqy = { protocolVersion: 2, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { protocolVersion: 3, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, locate, alive, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();

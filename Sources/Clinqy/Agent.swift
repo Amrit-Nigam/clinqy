@@ -505,6 +505,7 @@ final class Agent: ObservableObject {
         startPlace = (nil, nil, nil)
         openedLast = false
         runBackground = background
+        BrowserBridge.shared.beginActivityRun()
         Background.begin(background)
         buddy.quiet = background
         // Off to work somewhere else: the buddy leaves for the screen's edge until it's done or needs the user.
@@ -944,7 +945,7 @@ final class Agent: ObservableObject {
     }
 
     nonisolated static func canonical(_ action: [String: Any]) -> String {
-        (try? JSONSerialization.data(withJSONObject: action, options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "\(action)"
+        (try? JSONSerialization.data(withJSONObject: BrowserNavigation.normalizedAction(action), options: [.sortedKeys])).map { String(decoding: $0, as: UTF8.self) } ?? "\(action)"
     }
 
     /// Memory facts this run was shown (up front, as notes for a site or app, or recalled): the ones the run then used
@@ -1247,10 +1248,12 @@ final class Agent: ObservableObject {
                 + "and any confirmation number or result link that you actually saw. Never claim submission from filling alone."
         }
         if runBackground {
-            text += "\nBackground mode uses a separate headless Chrome process and profile, never the user's browser or native windows. "
-                + "Use open_url to open a worker page. Prefer files, PDF, media and supported service actions without opening apps. "
+            text += Background.usesExtension
+                ? "\nBackground web tasks use only Clinqy's own inactive tabs in the user's signed-in browser through the extension. Existing website sessions are shared with that profile. Never read or act on the user's other tabs. Browser password prompts or security dialogs may require the user. "
+                : "\nBackground mode uses a separate headless Chrome process and profile. Worker sign-ins are separate; ask the user to sign in through the Worker Chrome menu if needed. "
+            text += "Use open_url to open a task tab. "
+                + "Prefer files, PDF, media and supported service actions without opening apps. "
                 + "No Finder, native app input, clipboard, arbitrary shell or AppleScript is permitted in background mode. "
-                + "Worker Chrome has separate sign-ins; if a login is needed, ask the user to sign in via Clinqy's Worker Chrome menu and finish sign-in. "
                 + "Use ask for missing input. Native-only work requires an explicit switch to foreground."
 
         }
@@ -1395,7 +1398,7 @@ final class Agent: ObservableObject {
     fileprivate func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let kind = (action["do"] as? String ?? "").lowercased()
         if runBackground && !runDry {
-            if case .attention(let reason) = BackgroundPolicy.route(action, hasWorkerPage: context.page?.connection == ChromeWorker.shared.identity) {
+            if case .attention(let reason) = BackgroundPolicy.route(action, hasWorkerPage: BrowserBridge.shared.ownsBackgroundPage(context.page)) {
                 TaskStore.shared.update(taskRecordID, state: .needsAttention, stage: reason)
                 let reply = await askUser(reason + " You can continue this task in foreground mode, or stop it.", options: ["Keep background mode", "Continue in foreground", "Stop task"])
                 guard !Task.isCancelled else { return fail("Stopped") }
@@ -1517,9 +1520,38 @@ final class Agent: ObservableObject {
             if Background.active {
                 return end(line, await openInBackground(url, context: &context))
             }
-            // Never take over one of the user's tabs: reuse only a tab this task opened itself, or an empty
-            // new-tab page; anything else gets a fresh tab.
             let bridge = BrowserBridge.shared
+            let connectedBrowser = context.app.flatMap { Launcher.isBrowser($0) && bridge.isConnected($0) ? $0 : nil }
+                ?? (context.app.map(Launcher.isBrowser) != true ? NSWorkspace.shared.runningApplications.first {
+                    $0.cleanName == Launcher.defaultBrowserName && bridge.isConnected($0)
+                } : nil)
+            if let browser = connectedBrowser {
+                let before = await currentTab(browser)
+                let reuse = before.map { Self.isNewTabPage($0.url) || ($0.id == ownedTab && URL(string: $0.url)?.host == url.host) } ?? false
+                do {
+                    let opened = try await bridge.openForegroundTab(url, in: browser, reusing: reuse ? before : nil,
+                                                                  operationID: runID + ":" + BrowserNavigation.key(url.absoluteString))
+                    ownedTab = opened.id
+                    context.app = browser
+                    openedTab = true
+                    openedLast = true
+                    await Launcher.bringToFront(browser)
+                    for _ in 0..<15 {
+                        if let page = await bridge.snapshot(of: opened), page.ready != "loading", !Self.isNewTabPage(page.url) {
+                            adopt(page, into: &context)
+                            break
+                        }
+                        try? await Task.sleep(for: .milliseconds(150))
+                    }
+                    await refresh(&context)
+                    registerNavigationUndo(line, label: "Leave \(url.host ?? raw)", closing: reuse ? nil : opened.id, app: browser)
+                    return end(line, .init(ok: true, summary: "opened \(url.absoluteString) in tab \(opened.id) of \(browser.cleanName ?? "the browser")"))
+                } catch {
+                    return end(line, .init(outcome: .uncertain, summary: "The browser open could not be confirmed. No second tab was opened. Take a fresh look before retrying. " + error.localizedDescription, effect: .look))
+                }
+            }
+            // Without an extension, open once through native input. Never create a second tab based only on
+            // an old active-tab observation or a page that has not finished navigating.
             // Ask this browser, not whichever one has the extension too (Arc and Chrome both connected).
             let before = context.app.map(Launcher.isBrowser) == true ? await currentTab(context.app) : nil
             let emptyTab = before.map { Self.isNewTabPage($0.url) } ?? false
@@ -1532,30 +1564,10 @@ final class Agent: ObservableObject {
             openedTab = true
             if let before, let after = await currentTab(browser ?? context.app) {
                 log("    tab: \(reuse ? "reused" : "new") · before #\(before.id) \(before.url.prefix(50)) · now #\(after.id)")
-                if !reuse, after.id == before.id, !Self.isNewTabPage(before.url) {
-                    log("    tab: the user's tab was changed — restoring it and opening a separate tab")
-                    // The new tab didn't happen and the user's page was changed: put it back, open ours separately.
-                    await bridge.tabCommand("goBack", on: after, ["tabId": after.id])
-                    ownedTab = (await bridge.tabCommand("newTab", on: after, ["url": url.absoluteString]))?["id"] as? Int
-                    try? await Task.sleep(for: .milliseconds(1200))
-                } else {
-                    ownedTab = after.id
-                }
+                if after.id != before.id || reuse { ownedTab = after.id }
             }
             context.app = browser ?? NSWorkspace.shared.frontmostApplication
             await refresh(&context)
-            // With the extension we can check the page really opened; if the typed address went astray, go directly.
-            if let page = context.page, let host = url.host?.replacingOccurrences(of: "www.", with: ""),
-               !page.url.contains(host), let tab = await currentTab(context.app) {
-                // Only ever redirect our own tab; otherwise open the page in a new one.
-                if tab.id == ownedTab {
-                    await BrowserBridge.shared.tabCommand("navigate", on: tab, ["url": url.absoluteString])
-                } else {
-                    ownedTab = (await BrowserBridge.shared.tabCommand("newTab", on: tab, ["url": url.absoluteString]))?["id"] as? Int
-                }
-                try? await Task.sleep(for: .milliseconds(1200))
-                await refresh(&context)
-            }
             openedLast = true
             registerNavigationUndo(line, label: "Leave \(url.host ?? raw)", closing: reuse ? nil : ownedTab, app: context.app)
             return end(line, .init(ok: true, summary: "opened \(url.absoluteString) in \(context.app?.cleanName ?? "the browser")"))
@@ -1857,7 +1869,7 @@ final class Agent: ObservableObject {
             if !Background.active { await Launcher.bringToFront(app) }
             let before = try? await BrowserBridge.shared.perform("activeValue", on: page)
             // (In a background run the keys go to the run's tab whatever has focus there: the rest of the Mac is the user's.)
-            if Background.active, before?["editable"] as? Bool != true { return end(line, fail("No editable field is focused in Worker Chrome. Click a listed field first.")) }
+            if Background.active, before?["editable"] as? Bool != true { return end(line, fail("No editable field is focused in the task tab. Click a listed field first.")) }
             guard before?["editable"] as? Bool == true || Background.active else {
                 let result = await typeOutsidePage(text, submit: action["submit"] as? Bool == true, app: app,
                                                    pageFocused: before?["hasFocus"] as? Bool ?? false, context: &context)
@@ -2716,7 +2728,8 @@ final class Agent: ObservableObject {
             case "switch" where Background.active:
                 let line = begin("Switch tab")
                 guard let conn = Background.tab?.connection else { return end(line, fail("you have no tab of your own yet; open_url opens one")) }
-                Background.tab = BrowserBridge.TabInfo(id: id!, url: "", connection: conn)
+                guard let page = await bridge.snapshot(tab: id!, in: app) else { return end(line, fail("That tab does not belong to this task or is unavailable")) }
+                Background.tab = BrowserBridge.TabInfo(id: id!, url: page.url, connection: conn)
                 await refresh(&context)
                 return end(line, .init(ok: true, summary: "working on tab \(id!) now (in the background): \(context.page?.title.prefix(80) ?? "")"))
             case "switch":
@@ -3049,19 +3062,20 @@ final class Agent: ObservableObject {
         return BrowserBridge.TabInfo(id: tab.id, url: url ?? tab.url, connection: tab.connection)
     }
 
-    /// open_url in a background run: Clinqy's own tab, in its own window behind the user's. The same site stays in
+    /// open_url in a background run: Clinqy's own inactive tab. The same site stays in
     /// the tab it's in; another site gets a new tab there, so the earlier one can still be read.
     private func openInBackground(_ url: URL, context: inout ActionContext) async -> ActionResult {
         let bridge = BrowserBridge.shared
-        if let tab = Background.tab, tab.connection == ChromeWorker.shared.identity,
+        if let tab = Background.tab,
            URL(string: tab.url)?.host == url.host, url.host != nil {
-            guard await bridge.tabCommand("navigate", on: tab, ["url": url.absoluteString]) != nil else { return fail("Worker Chrome disconnected; your normal browser was not used") }
+            guard await bridge.tabCommand("navigate", on: tab, ["url": url.absoluteString]) != nil else { return fail("The task browser disconnected; reconnect it before continuing") }
         } else {
-            guard let opened = await bridge.backgroundTab(url.absoluteString) else { return fail("Couldn't start Worker Chrome. Check worker sign-in in the Clinqy menu; your normal browser was not used.") }
+            guard let opened = await bridge.backgroundTab(url.absoluteString) else { return fail("Couldn't open a task tab. Connect the Clinqy extension in your signed-in browser, or select headless mode in Background settings.") }
             Background.tab = opened.tab
+            Background.app = opened.browser
             ownedTab = opened.tab.id
         }
-        context.app = ChromeWorker.shared.app ?? NSRunningApplication.current
+        context.app = Background.app ?? ChromeWorker.shared.app ?? NSRunningApplication.current
         for _ in 0..<15 {
             try? await Task.sleep(for: .milliseconds(200))
             if let tab = Background.tab, let page = await bridge.snapshot(of: tab), page.ready != "loading", page.url == url.absoluteString || page.url.hasPrefix("http") {
@@ -3071,7 +3085,7 @@ final class Agent: ObservableObject {
         openedTab = true
         await refresh(&context)
         guard context.page != nil else { return fail("Worker page couldn't be read. Your desktop was not used.") }
-        return .init(ok: true, summary: "Opened \(url.absoluteString) in isolated Worker Chrome")
+        return .init(ok: true, summary: "Opened \(url.absoluteString) in Clinqy’s own \(Background.usesExtension ? "browser tab" : "headless Chrome tab")")
     }
 
     static func backgroundBrowser() async -> NSRunningApplication? {
@@ -3152,7 +3166,7 @@ final class Agent: ObservableObject {
             if delivered { inputDeliveryStarted = true }
             return delivered
         }
-        guard let page, page.connection == ChromeWorker.shared.identity else { return false }
+        guard let page, BrowserBridge.shared.ownsBackgroundPage(page) else { return false }
         if let why = Safety.blockedChord(keys, request: request) {
             log("    \(why)")
             return false
@@ -3594,6 +3608,7 @@ final class Agent: ObservableObject {
         hand.keepFrontApp = openedLast || Self.keepsFrontApp(request)
         hand.endRun()
         let wasBackground = Background.active
+        BrowserBridge.shared.endActivityRun()
         Background.end()
         buddy.quiet = false
         buddy.confine = nil
@@ -3761,7 +3776,7 @@ struct Observation {
         if Background.active {
             let page: BrowserBridge.Page?
             if let tab = Background.tab { page = await BrowserBridge.shared.snapshot(of: tab) } else { page = nil }
-            return Observation(app: ChromeWorker.shared.app ?? NSRunningApplication.current, elements: [], fingerprint: 0, page: page, webArea: page?.estimatedArea)
+            return Observation(app: Background.app ?? ChromeWorker.shared.app ?? NSRunningApplication.current, elements: [], fingerprint: 0, page: page, webArea: page?.estimatedArea)
         }
         let front = NSWorkspace.shared.frontmostApplication
         // A background run looks at its own app, never at what the user has in front.

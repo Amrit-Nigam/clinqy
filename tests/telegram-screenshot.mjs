@@ -12,7 +12,7 @@ const chrome = {
   tabs: { async get(id) { return { id, windowId: 5, url: 'http://localhost/demo' }; },
           async query() { return [{ id: 99, windowId: 5 }]; }, onRemoved: event },
   windows: { async get() { return { focused: false }; } },
-  debugger: { onDetach: event, async attach(target) { calls.push(['attach', target]); },
+  debugger: { onDetach: event, onEvent: event, async attach(target) { calls.push(['attach', target]); },
               async sendCommand(target, method, params) { calls.push([method, target, params]); return { data: 'PNG-DATA' }; } }
 };
 class WebSocket { constructor() { this.readyState = 0; } }

@@ -16,20 +16,20 @@ enum BackgroundPolicy {
             return .attention("This task needs a native app. Its input cannot be isolated safely in background mode.")
         case "click", "type", "choose", "fill":
             return hasWorkerPage && (webID || (action["id"] == nil && kind == "type")) ? .browser
-                : .attention("No owned Chrome page target is available. I won't use your active window.")
+                : .attention("No owned browser page target is available. I won't use your active window.")
         case "key":
             let key = (action["keys"] as? String ?? "").lowercased().replacingOccurrences(of: " ", with: "")
             let commands = ["cmd", "command", "meta", "super", "ctrl", "control", "alt", "option"]
             if commands.contains(where: { key.contains($0 + "+") }) && !["cmd+a", "command+a", "meta+a", "ctrl+a", "control+a"].contains(key) {
                 return .attention("This shortcut can use shared browser or system state. Use page fields, direct uploads or file tools instead.")
             }
-            return hasWorkerPage ? .browser : .attention("No owned Chrome page is available for this key.")
+            return hasWorkerPage ? .browser : .attention("No owned browser page is available for this key.")
         case "verify":
             if action["path"] as? String != nil { return .api }
             return hasWorkerPage && (!((action["value"] as? String) != nil) || webID) ? .browser
-                : .attention("Verify a saved file path or an outcome on the owned Chrome page. I won't inspect your foreground window.")
+                : .attention("Verify a saved file path or an outcome on the owned browser page. I won't inspect your foreground window.")
         case "read", "extract":
-            return action["path"] != nil || action["file"] != nil ? .api : hasWorkerPage ? .browser : .attention("Give a file path or open a worker Chrome page. I won't read your foreground document.")
+            return action["path"] != nil || action["file"] != nil ? .api : hasWorkerPage ? .browser : .attention("Give a file path or open a task browser page. I won't read your foreground document.")
         case "files":
             return ["show", "reveal"].contains((action["op"] as? String ?? "").lowercased())
                 ? .attention("Revealing files opens Finder on your desktop. I can return their paths in the results instead.") : .api
@@ -37,7 +37,7 @@ enum BackgroundPolicy {
             return (action["to"] as? String ?? "csv").lowercased() == "csv" ? .api : .attention("Write a CSV file in background mode. Spreadsheet windows and the shared clipboard need foreground access.")
         case "wait" where action["for"] == nil: return .api
         case "upload", "autofill", "review", "scroll", "tab", "look", "snap", "wait":
-            return hasWorkerPage ? .browser : .attention("This action needs an owned Chrome worker page. Open its URL first.")
+            return hasWorkerPage ? .browser : .attention("This action needs an owned browser task page. Open its URL first.")
         case "pdf":
             let paths = (action["files"] as? [String] ?? []) + [action["file"] as? String].compactMap { $0 }
             if paths.contains(where: { ["key", "keynote", "doc", "docx", "csv", "ppt", "pptx", "xls", "xlsx", "numbers", "pages"].contains(URL(fileURLWithPath: $0).pathExtension.lowercased()) }) {

@@ -3,7 +3,7 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.9";
+const SCRIPT_VERSION = "1.9.11";
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
@@ -32,7 +32,7 @@ function connect() {
     }
   };
   // Back quickly when the app restarts or Chrome wakes the worker (1 s, doubling to 10 s).
-  socket.onclose = () => { socket = null; setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); };
+  socket.onclose = () => { queueActivity(() => clinqyDone()); socket = null; setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); };
   socket.onerror = () => {};
 }
 
@@ -254,6 +254,64 @@ async function setOpened(set) {
   try { await chrome.storage.session.set({ opened: [...set] }); } catch {}
 }
 
+// Cosmetic feedback is independent of the action protocol: failure to draw it never retries input.
+async function activityTabs() {
+  try { return (await chrome.storage.session.get("activityTabs")).activityTabs || []; } catch { return []; }
+}
+async function renderActivity(tabId, state) {
+  try {
+    const target = { tabId, frameIds: [0] };
+    if (state.active !== false) await chrome.scripting.executeScript({ target, files: ["activity.js"] });
+    await chrome.scripting.executeScript({ target, func: state => window.__clinqyActivity?.update(state), args: [state] });
+  } catch {} // restricted pages and navigating documents may refuse scripts
+}
+async function showActivity(tabId, state = {}) {
+  const active = await activityTabs();
+  if (!active.includes(tabId)) await chrome.storage.session.set({ activityTabs: [...active, tabId] });
+  await renderActivity(tabId, state);
+}
+async function finishActivity(tabIds) {
+  const active = await activityTabs();
+  for (const id of active.filter(id => !tabIds || tabIds.includes(id))) await renderActivity(id, { active: false });
+  await chrome.storage.session.set({ activityTabs: active.filter(id => tabIds && !tabIds.includes(id)) });
+}
+
+function navigationKey(raw) {
+  try {
+    const url = new URL(raw.includes("://") ? raw : "https://" + raw);
+    url.hostname = url.hostname.replace(/^www\./, "");
+    return url.pathname === "/" ? url.href.replace(/\/(?=[?#]|$)/, "") : url.href;
+  } catch { return raw; }
+}
+
+// Retries after a lost native acknowledgement must resolve to the same tab, even after worker suspension.
+async function foregroundTab(msg) {
+  const token = typeof msg.operationID === "string" ? msg.operationID : null;
+  const requests = (await chrome.storage.session.get("tabRequests")).tabRequests || {};
+  if (token && requests[token]) {
+    const previous = requests[token];
+    if (navigationKey(previous.url) !== navigationKey(msg.url) || previous.id == null) throw new Error("The earlier tab open has an unknown outcome; inspect the browser before trying again");
+    const tab = await chrome.tabs.get(previous.id); // A closed tab is not silently recreated.
+    await chrome.tabs.update(tab.id, { active: true });
+    if (msg.activity) await showActivity(tab.id);
+    return { id: tab.id };
+  }
+  if (token) {
+    requests[token] = { url: msg.url }; // reserve before creation: a crash cannot turn a retry into another tab
+    const keys = Object.keys(requests);
+    for (const old of keys.slice(0, Math.max(0, keys.length - 100))) delete requests[old];
+    await chrome.storage.session.set({ tabRequests: requests });
+  }
+  const tab = await chrome.tabs.create({ url: msg.url, active: true });
+  const mine = await openedTabs(); mine.add(tab.id); await setOpened(mine);
+  if (token) {
+    requests[token] = { url: msg.url, id: tab.id };
+    await chrome.storage.session.set({ tabRequests: requests });
+  }
+  if (msg.activity) await showActivity(tab.id);
+  return { id: tab.id };
+}
+
 // ---- background runs ----
 
 // A background run works in Clinqy's own window, opened without focus behind the user's, and its input goes to the
@@ -312,9 +370,23 @@ async function clinqyTab(url, width, height) {
   const mine = await openedTabs();
   mine.add(t.id);
   await setOpened(mine);
-  try { await clinqyGroup(t.id, t.windowId); } catch {}
+  // Arc exposes tab-group APIs whose promises can remain pending. Grouping is cosmetic;
+  // it must never hold up attaching to or driving the owned tab.
+  void clinqyGroup(t.id, t.windowId).catch(() => {});
   try { await chrome.storage.session.set({ workTabs: [...await workTabs(), t.id], workSize: { width, height } }); } catch {}
-  await cdp(t.id, "Page.enable");
+  try {
+    await cdp(t.id, "Page.enable");
+  } catch (error) {
+    // A denied debugger permission must not leave an orphan task tab behind.
+    try { await chrome.debugger.detach({ tabId: t.id }); } catch {}
+    attached.delete(t.id);
+    try { await chrome.tabs.remove(t.id); } catch {}
+    mine.delete(t.id);
+    await setOpened(mine);
+    await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => id !== t.id) });
+    throw error;
+  }
+  await showActivity(t.id);
   return { id: t.id };
 }
 
@@ -322,13 +394,17 @@ async function prepareWorkTab(tabId) {
   const target = { tabId };
   const { workSize } = await chrome.storage.session.get("workSize");
   await chrome.debugger.sendCommand(target, "Page.enable");
+  // A hidden task must never open a native file picker over the user’s work. Uploads use page fields directly.
+  await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
   await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
   await chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", { ...(workSize || { width: 1280, height: 900 }), deviceScaleFactor: 1, mobile: false });
 }
 
 // The task ended: Chrome's debugging bar goes, and the tab behaves normally if the user looks at it.
-async function clinqyDone() {
-  for (const tabId of await workTabs()) {
+async function clinqyDone(tabIds) {
+  await finishActivity(tabIds);
+  const owned = await workTabs();
+  for (const tabId of tabIds ? owned.filter(id => tabIds.includes(id)) : owned) {
     try { await chrome.debugger.detach({ tabId }); } catch {}
     attached.delete(tabId);
   }
@@ -337,6 +413,7 @@ async function clinqyDone() {
 
 // The next task starts: the last one's tabs go, except one the user is on or one playing sound, which are theirs now.
 async function clinqyClear() {
+  await clinqyDone();
   const keep = [];
   for (const tabId of await workTabs()) {
     try {
@@ -423,14 +500,25 @@ async function cdpClick(tabId, x, y, count = 1) {
   return { clicked: at };
 }
 
-chrome.tabs.onRemoved.addListener(async (tabId) => {
+function queueActivity(update) {
+  const next = commandQueue.then(update);
+  commandQueue = next.catch(() => {});
+}
+if (chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.status === "complete") queueActivity(async () => {
+    if ((await activityTabs()).includes(tabId)) await renderActivity(tabId, { kind: "working" });
+  });
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => queueActivity(async () => {
+  await finishActivity([tabId]);
   attached.delete(tabId);
   maps.delete(tabId);
   focusFrames.delete(tabId);
   try { await chrome.storage.session.remove("map" + tabId); } catch {}
   const mine = await openedTabs();
   if (mine.delete(tabId)) await setOpened(mine);
-});
+}));
 
 async function tabCommand(msg) {
   const tabId = Number(msg.tabId);
@@ -461,10 +549,37 @@ async function tabCommand(msg) {
 }
 
 async function handle(msg) {
+  if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
+  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
+  // Task commands are explicitly scoped: they cannot fall through to the user's active tab.
+  if (msg.workOnly) {
+    const owned = await workTabs();
+    if (msg.cmd === "tabs") {
+      const tabs = [];
+      for (const id of owned) {
+        try {
+          const t = await chrome.tabs.get(id);
+          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true });
+        } catch {}
+      }
+      return { tabs };
+    }
+    if (msg.cmd === "newTab") throw new Error("Use clinqyTab to create an inactive task tab");
+    if (msg.tabId == null || !owned.includes(Number(msg.tabId)))
+      throw new Error("This tab does not belong to Clinqy's task");
+    if (msg.cmd === "switchTab") return { id: Number(msg.tabId) };
+  }
   if (/^(tabs|switchTab|closeTab)$/.test(msg.cmd)) return await tabCommand(msg);
   if (msg.cmd === "backgroundTab") return await backgroundTab(msg.url, msg.at);
   if (msg.cmd === "clinqyTab") return await clinqyTab(msg.url, Number(msg.width) || 1280, Number(msg.height) || 900);
-  if (msg.cmd === "clinqyDone") return await clinqyDone();
+  if (msg.cmd === "clinqyDone") {
+    let ids = msg.tabIds;
+    if (msg.operationIDs?.length) {
+      const requests = (await chrome.storage.session.get("tabRequests")).tabRequests || {};
+      ids = [...new Set([...(ids || []), ...msg.operationIDs.map(token => requests[token]?.id).filter(Number.isInteger)])];
+    }
+    return await clinqyDone(ids);
+  }
   if (msg.cmd === "clinqyClear") return await clinqyClear();
   // A window Clinqy left behind (it quit without closing it) goes; one the user took over is only forgotten.
   if (msg.cmd === "closeAgentWindow" || msg.cmd === "releaseAgentWindow") {
@@ -473,10 +588,25 @@ async function handle(msg) {
     if (win && msg.cmd === "closeAgentWindow") { await chrome.windows.remove(win.id); return { closed: win.id }; }
     return { closed: null };
   }
-  // A command may name its tab (a snapshot of a background tab, acting on a tab the app pinned); else the one in front.
+  if (msg.cmd === "newTab") return await foregroundTab(msg);
+  // Every action is pinned to its explicit observed tab when available.
   const tab = msg.tabId != null ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
-  if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
-  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
+  if (msg.activity || (await activityTabs()).includes(tab.id)) {
+    const kind = /^(cdpClick|click|clickOption)$/.test(msg.cmd) ? "click"
+      : /^(cdpType|fill|fillActive)$/.test(msg.cmd) ? "type"
+      : /^(scroll|cdpScroll)$/.test(msg.cmd) ? "scroll" : "working";
+    const state = { kind };
+    if (msg.x != null && msg.y != null) { state.x = Number(msg.x); state.y = Number(msg.y); }
+    else if (Number.isInteger(msg.index) && ["locate", "focus", "focusFor", "click", "fill", "prepare", "upload"].includes(msg.cmd)) {
+      try {
+        const { frameId, local } = await route(tab.id, msg.index);
+        const point = await call(tab.id, frameId, "activityPoint", [local]);
+        const offset = (await mapFor(tab.id)).offsets?.[frameId];
+        if (point && offset) { state.x = point.x + offset.x; state.y = point.y + offset.y; }
+      } catch {}
+    }
+    await showActivity(tab.id, state);
+  }
   if (msg.cmd === "selection") {
     const win = await chrome.windows.get(tab.windowId);
     if (!/^(https?|file):/.test(tab.url || "")) return { focused: !!win.focused, text: "" };
@@ -494,13 +624,6 @@ async function handle(msg) {
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
     return { id: tab.id, url: tab.url || tab.pendingUrl || "", title: tab.title || "", focused: !!win.focused };
-  }
-  if (msg.cmd === "newTab") {
-    const t = await chrome.tabs.create({ url: msg.url, active: true });
-    const mine = await openedTabs();
-    mine.add(t.id);
-    await setOpened(mine);
-    return { id: t.id };
   }
   const unguarded = new Set(["snapshot", "goBack", "navigate"]);
   if (!unguarded.has(msg.cmd)) {
@@ -684,5 +807,8 @@ chrome.alarms.create("clinqy-keepalive", { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener(() => { connect(); send({ type: "ping" }); });
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
-setInterval(() => { connect(); send({ type: "ping" }); }, 20000);
+setInterval(() => {
+  connect(); send({ type: "ping" });
+  if (socket?.readyState === WebSocket.OPEN) queueActivity(async () => { for (const id of await activityTabs()) await renderActivity(id, { kind: "working" }); });
+}, 20000);
 connect();

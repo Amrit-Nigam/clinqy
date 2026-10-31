@@ -1,6 +1,6 @@
 import AppKit
 
-/// Current background policy allows supported direct tools and owned headless Chrome/CDP only. Native app
+/// Background tasks use supported direct tools and owned browser tabs only. Native app
 /// input, shared clipboard use and arbitrary scripts require attention and an explicit foreground switch.
 /// This type also retains experimental native-window bookkeeping; those mechanisms are not a guarantee that
 /// arbitrary native apps can run without focus. Local work requires an awake Mac and a running Clinqy process.
@@ -69,8 +69,18 @@ enum Background {
         Config.value("BACKGROUND_BROWSER") ?? UserDefaults.standard.string(forKey: "backgroundBrowser") ?? "Google Chrome"
     }
 
+    /// Captured at run start so a settings change cannot switch browsers mid-task.
+    private(set) static var usesExtension = true
+    static var extensionPreferred: Bool {
+        (Config.value("BACKGROUND_WEB_MODE") ?? UserDefaults.standard.string(forKey: "backgroundWebMode") ?? "extension") != "headless"
+    }
+
     static func begin(_ on: Bool) {
-        if on { ChromeWorker.shared.runStarted() }
+        usesExtension = extensionPreferred
+        if on {
+            BrowserBridge.shared.beginBackgroundRun()
+            if !usesExtension { ChromeWorker.shared.runStarted() }
+        }
         active = on
         app = nil
         tab = nil
@@ -83,9 +93,13 @@ enum Background {
         if active, app != nil || tab != nil { last = (tab, app) }
         if active {
             lastRun = Date()
-            let keep = last.tab?.connection == ChromeWorker.shared.identity ? last.tab?.id : nil
-            let run = ChromeWorker.shared.generation
-            Task { await ChromeWorker.shared.runEnded(keep: keep, generation: run) }
+            if usesExtension {
+                BrowserBridge.shared.endBackgroundRun()
+            } else {
+                let keep = tab?.connection == ChromeWorker.shared.identity ? tab?.id : nil
+                let run = ChromeWorker.shared.generation
+                Task { await ChromeWorker.shared.runEnded(keep: keep, generation: run) }
+            }
         }
         active = false
         userWindows = [:]
@@ -158,11 +172,12 @@ enum Background {
 
     /// Brings the last background run's window to the front: its tab in Clinqy's browser window, or its app.
     static func showLast() async {
-        if last.tab?.connection == ChromeWorker.shared.identity { AgentScreenView.shared.show(); return }
-        if let tab = last.tab {
-            await BrowserBridge.shared.tabCommand("switchTab", on: tab, ["tabId": tab.id])
+        let target = active ? (tab, app) : (last.tab, last.app)
+        if target.0?.connection == ChromeWorker.shared.identity { AgentScreenView.shared.show(); return }
+        if let tab = target.0 {
+            await BrowserBridge.shared.revealTaskTab(tab)
         }
-        if let app = last.app, !app.isTerminated { await Launcher.bringToFront(app) }
+        if let app = target.1, !app.isTerminated { await Launcher.bringToFront(app) }
     }
 
     /// What the request itself says about where to work, typed or spoken, whatever the toggle is: true for "in the
