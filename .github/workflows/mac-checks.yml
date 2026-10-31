@@ -1,0 +1,34 @@
+name: Mac checks
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+permissions:
+  contents: read
+jobs:
+  checks:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Build the Mac app sources
+        run: swift build -c release
+      - name: Native and Telegram regressions (mocked services)
+        run: |
+          bash tests/task-power.sh
+          bash tests/computer-control.sh
+          bash tests/background-tasks.sh
+          bash tests/task-context.sh
+          bash tests/image-assets.sh
+          bash tests/telegram.sh
+      - name: Extension and download routing
+        run: |
+          node tests/extension-version.mjs
+          node tests/extension-background.mjs
+          node tests/extension-gestures.mjs
+          node tests/extension-images.mjs
+          node tests/telegram-screenshot.mjs
+          node tests/mac-download.mjs
+      - name: Website build
+        working-directory: website
+        run: npm ci && npm run build

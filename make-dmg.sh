@@ -30,5 +30,5 @@ ln -s /Applications "$STAGE/Applications"
 DMG="dist/Clinqy.dmg"
 rm -f "$DMG"
 hdiutil create -volname "Clinqy $VERSION" -srcfolder "$STAGE" -fs HFS+ -format UDZO -imagekey zlib-level=9 -ov "$DMG" >/dev/null
-shasum -a 256 "$DMG" | tee "$DMG.sha256"
+(cd dist && shasum -a 256 Clinqy.dmg) | tee "$DMG.sha256"
 echo "Made $DMG ($(du -h "$DMG" | cut -f1)), version $VERSION"

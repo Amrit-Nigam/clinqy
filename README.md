@@ -12,13 +12,13 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 "message mom I'll be late"           "in the background, add a reminder to call Raj"
 ```
 
-> **On Windows?** Clinqy runs there too, with the same browser extension, settings and workflows. [**Download it for Windows**](https://github.com/Amrit-Nigam/clinqy/releases/latest) and see [Setup on Windows](#setup-on-windows).
+> **On Windows?** Clinqy runs there too, with the same browser extension, settings and workflows. [**Download it for Windows**](https://clinqy.vercel.app/api/windows-download) and see [Setup on Windows](#setup-on-windows).
 
 ## Setup guide
 
 Download, paste one prompt into your coding agent, done. It needs macOS 14 or later on Apple silicon.
 
-**1. Download** **[`Clinqy.dmg`](https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.3/Clinqy.dmg)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
+**1. Download** **[`Clinqy.dmg`](https://clinqy.vercel.app/api/mac-download)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
 
 **2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
@@ -30,7 +30,7 @@ Set up Clinqy for Mac (https://github.com/Amrit-Nigam/clinqy) on this Mac for me
 commands yourself. Only stop when you need my answer or a click that only I can do.
 
 1. Install Clinqy (this also updates an older copy). It needs macOS 14+ on Apple silicon and no admin rights:
-     curl -fsSL -o /tmp/Clinqy.dmg https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.3/Clinqy.dmg
+     curl -fsSL -o /tmp/Clinqy.dmg https://clinqy.vercel.app/api/mac-download
      v=$(hdiutil attach -nobrowse /tmp/Clinqy.dmg | grep -o '/Volumes/.*'); pkill -x Clinqy; rm -rf /Applications/Clinqy.app
      ditto "$v/Clinqy.app" /Applications/Clinqy.app; hdiutil detach -quiet "$v"; open /Applications/Clinqy.app
    From then on use the full path: c=/Applications/Clinqy.app/Contents/MacOS/Clinqy
@@ -74,6 +74,8 @@ clinqy doctor             # what's ready
 API keys go in the settings file (`clinqy settings` opens it); all the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration). Building from source instead? See [Build & run](#build--run).
 
 While a task runs, Clinqy uses an IOKit `PreventUserIdleSystemSleep` assertion to keep the Mac awake. Foreground tasks also prevent idle display sleep. Overlapping tasks share reference-counted assertions; finishing, failing, stopping, or quitting releases the relevant leases. Queued tasks hold none. This prevents idle sleep, not manual locking, lid-close sleep, or shutdown.
+
+Mac releases use `MAC_VERSION` as the version source. `./make-dmg.sh` builds `dist/Clinqy.dmg` and a portable SHA-256 file; `./scripts/verify-mac-release.sh` checks the signed bundle and bundled extension. After committing and pushing release sources, maintainers run `./scripts/stage-mac-release.sh` on the signing Mac to upload a draft using the existing certificate. Merging into `main` runs Mac checks; only a successful main-branch check can publish a staged draft whose Mac sources match the merged commit. Windows stays the repository's latest release. The website, README and setup prompt use a stable Mac download endpoint that selects published Mac releases, so drafts and merge-time publishing do not break download links. No signing private key is uploaded to CI. Windows download buttons and setup commands resolve the latest published `windows-v` ZIP and installer independently; the site displays each platform’s published version. On Windows 0.3.1+, `clinqy update` upgrades in place. Windows 0.3.0 and older should reinstall the latest ZIP, keeping their data.
 
 ## Telegram tasks and attachments (Mac)
 
@@ -123,7 +125,7 @@ Validation: `zsh tests/browser-navigation.sh` checks URL and streamed-action ide
 
 Download, paste one prompt into your coding agent, done. It needs Windows 10 (1903 or later) or Windows 11, on x64, and no admin rights.
 
-**1. Download** **`Clinqy-windows-x64.zip`** from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH and starts it. Open at login is off until you turn it on in settings (Dashboard → General). The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. If Microsoft Defender quarantines it, open Windows Security → Protection history, choose the Clinqy entry and allow it on your device. (You can skip this step: the prompt installs Clinqy too.)
+**1. Download** **`Clinqy-windows-x64.zip`** from the [latest Windows download](https://clinqy.vercel.app/api/windows-download), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH and starts it. Open at login is off until you turn it on in settings (Dashboard → General). The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. If Microsoft Defender quarantines it, open Windows Security → Protection history, choose the Clinqy entry and allow it on your device. (You can skip this step: the prompt installs Clinqy too.)
 
 **2. Paste this into any AI you use** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, or a chat with no terminal, which walks you through it). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It connects your coding agents, has Clinqy add its own browser extension, and checks everything. Want a particular AI? Change the first line to `claude`, `codex`, `agy`, `ollama` or `anthropic` (or `openai`, `gemini`, `openrouter`).
 
@@ -136,7 +138,7 @@ commands yourself in PowerShell. Only stop when you need my answer or a click th
 commands here, tell me to open PowerShell, give me one command at a time to paste, and work from what I send back.
 
 1. Install Clinqy (this also updates an older copy). It needs Windows 10 or 11 and no admin rights:
-     powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex"
+     powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm 'https://clinqy.vercel.app/api/windows-download?asset=installer'))) -Url 'https://clinqy.vercel.app/api/windows-download'"
    From then on use the full path, because PATH only updates in new terminals:
      $c = "$env:LOCALAPPDATA\Programs\Clinqy\clinqy.exe"
 2. Tell me Clinqy is about to use my mouse for a moment to add its browser extension, then run setup:

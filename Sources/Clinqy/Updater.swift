@@ -42,7 +42,7 @@ final class Updater {
 
     /// The newest published Mac release, from the GitHub API.
     nonisolated static func newestRelease() async throws -> Release? {
-        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases?per_page=30")!)
+        var request = URLRequest(url: URL(string: "https://api.github.com/repos/\(repo)/releases?per_page=100")!)
         request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
         request.setValue("Clinqy/\(current)", forHTTPHeaderField: "User-Agent")
         request.timeoutInterval = 20
@@ -150,6 +150,8 @@ final class Updater {
         }
         let work = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-update-\(release.version)-\(UUID().uuidString.prefix(6))")
         try FileManager.default.createDirectory(at: work, withIntermediateDirectories: true)
+        var keepStagedApp = false
+        defer { if !keepStagedApp { try? FileManager.default.removeItem(at: work) } }
         let dmg = work.appendingPathComponent("Clinqy.dmg")
         try FileManager.default.moveItem(at: file, to: dmg)
         let mount = work.appendingPathComponent("mnt")
@@ -158,13 +160,21 @@ final class Updater {
         let app = mount.appendingPathComponent("Clinqy.app")
         let staged = work.appendingPathComponent("Clinqy.app")
         try run("/usr/bin/ditto", [app.path, staged.path])
-        // It must really be Clinqy, intact, and the version the release says.
-        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", staged.path])
-        let info = NSDictionary(contentsOf: staged.appendingPathComponent("Contents/Info.plist"))
+        try validateApp(staged, expectedVersion: release.version)
+        keepStagedApp = true
+        return staged
+    }
+
+    /// The signed bundle must match the release selected before it can replace an installed copy.
+    nonisolated static func validateApp(_ app: URL, expectedVersion: String) throws {
+        try run("/usr/bin/codesign", ["--verify", "--deep", "--strict", app.path])
+        let info = NSDictionary(contentsOf: app.appendingPathComponent("Contents/Info.plist"))
         guard info?["CFBundleIdentifier"] as? String == "com.amritnigam.clinqy" else {
             throw NSError(domain: "Clinqy", code: 4, userInfo: [NSLocalizedDescriptionKey: "the download isn't Clinqy"])
         }
-        return staged
+        guard info?["CFBundleShortVersionString"] as? String == expectedVersion else {
+            throw NSError(domain: "Clinqy", code: 5, userInfo: [NSLocalizedDescriptionKey: "the downloaded app version does not match this release"])
+        }
     }
 
     /// Hands the swap to a small script that waits for this process to quit, replaces the app and opens the new one.
