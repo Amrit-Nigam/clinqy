@@ -49,7 +49,7 @@ final class Agent: ObservableObject {
     }
 
     private func rememberTelegramTarget(app: NSRunningApplication?, page: BrowserBridge.Page?) {
-        guard Telegram.shared.ownsRun || runBackground else { return }
+        guard telegramOwned || runBackground else { return }
         if let page, let id = page.tabId {
             telegramTab = .init(id: id, url: page.url, connection: page.connection)
             telegramWindow = nil
@@ -103,6 +103,35 @@ final class Agent: ObservableObject {
     /// A test run that still saves form answers to the job profile (tests/run.sh restores the profile after).
     var saveInTests = false
 
+    let executionContext: TaskExecutionContext?
+    var isolatedBrowserJob = false
+    var runReceiptID: String?
+    private var currentTaskDraft = ""
+    private var newTaskDraft = ""
+    @Published var inputPanelVisible = false
+    @Published var newTaskMode = false {
+        didSet {
+            guard newTaskMode != oldValue else { return }
+            if newTaskMode { currentTaskDraft = input; input = newTaskDraft }
+            else { newTaskDraft = input; input = currentTaskDraft }
+        }
+    }
+    var enqueueNewRequest: ((String) -> Bool)?
+    @discardableResult func submitNewRequest(_ raw: String) -> Bool {
+        let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !text.isEmpty, enqueueNewRequest?(text) == true else { return false }
+        input = ""; newTaskMode = false
+        return true
+    }
+    var dispatchBrowserTask: ((String, Bool, String?, Provider?, UUID?) -> Bool)?
+    var parallelBrowserTasks: (([String]) async -> (ok: Bool, summary: String))?
+    private(set) var completedBrowserTab: BrowserBridge.TabInfo?
+    var browserTab: BrowserBridge.TabInfo? {
+        if let context = executionContext { return TaskExecution.$current.withValue(context) { Background.tab ?? completedBrowserTab } }
+        return Background.tab ?? completedBrowserTab
+    }
+    private var telegramOwned: Bool { !isolatedBrowserJob && Telegram.shared.ownsRun }
+    var shouldDispatchBrowserInput: Bool { dispatchBrowserTask != nil && BrowserTaskRouting.isBrowserTask(input) }
     private let buddy: Buddy
     private let hand: Hand
     fileprivate var task: Task<Void, Never>?
@@ -153,6 +182,9 @@ final class Agent: ObservableObject {
 
     /// Steer a running task: more context or a change of plan, picked up at the next step.
     func addContext(_ raw: String) {
+        if let context = executionContext, TaskExecution.current !== context {
+            TaskExecution.$current.withValue(context) { addContext(raw) }; return
+        }
         let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, isRunning else { return }
         if question != nil { return answer(text) }   // waiting on a question: this is the answer
@@ -172,14 +204,15 @@ final class Agent: ObservableObject {
         // Waiting on the user isn't a hang: say so in the log, and keep the buddy's bubble up until they answer.
         log("  waiting for your answer: \(sensitive ? "(hidden)" : String(text.prefix(120)))")
         // A background run comes back to the user to ask.
-        if runBackground { buddy.quiet = true; buddy.goHome() }
+        if runBackground, !isolatedBrowserJob { buddy.quiet = true; buddy.goHome() }
         buddy.bubble("need your input", for: 600)
         question = Question(text: text, options: options, sensitive: sensitive)
         onQuestion()
-        if runBackground { Notifier.ask(text, options: options, sensitive: sensitive) }
-        Telegram.shared.ask(text, options: options, sensitive: sensitive)
+        if runBackground, !isolatedBrowserJob { Notifier.ask(text, options: options, sensitive: sensitive) }
+        if !isolatedBrowserJob { Telegram.shared.ask(text, options: options, sensitive: sensitive) }
         let reply = await withCheckedContinuation { answerWaiter = $0 }
         buddy.bubble(nil)
+        guard !Task.isCancelled, isRunning else { return nil }
         if runBackground, !Task.isCancelled { buddy.goAway(to: AgentScreen.bounds) }
         if !Task.isCancelled { phase = previous == .waiting ? .acting : previous }
         TaskStore.shared.update(taskRecordID, state: .running, stage: "Continuing after your answer")
@@ -203,13 +236,13 @@ final class Agent: ObservableObject {
         // following SNS topic" is a choice in a form); only a control that acts needs the user's OK.
         guard Self.acts(role) else { return nil }
         if let page, Self.isFormSubmit(label) {
-            if Telegram.shared.ownsRun {
+            if telegramOwned {
                 guard let ok = await reviewBeforeSubmit(page) else {
                     return "Couldn't read the form for your Telegram review. Do not submit; report this and ask the user to check it on the Mac."
                 }
-                return ok ? nil : Self.editedReview
+                return ok ? nil : editedReview
             }
-            if !userConfirmed, let ok = await reviewBeforeSubmit(page) { return ok ? nil : Self.editedReview }
+            if !userConfirmed, let ok = await reviewBeforeSubmit(page) { return ok ? nil : editedReview }
         }
         return await confirmRisky(label) ? nil
             : "the user said not to click \(label.prefix(40).debugDescription); stop and tell them where things stand"
@@ -217,7 +250,7 @@ final class Agent: ObservableObject {
 
     /// Return can submit a web form just like clicking its final button. It needs the same review.
     private func approveReturn(_ page: BrowserBridge.Page?) async -> String? {
-        guard Telegram.shared.ownsRun, let page,
+        guard telegramOwned, let page,
               let submit = page.elements.first(where: { Self.acts($0.role) && Self.isFormSubmit($0.text) }) else { return nil }
         return await approve(submit.text, role: submit.role, page: page)
     }
@@ -298,8 +331,13 @@ final class Agent: ObservableObject {
                        options: .regularExpression) != nil
     }
 
-    private static var editedReview: String {
-        "the user chose Edit on the review" + (UI.lastReviewNote.map { ": \"\($0)\". Make that change, then submit again" }
+    private var localReviewNote: String?
+    private var reviewNote: String? {
+        get { isolatedBrowserJob ? localReviewNote : UI.lastReviewNote }
+        set { if isolatedBrowserJob { localReviewNote = newValue } else { UI.lastReviewNote = newValue } }
+    }
+    private var editedReview: String {
+        "the user chose Edit on the review" + (reviewNote.map { ": \"\($0)\". Make that change, then submit again" }
             ?? " without saying what; ask them what to change")
     }
 
@@ -318,9 +356,9 @@ final class Agent: ObservableObject {
             guard let q = i["q"] as? String, !q.isEmpty else { return nil }
             return (q, i["answer"] as? String ?? "")
         }
-        guard pairs.count >= (Telegram.shared.ownsRun ? 1 : 2) else { return nil }
+        guard pairs.count >= (telegramOwned ? 1 : 2) else { return nil }
         reviewedForm = true
-        if Telegram.shared.ownsRun || runBackground {
+        if telegramOwned || runBackground {
             let formKey = Telegram.formKey(url: page.url, answers: pairs)
             if telegramApprovedForm == formKey { return true }
             let cards = items.compactMap { item -> ResultCard.Item? in
@@ -333,7 +371,7 @@ final class Agent: ObservableObject {
             let card = ResultCard(title: "Review before submitting: " + String(page.title.prefix(70)),
                                   text: missing.isEmpty ? "Check these answers before submitting." : "Required answers missing: " + missing.joined(separator: "; "), items: cards)
             runResult = card; result = card; onResult()
-            Telegram.shared.present(card)
+            if !isolatedBrowserJob { Telegram.shared.present(card) }
             let reply = await askUser("Please review the answers above. Submit this form, or tell me what to change?", options: ["Submit", "Edit"])
             guard let reply, !Task.isCancelled else { return false }
             let approve = reply.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == "submit" || Safety.isYes(reply)
@@ -343,10 +381,10 @@ final class Agent: ObservableObject {
             userConfirmed = false
             reviewedForm = false
             if approve && !missing.isEmpty {
-                UI.lastReviewNote = "Fill the required fields: " + missing.joined(separator: "; ")
+                reviewNote = "Fill the required fields: " + missing.joined(separator: "; ")
             } else if reply.lowercased() == "edit" {
-                UI.lastReviewNote = await askUser("What should I change in the form?")
-            } else { UI.lastReviewNote = reply }
+                reviewNote = await askUser("What should I change in the form?")
+            } else { reviewNote = reply }
             return false
         }
         let ok = await UI.reviewBeforeSubmit(items: pairs, title: String((r["title"] as? String ?? page.title).prefix(70)))
@@ -357,9 +395,12 @@ final class Agent: ObservableObject {
 
     /// The user's reply to the current question (nil = they declined / cancelled).
     func answer(_ text: String?) {
+        if let context = executionContext, TaskExecution.current !== context {
+            TaskExecution.$current.withValue(context) { answer(text) }; return
+        }
         // A waiting review card takes the answer too (voice, `clinqy://answer`): "submit"/"yes" approves, anything
         // else is an edit to make first.
-        if ReviewCenter.shared.pending != nil, answerWaiter == nil {
+        if !isolatedBrowserJob, ReviewCenter.shared.pending != nil, answerWaiter == nil {
             let t = (text ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
             let approve = t.range(of: #"(?i)^(submit|yes|ok|okay|go ahead|approve|send)\b"#, options: .regularExpression) != nil
             ReviewCenter.shared.decide(approve, note: approve ? nil : t)
@@ -367,8 +408,8 @@ final class Agent: ObservableObject {
         }
         guard let waiter = answerWaiter else { return }
         answerWaiter = nil
-        Telegram.shared.dismissQuestion()
-        Notifier.clearQuestion()
+        if !isolatedBrowserJob { Telegram.shared.dismissQuestion() }
+        if !isolatedBrowserJob { Notifier.clearQuestion() }
         lastProgress = Date()   // time spent answering isn't "stuck"
         question = nil
         input = ""
@@ -377,7 +418,8 @@ final class Agent: ObservableObject {
         waiter.resume(returning: text?.trimmingCharacters(in: .whitespacesAndNewlines))
     }
 
-    init(buddy: Buddy) {
+    init(buddy: Buddy, context: TaskExecutionContext? = nil) {
+        self.executionContext = context
         self.buddy = buddy
         hand = Hand(buddy: buddy)
     }
@@ -388,9 +430,12 @@ final class Agent: ObservableObject {
 
     func submit(_ raw: String, test: Bool = false, auto: Bool = false, model: String? = nil, provider: Provider? = nil,
                 background preferred: Bool? = nil, taskID: UUID? = nil, unattended: Bool = false) {
-        if !auto { autoContinues = 0 }
+        if let context = executionContext, TaskExecution.current !== context {
+            TaskExecution.$current.withValue(context) { submit(raw, test: test, auto: auto, model: model, provider: provider, background: preferred, taskID: taskID, unattended: unattended) }
+            return
+        }
         var request = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !request.isEmpty, !isRunning else { return }
+        guard !request.isEmpty else { return }
         // "dry run: book a cab" rehearses just this request.
         var dry = dryRun
         if let r = request.range(of: #"(?i)^\(?(dry[ -]?run|rehearse|practice run)\)?[:,\s-]+"#, options: .regularExpression) {
@@ -401,6 +446,13 @@ final class Agent: ObservableObject {
         // saying nothing follows the toggle (or BACKGROUND_TASKS=1).
         let explicitBackground = Background.choice(&request)
         let background = unattended ? true : explicitBackground ?? preferred ?? (Background.always || (auto && runBackground))
+        if !auto, !dry, (explicitBackground ?? preferred) != false, background || (!test && BrowserTaskRouting.isBrowserTask(request)),
+           let dispatchBrowserTask, dispatchBrowserTask(raw, test, model, provider, taskID) {
+            input = ""; selectedText = nil; selectedFiles = []; annotation = nil; copied = nil; continuation = nil
+            return
+        }
+        guard !isRunning else { return }
+        if !auto { autoContinues = 0 }
         if unattended {
             targetApp = nil; selectedText = nil; selectedFiles = []; annotation = nil; copied = nil; continuation = nil
         }
@@ -429,7 +481,7 @@ final class Agent: ObservableObject {
             self?.modelOverride = nil
         }
         // A saved workflow that does exactly this: replay it with no model (the model only heals a broken step).
-        if !unattended, !test, !dry, let match = workflowFirst(request) {
+        if !isolatedBrowserJob, !unattended, !test, !dry, let match = workflowFirst(request) {
             prepare(request, test: false, background: background)
             self.modelOverride = model
             self.providerOverride = provider
@@ -470,6 +522,7 @@ final class Agent: ObservableObject {
         isTest = test || echo
         if isTest { taskRecordID = nil }
         runDry = dry
+        completedBrowserTab = nil
         pendingVerification = nil
         completionEvidence = CompletionEvidence()
         started = Date()
@@ -477,7 +530,7 @@ final class Agent: ObservableObject {
         lastTarget = nil
         steps = []
         answer = ""
-        input = ""
+        if newTaskMode { currentTaskDraft = "" } else { input = "" }
         narration = ""
         openedTab = false
         memoryCheckedAsks = []
@@ -528,7 +581,10 @@ final class Agent: ObservableObject {
     }
 
     func cancel() {
-        UI.cancelReview()
+        if let context = executionContext, TaskExecution.current !== context {
+            TaskExecution.$current.withValue(context) { cancel() }; return
+        }
+        if !isolatedBrowserJob { UI.cancelReview() }
         answer(nil)
         task?.cancel()
         controlOperation?.cancel()
@@ -570,6 +626,7 @@ final class Agent: ObservableObject {
         defer { fast.close() }
         message += fast.leadNote
         var wantsLook = false
+        var completionBlocks = 0
         var failures = 0
         var lastSignature = ""
         var repeats = 0, sameRuns = 0
@@ -583,7 +640,7 @@ final class Agent: ObservableObject {
         let maxTurns = 80
 
         for turn in 0..<maxTurns {   // long forms take 30+ turns
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, isRunning else { return }
             if turn == maxTurns - 10 {
                 message += "\n(\(turn) of \(maxTurns) steps used. If the current approach isn't getting closer, change it now. "
                     + "A long task that is making progress just carries on in a new run when these run out, so don't finish early "
@@ -872,6 +929,7 @@ final class Agent: ObservableObject {
                     await relist(&context)
                 }
             }
+            if !isRunning { return }
             app = context.app
             // A final reply may carry last actions; finish once they ran (unless one failed).
             if isDone, failures == 0, !addedNotes.isEmpty || cutShort {
@@ -911,6 +969,11 @@ final class Agent: ObservableObject {
                 continue
             }
             if isDone, failures == 0, let pendingVerification {
+                completionBlocks += 1
+                if isolatedBrowserJob && completionBlocks >= 3 {
+                    finish(ok: false, "The last browser action (" + pendingVerification.kind + ") remains unverified. Check this task's tab before retrying; other tasks can continue.")
+                    return
+                }
                 message = "The \(pendingVerification.kind) input was delivered but its outcome is unverified. Do not repeat it or claim completion. Use {\"do\":\"verify\",\"text\":\"<expected confirmation actually visible>\"}, or verify a current url, field value/id, or changed saved-file path. A closed dialog or generic visual change is insufficient. Read first if needed."
                 continue
             }
@@ -1248,7 +1311,10 @@ final class Agent: ObservableObject {
         Running apps: \(running.joined(separator: ", "))
         Default browser: \(Launcher.defaultBrowserName ?? "unknown")
         """
-        if Telegram.shared.ownsRun {
+        if parallelBrowserTasks != nil {
+            text += "\nThis request explicitly asks for independent browser work in parallel. Before opening pages, split it into one complete goal per tab/task with {\"do\":\"parallel_browser\",\"tasks\":[\"first goal\",\"second goal\",\"third goal\"]}. Preserve the user's constraints in each goal. Children get separate browser tabs, models and verification, and can ask their own login questions. Only split genuinely independent goals; do not split dependent steps. The coordinator collects actual child results and finishes the group. Do not open each site sequentially yourself."
+        }
+        if telegramOwned {
             text += "\nThe user is talking to you through Telegram. Ask for missing input with ask; they can answer remotely. "
                 + "Use short, concrete say messages describing the current stage. For forms and applications, use review after filling each page "
                 + "and before finishing, so the user gets the actual field labels and answers. Use show for structured output. "
@@ -1536,17 +1602,37 @@ final class Agent: ObservableObject {
     private var controlContext: ActionContext?
     private var controlBusy = false
     private var externalRun = false
+    private var coordinatingBrowserJobs = false
     private var controlOperation: Task<[String: Any], Never>?
     private var controlExpiry: Task<Void, Never>?
     /// Set immediately before input dispatch, including calls whose acknowledgement may be lost.
     private var inputDeliveryStarted = false
     private static let observationActions: Set<String> = ["verify", "read", "look", "wait", "extract", "recall", "ask", "show", "point", "mark", "scroll", "assert", "review", "think"]
+    private static let browserRecoveryActions: Set<String> = ["click", "type", "choose", "fill", "hover", "right_click", "double_click", "drag", "scroll", "read", "extract", "verify", "tab", "look", "snap", "wait", "upload", "autofill", "review"]
 
     fileprivate func perform(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
+        while inputPanelVisible && !runBackground && question == nil {
+            guard !Task.isCancelled, isRunning else { return .init(outcome: .refused, summary: "Stopped") }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        guard !Task.isCancelled, isRunning else { return .init(outcome: .refused, summary: "Stopped") }
         let kind = (action["do"] as? String ?? "").lowercased()
         if runBackground && !runDry {
             if case .attention(let reason) = BackgroundPolicy.route(action, hasWorkerPage: BrowserBridge.shared.ownsBackgroundPage(context.page)) {
+                if isolatedBrowserJob, kind == "key" {
+                    return .init(outcome: .refused, summary: reason + " No shortcut was sent. Recover with open_url to navigate or create an owned task tab, tab actions to manage your own tabs, or a page field id to type. Do not ask the user to perform a browser navigation shortcut.", effect: .look)
+                }
+                if isolatedBrowserJob, Self.browserRecoveryActions.contains(kind) {
+                    log("  browser recovery: " + reason)
+                    return .init(outcome: .refused, summary: reason + " No input was sent. Take a fresh look at your owned task tab and use its current w<number> element ids, never text labels as ids. If navigation is still loading, wait and look again; verify the resulting URL before continuing pending input. Recover using browser tools without asking the user for foreground access.", effect: .look)
+                }
                 TaskStore.shared.update(taskRecordID, state: .needsAttention, stage: reason)
+                if isolatedBrowserJob {
+                    let reply = await askUser(reason + " This browser task will not take over your desktop. Open its task card to handle anything that needs you.", options: ["I've handled it in the task tab", "Stop this task"])
+                    if reply == "Stop this task" || Task.isCancelled { cancel(); return fail("Stopped") }
+                    await refresh(&context)
+                    return .init(outcome: .refused, summary: "Foreground fallback was refused. Inspect the owned browser page and continue with browser tools only.", effect: .look)
+                }
                 let reply = await askUser(reason + " You can continue this task in foreground mode, or stop it.", options: ["Keep background mode", "Continue in foreground", "Stop task"])
                 guard !Task.isCancelled else { return fail("Stopped") }
                 if reply == "Continue in foreground" {
@@ -1560,7 +1646,20 @@ final class Agent: ObservableObject {
                 }
             }
         }
-        if let pendingVerification, !Self.observationActions.contains(kind), !runDry {
+        if kind == "parallel_browser" {
+            guard pendingVerification == nil, let launch = parallelBrowserTasks,
+                  let tasks = action["tasks"] as? [String], !tasks.isEmpty, tasks.count <= 32,
+                  tasks.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.utf8.count <= 8000 }) else {
+                return .init(outcome: .refused, summary: "Parallel browser jobs are allowed only for an explicitly parallel request; provide 1–32 independent task strings.")
+            }
+            coordinatingBrowserJobs = true
+            defer { coordinatingBrowserJobs = false }
+            let outcome = await launch(tasks)
+            if !Task.isCancelled { finish(ok: outcome.ok, outcome.summary) }
+            return .init(ok: outcome.ok, summary: outcome.summary)
+        }
+        let inspectingTab = kind == "tab" && ["list", "look", "read", "switch"].contains(action["op"] as? String ?? "list")
+        if let pendingVerification, !Self.observationActions.contains(kind), !inspectingTab, !runDry {
             return .init(outcome: .refused, summary: "NOT REPEATED: \(pendingVerification.kind) has an unverified outcome. Read the current state, then use verify with text, url, value/id or a saved file path. Do not repeat input until the outcome is checked.", effect: .look)
         }
         guard TaskStore.shared.beginAction(taskRecordID, kind: kind) else { cancel(); return fail("Couldn't save the task checkpoint") }
@@ -1592,6 +1691,7 @@ final class Agent: ObservableObject {
         let actionStarted = Date()
         inputDeliveryStarted = false
         var result = await execute(action, context: &context)
+        guard !Task.isCancelled, isRunning else { return .init(outcome: .refused, summary: "Stopped") }
         if !result.ok, result.outcome.status == .failed, inputDeliveryStarted {
             result = .init(outcome: .uncertain, summary: "UNVERIFIED: input may have been applied before the error. " + result.summary + " Read and verify before retrying.", effect: .look)
         }
@@ -2410,13 +2510,13 @@ final class Agent: ObservableObject {
             hand.lingerBeforeHome = 3.5
             return end(line, .init(ok: true, summary: "marked it on screen with a circle and arrow"))
 
-        case "ask" where (Telegram.shared.ownsRun || (!reviewedForm && !userConfirmed)) && context.page != nil && Self.asksToSubmit(action):
+        case "ask" where (telegramOwned || (!reviewedForm && !userConfirmed)) && context.page != nil && Self.asksToSubmit(action):
             // "Ready to submit?" is answered by the review: every answer on the form, with Submit or Edit.
             reviewedForm = true   // local review shown once; Telegram edits can require another review
             let line = begin("Review before submitting")
             guard let ok = await reviewBeforeSubmit(context.page!) else { return await perform(action, context: &context) }   // no form: just ask
             return end(line, ok ? .init(ok: true, summary: "the user checked every answer on the form and approved submitting: submit now, without asking again")
-                                : fail(Self.editedReview))
+                                : fail(editedReview))
 
         case "ask" where qa == nil && !profileOffered.contains(action["question"] as? String ?? "") && Self.profileAnswer(for: action) != nil:
             // Standard application answers (CTC, notice period, links…) and earlier form answers are in the profile.
@@ -3273,6 +3373,7 @@ final class Agent: ObservableObject {
     /// A background run the user came to watch (its window in front): the buddy works there as in any run. Once
     /// they go back to their own work, it goes back off to the screen's edge.
     private func followWatching() async {
+        if isolatedBrowserJob { buddy.quiet = true; return }
         guard Background.active, question == nil else { return }
         buddy.quiet = true
         return
@@ -3299,7 +3400,7 @@ final class Agent: ObservableObject {
     private func openInBackground(_ url: URL, context: inout ActionContext) async -> ActionResult {
         let bridge = BrowserBridge.shared
         if let tab = Background.tab,
-           URL(string: tab.url)?.host == url.host, url.host != nil {
+           Self.isNewTabPage(tab.url) || (URL(string: tab.url)?.host == url.host && url.host != nil) {
             guard await bridge.tabCommand("navigate", on: tab, ["url": url.absoluteString]) != nil else { return fail("The task browser disconnected; reconnect it before continuing") }
         } else {
             guard let opened = await bridge.backgroundTab(url.absoluteString) else { return fail("Couldn't open a task tab. Connect the Clinqy extension in your signed-in browser, or select headless mode in Background settings.") }
@@ -3407,6 +3508,7 @@ final class Agent: ObservableObject {
     }
 
     private func refresh(_ context: inout ActionContext) async {
+        defer { if context.page == nil { BrowserBridge.shared.useNativeCursor() } }
         defer { rememberTelegramTarget(app: context.app, page: context.page) }
         if Background.active {
             context.elements = []; context.fingerprint = 0
@@ -3653,6 +3755,11 @@ final class Agent: ObservableObject {
     /// A model's claim of success is not evidence: execute its explicit postcondition against current state.
     private func verify(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let line = begin("Verify outcome")
+        if let pending = pendingVerification, let connection = pending.pageConnection, let tabID = pending.tabID,
+           let page = await BrowserBridge.shared.snapshot(of: .init(id: tabID, url: pending.url ?? "", connection: connection)) {
+            context.page = page
+            if Background.active { Background.tab = .init(id: tabID, url: page.url, connection: connection) }
+        }
         let originalPage = context.page
         let originalNative = (action["id"] as? String).flatMap { AXEngine.lookup($0, in: context.elements) }
         let seconds = min(15, max(0, (action["seconds"] as? NSNumber)?.doubleValue ?? 2))
@@ -3822,6 +3929,9 @@ final class Agent: ObservableObject {
     }
 
     fileprivate func finish(ok: Bool, _ text: String) {
+        if let context = executionContext, TaskExecution.current !== context {
+            TaskExecution.$current.withValue(context) { finish(ok: ok, text) }; return
+        }
         guard isRunning else { return }
         let unresolved = pendingVerification?.kind ?? TaskStore.shared.record(taskRecordID)?.unverifiedAction
         let text = ok && unresolved != nil ? "Outcome needs checking: \(unresolved!). " + text
@@ -3854,6 +3964,7 @@ final class Agent: ObservableObject {
         hand.keepFrontApp = openedLast || Self.keepsFrontApp(request)
         hand.endRun()
         let wasBackground = Background.active
+        completedBrowserTab = Background.tab
         BrowserBridge.shared.endActivityRun()
         Background.end()
         buddy.quiet = false
@@ -3882,12 +3993,16 @@ final class Agent: ObservableObject {
         // A run that got real work done (a long lab, a big form) keeps going longer than one that's flailing.
         let progressed = steps.filter { $0.state == .ok }.count >= 10
         let limit = progressed ? 12 : 3
-        let continues = !externalRun && !ok && !isTest && !runDry && qa == nil && autoContinues < limit
+        let continues = !isolatedBrowserJob && !externalRun && !ok && !isTest && !runDry && qa == nil && autoContinues < limit
             && (text.hasPrefix("Ran out of steps") || text.hasPrefix("I got stuck on"))
         // A background run tells the user when it's through (not at a pause it carries on from by itself).
-        if wasBackground, !isTest, !continues { Notifier.finished(request: request, answer: text, ok: ok, result: runResult) }
+        if wasBackground, !isolatedBrowserJob, !isTest, !continues { Notifier.finished(request: request, answer: text, ok: ok, result: runResult) }
+        if !continues, let receipt = runReceiptID {
+            RunReceipt.write(id: receipt, ok: ok, answer: text, steps: steps.map(\.text))
+            runReceiptID = nil
+        }
         if !continues { TaskStore.shared.finish(taskRecordID, ok: ok, answer: journalText(text)) }
-        if !continues { Telegram.shared.finished(answer: text, ok: ok, result: runResult) }
+        if !continues, !isolatedBrowserJob { Telegram.shared.finished(answer: text, ok: ok, result: runResult) }
         if continues {
             autoContinues += 1
             log("auto-continue \(autoContinues)/\(limit) after: \(text.prefix(60))")
@@ -3908,7 +4023,7 @@ final class Agent: ObservableObject {
         watchdog = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] timer in
             MainActor.assumeIsolated {
                 guard let self, self.isRunning else { timer.invalidate(); return }
-                if self.externalRun { return } // Host-agent idle expiry is owned by the control lease, never auto-continue.
+                if self.externalRun || self.coordinatingBrowserJobs || (self.inputPanelVisible && !self.runBackground) { return } // User input, child agents and external leases own their wait time.
                 // A model reply with a screenshot and a long history can take well over 30 s; that's slow, not stuck.
                 let limit: TimeInterval = self.phase == .thinking ? 180 : 30
                 guard self.phase != .waiting, Date().timeIntervalSince(self.lastProgress) > limit else { return }

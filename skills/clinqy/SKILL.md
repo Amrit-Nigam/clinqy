@@ -77,6 +77,14 @@ CLI observe without `--image-out` returns semantic state only. Direct control cu
 For background browser tasks, delegate with `clinqy_run` and `background:true` instead; native input may
 require a foreground handoff.
 
+## Parallel browser tasks
+
+Normal browser requests use independent owned inactive tabs, leaving the main Clinqy free. Each task has a
+colored cursor at the top right; hover for status, click for its answer, stop and show-tab controls. Explicitly parallel multi-tab requests can
+split into child jobs; dependent steps stay together. Default capacity is three browser jobs, adjustable in
+the cursor's hover panel up to sixteen, with excess requests queued. Use `foreground:` when native foreground work is
+intended. A login or approval pauses only its task; never send one task's answer to another task.
+
 ## Delegate a whole task
 
 ```bash

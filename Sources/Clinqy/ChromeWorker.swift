@@ -74,7 +74,13 @@ final class WorkerCDP {
 
 @MainActor
 final class ChromeWorker {
-    static let shared = ChromeWorker()
+    private static let primary = ChromeWorker()
+    static var shared: ChromeWorker {
+        guard let context = TaskExecution.current else { return primary }
+        return context.service(ChromeWorker.self) {
+            ChromeWorker(root: FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/BrowserJobs/" + context.id.uuidString))
+        }
+    }
     var identity: ObjectIdentifier { ObjectIdentifier(self) }
     private let root: URL
     private let scriptURL: URL?

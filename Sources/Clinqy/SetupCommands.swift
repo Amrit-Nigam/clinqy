@@ -357,7 +357,13 @@ enum SetupCommands {
     /// Clinqy loads its own extension (extensions page → Developer mode → Load unpacked), then waits until it connects.
     private static func extensionInstall(_ browser: String?) -> Int32 {
         guard let s = status() else { return failed("Clinqy didn't answer. Is it installed in /Applications?") }
-        if s["extension"] as? Bool == true { print("✓ The browser extension is already connected."); return 0 }
+        func connected(_ status: [String: Any]) -> Bool {
+            guard let browser else { return status["extension"] as? Bool == true }
+            let names = ["chrome": "Google Chrome", "arc": "Arc", "brave": "Brave Browser", "edge": "Microsoft Edge"]
+            let name = names[browser.lowercased()] ?? browser
+            return (status["browserConnections"] as? [String] ?? []).contains { $0.caseInsensitiveCompare(name) == .orderedSame }
+        }
+        if connected(s) { print("✓ The browser extension is already connected."); return 0 }
         let lacking = missing(s).filter { $0 != "Automation (System Events)" }
         guard lacking.isEmpty else {
             return failed("Clinqy needs these permissions before it can add the extension: \(lacking.joined(separator: ", ")). Run: Clinqy permissions")
@@ -367,7 +373,7 @@ enum SetupCommands {
         for _ in 0..<60 {
             sleep(3)
             if let now = status() {
-                if now["extension"] as? Bool == true { print("✓ The browser extension is connected."); return 0 }
+                if connected(now) { print("✓ The browser extension is connected."); return 0 }
                 if let err = now["extensionInstall"] as? String, !err.isEmpty { return failedExtension(err, s) }
             }
         }

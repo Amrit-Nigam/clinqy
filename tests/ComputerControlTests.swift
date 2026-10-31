@@ -50,6 +50,12 @@ import Foundation
         check(ControlProtocol.validateRequest(["op": "release", "session": lease.session, "complete": true]) == nil, "owned release request accepted")
         check(ControlProtocol.validateRequest(["op": "act", "session": lease.session, "observation": UUID().uuidString,
                                               "action": ["do": "shell"]]) != nil, "unsupported action refused before app launch")
+        for browser in ["Chrome", "Google Chrome", "Arc", "Brave", "Brave Browser", "Edge", "Microsoft Edge", "browser"] {
+            check(BackgroundPolicy.route(["do": "open_app", "name": browser], hasWorkerPage: false) == .browser,
+                  "opening a supported browser stays in the background: \(browser)")
+        }
+        if case .attention = BackgroundPolicy.route(["do": "open_app", "name": "TextEdit"], hasWorkerPage: false) { checks += 1 }
+        else { preconditionFailure("native app was treated as a background browser") }
         for kind in ["hover", "right_click", "double_click", "drag"] {
             let web: [String: Any] = ["do": kind, "id": "w1", "to_id": "w2"]
             check(BackgroundPolicy.route(web, hasWorkerPage: true) == .browser, "owned semantic gesture stays in browser")

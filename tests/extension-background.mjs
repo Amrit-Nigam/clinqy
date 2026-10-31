@@ -114,3 +114,39 @@ assert.equal(calls.filter(c => c[0] === 'create').length, attempts);
 chrome.tabs.query = originalTabQuery;
 console.log('PASS exactly one foreground tab across retries, equivalent URLs, stale active-tab state and worker restart');
 console.log('PASS uncertain opens are not repeated, closed tabs are not recreated, completed feedback stays off');
+
+// One tab's pending capture must not block other tabs, while commands on that same tab stay ordered.
+denyCreate = false;
+const parallelCallsStart = calls.length;
+chrome.tabGroups.query = async () => [];
+const parallelA = await context.serializedHandle({ cmd: 'clinqyTab', url: 'https://parallel-a.test' });
+const parallelB = await context.serializedHandle({ cmd: 'clinqyTab', url: 'https://parallel-b.test' });
+const originalSend = chrome.debugger.sendCommand;
+let releaseCapture, capturesA = 0, capturesB = 0;
+const pendingCapture = new Promise(resolve => { releaseCapture = resolve; });
+chrome.debugger.sendCommand = async (target, method, params) => {
+  if (method === 'Page.captureScreenshot' && target.tabId === parallelA.id) {
+    capturesA++;
+    if (capturesA === 1) await pendingCapture;
+  }
+  if (method === 'Page.captureScreenshot' && target.tabId === parallelB.id) capturesB++;
+  return originalSend(target, method, params);
+};
+const firstCapture = context.serializedHandle({ cmd: 'captureTask', tabId: parallelA.id });
+const orderedCapture = context.serializedHandle({ cmd: 'captureTask', tabId: parallelA.id });
+await new Promise(resolve => setTimeout(resolve, 10));
+const independentCapture = context.serializedHandle({ cmd: 'captureTask', tabId: parallelB.id });
+await Promise.race([independentCapture, new Promise((_, reject) => { const t = setTimeout(() => reject(Error('another tab was blocked by the first task')), 500); t.unref(); })]);
+assert.equal(capturesA, 1, 'same-tab second request waits');
+assert.equal(capturesB, 1, 'other task proceeds while first is waiting');
+releaseCapture();
+await Promise.all([firstCapture, orderedCapture]);
+assert.equal(capturesA, 2);
+await context.serializedHandle({ cmd: 'clinqyDone', tabIds: [parallelB.id] });
+assert(data.workTabs.includes(parallelA.id), 'finishing one job preserves another job ownership');
+assert(calls.some(c => c[0] === 'detach' && c[1] === parallelB.id));
+assert(!calls.some(c => c[0] === 'detach' && c[1] === parallelA.id));
+assert(!calls.slice(parallelCallsStart).some(c => c[0] === 'focusWindow' || (c[0] === 'update' && c[2].active)), 'parallel background work never takes foreground focus');
+chrome.debugger.sendCommand = originalSend;
+await context.serializedHandle({ cmd: 'clinqyDone', tabIds: [parallelA.id] });
+console.log('PASS parallel cross-tab commands, ordered same-tab commands, per-task cleanup and no foreground activation');

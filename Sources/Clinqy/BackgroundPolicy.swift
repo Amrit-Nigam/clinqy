@@ -8,10 +8,11 @@ enum BackgroundPolicy {
         let kind = (action["do"] as? String ?? "").lowercased()
         let webID = (action["id"] as? String)?.lowercased().hasPrefix("w") == true
         switch kind {
+        case "parallel_browser": return .api
         case "open_url": return .browser
         case "open_app":
             let name = (action["name"] as? String ?? "").lowercased()
-            if ["chrome", "google chrome", "browser"].contains(name) { return .browser }
+            if ["chrome", "google chrome", "arc", "brave", "brave browser", "edge", "microsoft edge", "browser"].contains(name) { return .browser }
             if name.contains("finder") { return .attention("Use the files action to find, list, rename or move files without opening Finder.") }
             return .attention("This task needs a native app. Its input cannot be isolated safely in background mode.")
         case "hover", "right_click", "double_click", "drag":

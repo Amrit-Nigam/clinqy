@@ -3,14 +3,21 @@
 const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
-const SCRIPT_VERSION = "1.9.12";
+const SCRIPT_VERSION = "1.9.14";
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
-let commandQueue = Promise.resolve();
+const commandQueues = new Map();
 function serializedHandle(msg) {
-  const next = commandQueue.then(() => handle(msg));
-  commandQueue = next.catch(() => {});
+  // Snapshot/index mutations serialize within a tab. Different tabs can wait/read/act concurrently.
+  // Creation and shared extension lifecycle/storage operations retain their own management lane.
+  const tabScoped = msg.tabId != null && !["clinqyDone", "clinqyClear", "newTab", "clinqyTab", "reload"].includes(msg.cmd);
+  const key = tabScoped ? `tab:${msg.tabId}` : "management";
+  const previous = commandQueues.get(key) || Promise.resolve();
+  const next = previous.then(() => handle(msg));
+  const tail = next.catch(() => {});
+  commandQueues.set(key, tail);
+  void tail.then(() => { if (commandQueues.get(key) === tail) commandQueues.delete(key); });
   return next;
 }
 
@@ -265,15 +272,25 @@ async function renderActivity(tabId, state) {
     await chrome.scripting.executeScript({ target, func: state => window.__clinqyActivity?.update(state), args: [state] });
   } catch {} // restricted pages and navigating documents may refuse scripts
 }
+let activityUpdates = Promise.resolve();
+function updateActivity(operation) {
+  const next = activityUpdates.then(operation);
+  activityUpdates = next.catch(() => {});
+  return next;
+}
 async function showActivity(tabId, state = {}) {
-  const active = await activityTabs();
-  if (!active.includes(tabId)) await chrome.storage.session.set({ activityTabs: [...active, tabId] });
-  await renderActivity(tabId, state);
+  return updateActivity(async () => {
+    const active = await activityTabs();
+    if (!active.includes(tabId)) await chrome.storage.session.set({ activityTabs: [...active, tabId] });
+    await renderActivity(tabId, state);
+  });
 }
 async function finishActivity(tabIds) {
-  const active = await activityTabs();
-  for (const id of active.filter(id => !tabIds || tabIds.includes(id))) await renderActivity(id, { active: false });
-  await chrome.storage.session.set({ activityTabs: active.filter(id => tabIds && !tabIds.includes(id)) });
+  return updateActivity(async () => {
+    const active = await activityTabs();
+    for (const id of active.filter(id => !tabIds || tabIds.includes(id))) await renderActivity(id, { active: false });
+    await chrome.storage.session.set({ activityTabs: active.filter(id => tabIds && !tabIds.includes(id)) });
+  });
 }
 
 function navigationKey(raw) {
@@ -548,9 +565,11 @@ async function cdpGesture(tabId, msg) {
 }
 
 function queueActivity(update) {
-  const next = commandQueue.then(update);
-  commandQueue = next.catch(() => {});
+  const previous = commandQueues.get("management") || Promise.resolve();
+  const next = previous.then(update).catch(() => {});
+  commandQueues.set("management", next);
 }
+
 if (chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, change) => {
   if (change.status === "complete") queueActivity(async () => {
     if ((await activityTabs()).includes(tabId)) await renderActivity(tabId, { kind: "working" });

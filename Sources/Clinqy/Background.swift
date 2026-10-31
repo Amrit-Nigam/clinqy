@@ -6,26 +6,41 @@ import AppKit
 /// arbitrary native apps can run without focus. Local work requires an awake Mac and a running Clinqy process.
 @MainActor
 enum Background {
+    final class State {
+        var active = false
+        var app: NSRunningApplication?
+        var appSince = Date.distantPast
+        var tab: BrowserBridge.TabInfo?
+        var userWindows: [pid_t: Set<CGWindowID>] = [:]
+        var windowsAtStart: Set<CGWindowID> = []
+        var usesExtension = true
+        var browserOverride: String?
+    }
+    private static let primaryState = State()
+    private static var state: State { TaskExecution.current?.service(State.self, make: State.init) ?? primaryState }
     /// This run is a background run.
-    private(set) static var active = false
+    private(set) static var active: Bool { get { state.active } set { state.active = newValue } }
     /// The app the run works in now (its window may well sit behind the user's).
     static var app: NSRunningApplication? {
-        didSet {
-            AXEngine.backgroundPid = active ? app?.processIdentifier : nil
-            if app != nil { appSince = Date() }
+        get { state.app }
+        set {
+            state.app = newValue
+            // Browser jobs never write the foreground controller's global native-input destination.
+            if TaskExecution.current == nil { AXEngine.backgroundPid = active ? newValue?.processIdentifier : nil }
+            if newValue != nil { appSince = Date() }
         }
     }
     /// When the run last moved into an app: launching one can bring it forward for a moment, which isn't the user.
-    private static var appSince = Date.distantPast
+    private static var appSince: Date { get { state.appSince } set { state.appSince = newValue } }
     /// Clinqy's tab in its own browser window: every page read and page action of the run is pinned to it.
-    static var tab: BrowserBridge.TabInfo?
+    static var tab: BrowserBridge.TabInfo? { get { state.tab } set { state.tab = newValue } }
     /// Per app the run worked in: the windows it already had then (the user's), which never move. Any other window
     /// of that app (one the run opened: ⌘N, a dialog) goes to Clinqy's hidden screen.
-    private static var userWindows: [pid_t: Set<CGWindowID>] = [:]
+    private static var userWindows: [pid_t: Set<CGWindowID>] { get { state.userWindows } set { state.userWindows = newValue } }
 
     /// Every window on the Mac when the run started: a window that appears later in an app the user isn't in (one a
     /// script or shell `open` brought up) is the run's.
-    private static var windowsAtStart: Set<CGWindowID> = []
+    private static var windowsAtStart: Set<CGWindowID> { get { state.windowsAtStart } set { state.windowsAtStart = newValue } }
 
     /// Notes the windows `app` has before the run first touches it (`had`: as they were before a launch).
     static func track(_ app: NSRunningApplication, had: Set<CGWindowID>? = nil) {
@@ -66,14 +81,16 @@ enum Background {
     /// The browser background runs work in, by app name (Dashboard → Background, or BACKGROUND_BROWSER): Chrome
     /// unless set otherwise.
     static var browserName: String {
-        Config.value("BACKGROUND_BROWSER") ?? UserDefaults.standard.string(forKey: "backgroundBrowser") ?? "Google Chrome"
+        state.browserOverride ?? Config.value("BACKGROUND_BROWSER") ?? UserDefaults.standard.string(forKey: "backgroundBrowser") ?? "Google Chrome"
     }
 
     /// Captured at run start so a settings change cannot switch browsers mid-task.
-    private(set) static var usesExtension = true
+    private(set) static var usesExtension: Bool { get { state.usesExtension } set { state.usesExtension = newValue } }
     static var extensionPreferred: Bool {
         (Config.value("BACKGROUND_WEB_MODE") ?? UserDefaults.standard.string(forKey: "backgroundWebMode") ?? "extension") != "headless"
     }
+
+    static func chooseBrowser(_ name: String?) { state.browserOverride = name }
 
     static func begin(_ on: Bool) {
         usesExtension = extensionPreferred

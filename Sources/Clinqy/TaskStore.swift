@@ -39,6 +39,7 @@ final class TaskStore: ObservableObject {
         var requiresReview = false
         var conversationID: Int64?
         var reviewReason: String?
+        var coordinating: Bool?
 
         var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
         var status: String {
@@ -90,6 +91,11 @@ final class TaskStore: ObservableObject {
         let matches = records.filter { $0.id.uuidString.lowercased().hasPrefix(shortID.lowercased()) }
         return matches.count == 1 ? matches[0] : nil
     }
+    var backgroundLimit = 3
+    var activeForeground: Record? { records.last { !$0.background && [.running, .waiting, .needsAttention].contains($0.state) } }
+    var activeBackground: [Record] { records.filter { $0.background && $0.coordinating != true && [.running, .waiting, .needsAttention].contains($0.state) } }
+    func coordinate(_ id: UUID) { _ = change(id) { $0.coordinating = true; $0.stage = "Waiting for parallel browser tasks" } }
+
     var active: Record? { records.last { [.running, .waiting, .needsAttention].contains($0.state) } }
     var queued: [Record] { records.filter { $0.state == .queued }.sorted { $0.createdAt < $1.createdAt } }
     var recovery: [Record] { records.filter { $0.state == .interrupted || ($0.state == .queued && $0.requiresReview) } }
@@ -110,7 +116,9 @@ final class TaskStore: ObservableObject {
     @discardableResult
     func start(_ id: UUID, explicitlyReviewed: Bool = false) -> Bool {
         guard let item = record(id), item.state == .queued, !item.requiresReview || explicitlyReviewed,
-              item.reviewReason?.contains("Private values") != true, active == nil else { return false }
+              item.reviewReason?.contains("Private values") != true,
+              TaskCapacity.canStart(background: item.background, foregroundRunning: activeForeground != nil,
+                  backgroundRunning: activeBackground.count, limit: backgroundLimit) else { return false }
         guard item.files.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
             update(id, state: .failed, stage: "An attached file is missing. Reattach it and send a new task.")
             return false

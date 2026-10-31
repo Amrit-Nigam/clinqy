@@ -16,7 +16,7 @@ enum MCPServer {
     single-use observation and screenshot. Call clinqy_act, clinqy_wait or clinqy_verify with both tokens;
     observe again after every action. Never repeat input after a timeout; inspect and verify instead.
     Finish with clinqy_release complete=true only after verifying the final goal. complete=false stops.
-    Direct control currently uses the foreground. One task at a time. clinqy_stats: how recent runs went.
+    Direct control uses one foreground controller; delegated browser jobs run in independent background tabs. clinqy_stats: how recent runs went.
     """
 
     private static func tool(_ name: String, _ title: String, _ description: String, _ props: [String: Any], required: [String] = [],
@@ -88,7 +88,7 @@ enum MCPServer {
     nonisolated(unsafe) private static var out: FileHandle!
     private static let writeQueue = DispatchQueue(label: "clinqy.mcp.write")
     /// Request ids of tasks in flight, so a cancel from the client stops the task in the app.
-    nonisolated(unsafe) private static var running: Set<String> = []
+    nonisolated(unsafe) private static var running: [String: String] = [:]
     nonisolated(unsafe) private static var controlRequests: [String: String] = [:]
     private static let lock = NSLock()
 
@@ -141,8 +141,8 @@ enum MCPServer {
         guard let id = msg["id"] else {
             if method == "notifications/cancelled", let rid = params["requestId"] {
                 let key = "\(rid)"
-                let wasRunning = lock.withLock { running.remove(key) != nil }
-                if wasRunning { openLink("cancel", [:]) }
+                let receipt = lock.withLock { running.removeValue(forKey: key) }
+                if let receipt { openLink("cancel", ["receipt": receipt]) }
                 if let session = lock.withLock({ controlRequests[key] }) { openLink("control-cancel", ["session": session]) }
             }
             return nil   // other notifications need no answer
@@ -166,10 +166,11 @@ enum MCPServer {
                 guard let task = (args["task"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines), !task.isEmpty
                 else { return ["jsonrpc": "2.0", "id": id, "result": text("task is required", isError: true)] }
                 let key = "\(id)"
-                lock.withLock { _ = running.insert(key) }
-                defer { lock.withLock { _ = running.remove(key) } }
+                let receipt = UUID().uuidString
+                lock.withLock { running[key] = receipt }
+                defer { lock.withLock { _ = running.removeValue(forKey: key) } }
                 result = await run(task, dry: args["dry"] as? Bool == true, background: args["background"] as? Bool == true,
-                                   timeout: (args["timeout"] as? NSNumber)?.doubleValue ?? 300)
+                                   timeout: (args["timeout"] as? NSNumber)?.doubleValue ?? 300, receipt: receipt)
             case "clinqy_observe", "clinqy_act", "clinqy_verify", "clinqy_wait", "clinqy_release":
                 let name = params["name"] as? String ?? ""
                 var body = args
@@ -194,7 +195,6 @@ enum MCPServer {
     // MARK: - Talking to the running app
 
     private static let support = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy")
-    private static let logURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Clinqy/agent.log")
 
     /// The app, not this relay process (both are the same binary).
     private static var appRunning: Bool {
@@ -235,52 +235,24 @@ enum MCPServer {
         return p.terminationStatus
     }
 
-    /// agent.log from byte `offset` on (the app rotates it at 5 MB: a shorter file means start over).
-    private static func readLog(from offset: inout UInt64) -> String {
-        guard let h = try? FileHandle(forReadingFrom: logURL) else { return "" }
-        defer { try? h.close() }
-        let size = (try? h.seekToEnd()) ?? 0
-        if size < offset { offset = 0 }
-        try? h.seek(toOffset: offset)
-        let data = (try? h.readToEnd()) ?? Data()
-        offset += UInt64(data.count)
-        return String(decoding: data, as: UTF8.self)
-    }
-
-    static func run(_ task: String, dry: Bool, background: Bool = false, timeout: Double) async -> [String: Any] {
-        guard await ensureApp() else { return text("Clinqy isn't installed or wouldn't start (build it with ./build.sh).", isError: true) }
-        var offset = (try? FileManager.default.attributesOfItem(atPath: logURL.path)[.size] as? UInt64) ?? 0
-        guard openLink("run", ["task": (background ? "in the background: " : "") + task, "test": "1"].merging(dry ? ["dry": "1"] : [:]) { a, _ in a }) else {
-            return text("Couldn't open the clinqy:// link.", isError: true)
-        }
-        // The app ignores a task while another runs, so first see this one start ("=== <task>").
-        let head = String(task.prefix(40))
-        var started = false, lines: [String] = []
-        let begun = Date(), deadline = begun.addingTimeInterval(max(10, timeout))
-        while Date() < deadline {
-            try? await Task.sleep(for: .milliseconds(400))
-            if Task.isCancelled { break }
-            for line in readLog(from: &offset).split(separator: "\n").map(String.init) {
-                if !started {
-                    if line.hasPrefix("=== "), line.contains(head) { started = true }
-                    continue
-                }
-                if line.hasPrefix("=== ") { break }   // a later run: ours ended without a verdict line
-                let body = line.replacingOccurrences(of: #"^\[ *[0-9.]+s\] "#, with: "", options: .regularExpression)
-                if body.hasPrefix("✓ ") || body.hasPrefix("✗ ") {
-                    let ok = body.hasPrefix("✓")
-                    let steps = lines.isEmpty ? "" : "Steps:\n" + lines.joined(separator: "\n") + "\n\n"
-                    return text(steps + (ok ? "Done: " : "Failed: ") + body.dropFirst(2), isError: !ok)
-                }
-                if body.hasPrefix("  → ") { lines.append("- " + body.dropFirst(4)) }
-                else if body.hasPrefix("    ✗ ") { lines.append("  (failed: \(body.dropFirst(6)))") }
+    static func run(_ task: String, dry: Bool, background: Bool = false, timeout: Double, receipt: String = UUID().uuidString) async -> [String: Any] {
+        guard await ensureApp() else { return text("Clinqy couldn't start. Build/install the app first.", isError: true) }
+        let requestedMode = await MainActor.run { var text = task; return Background.choice(&text) }
+        let useBackground = requestedMode ?? (background || (!dry && BrowserTaskRouting.isBrowserTask(task)))
+        guard let file = RunReceipt.url(receipt),
+              openLink("run", ["task": (requestedMode == nil && useBackground ? "in the background: " : "") + task, "test": "1", "id": receipt]
+                .merging(dry ? ["dry": "1"] : [:]) { value, _ in value }) else { return text("Couldn't deliver task", isError: true) }
+        defer { try? FileManager.default.removeItem(at: file) }
+        let deadline = Date().addingTimeInterval(max(10, timeout))
+        while Date() < deadline && !Task.isCancelled {
+            if let data = try? Data(contentsOf: file), let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
+                let ok = result["ok"] as? Bool == true
+                let steps = (result["steps"] as? [String] ?? []).map { "- " + $0 }.joined(separator: "\n")
+                return text((steps.isEmpty ? "" : steps + "\n\n") + (ok ? "Done: " : "Needs checking: ") + (result["answer"] as? String ?? ""), isError: !ok)
             }
-            if !started, Date().timeIntervalSince(begun) > 15 {
-                return text("Clinqy didn't start the task: it's probably busy with another one (or the link was refused). Try again when it's idle.", isError: true)
-            }
+            try? await Task.sleep(for: .milliseconds(200))
         }
-        let so = lines.isEmpty ? "" : "\nSo far:\n" + lines.joined(separator: "\n")
-        return text("Still running after \(Int(timeout)) s; it keeps going in the app (stop it from the menu bar)." + so, isError: true)
+        return text("No final result yet. This task may still be queued or running; inspect its own task card before retrying.", isError: true)
     }
 
     /// Local file relay keeps large JSON arguments and images out of URL limits. A timed-out mutation

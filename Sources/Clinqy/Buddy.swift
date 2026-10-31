@@ -30,6 +30,10 @@ final class Buddy {
     var qaMode = false { didSet { wake() } }
     /// A background run nobody is watching: the buddy doesn't fly to clicks in windows the user can't see.
     var quiet = false
+    var suppressed = false { didSet { stages.forEach { $0.window.alphaValue = suppressed ? 0 : 1 } } }
+    var tint: NSColor?
+    var parkingSlot: Int?
+    private var disposed = false
     /// A background run on Clinqy's hidden screen: the buddy only goes, points and frames things there.
     var confine: CGRect?
     /// Parked at the screen's edge, off doing a background run (see `goAway`).
@@ -166,6 +170,7 @@ final class Buddy {
 
     /// Back to full frame rate (something changed that has to animate).
     private func wake() {
+        guard !disposed else { return }
         stillSince = nil
         setRate(fast: true)
     }
@@ -217,7 +222,8 @@ final class Buddy {
         let m = Self.mouse()
         let screen = NSScreen.screens.map { AXEngine.flipped($0.frame) }.first { $0.contains(m) }
             ?? AXEngine.flipped(NSScreen.main?.frame ?? .zero)
-        let end = elsewhere.map { CGPoint(x: $0.midX, y: $0.midY) } ?? CGPoint(x: screen.maxX - 10, y: screen.minY + screen.height * 0.22)
+        let end = parkingSlot.map { CGPoint(x: screen.maxX - 26, y: screen.maxY - 55 - CGFloat($0) * 58) }
+            ?? elsewhere.map { CGPoint(x: $0.midX, y: $0.midY) } ?? CGPoint(x: screen.maxX - 10, y: screen.minY + screen.height * 0.22)
         away = true
         let start = pos
         let distance = hypot(end.x - start.x, end.y - start.y)
@@ -428,15 +434,27 @@ final class Buddy {
             bubbleAge: now - bubbleAppeared,
             level: level,
             mark: mark.map { ($0, now - $0.began) },
+            tint: tint?.usingColorSpace(.deviceRGB).map { ($0.redComponent, $0.greenComponent, $0.blueComponent) },
             qa: qaMode,
             flash: flash.flatMap { now - $0.1 < 0.7 ? ($0.0, now - $0.1) : nil },
             offstage: offstage)
         for stage in stages { stage.render(frame, bubbleWidth: &bubbleWidth, dt: dt) }
     }
 
+    func dismiss() {
+        disposed = true
+        timer?.invalidate(); timer = nil
+        bubbleTimer?.invalidate(); bubbleTimer = nil
+        mouseMonitors.forEach(NSEvent.removeMonitor); mouseMonitors = []
+        if let screenObserver { NotificationCenter.default.removeObserver(screenObserver); self.screenObserver = nil }
+        finishFlight()
+        stages.forEach { $0.window.orderOut(nil) }
+    }
+
     private func rebuildStages() {
         stages.forEach { $0.window.orderOut(nil) }
         stages = NSScreen.screens.map(Stage.init)
+        stages.forEach { $0.window.alphaValue = suppressed ? 0 : 1 }
         wake()
     }
 
@@ -469,6 +487,7 @@ private struct Frame {
     let bubbleAge: CFTimeInterval
     let level: CGFloat
     let mark: (Buddy.Mark, CFTimeInterval)?
+    let tint: (CGFloat, CGFloat, CGFloat)?
     let qa: Bool
     let flash: (Bool, CFTimeInterval)?
     let offstage: CGFloat
@@ -671,6 +690,7 @@ private final class Stage {
         CATransaction.begin()
         CATransaction.setDisableActions(true)
         var want = f.qa && f.mood != .success && f.mood != .failure ? Palette.qa : Palette.rgba(for: f.mood)
+        if let tint = f.tint, f.mood != .success, f.mood != .failure { want = (r: tint.0, g: tint.1, b: tint.2) }
         if let (ok, age) = f.flash, age < 0.7 { want = Palette.rgba(for: ok ? .success : .failure) }
         let k = min(1, dt * 8)
         color = (color.r + (want.r - color.r) * k, color.g + (want.g - color.g) * k, color.b + (want.b - color.b) * k)

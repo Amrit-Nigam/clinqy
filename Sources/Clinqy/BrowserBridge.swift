@@ -1,12 +1,18 @@
 import AppKit
 import Network
+import Combine
 
 /// Talks to the Clinqy browser extension over a localhost WebSocket. The extension reads the live page
 /// (exact buttons, links, fields and where they are) and performs precise clicks and fills in it.
 /// Only browser-extension origins may connect, so web pages can't reach this server.
 @MainActor
-final class BrowserBridge {
-    static let shared = BrowserBridge()
+final class BrowserBridge: ObservableObject {
+    private static let primary = BrowserBridge()
+    static var shared: BrowserBridge {
+        TaskExecution.current?.service(BrowserBridge.self) { BrowserBridge(transport: primary) } ?? primary
+    }
+    private let transport: BrowserBridge?
+    init(transport: BrowserBridge? = nil) { self.transport = transport }
     static let port: NWEndpoint.Port = 47823
 
     struct PageElement {
@@ -65,11 +71,18 @@ final class BrowserBridge {
     }
 
     private var listener: NWListener?
-    private var connections: [ObjectIdentifier: NWConnection] = [:]
+    private var connectionStorage: [ObjectIdentifier: NWConnection] = [:]
+    private var connections: [ObjectIdentifier: NWConnection] {
+        get { transport?.connections ?? connectionStorage }
+        set { if let transport { transport.connections = newValue } else { connectionStorage = newValue } }
+    }
     private var pending: [String: CheckedContinuation<[String: Any], Error>] = [:]
     private var counter = 0
 
     var isConnected: Bool { ChromeWorker.shared.connected || !connections.isEmpty }
+    var connectedBrowserNames: [String] {
+        Array(Set(owners.filter { connections[$0.key] != nil }.values.map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent })).sorted()
+    }
 
     enum BridgeError: LocalizedError {
         case notConnected, timeout, failed(String)
@@ -83,7 +96,7 @@ final class BrowserBridge {
     }
 
     func start() {
-        guard listener == nil else { return }
+        guard transport == nil, listener == nil else { return }
         let ws = NWProtocolWebSocket.Options()
         ws.autoReplyPing = true
         // Browser pages send their own origin; only extensions (chrome-extension://…) are let in.
@@ -145,6 +158,7 @@ final class BrowserBridge {
     }
 
     private func request(_ conn: NWConnection, _ body: [String: Any], timeout: Double = 2.5) async throws -> [String: Any] {
+        if let transport { return try await transport.request(conn, body, timeout: timeout) }
         counter += 1
         let id = "r\(counter)"
         var msg = body
@@ -163,7 +177,7 @@ final class BrowserBridge {
 
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
-    static let extensionVersion = "1.9.12"
+    static let extensionVersion = "1.9.14"
     /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
     /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
     private var reloadAsked: [String: Int] = [:]
@@ -269,25 +283,36 @@ final class BrowserBridge {
     }
 
     private var activityRunning = false
+    @Published private(set) var pageCursorVisible = false
+    private var activityGeneration = 0
     private var activityTabs: [ObjectIdentifier: Set<Int>] = [:]
     private var activityRequests: [ObjectIdentifier: Set<String>] = [:]
 
-    func beginActivityRun() { activityRunning = true; activityTabs = [:]; activityRequests = [:] }
+    func beginActivityRun() {
+        activityGeneration += 1; pageCursorVisible = false
+        activityRunning = true; activityTabs = [:]; activityRequests = [:]
+    }
+    func useNativeCursor() { pageCursorVisible = false }
 
     func endActivityRun() {
         activityRunning = false
         let ended = activityTabs, requests = activityRequests
         activityTabs = [:]; activityRequests = [:]
-        for key in Set(ended.keys).union(requests.keys) {
-            guard let conn = connections[key] else { continue }
-            let ids = Array(ended[key] ?? []), operations = Array(requests[key] ?? [])
-            Task { _ = try? await request(conn, ["cmd": "clinqyDone", "tabIds": ids, "operationIDs": operations], timeout: 5) }
+        let generation = activityGeneration
+        Task {
+            for key in Set(ended.keys).union(requests.keys) {
+                guard let conn = connections[key] else { continue }
+                let ids = Array(ended[key] ?? []), operations = Array(requests[key] ?? [])
+                _ = try? await request(conn, ["cmd": "clinqyDone", "tabIds": ids, "operationIDs": operations], timeout: 5)
+            }
+            if activityGeneration == generation && !activityRunning { pageCursorVisible = false }
         }
     }
 
     /// One extension request returns the exact tab it created. A lost acknowledgement is never followed by
     /// keyboard input or a second open. The extension deduplicates retries using the run's operation id.
     func openForegroundTab(_ url: URL, in app: NSRunningApplication, reusing tab: TabInfo?, operationID: String) async throws -> TabInfo {
+        pageCursorVisible = true
         guard let (key, conn) = await frontConnection(for: app) else { throw BridgeError.notConnected }
         let result: TabInfo
         if let tab {
@@ -343,16 +368,16 @@ final class BrowserBridge {
                 guard let existing = connections[selected] else { throw BridgeError.notConnected }
                 key = selected; conn = existing
             } else {
-                let preferred = app ?? NSWorkspace.shared.runningApplications.first {
+                guard let preferred = app ?? NSWorkspace.shared.runningApplications.first(where: {
                     $0.cleanName == Background.browserName && isConnected($0)
-                }
+                }) else { throw BridgeError.failed("Connect the Clinqy extension in " + Background.browserName + "; another browser will not be used instead.") }
                 guard let selected = await frontConnection(for: preferred) else {
                     throw BridgeError.failed("Connect the Clinqy extension in the browser profile you want to use.")
                 }
                 guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
                 key = selected.0; conn = selected.1
                 taskConnection = key
-                _ = try await request(conn, ["cmd": "clinqyClear"], timeout: 5)
+                // Each job cleans up only its own tabs; global cleanup would detach parallel jobs.
             }
             guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
             let result = try await request(conn, ["cmd": "clinqyTab", "url": url, "width": 1280, "height": 900], timeout: 15)
@@ -461,7 +486,11 @@ final class BrowserBridge {
     /// Which browser each connection comes from (its app bundle path, e.g. /Applications/Arc.app), found from
     /// the process on the other end. A page must only ever be read from the browser that's actually in front:
     /// with Chrome in front and only Arc connected, Arc's tab must not be mistaken for Chrome's.
-    private var owners: [ObjectIdentifier: String] = [:]
+    private var ownerStorage: [ObjectIdentifier: String] = [:]
+    private var owners: [ObjectIdentifier: String] {
+        get { transport?.owners ?? ownerStorage }
+        set { if let transport { transport.owners = newValue } else { ownerStorage = newValue } }
+    }
 
     private func identify(_ conn: NWConnection, key: ObjectIdentifier) {
         guard case let .hostPort(_, port) = conn.endpoint else { return }
@@ -518,6 +547,7 @@ final class BrowserBridge {
         guard let conn = connections[page.connection] else { throw BridgeError.notConnected }
         body["workOnly"] = Background.active && Background.usesExtension
         body["activity"] = activityRunning
+        if activityRunning { pageCursorVisible = true }
         if activityRunning { activityTabs[page.connection, default: []].insert(tabID) }
         body["cmd"] = cmd
         return try await request(conn, body, timeout: timeout)

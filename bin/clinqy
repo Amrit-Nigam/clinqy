@@ -48,20 +48,23 @@ ensure_app() {
   sleep 3
 }
 
-wait_log() {   # wait for a run started after line $1 to finish; print its steps
-  local start=$1
-  for i in $(seq 1 14400); do   # long tasks (a whole lab) run for hours
-    pgrep -xq Clinqy || break
-    sleep 1
-    # Finished when the newest end/restart line is an end (✓/✗) that no auto-continue followed within a few seconds.
-    local last=$(tail -n +$((start+1)) $LOG 2>/dev/null | grep -E "\] (✓|✗)|\] auto-continue " | tail -1)
-    if print -r -- "$last" | grep -qE "\] (✓|✗)"; then
-      sleep 3
-      [[ $(tail -n +$((start+1)) $LOG | grep -E "\] (✓|✗)|\] auto-continue " | tail -1) == "$last" ]] && break
-    fi
-  done
-  tail -n +$((start+1)) $LOG | grep -E "→|\] (✓|✗)" | sed 's/^\[ *[0-9.]*s\] *//'
-  tail -n +$((start+1)) $LOG | grep -E "\] (✓|✗)" | tail -1 | grep -qE "\] ✓"   # the last run's outcome
+wait_receipt() {
+  local id=$1
+  local result=~/Library/Application\ Support/Clinqy/cli/$id.run.json
+    for i in $(seq 1 14400); do
+      [[ -f $result ]] && break
+      pgrep -xq Clinqy || break
+      sleep 1
+    done
+    [[ -f $result ]] || { echo "No result yet. Inspect this task's card before retrying."; exit 1; }
+    python3 - "$result" <<'PYRUN'
+import json,sys,os
+path=sys.argv[1]
+r=json.load(open(path));os.unlink(path)
+for step in r.get('steps',[]):print('→ '+step)
+print(('✓ ' if r.get('ok') else '✗ ')+r.get('answer',''))
+sys.exit(0 if r.get('ok') else 1)
+PYRUN
 }
 
 cmd=${1:-help}; shift 2>/dev/null
@@ -126,17 +129,18 @@ PY
       esac
       shift
     done
-    start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://run?task=$(enc "$*")$flags&token=$TOKEN"
-    wait_log $start ;;
+    id=$(uuidgen)
+    open -g "clinqy://run?task=$(enc "$*")$flags&id=$id&token=$TOKEN"
+    wait_receipt "$id"
+    ;;
   workflow)
     ensure_app
     name=${1:-}; shift 2>/dev/null
     q="name=$(enc "$name")"
     for kv in "$@"; do q+="&$(enc "${kv%%=*}")=$(enc "${kv#*=}")"; done
-    start=$(wc -l < $LOG 2>/dev/null || echo 0)
-    open -g "clinqy://workflow?$q&token=$TOKEN"
-    wait_log $start ;;
+    id=$(uuidgen)
+    open -g "clinqy://workflow?$q&id=$id&token=$TOKEN"
+    wait_receipt "$id" ;;
   workflows)
     python3 - "$WF" <<'PY'
 import json, os, sys
