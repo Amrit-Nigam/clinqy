@@ -11,8 +11,6 @@ jobs:
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: Build the Mac app sources
-        run: swift build -c release
       - name: Native and Telegram regressions (mocked services)
         run: |
           bash tests/task-power.sh
@@ -36,6 +34,8 @@ jobs:
           bash tests/scheduler.sh
           bash tests/router.sh
           bash tests/data-stores.sh
+      - name: Build the Mac app sources
+        run: swift build -c release
       - name: Extension and download routing
         run: |
           node tests/extension-version.mjs

@@ -14,6 +14,9 @@ actor SourceCache {
     private var flights: [String: Flight] = [:]
     private var stopped = false
 
+    /// Consumers currently waiting for source loads (excludes cached reads).
+    var pendingConsumerCount: Int { flights.values.reduce(0) { $0 + $1.consumers.count } }
+
     init() {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 15

@@ -3,6 +3,20 @@ import SQLite3
 
 actor LoadCounter { var calls = 0; func next() -> Int { calls += 1; return calls }; func count() -> Int { calls } }
 
+actor SourceLoadGate {
+    private var released = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+    func wait() async {
+        if released { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+    func release() {
+        released = true
+        let pending = waiters; waiters.removeAll()
+        for waiter in pending { waiter.resume() }
+    }
+}
+
 @main struct EfficiencyTests {
     @MainActor static func main() async throws {
         let root = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-efficiency-tests-\(UUID())")
@@ -14,6 +28,8 @@ actor LoadCounter { var calls = 0; func next() -> Int { calls += 1; return calls
             checks += 1
         }
 
+        func stage(_ name: String) { FileHandle.standardError.write(Data("Efficiency: \(name)\n".utf8)) }
+        stage("storage")
         let legacy = root.appendingPathComponent("tasks.json"), file = root.appendingPathComponent("tasks.sqlite")
         var old = (0..<10_000).map { i in TaskStore.Record(request: "Review report \(i)", files: [], source: .mac, background: true, state: .succeeded) }
         old[0].dispatchKey = "archived-dispatch"
@@ -45,23 +61,39 @@ actor LoadCounter { var calls = 0; func next() -> Int { calls += 1; return calls
         check(store.record(id)?.pendingAction == nil, "failed checkpoint isn't published as durable state")
         print(String(format: "10,000-task checkpoint pair: median %.2f ms, p95 %.2f ms", samples[15], samples[27]))
 
-        let cache = SourceCache(), counter = LoadCounter()
+        stage("source cache")
+        let cache = SourceCache(), counter = LoadCounter(), gate = SourceLoadGate()
         let loader: @Sendable () async throws -> String = {
             _ = await counter.next()
-            try await Task.sleep(for: .milliseconds(100))
+            await gate.wait()
+            try Task.checkCancellation()
             return "Shared source"
         }
         let a = Task { try await cache.value(for: "same", load: loader) }
         let b = Task { try await cache.value(for: "same", load: loader) }
-        try await Task.sleep(for: .milliseconds(20)); a.cancel()
-        do { _ = try await a.value; preconditionFailure("cancelled consumer resumed successfully") } catch { checks += 1 }
+        // Hold the load until both consumers are registered. A wall-clock delay cannot establish
+        // this ordering on a loaded CI runner, and cancelling an already completed task is valid.
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while await cache.pendingConsumerCount != 2, ContinuousClock.now < deadline {
+            await Task.yield()
+        }
+        check(await cache.pendingConsumerCount == 2, "both consumers registered before cancellation")
+        // Release the gate even if a cancellation regression prevents the waiter from returning.
+        let watchdog = Task { try? await Task.sleep(for: .seconds(5)); await gate.release() }
+        defer { watchdog.cancel() }
+        a.cancel()
+        do { _ = try await a.value; check(false, "cancelled consumer resumed successfully") } catch { check(error is CancellationError, "cancelled consumer throws CancellationError") }
+        check(await cache.pendingConsumerCount == 1, "cancellation removes only its own consumer")
+        await gate.release()
+        watchdog.cancel()
         check(try await b.value == "Shared source", "another consumer retains the shared request")
         check(await counter.count() == 1, "overlapping source requests coalesce")
         _ = try await cache.value(for: "same", load: loader)
         check(await counter.count() == 1, "finished source snapshot is reused")
         await cache.cancelAll()
-        do { _ = try await cache.value(for: "late", load: loader); preconditionFailure("stopped cache loaded source") } catch { checks += 1 }
+        do { _ = try await cache.value(for: "late", load: loader); check(false, "stopped cache loaded source") } catch { check(error is CancellationError, "stopped cache throws CancellationError") }
 
+        stage("process cancellation and output")
         let stdinFile = root.appendingPathComponent("prompt with spaces.txt")
         try Data("private Unicode input héllo".utf8).write(to: stdinFile)
         let fed = await ProcessRunner.run("/bin/sh", ["-c", "prompt_file=$1; shift; exec \"$@\" < \"$prompt_file\"", "fixture", stdinFile.path, "/bin/cat"], directory: root)
@@ -80,6 +112,7 @@ actor LoadCounter { var calls = 0; func next() -> Int { calls += 1; return calls
         let bounded = await ProcessRunner.run("/usr/bin/yes", ["fixture"], timeout: 0.03, outputLimit: 1_024)
         check(bounded.output.utf8.count < 1_200 && bounded.output.contains("truncated"), "command output is bounded while the pipe is drained")
 
+        stage("stream decoding and HTTP fixture")
         var frames = ServerEvents()
         check(frames.line(": keepalive") == nil, "SSE comments aren't model data")
         check(frames.line("data: {\"choices\":") == nil, "SSE waits for a complete event")
@@ -97,13 +130,14 @@ actor LoadCounter { var calls = 0; func next() -> Int { calls += 1; return calls
         var gemini = ModelStream()
         _ = try gemini.consume(#"{"candidates":[{"content":{"parts":[{"text":"private thought","thought":true},{"text":"Answer"}]},"finishReason":"STOP"}]}"#)
         check(gemini.text == "Answer" && gemini.finished, "Gemini reasoning isn't exposed as answer text")
-        do { _ = try stream.consume(#"{"error":{"message":"fixture error"}}"#); preconditionFailure("stream error ignored") } catch { checks += 1 }
+        do { _ = try stream.consume(#"{"error":{"message":"fixture error"}}"#); check(false, "stream error ignored") } catch { checks += 1 }
         let (network, _) = try await URLSession.shared.bytes(from: URL(string: CommandLine.arguments[1])!)
         defer { network.task.cancel() }
         var wire = ServerEvents(), decoded = ModelStream()
         for try await byte in network { if let event = try wire.byte(byte) { _ = try decoded.consume(event) } }
         if let event = wire.flush() { _ = try decoded.consume(event) }
         check(decoded.text == "héllo" && decoded.finished, "actual URLSession SSE preserves event boundaries and Unicode")
+        stage("conversation compaction")
         let turns = [ConversationBudget.Turn(user: true, text: "Original task requirements", image: "old")]
             + (0..<100).map { ConversationBudget.Turn(user: $0 % 2 == 0, text: "Turn \($0): " + String(repeating: "x", count: 2_000), image: $0 == 99 ? "latest" : nil) }
         let compacted = ConversationBudget.compact(turns)

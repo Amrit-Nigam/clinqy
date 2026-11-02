@@ -12,10 +12,24 @@ actor WorkerProbe {
     func dependencies(_ id: String) -> [DelegationPool.Result] { inputs[id] ?? [] }
 }
 
+/// Workers cannot complete until the test has observed the whole admitted wave.
+actor WorkerGate {
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+    var waitingCount: Int { waiting.count }
+    func hold() async { await withCheckedContinuation { waiting.append($0) } }
+    func releaseWave() {
+        let wave = waiting; waiting.removeAll()
+        for worker in wave { worker.resume() }
+    }
+}
+
 @main struct DelegationTests {
     @MainActor static func main() async throws {
         var checks = 0
-        func check(_ condition: Bool, _ message: String) { precondition(condition, message); checks += 1 }
+        func check(_ condition: Bool, _ message: String) {
+            if !condition { FileHandle.standardError.write(Data("FAIL: \(message)\n".utf8)); fatalError(message) }
+            checks += 1
+        }
         func rejected(_ block: () throws -> Void) -> Bool { do { try block(); return false } catch { return true } }
         func job(_ id: String, dependencies: [String] = []) -> DelegationPool.Job {
             .init(id: id, task: "Analyze \(id)", dependsOn: dependencies)
@@ -138,6 +152,32 @@ actor WorkerProbe {
         check(bounded.status(ids: ["large_7"]).count < 6_300, "omitted results are still retrievable by ID")
         check(bounded.status(ids: ["large_7"]).contains("Worker output truncated"), "long output is never silently presented as complete")
 
+        // Correctness is overlap and bounded admission, not a speed ratio on a shared runner.
+        for concurrency in [1, 3] {
+            let gate = WorkerGate(), overlap = WorkerProbe()
+            let batch = DelegationPool(concurrency: concurrency, timeout: 10) { job, dependencies in
+                await overlap.begin(job.id, dependencies: dependencies)
+                await gate.hold()
+                await overlap.end()
+                return "Completed \(job.id)"
+            }
+            let ids = (0..<6).map { "gated_\($0)" }
+            _ = try batch.submit(ids.map { job($0) })
+            for wave in 0..<(ids.count / concurrency) {
+                let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+                while await gate.waitingCount < concurrency, ContinuousClock.now < deadline {
+                    await Task.yield()
+                }
+                check(await gate.waitingCount == concurrency, "all admitted workers overlap before release at concurrency \(concurrency)")
+                let state = await overlap.snapshot()
+                check(state.0 == concurrency && state.1 == concurrency, "active workers respect configured concurrency \(concurrency)")
+                check(state.2.count == (wave + 1) * concurrency, "queued workers wait until a slot is released")
+                await gate.releaseWave()
+            }
+            _ = await batch.collect(wait: true, timeout: 5)
+            check(ids.allSatisfy { batch.state(of: $0) == .succeeded }, "all gated jobs finish at concurrency \(concurrency)")
+        }
+
         func benchmark(_ concurrency: Int) async throws -> Double {
             let batch = DelegationPool(concurrency: concurrency, timeout: 3, runner: runner(WorkerProbe(), delay: 0.1))
             let start = Date()
@@ -146,7 +186,6 @@ actor WorkerProbe {
             return Date().timeIntervalSince(start)
         }
         let serial = try await benchmark(1), parallel = try await benchmark(3)
-        check(serial / parallel > 2, "independent jobs complete substantially faster in parallel")
         print(String(format: "Six simulated 100 ms jobs: serial %.0f ms, parallel %.0f ms (%.2f×)", serial * 1_000, parallel * 1_000, serial / parallel))
         print("PASS: \(checks) asynchronous delegation checks")
     }
