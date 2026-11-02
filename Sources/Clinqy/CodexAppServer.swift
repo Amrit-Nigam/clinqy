@@ -5,7 +5,11 @@ import Darwin
 /// Protocol: https://learn.chatgpt.com/docs/app-server ; fields checked against `codex 0.165.0`
 /// `app-server generate-json-schema --experimental`. Opt-in because older CLIs lack environment isolation.
 actor CodexAppServer {
-    struct Failure: LocalizedError { let message: String; var errorDescription: String? { message } }
+    struct Failure: LocalizedError {
+        let message: String
+        var timedOut = false
+        var errorDescription: String? { message }
+    }
     private struct Object: @unchecked Sendable { let value: [String: Any] }
     private let executable: String
     private let prefix: [String]
@@ -281,10 +285,10 @@ actor CodexAppServer {
         let waiter = turnWaiter; turnWaiter = nil; waiter?.resume(with: result)
     }
     private func expireRequest(_ token: UUID, id: Int) {
-        if token == generation, pending[id] != nil { stop(failure("server request timed out; it was not replayed")) }
+        if token == generation, pending[id] != nil { stop(failure("server request timed out; it was not replayed", timedOut: true)) }
     }
     private func expireTurn(_ token: UUID, turn: String) {
-        if token == generation, turnID == turn, completion == nil { stop(failure("turn timed out; it was not replayed")) }
+        if token == generation, turnID == turn, completion == nil { stop(failure("turn timed out; it was not replayed", timedOut: true)) }
     }
     private func writeFailed(_ token: UUID) {
         if token == generation, !closed { stop(failure("server input disconnected; no turn was replayed")) }
@@ -313,5 +317,7 @@ actor CodexAppServer {
         try? output?.close(); try? errors?.close()
         process = nil; input = nil; output = nil; errors = nil; buffer = Data()
     }
-    private func failure(_ message: String) -> Failure { Failure(message: "Codex app-server: " + message) }
+    private func failure(_ message: String, timedOut: Bool = false) -> Failure {
+        Failure(message: "Codex app-server: " + message, timedOut: timedOut)
+    }
 }

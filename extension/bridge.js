@@ -228,13 +228,16 @@ function associateFrames(boxes, subs, claimed) {
   const matches = [];
   const free = [];
   for (const box of boxes) {
-    const sub = box.frameId != null ? subs.get(box.frameId) : null;
-    if (sub && !claimed.has(box.frameId)) { claimed.add(box.frameId); matches.push({ box, frameId: box.frameId, sub }); }
+    const inline = box.inlineDocumentID ? [...subs].filter(([, sub]) => sub.documentID === box.inlineDocumentID && /^about:(blank|srcdoc)(?:[#?]|$)/.test(sub.url || "")) : [];
+    const frameId = inline.length === 1 ? inline[0][0] : box.frameId;
+    const sub = frameId != null ? subs.get(frameId) : null;
+    const permitted = sub && (/^https?:/.test(sub.url || "") || (inline.length === 1 && sub.documentID === box.inlineDocumentID));
+    if (permitted && !claimed.has(frameId)) { claimed.add(frameId); matches.push({ box, frameId, sub }); }
     else free.push(box);
   }
   const unplaced = free.filter((b) => b.frameId == null);
   for (const [frameId, sub] of subs) {
-    if (claimed.has(frameId) || !unplaced.length) continue;
+    if (claimed.has(frameId) || !unplaced.length || !/^https?:/.test(sub.url || "")) continue;
     const addressed = unplaced.filter((f) => f.src && samePage(f.src, sub.url));
     let box = addressed.length === 1 ? addressed[0] : null;
     if (!box) {
@@ -251,6 +254,7 @@ function associateFrames(boxes, subs, claimed) {
 }
 
 async function snapshot(tab) {
+  const frameSnapshots = await callAll(tab.id, "snapshot", [{ excludeTop: true }]);
   const top = await call(tab.id, 0, "snapshot");
   const list = top.elements.map((e) => ({ key: e.key, frameId: 0, local: e.i, e }));
   if (!top.documentID || !top.snapshotID) throw new Error("update browser page helpers before acting");
@@ -261,8 +265,8 @@ async function snapshot(tab) {
   const elements = top.elements;
   const extraText = [];
   if (top.frames && top.frames.length) {
-    const subs = new Map((await callAll(tab.id, "snapshot", [{ excludeTop: true }]))
-      .filter((s) => s.frameId !== 0 && /^https?:/.test(s.result.url || "")).map((s) => [s.frameId, s.result]));
+    const subs = new Map(frameSnapshots
+      .filter((s) => s.frameId !== 0 && /^(https?:|about:(blank|srcdoc)(?:[#?]|$))/.test(s.result.url || "")).map((s) => [s.frameId, s.result]));
     const claimed = new Set();
     const queue = [{ parent: 0, boxes: top.frames, origin: offsets[0], depth: 1 }];
     while (queue.length) {
@@ -317,7 +321,7 @@ async function frameChainStable(tabId, map, frameId) {
     if (!observed) return false;
     const live = (await call(tabId, observed.parent ?? 0, "frameBoxes")).frames || [];
     const current = live.find((box) => box.nodeToken === observed.nodeToken);
-    if (!current || ["x", "y", "w", "h"].some((key) => Math.abs(current[key] - observed[key]) > 0.5)
+    if (!current || (observed.inlineDocumentID && current.inlineDocumentID !== observed.inlineDocumentID) || ["x", "y", "w", "h"].some((key) => Math.abs(current[key] - observed[key]) > 0.5)
         || Math.abs((current.sx || 1) - (observed.sx || 1)) > 0.01 || Math.abs((current.sy || 1) - (observed.sy || 1)) > 0.01 || current.rotated) return false;
     f = observed.parent ?? 0;
     if (f === 0) return true;
@@ -454,8 +458,9 @@ async function backgroundTab(url, at) {
 }
 
 // A task in the user's own browser works in a tab of its own, in a "Clinqy" group beside theirs. It's never made active,
-// so they keep the tab and window they're in. Metrics and focus are emulated because a tab out of sight has no size and
-// counts as hidden. Only tabs Clinqy opened are touched, and it lets go of them when the task ends.
+// so they keep the tab and window they're in. Focus is emulated, while layout keeps the browser's natural viewport.
+// Screenshots, DOM targets and the visible task halo therefore share the same geometry when a user views the tab.
+// Only tabs Clinqy opened are touched, and it lets go of them when the task ends.
 async function workTabs() {
   try { return (await chrome.storage.session.get("workTabs")).workTabs || []; } catch { return []; }
 }
@@ -495,24 +500,44 @@ async function clinqyTab(url, width, height) {
 
 async function prepareWorkTab(tabId) {
   const target = { tabId };
-  const { workSize } = await chrome.storage.session.get("workSize");
   await chrome.debugger.sendCommand(target, "Page.enable");
   // A hidden task must never open a native file picker over the user’s work. Uploads use page fields directly.
   await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
   try { await chrome.debugger.sendCommand(target, "Page.setDownloadBehavior", { behavior: "default" }); } catch {}   // lifecycle events; best effort
   await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
-  await chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", { ...(workSize || { width: 1280, height: 900 }), deviceScaleFactor: 1, mobile: false });
+  // Do not force a 1280px canvas inside a wider visible tab. Inactive Chrome tabs retain their layout viewport;
+  // use that same geometry for DOM observations, screenshots and input. Clear overrides left by older sessions.
+  await chrome.debugger.sendCommand(target, "Emulation.clearDeviceMetricsOverride");
 }
 
 // The task ended: Chrome's debugging bar goes, and the tab behaves normally if the user looks at it.
-async function clinqyDone(tabIds) {
+async function clinqyDone(tabIds, closeInactive = false) {
   await finishActivity(tabIds);
   const owned = await workTabs();
   for (const tabId of tabIds ? owned.filter(id => tabIds.includes(id)) : owned) {
     try { await chrome.debugger.detach({ tabId }); } catch {}
     attached.delete(tabId);
   }
-  return { done: true };
+  const closed = [], kept = [];
+  // Only an explicit test-run list may be removed. Never sweep another run's tabs,
+  // and a tab the user selected or which is playing audio belongs to the user now.
+  if (closeInactive && Array.isArray(tabIds)) {
+    const mine = await openedTabs();
+    for (const tabId of owned.filter(id => tabIds.includes(id) && mine.has(id))) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.active || tab.audible) { kept.push(tabId); continue; }
+        await chrome.tabs.remove(tabId);
+        closed.push(tabId);
+      } catch { kept.push(tabId); }
+    }
+    // Do not overwrite storage from the beginning of this await-heavy operation: another run may have opened a tab.
+    const current = await openedTabs();
+    for (const id of closed) current.delete(id);
+    await setOpened(current);
+    await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => !closed.includes(id)) });
+  }
+  return { done: true, closed, kept };
 }
 
 // The next task starts: the last one's tabs go, except one the user is on or one playing sound, which are theirs now.
@@ -794,7 +819,7 @@ async function handleCommand(msg) {
       const requests = (await chrome.storage.session.get("tabRequests")).tabRequests || {};
       ids = [...new Set([...(ids || []), ...msg.operationIDs.map(token => requests[token]?.id).filter(Number.isInteger)])];
     }
-    return await clinqyDone(ids);
+    return await clinqyDone(ids, msg.closeInactive === true);
   }
   if (msg.cmd === "clinqyClear") return await clinqyClear();
   // A window Clinqy left behind (it quit without closing it) goes; one the user took over is only forgotten.
@@ -832,9 +857,20 @@ async function handleCommand(msg) {
   if (msg.cmd === "captureTask") {
     // The debugger helper only accepts tabs opened by Clinqy. Never activate a tab or capture the user's display.
     if (msg.tabId == null) throw new Error("task screenshot requires an explicit tab");
-    const captured = await cdp(tab.id, "Page.captureScreenshot", {
-      format: msg.format || "png", ...(msg.quality ? { quality: Number(msg.quality) } : {}), fromSurface: true, captureBeyondViewport: false
-    });
+    // Our task feedback is not page evidence. Hide it only for capture, restoring even on CDP failure.
+    const captureVisibility = async hidden => {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] },
+        func: hidden => window.__clinqyActivity?.setCaptureHidden(hidden), args: [hidden] });
+    };
+    let captured;
+    try {
+      await captureVisibility(true);
+      captured = await cdp(tab.id, "Page.captureScreenshot", {
+        format: msg.format || "png", ...(msg.quality ? { quality: Number(msg.quality) } : {}), fromSurface: true, captureBeyondViewport: false
+      });
+    } finally {
+      try { await captureVisibility(false); } catch {} // A navigated/closed document no longer owns this overlay.
+    }
     // Freshness/coverage: which observation this picture matches, when it was taken, and what it can show.
     const meta = { capturedAt: Date.now(), coverage: "viewport", beyondViewport: false };
     const map = await mapFor(tab.id);
@@ -849,7 +885,14 @@ async function handleCommand(msg) {
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
-    return { id: tab.id, url: tab.url || tab.pendingUrl || "", status: tab.status, title: tab.title || "", focused: !!win.focused };
+    let live = null;
+    try {
+      const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] },
+        func: () => ({ url: location.href, ready: document.readyState }) });
+      live = result?.result;
+    } catch {} // Restricted or navigating documents retain the browser's status fallback.
+    return { id: tab.id, url: live?.url || tab.url || tab.pendingUrl || "", ready: live?.ready,
+      status: tab.status, title: tab.title || "", focused: !!win.focused };
   }
   if (msg.cmd === "dialogPolicy") {
     // The app's explicit decision for the next dialog on this owned tab (or every one, when persistent).

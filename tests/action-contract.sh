@@ -29,3 +29,7 @@ if problems:
     print("\n".join("FAIL: " + p for p in problems)); sys.exit(1)
 print(f"PASS: {len(supported)} actions consistent across prompt ({len(advertised)} advertised), table and dispatcher")
 PY
+TEST_DIR=$(mktemp -d)
+trap 'rm -rf "$TEST_DIR"' EXIT
+swiftc -parse-as-library Sources/Clinqy/InputPlan.swift Sources/Clinqy/ActionContract.swift Sources/Clinqy/AgentPrompt.swift tests/CompactPromptTests.swift -o "$TEST_DIR/compact-prompt-tests"
+"$TEST_DIR/compact-prompt-tests"

@@ -4,7 +4,7 @@ import Foundation
 /// model time (~1 s), and the conversation (what was tried, what the screen looked like) stays in context.
 final class AgySession: @unchecked Sendable {
     enum BrainError: LocalizedError {
-        case notInstalled, failed(String), died, busy
+        case notInstalled, failed(String), died, busy, observation(String), timeout
 
         var errorDescription: String? {
             switch self {
@@ -19,6 +19,8 @@ final class AgySession: @unchecked Sendable {
                         : "Claude CLI isn't logged in. Run `claude` in a terminal once and log in."
                 }
                 return message
+            case .observation(let message): return message
+            case .timeout: return "The model turn timed out; obtain a fresh observation before retrying."
             case .died: return Provider.current == .agyCLI ? "The Agy process stopped unexpectedly" : "The Claude process stopped unexpectedly"
             case .busy: return "Still waiting on the previous reply"
             }
@@ -46,6 +48,9 @@ final class AgySession: @unchecked Sendable {
     private let output = Pipe()
     private let errorPipe = Pipe()
     private let lock = NSLock()
+    private let writes = DispatchQueue(label: "clinqy.brain.stdin")
+    private let turnTimeout: TimeInterval
+    private var pendingID: UUID?
     private var buffer = Data()
     private var pending: CheckedContinuation<String, Error>?
     /// The current turn's reply so far, and who wants to see it grow (see `send`).
@@ -104,7 +109,7 @@ final class AgySession: @unchecked Sendable {
 
     You are running inside the Antigravity CLI, which offers you its own coding and browser tools. Don't use them: \
     nothing they do reaches the user's screen, and everything on the Mac is done only through the JSON actions. \
-    The one exception: when a turn names a screenshot file, view that file with view_file first (it's the only way \
+    The one exception: when a turn names a screenshot file, view that file with read_file (or view_file) first (it's the only way \
     to see the screen), then reply with the JSON. Never run commands, write or edit files, open a browser or search \
     the web yourself.
     """
@@ -114,9 +119,6 @@ final class AgySession: @unchecked Sendable {
     static let agyPlainAddendum = "\n\nYou are running inside the Antigravity CLI, which offers you its own tools. "
         + "Don't call any of them (no commands, files, browser or web search): answer only from the text of the message, "
         + "in the format asked for above."
-
-    /// Tools the model may use in an agy session: only viewing the screenshot file of the turn.
-    private static let screenshotTools: Set<String> = ["view_file", "read_file", "view_content_chunk"]
 
     /// The id and --effort an agy session starts with, from a tier alias or id and the effort asked for (or
     /// AGY_EFFORT / CLAUDE_EFFORT). Only gemini-* ids are measured to take --effort (agy 1.4.7); claude-* ids refuse
@@ -139,7 +141,8 @@ final class AgySession: @unchecked Sendable {
     }
 
     /// `effort` overrides the configured reasoning effort (AGY_EFFORT / CLAUDE_EFFORT) for this session.
-    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil) throws {
+    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil, timeout: TimeInterval = 120) throws {
+        self.turnTimeout = max(0.01, timeout)
         self.systemPrompt = system
         self.sessionProvider = provider
         self.sessionModel = provider.model(model)
@@ -197,6 +200,9 @@ final class AgySession: @unchecked Sendable {
         env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
         process.environment = env
         process.currentDirectoryURL = tempDir
+        guard fcntl(input.fileHandleForWriting.fileDescriptor, F_SETNOSIGPIPE, 1) != -1 else {
+            throw BrainError.failed("Could not configure safe model-process input")
+        }
         process.standardInput = input
         process.standardOutput = output
         process.standardError = errorPipe
@@ -254,7 +260,10 @@ final class AgySession: @unchecked Sendable {
             }
             // Stream-json input is text only, so the screenshot goes in a file. A new name each time: the model
             // remembers what the last file showed, and a same-named file would read as already seen.
-            if let image, let imgData = Data(base64Encoded: image), let dir = sessionDir {
+            if let image {
+                guard let imgData = Data(base64Encoded: image), !imgData.isEmpty, let dir = sessionDir else {
+                    throw BrainError.observation("Could not deliver the screenshot: invalid image or unavailable session directory")
+                }
                 let n = lock.withLock { () -> Int in screenshotCount += 1; return screenshotCount }
                 let screenURL = dir.appendingPathComponent("screen-\(n).jpg")
                 // The folder is agy's cwd too; if anything took it away (macOS clears old temp files), make it again.
@@ -269,7 +278,7 @@ final class AgySession: @unchecked Sendable {
                     // model answered from its memory of the last one. Not that the screen changed, though: the
                     // retry look after failed steps usually shows the same screen.
                     let fresh = n > 1 ? " (new, taken just now; look at it again rather than going by earlier screenshots)" : ""
-                    let line = "Screenshot for this turn: \(screenURL.path)\(fresh) — view it with view_file now, before replying "
+                    let line = "Screenshot for this turn: \(screenURL.path)\(fresh) — view it with read_file (or view_file) now, before replying "
                         + "(its red boxes carry the e<N> ids; x/y in click/point are pixels in it)."
                     // Right after the "(Screenshot in the file below: …)" marker, before the turn's closing lines
                     // (Agent's "…starting with {", then FastLane's "— no tool-call or XML tags"), as bench.py measured:
@@ -283,12 +292,10 @@ final class AgySession: @unchecked Sendable {
                     // FastLane's closing line bans tool-call tags in the reply text (fake <invoke> tags); say so,
                     // so it doesn't read as a ban on the view_file call just asked for.
                     promptText = promptText.replacingOccurrences(of: "— no tool-call or XML tags.",
-                        with: "— no tool-call or XML tags in the reply text (view the screenshot file with view_file first).")
+                        with: "— no tool-call or XML tags in the reply text (view the screenshot file with read_file (or view_file) first).")
                 } catch {
                     note("couldn't save the screenshot: \(error.localizedDescription)")
-                    // The turn text says one is attached: don't send the model looking for a file that isn't there.
-                    promptText = promptText.replacingOccurrences(of: "(Screenshot attached:",
-                                                                 with: "(No screenshot this turn: it couldn't be saved. Ignore this note:")
+                    throw BrainError.observation("Could not deliver the screenshot: \(error.localizedDescription)")
                 }
             }
             let payload: [String: Any] = [
@@ -308,30 +315,50 @@ final class AgySession: @unchecked Sendable {
         }
         line.append(0x0A)
 
-        let reply: String = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-            lock.lock()
-            if dead {
-                let err = failureMessage().map { BrainError.failed(withLoginHint($0)) } ?? BrainError.died
+        try Task.checkCancellation()
+        let reply: String = try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                lock.lock()
+                if Task.isCancelled {
+                    lock.unlock()
+                    continuation.resume(throwing: CancellationError())
+                    return
+                }
+                if dead {
+                    let err = failureMessage().map { BrainError.failed(withLoginHint($0)) } ?? BrainError.died
+                    lock.unlock()
+                    continuation.resume(throwing: err)
+                    return
+                }
+                if pending != nil { lock.unlock(); continuation.resume(throwing: BrainError.busy); return }
+                let token = UUID()
+                pendingID = token
+                pending = continuation
+                partialText = ""
+                partialHandler = partial
+                // Per-turn state starts over: a turn without usage records none (not the last turn's), and an earlier
+                // turn's error isn't this one's.
+                responseStep = nil
+                lastUsage = (nil, nil)
+                lastErrorMessage = nil
+                turnHasScreenshot = shotThisTurn
+                viewedScreenshot = false
+                replySkippedScreenshot = false
                 lock.unlock()
-                continuation.resume(throwing: err)
-                return
+                // Keep pipe writes off the caller executor: a child can stop reading indefinitely.
+                let payload = line
+                writes.async { [weak self] in
+                    guard let self, self.lock.withLock({ self.pendingID == token && !self.dead }) else { return }
+                    do { try self.input.fileHandleForWriting.write(contentsOf: payload) }
+                    catch { self.fail(BrainError.died) }
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + turnTimeout) { [weak self] in
+                    self?.expire(token)
+                }
             }
-            if pending != nil { lock.unlock(); continuation.resume(throwing: BrainError.busy); return }
-            pending = continuation
-            partialText = ""
-            partialHandler = partial
-            // Per-turn state starts over: a turn without usage records none (not the last turn's), and an earlier
-            // turn's error isn't this one's.
-            responseStep = nil
-            lastUsage = (nil, nil)
-            lastErrorMessage = nil
-            turnHasScreenshot = shotThisTurn
-            viewedScreenshot = false
-            replySkippedScreenshot = false
-            lock.unlock()
-            // `dead` is set only once the exit is noticed: until then a write can hit a closed pipe (EPIPE). The
-            // throwing write reports that instead of raising an Objective-C exception.
-            do { try input.fileHandleForWriting.write(contentsOf: line) } catch { fail(BrainError.died) }
+        } onCancel: {
+            // A cancelled turn cannot be reused: late output must never become a later reply.
+            self.close()
         }
         let usage = lock.withLock { lastUsage }
         UsageStore.record(provider: sessionProvider, model: sessionModel, inputTokens: usage.input, outputTokens: usage.output)
@@ -383,11 +410,22 @@ final class AgySession: @unchecked Sendable {
 
     func close() {
         if let api { api.close(); return }
+        fail(CancellationError())
+        tearDown()
+    }
+
+    private func tearDown() {
         output.fileHandleForReading.readabilityHandler = nil
         errorPipe.fileHandleForReading.readabilityHandler = nil
-        if process.isRunning { process.terminate() }
+        if process.isRunning {
+            process.terminate()
+            // An uncooperative child must release a blocked writer too. Hold Process until reaped.
+            let child = process
+            DispatchQueue.global().asyncAfter(deadline: .now() + 1) {
+                if child.isRunning { kill(child.processIdentifier, SIGKILL) }
+            }
+        }
         if let sessionDir { try? FileManager.default.removeItem(at: sessionDir) }
-        fail(BrainError.died)
         process.terminationHandler = nil
     }
 
@@ -429,16 +467,11 @@ final class AgySession: @unchecked Sendable {
                     let secs = (step["duration_seconds"] as? NSNumber).map { String(format: " (%.1f s)", $0.doubleValue) } ?? ""
                     // Paths come back with symlinks resolved (/private/var/… for /var/…): compare them resolved.
                     let resolved = target.map { URL(fileURLWithPath: $0).resolvingSymlinksInPath().path }
-                    let folder = sessionDir?.resolvingSymlinksInPath().path
-                    if Self.screenshotTools.contains(name), let resolved, let folder, resolved.hasPrefix(folder) {
-                        let file = URL(fileURLWithPath: resolved).lastPathComponent
-                        // A view that ended in ERROR showed the model nothing.
-                        if state == "DONE" {
-                            viewedScreenshot = true
-                            note("viewed \(file)\(secs)")
-                        } else {
-                            note("couldn't view \(file)\(secs) (\(state ?? "no state"))")
-                        }
+                    let exactView = ScreenshotAcknowledgement.matches(tool: name, state: state, target: target,
+                        current: lastScreenshot, active: pending != nil && turnHasScreenshot)
+                    if exactView, let resolved {
+                        viewedScreenshot = true
+                        note("viewed \(URL(fileURLWithPath: resolved).lastPathComponent)\(secs)")
                     } else {
                         strayTools.append(name)
                         note("called its own tool \(name)\(target.map { " …\($0.suffix(60))" } ?? "")\(secs) — not allowed here, it'll be told")
@@ -488,7 +521,9 @@ final class AgySession: @unchecked Sendable {
                 }
                 // An empty `error` is no error message: fall back as if it were missing.
                 let err = (res["error"] as? String).flatMap { $0.isEmpty ? nil : $0 }
-                if status == "ERROR" || err != nil {
+                if replySkippedScreenshot {
+                    results.append(.failure(BrainError.observation("The model did not view the current screenshot; its response was discarded. Obtain a fresh observation before retrying.")))
+                } else if status == "ERROR" || err != nil {
                     let msg = err ?? (text.isEmpty ? "Agy process error" : text)
                     lastErrorMessage = msg
                     results.append(.failure(BrainError.failed(msg)))
@@ -514,7 +549,7 @@ final class AgySession: @unchecked Sendable {
         }
         var toResume: [(CheckedContinuation<String, Error>, Result<String, Error>)] = []
         for result in results {
-            if let p = pending { toResume.append((p, result)); pending = nil; partialHandler = nil }
+            if let p = pending { toResume.append((p, result)); pending = nil; pendingID = nil; partialHandler = nil }
         }
         let handler = results.isEmpty ? partialHandler : nil
         lock.unlock()
@@ -522,11 +557,24 @@ final class AgySession: @unchecked Sendable {
         for (continuation, result) in toResume { continuation.resume(with: result) }
     }
 
+    private func expire(_ token: UUID) {
+        lock.lock()
+        guard pendingID == token, let continuation = pending else { lock.unlock(); return }
+        pending = nil
+        pendingID = nil
+        partialHandler = nil
+        dead = true
+        lock.unlock()
+        continuation.resume(throwing: BrainError.timeout)
+        tearDown()
+    }
+
     private func fail(_ error: Error) {
         lock.lock()
         dead = true
         let p = pending
         pending = nil
+        pendingID = nil
         partialHandler = nil
         let errMsg = failureMessage()
         lock.unlock()

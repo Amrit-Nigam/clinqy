@@ -722,7 +722,7 @@ final class Agent: ObservableObject {
         guard !Task.isCancelled else { return }
         log("startup: observation + task memory \(Int(Date().timeIntervalSince(memoryStart) * 1000)) ms · \(historyContext.count) context chars")
 
-        let session: AgySession
+        var session: AgySession
         do { session = try Brain.session(model: modelOverride, provider: providerOverride) } catch { return finish(ok: false, error.localizedDescription) }
         self.session = session
         defer {
@@ -761,6 +761,7 @@ final class Agent: ObservableObject {
         }
         var wantsLook = false
         var completionBlocks = 0
+        var observationRecoveries = 0
         var failures = 0
         var lastSignature = ""
         var repeats = 0, sameRuns = 0
@@ -885,7 +886,7 @@ final class Agent: ObservableObject {
             lastScreen = full
             shown = obs
             lookedLastTurn = image != nil
-            if image != nil, assetInput == nil { lastVisualAt = Date() }
+            if image != nil, assetInput == nil { recordVisual(page: obs.page, window: obs.nativeWindow) }
             // Anything the user added mid-task comes first: it can change the plan.
             if !addedNotes.isEmpty {
                 message = "The user added while you were working (take it into account; it may change the plan):\n"
@@ -939,6 +940,33 @@ final class Agent: ObservableObject {
             let reply: String
             do { reply = try await withTaskCancellationHandler { try await replying.value } onCancel: { replying.cancel() } } catch {
                 if Task.isCancelled { return }
+                if let providerError = error as? AgySession.BrainError {
+                    let recoverable: Bool
+                    let restart: Bool
+                    switch providerError {
+                    case .observation: recoverable = true; restart = false
+                    case .timeout: recoverable = true; restart = true
+                    default: recoverable = false; restart = false
+                    }
+                    if recoverable, ObservationRecoveryPolicy.canRetry(attempts: observationRecoveries) {
+                        observationRecoveries += 1
+                        if restart {
+                            session.close()
+                            do { session = try Brain.session(model: modelOverride, provider: providerOverride) }
+                            catch { return finish(ok: false, error.localizedDescription) }
+                            self.session = session
+                        }
+                        wantsLook = true
+                        lastScreen = ""
+                        visualRunID = nil
+                        message = intro(request) + "\nObservation recovery: " + error.localizedDescription
+                            + "\nThe rejected reply's actions were not executed. Reinspect fresh state; never replay a prior mutation."
+                            + "\nRecent executed steps:\n" + steps.suffix(12).map(\.text).joined(separator: "\n")
+                            + (pendingVerification.map { "\nPending input must be verified before further mutation: " + $0.kind } ?? "")
+                            + (early.map { "\nA read-only early step already ran: " + $0.result.summary } ?? "")
+                        continue
+                    }
+                }
                 return finish(ok: false, error.localizedDescription)
             }
             if Task.isCancelled { return }
@@ -1151,7 +1179,7 @@ final class Agent: ObservableObject {
             }
             if isDone, failures == 0, let pendingVerification {
                 completionBlocks += 1
-                if completionBlocks >= 3 {
+                if VisualEvidencePolicy.exhaustedCompletionAttempts(completionBlocks) {
                     finish(ok: false, "The last action (" + pendingVerification.kind + ") remains unverified. Check its task window before retrying; it was not repeated.")
                     return
                 }
@@ -1167,7 +1195,12 @@ final class Agent: ObservableObject {
                 continue
             }
             if isDone, failures == 0, !runDry, completionEvidence.needsVerification {
-                message = "Before claiming the task is complete, independently verify its final result with a verify action: expected visible text, exact URL, a field value/id, or saved-file path (with contains for expected file contents). Check the user's actual objective after the last edit. Process exit zero, a delivered gesture, or your own done:true is not completion evidence. Do not repeat an input to obtain evidence."
+                completionBlocks += 1
+                if VisualEvidencePolicy.exhaustedCompletionAttempts(completionBlocks) {
+                    finish(ok: false, "The final result could not be independently verified after three completion attempts.")
+                    return
+                }
+                message = "Before claiming the task is complete, independently verify its final result with a verify action: expected visible text, exact URL, a field value/id, saved-file path (with contains for expected file contents), or scoped visual verification for ordinary UI outcomes. Check the user's actual objective after the last edit. Process exit zero, a delivered gesture, or your own done:true is not completion evidence. Do not repeat an input to obtain evidence."
                 continue
             }
             if isDone, failures == 0 {
@@ -1736,6 +1769,7 @@ final class Agent: ObservableObject {
             if body["image"] as? Bool != false, imageMatchesPage, let app = obs.app {
                 context.coordinateCapture = await Screenshot.capture(app: app, window: obs.nativeWindow, elements: obs.elements)
                 image = context.coordinateCapture?.base64
+                if image != nil { recordVisual(page: obs.page, window: obs.nativeWindow) }
             }
             guard !Task.isCancelled, isRunning else { return Self.controlError("Stopped") }
             let token = controlLease!.observe()
@@ -1811,6 +1845,20 @@ final class Agent: ObservableObject {
     private var pendingVerification: PendingVerification?
     /// When the model last received a screenshot of the task (visual evidence is only valid after the pending input).
     private var lastVisualAt = Date.distantPast
+    private var inspectionRequests = Set<String>()
+    private var visualRunID: String?
+    private var visualConnection: ObjectIdentifier?
+    private var visualTabID: Int?
+    private var visualDocumentID: String?
+    private var visualWindow: NativeWindowObservation?
+    private func recordVisual(page: BrowserBridge.Page?, window: NativeWindowObservation?) {
+        lastVisualAt = Date()
+        visualRunID = runID
+        visualConnection = page?.connection
+        visualTabID = page?.tabId
+        visualDocumentID = page?.documentID
+        visualWindow = window
+    }
     /// Inputs whose effect is ordinary UI state, so a fresh screenshot may resolve them. Submissions, scripts, saves and
     /// deletions (unknown delivery of something irreversible) need independent or user evidence.
     static let visualResolvable: Set<String> = ["click", "hover", "double_click", "right_click", "drag", "scroll"]
@@ -1923,8 +1971,9 @@ final class Agent: ObservableObject {
         let priorText: String?
         if !Self.observationActions.contains(kind), let page = priorPage,
            let read = try? await BrowserBridge.shared.perform("read", on: page) {
-            priorText = (read["title"] as? String ?? "") + "\n" + (read["text"] as? String ?? "") + "\n"
-                + context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
+            // Browser before/after evidence uses the same DOM channel. AX may describe a different
+            // active tab while this owned task tab is inactive and must never contaminate its baseline.
+            priorText = VerificationEvidence.browserText(read)
         } else if !Self.observationActions.contains(kind), priorPage == nil {
             // OCR is part of the baseline too: canvas text absent from AX must not become false "new" evidence.
             let axText = context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
@@ -1976,10 +2025,8 @@ final class Agent: ObservableObject {
                 fieldInput: ["type", "fill", "choose"].contains(kind) && (!submitting || !result.ok),
                 webTarget: priorWebTarget, webTargetUnique: priorWebUnique, nativeTarget: priorNativeTarget, beforeFieldValue: beforeFieldValue, documentID: priorPage?.documentID)
         }
-        // Screenshot-only resolution lifts the repeat barrier but is never the independent final check.
-        if action["visual"] == nil || kind != "verify" {
-            completionEvidence.record(kind: kind, outcome: result.outcome, op: action["op"] as? String ?? "")
-        }
+        // Successful scoped visual verification is evidence for ordinary UI outcomes only.
+        completionEvidence.record(kind: kind, outcome: result.outcome, op: action["op"] as? String ?? "")
         let provenance = pendingVerification.map {
             TaskStore.PendingProvenance(kind: $0.kind, startedAt: $0.startedAt, url: $0.url, tabID: $0.tabID, visualOK: $0.visualOK, delivery: result.outcome.delivery)
         }
@@ -4216,12 +4263,29 @@ final class Agent: ObservableObject {
     /// A model's claim of success is not evidence: execute its explicit postcondition against current state.
     private func verify(_ action: [String: Any], context: inout ActionContext) async -> ActionResult {
         let line = begin("Verify outcome")
-        if let claim = action["user_confirms"] as? String { return end(line, await resolveByUser(claim)) }
+        if let claim = action["user_confirms"] as? String {
+            let trimmed = claim.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed.utf8.count <= 400 else { return end(line, fail("user_confirms needs a short statement of what should now be true")) }
+            // Execute a fresh, scoped observation now. Explicit machine-checkable fields take precedence;
+            // otherwise only an exact occurrence of the claim is eligible, never a semantic guess.
+            let inspection = AutonomousInspectionPolicy.verificationAction(action, claim: trimmed)
+            let inspected = await verify(inspection, context: &context)
+            if inspected.outcome.isConfirmed { return end(line, inspected) }
+            guard !Task.isCancelled else { return end(line, fail("Stopped")) }
+            let key = runID + ":" + String((pendingVerification?.startedAt ?? started).timeIntervalSince1970) + ":" + claim
+            if inspectionRequests.insert(key).inserted {
+                return end(line, .init(outcome: .failed, summary: "Inspect the task target before asking the user. Take a fresh look, then verify visible text, URL, field value or saved artifact. If autonomous inspection cannot establish this claim, request user_confirms again: " + claim, effect: .look))
+            }
+            return end(line, await resolveByUser(claim))
+        }
         if let claim = action["visual"] as? String { return end(line, resolveByVisual(claim)) }
         if let pending = pendingVerification, let connection = pending.pageConnection, let tabID = pending.tabID,
            let page = await BrowserBridge.shared.snapshot(of: .init(id: tabID, url: pending.url ?? "", connection: connection)) {
             context.page = page
             if Background.active { Background.tab = .init(id: tabID, url: page.url, connection: connection) }
+        }
+        if let pending = pendingVerification, pending.pageConnection == nil, pending.nativeWindow == nil, action["path"] == nil {
+            return end(line, fail("this restored input has no trustworthy live target or observation baseline; verify a saved artifact or request explicit user review"))
         }
         let originalPage = context.page
         let originalNative = (action["id"] as? String).flatMap { AXEngine.lookup($0, in: context.elements) }
@@ -4287,17 +4351,24 @@ final class Agent: ObservableObject {
                 var actual: String?
                 if let page = context.page {
                     if let result = try? await BrowserBridge.shared.perform("read", on: page) {
-                        actual = (result["title"] as? String ?? "") + "\n" + (result["text"] as? String ?? "")
-                        // The host may inspect a pinned task tab while another tab is active. Native
-                        // toolbar/menu evidence must never come from that unrelated active page.
-                        let active = await BrowserBridge.shared.activeTab(in: context.app)
+                        actual = VerificationEvidence.browserText(result)
+                    }
+                    if pendingVerification == nil, actual.map({ VerificationEvidence.appears(text, in: $0) }) != true,
+                       let app = context.app, let window = context.nativeWindow, window.staleness() == nil {
+                        let active = await BrowserBridge.shared.activeTab(in: app)
                         if active?.id == page.tabId, active?.connection == page.connection {
-                            actual = (actual ?? "") + "\n" + context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
+                            let recognized = await Reader.ocr(app, window: window)
+                            let after = await BrowserBridge.shared.activeTab(in: app)
+                            let refreshed = await BrowserBridge.shared.snapshot(of: .init(id: page.tabId ?? -1, url: page.url, connection: page.connection))
+                            if after?.id == page.tabId, after?.connection == page.connection,
+                               page.documentID != nil, refreshed?.documentID == page.documentID, window.staleness() == nil {
+                                actual = recognized
+                            }
                         }
                     }
                 } else if let app = context.app, let window = context.nativeWindow, window.staleness() == nil {
                     actual = context.elements.map { $0.label + " " + ($0.value ?? "") }.joined(separator: "\n")
-                    if actual.map({ VerificationEvidence.appears(text, in: $0) }) != true {
+                    if pendingVerification == nil, actual.map({ VerificationEvidence.appears(text, in: $0) }) != true {
                         actual = await Reader.ocr(app, window: window)
                     }
                 }
@@ -4314,7 +4385,9 @@ final class Agent: ObservableObject {
             if urlUnchanged {
                 return end(line, fail("the URL is still \(action["url"] as? String ?? "") — the same as before the pending input, so it is not evidence that the input did anything. Verify page text, a field value, a saved file, or use visual / user_confirms."))
             }
-            return end(line, fail("the expected outcome is not confirmed. Read the current state; do not repeat an uncertain submission."))
+            let visualHint = pendingVerification?.visualOK == true
+                ? " For this ordinary UI input, take a fresh look at the task target and use verify visual with the specific outcome shown; do not repeat the input." : ""
+            return end(line, fail("the expected outcome is not confirmed. Read the current state; do not repeat an uncertain submission." + visualHint))
         }
         guard TaskStore.shared.confirmAction(taskRecordID, evidence: evidence) else {
             cancel(); return end(line, fail("couldn't persist the verification result"))
@@ -4354,7 +4427,7 @@ final class Agent: ObservableObject {
     }
 
     /// A screenshot taken after the pending input can resolve an ordinary UI input whose effect text cannot expose.
-    /// This is recorded as visual-only evidence and never counts as the final completion check.
+    /// Only ordinary UI inputs qualify; consequential operations still require independent evidence.
     private func resolveByVisual(_ claim: String) -> ActionResult {
         let trimmed = claim.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, trimmed.utf8.count <= 400 else { return fail("visual needs a short description of what the screenshot shows") }
@@ -4362,12 +4435,22 @@ final class Agent: ObservableObject {
         guard pending.visualOK else {
             return fail("\(pending.kind) can't be resolved from a screenshot alone (submissions, scripts, saves, deletions and unknown deliveries need text/url/value/path evidence or user_confirms)")
         }
+        let sameTarget: Bool
+        if let connection = pending.pageConnection {
+            sameTarget = visualConnection == connection && visualTabID == pending.tabID
+                && VisualEvidencePolicy.sameDocument(pending.documentID, visualDocumentID)
+        } else if let window = visualWindow {
+            sameTarget = pending.nativeWindow?.containsVerificationWindow(window) == true && window.staleness() == nil
+        } else { sameTarget = false }
+        guard VisualEvidencePolicy.accepts(run: runID, observedRun: visualRunID, sameTarget: sameTarget, observedAt: lastVisualAt, actionAt: pending.startedAt) else {
+            return fail("the screenshot is not tied to this run and the original task window/document; take a fresh look at that target")
+        }
         guard lastVisualAt > pending.startedAt else { return fail("no screenshot has been taken since \(pending.kind); send {\"do\":\"look\"} first and describe only what it shows") }
         guard TaskStore.shared.confirmAction(taskRecordID, evidence: "visual-only (screenshot after the input): " + trimmed) else {
             cancel(); return fail("couldn't persist the verification result")
         }
         pendingVerification = nil
-        return .init(outcome: .confirmed, summary: "Resolved by screenshot (visual-only, not independent evidence): " + trimmed + ". Verify the final result with text, url, value, path or user_confirms before finishing.")
+        return .init(outcome: .confirmed, summary: "CONFIRMED by scoped screenshot: " + trimmed + ". This confirms only the described ordinary UI outcome.")
     }
 
     private func fail(_ why: String) -> ActionResult { .init(ok: false, summary: "FAILED: \(why)") }
@@ -4516,6 +4599,7 @@ final class Agent: ObservableObject {
         hand.keepFrontApp = openedLast || Self.keepsFrontApp(request)
         hand.endRun()
         let wasBackground = Background.active
+        let testCleanup = isTest && Background.active && Background.usesExtension ? BrowserBridge.shared.cleanUpBackgroundTestTabs() : nil
         completedBrowserTab = Background.tab
         BrowserBridge.shared.endActivityRun()
         Background.end()
@@ -4555,7 +4639,11 @@ final class Agent: ObservableObject {
         // A background run tells the user when it's through (not at a pause it carries on from by itself).
         if wasBackground, !isolatedBrowserJob, !isTest, !continues { Notifier.finished(request: request, answer: text, ok: ok, result: runResult) }
         if !continues, let receipt = runReceiptID {
-            RunReceipt.write(id: receipt, ok: ok, answer: text, steps: steps.map(\.text))
+            let completedSteps = steps.map(\.text)
+            Task {
+                await testCleanup?.value
+                RunReceipt.write(id: receipt, ok: ok, answer: text, steps: completedSteps)
+            }
             runReceiptID = nil
         }
         if !continues { TaskStore.shared.finish(taskRecordID, ok: ok, answer: journalText(text)) }

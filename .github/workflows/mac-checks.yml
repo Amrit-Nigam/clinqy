@@ -31,6 +31,8 @@ jobs:
           bash tests/telegram.sh
           bash tests/notifier.sh
           bash tests/codex-session.sh
+          bash tests/http-provider.sh
+          python3 tests/benchmarks/test_scoring.py
           bash tests/scheduler.sh
           bash tests/router.sh
           bash tests/data-stores.sh
@@ -40,6 +42,7 @@ jobs:
         run: |
           node tests/extension-version.mjs
           node tests/extension-background.mjs
+          node tests/extension-activity.mjs
           node tests/extension-gestures.mjs
           node tests/extension-images.mjs
           node tests/extension-frames.mjs

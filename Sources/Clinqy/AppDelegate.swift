@@ -394,13 +394,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
             let test = items.first { $0.name == "test" }?.value == "1"
             let dry = items.first { $0.name == "dry" }?.value == "1"
+            let receipt = items.first { $0.name == "id" }?.value.flatMap { UUID(uuidString: $0) != nil ? $0 : nil }
             var runProvider: Provider? = nil
-            if items.first(where: { $0.name == "agy" })?.value == "1" {
+            if let requested = items.first(where: { $0.name == "provider" })?.value {
+                let aliases = ["agy": "agy-cli", "claude": "claude-cli", "codex": "codex-cli", "compatible": "openai-compatible"]
+                guard let provider = Provider(rawValue: aliases[requested] ?? requested) else {
+                    if let receipt { RunReceipt.write(id: receipt, ok: false, answer: "Unsupported per-run provider", steps: []) }
+                    continue
+                }
+                runProvider = provider
+            } else if items.first(where: { $0.name == "agy" })?.value == "1" {
                 runProvider = .agyCLI
             } else if items.first(where: { $0.name == "claude" })?.value == "1" {
                 runProvider = .claudeCLI
             }
-            let receipt = items.first { $0.name == "id" }?.value.flatMap { UUID(uuidString: $0) != nil ? $0 : nil }
             var modeProbe = task
             let explicitMode = Background.choice(&modeProbe)
             let canQueue = !dry && explicitMode != false && (explicitMode == true || Background.always || (!test && BrowserTaskRouting.isBrowserTask(task)))
@@ -544,6 +551,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var status: [String: Any] = [
             "permissions": perms,
             "extension": BrowserBridge.shared.isConnected,
+            "backgroundBrowser": Background.browserName,
+            "backgroundUsesExtension": Background.extensionPreferred,
+            "backgroundBrowserConnected": NSWorkspace.shared.runningApplications.contains {
+                $0.cleanName == Background.browserName && BrowserBridge.shared.isConnected($0)
+            },
             "extensionFolder": extensionInstaller?.extensionFolder.path
                 ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension").path,
             "provider": Provider.current.rawValue,

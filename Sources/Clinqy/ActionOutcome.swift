@@ -40,6 +40,11 @@ enum TargetResolution {
 
 /// A postcondition must demonstrate the pending operation, rather than merely describe existing UI.
 enum VerificationEvidence {
+    /// Only title and visible DOM readback belong to this channel, never AX/OCR from another surface.
+    static func browserText(_ read: [String: Any]) -> String {
+        (read["title"] as? String ?? "") + "\n" + (read["text"] as? String ?? "")
+    }
+
     static func changedValue(before: String?, after: String?, expected: String, sameTarget: Bool, fieldInput: Bool) -> Bool {
         guard fieldInput, sameTarget, let before, let after else { return false }
         return before != expected && after == expected
@@ -103,4 +108,35 @@ enum TaskCompletionPolicy {
 enum InputDelivery {
     static func pageScroll(error: Error?) -> ActionOutcome { error == nil ? .confirmed : .failed }
     static func returnPress(delivered: Bool) -> ActionOutcome { delivered ? .unverified : .uncertain }
+}
+
+/// Fail closed when visual evidence cannot be attributed to a live action target.
+enum VisualEvidencePolicy {
+    static func accepts(run: String, observedRun: String?, sameTarget: Bool,
+                        observedAt: Date, actionAt: Date) -> Bool {
+        observedRun == run && sameTarget && observedAt > actionAt
+    }
+    static func sameDocument(_ expected: String?, _ observed: String?) -> Bool {
+        expected != nil && expected == observed
+    }
+    static func exhaustedCompletionAttempts(_ attempts: Int) -> Bool { attempts >= 3 }
+}
+
+/// Recovery retries observe again; they never replay an action from a rejected response.
+enum ObservationRecoveryPolicy {
+    static func canRetry(attempts: Int) -> Bool { attempts < 2 }
+}
+
+/// User review is a fallback after the same deterministic verifier used by explicit verify actions.
+enum AutonomousInspectionPolicy {
+    static func verificationAction(_ action: [String: Any], claim: String) -> [String: Any] {
+        var inspection = action
+        inspection.removeValue(forKey: "user_confirms")
+        inspection.removeValue(forKey: "visual")
+        if !["text", "url", "value", "path"].contains(where: { inspection[$0] != nil }) {
+            inspection["text"] = claim
+        }
+        inspection["seconds"] = 0
+        return inspection
+    }
 }

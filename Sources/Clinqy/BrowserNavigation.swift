@@ -13,6 +13,15 @@ enum BrowserNavigation {
         return url.string ?? text
     }
 
+    /// DOM interactive is sufficient to inspect a page even while subframes/resources keep tab status loading.
+    static func isReady(info: [String: Any], requested: String, previous: String?) -> Bool {
+        let url = info["url"] as? String ?? ""
+        let ready = info["ready"] as? String ?? info["status"] as? String ?? "loading"
+        let arrived = key(url) == key(requested)
+            || (!url.isEmpty && url != previous && url != "about:blank" && (url.hasPrefix("http://") || url.hasPrefix("https://")))
+        return arrived && (ready == "complete" || ready == "interactive")
+    }
+
     static func normalizedAction(_ action: [String: Any]) -> [String: Any] {
         guard (action["do"] as? String)?.lowercased() == "open_url", let raw = action["url"] as? String else { return action }
         var normalized = action

@@ -443,6 +443,12 @@ enum SetupCommands {
             }
             let lacking = missing(s)
             if lacking.isEmpty { print("✓ Permissions: all on") } else { ok = false; print("✗ Permissions missing: \(lacking.joined(separator: ", ")) — run: Clinqy permissions") }
+            if s["backgroundUsesExtension"] as? Bool == true,
+               s["backgroundBrowserConnected"] as? Bool != true {
+                ok = false
+                let browser = s["backgroundBrowser"] as? String ?? "configured browser"
+                print("✗ Background browser: connect the Clinqy extension in \(browser). A connection in another browser does not satisfy this route.")
+            }
             if s["extension"] as? Bool == true { print("✓ Browser extension: connected") } else {
                 ok = false
                 print("✗ Browser extension: not connected — run: Clinqy extension install")

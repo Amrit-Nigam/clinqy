@@ -1,6 +1,6 @@
 // Page-local feedback. No browser/system pointer events, focus changes, or page input.
 (() => {
-  if (window !== window.top || window.__clinqyActivity?.version === 2) return;
+  if (window !== window.top || window.__clinqyActivity?.version === 5) return;
   window.__clinqyActivity?.stop();
   const prefix = '◉ Clinqy · ';
   let host, root, cursor, ring, label, titleObserver, expiry, settle;
@@ -19,22 +19,25 @@
     if (host?.isConnected) return;
     host = document.createElement('div');
     host.setAttribute('data-clinqy-overlay', '');
-    host.setAttribute('aria-hidden', 'true');
-    host.inert = true;
+
     host.style.cssText = 'all:initial!important;position:fixed!important;inset:0!important;z-index:2147483647!important;pointer-events:none!important;contain:layout style!important;';
     root = host.attachShadow({ mode: 'closed' });
     root.innerHTML = `<style>
       :host, * { box-sizing:border-box; pointer-events:none !important; }
-      .edge, .badge { display:none; }
+      .edge { position:fixed; inset:0; border:2px solid #6aa7edb3; border-radius:8px; box-shadow:inset 0 0 10px #438bff26; animation:breathe 2.6s ease-in-out infinite; }
+      @keyframes breathe { 50% { border-color:#8bb9f0cc; box-shadow:inset 0 0 14px #438bff38; } }
+      .badge { position:fixed; top:12px; right:14px; display:flex; align-items:center; gap:9px; padding:9px 13px; border:1px solid #7eb5ff; border-radius:24px; background:#102341f5; color:#f4f8ff; box-shadow:0 3px 16px #07162e45; font:600 12px/1.35 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; }
+      .cursor-name { position:absolute; top:23px; left:12px; padding:4px 8px; border-radius:5px 12px 12px 12px; background:#135fc8; color:white; box-shadow:0 2px 8px #07162e40; font:600 11px/1.3 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif; white-space:nowrap; }
       .dot { width:7px; height:7px; border-radius:50%; background:#82afff; box-shadow:0 0 0 4px #4a8cff25; }
-      .cursor { position:fixed; top:0; left:0; width:1px; height:1px; opacity:0; transform:translate(32px,64px); transform-origin:0 0; }
+      .cursor { position:fixed; top:0; left:0; width:1px; height:1px; opacity:1; transform:translate(32px,64px); transform-origin:0 0; }
       .cursor svg { position:absolute; left:-3px; top:-3px; overflow:visible; transform-origin:3px 3px; filter:drop-shadow(0 0 6px #3b82ffd9); }
       .cursor.typing svg { animation:typing 450ms ease-in-out infinite alternate; }
       @keyframes typing { from { translate:0 -1.5px; } to { translate:0 1.5px; } }
       .ring { position:fixed; top:0; left:0; width:36px; height:36px; margin:-18px; border:2px solid #3b82ff; background:#3b82ff20; border-radius:50%; opacity:0; }
-      @media (prefers-reduced-motion:reduce) { .cursor { transition:none; } }
-    </style><div class="edge"></div><div class="badge"><span class="label">Clinqy is working</span></div><div class="ring"></div><div class="cursor"><svg width="20" height="25" viewBox="-3 -3 20 25" aria-hidden="true"><path d="M0 0L0 19L5.2 14.2L13.6 14.2Z" fill="#3b82ff" stroke="#3b82ff" stroke-width="2" stroke-linejoin="round"/></svg></div>`;
+      @media (prefers-reduced-motion:reduce) { .edge, .cursor.typing svg { animation:none; } .cursor { transition:none; } }
+    </style><div class="edge" aria-hidden="true"></div><div class="badge" role="status" aria-live="polite" aria-atomic="true"><span class="dot" aria-hidden="true"></span><span class="label">Clinqy is working</span></div><div class="ring" aria-hidden="true"></div><div class="cursor" aria-hidden="true"><svg width="20" height="25" viewBox="-3 -3 20 25" aria-hidden="true"><path d="M0 0L0 19L5.2 14.2L13.6 14.2Z" fill="#3b82ff" stroke="#ffffff" stroke-width="2" stroke-linejoin="round"/></svg><span class="cursor-name">Clinqy</span></div>`;
     cursor = root.querySelector('.cursor'); ring = root.querySelector('.ring'); label = root.querySelector('.label');
+    cursor.style.transform = `translate(${Math.max(24, innerWidth - 185)}px,70px)`;
     document.documentElement.append(host);
     siteTitle = pageTitle();
     const markTitle = () => {
@@ -51,9 +54,11 @@
     mount();
     clearTimeout(expiry);
     // A crashed app/worker must not leave a permanent "working" marker behind.
-    expiry = setTimeout(stop, 45000);
+    // Allow a model turn and an explicit rate-limit wait; normal completion/socket loss clears immediately.
+    expiry = setTimeout(stop, 180000);
     const labels = { click:'Clinqy is clicking', type:'Clinqy is typing', scroll:'Clinqy is scrolling', working:'Clinqy is working' };
-    label.textContent = labels[state.kind] || labels.working;
+    const nextLabel = labels[state.kind] || labels.working;
+    if (label.textContent !== nextLabel) label.textContent = nextLabel;
     clearTimeout(settle);
     cursor.classList.toggle('typing', state.kind === 'type' && !reduced());
     if (state.kind && state.kind !== 'working') settle = setTimeout(() => {
@@ -86,5 +91,8 @@
       }
     }
   }
-  window.__clinqyActivity = { version:2, update, stop, pageTitle };
+  // Evidence captures exclude feedback so OCR/model checks cannot mistake our status for page content.
+  // Visibility is restored by the capture caller in finally; no DOM/title lifecycle changes are needed.
+  function setCaptureHidden(hidden) { if (host) host.style.setProperty('visibility', hidden ? 'hidden' : 'visible', 'important'); }
+  window.__clinqyActivity = { version:5, update, stop, pageTitle, setCaptureHidden };
 })();

@@ -1,7 +1,7 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  const HELPER_VERSION = 2;
+  const HELPER_VERSION = 3;
   if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
   window.__clinqy?.dispose?.();
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
@@ -341,6 +341,13 @@ function frameBoxes() {
       // needn't guess from URL/size. Absent API or a detached element leaves it null and the bridge falls back.
       let frameId = null;
       try { if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getFrameId) { const id = chrome.runtime.getFrameId(f); if (Number.isInteger(id) && id >= 0) frameId = id; } } catch {}
+      // Same-origin inline documents have no unique URL. Read their isolated-world helper identity,
+      // never a page-controlled DOM attribute; cross-origin/sandboxed access fails closed.
+      let inlineDocumentID = null;
+      try {
+        if (/^about:(blank|srcdoc)(?:[#?]|$)/.test(f.contentWindow.location.href))
+          inlineDocumentID = f.contentWindow.__clinqy?.documentID || null;
+      } catch {}
       // CSS transforms: a scaled frame draws its content at rect.width / offsetWidth; a rotated or skewed one has
       // no translation-only placement, which the bridge refuses to guess at.
       const ow = f.offsetWidth || 0, oh = f.offsetHeight || 0;
@@ -355,7 +362,7 @@ function frameBoxes() {
         if (Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6) rotated = true;
       }
       const scaleX = Math.abs(sx - 1) < 0.005 ? 1 : sx, scaleY = Math.abs(sy - 1) < 0.005 ? 1 : sy;
-      return { nodeToken: frameNodes.get(f), frameId, src: f.src || "", x: r.left + (f.clientLeft + (parseFloat(cs.paddingLeft) || 0)) * scaleX,
+      return { nodeToken: frameNodes.get(f), frameId, inlineDocumentID, src: f.src || "", x: r.left + (f.clientLeft + (parseFloat(cs.paddingLeft) || 0)) * scaleX,
                y: r.top + (f.clientTop + (parseFloat(cs.paddingTop) || 0)) * scaleY,
                w: f.clientWidth, h: f.clientHeight, sx: scaleX, sy: scaleY, rotated, hidden: cs.visibility === "hidden" || cs.display === "none" };
     }).filter((f) => !f.hidden && f.w >= 80 && f.h >= 40 && f.x < vw && f.y < vh && f.x + f.w * f.sx > 0 && f.y + f.h * f.sy > 0);

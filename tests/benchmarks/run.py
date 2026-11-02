@@ -6,6 +6,8 @@ import math
 import os
 from pathlib import Path
 import secrets
+import signal
+import uuid
 import statistics
 import subprocess
 import threading
@@ -15,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 CASES = [
     ('name', 'Fill Name with Amrit and do not submit.', {'name': 'Amrit'}),
     ('multiline', 'Fill Message with two lines, first Hello and then World. Do not submit.', {'message': 'Hello\nWorld'}),
+    ('keyboard', 'Fill Name with Old, focus Name, use Cmd+A then type Fresh to replace it using the keyboard. Leave Message empty.', {'name': 'Fresh', 'message': ''}),
     ('checkbox', 'Tick Design panel.', {'checked': True}),
     ('dropdown', 'Set City to Pune.', {'city': 'Pune'}),
     ('hover', 'Hover over Show hint to reveal its hint, without clicking it.', {'hint': True}),
@@ -55,10 +58,73 @@ def summary(rows):
             'p95_seconds': durations[max(0, math.ceil(count * .95) - 1)] if count else None}
 
 
+PROVIDERS = ['agy', 'claude', 'codex', 'anthropic', 'openai', 'gemini', 'openrouter', 'ollama', 'compatible']
+
+
+def task_text(browser, url, task, attachment, foreground=False):
+    return ('' if foreground else 'in the background: ') + f'In {browser}, open {url}. ' + task.format(attachment=attachment)
+
+
+def save_results(path, payload):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + '.tmp')
+    temporary.write_text(json.dumps(payload, indent=2) + '\n')
+    temporary.replace(path)
+
+
+class OwnedRun:
+    """Own a receipt, not the foreground controller; every cleanup is scoped to this UUID."""
+    def __init__(self, cli, directory=None, runner=subprocess.run):
+        self.cli, self.runner = cli, runner
+        self.receipt = str(uuid.uuid4())
+        self.path = (directory or Path.home() / 'Library/Application Support/Clinqy/cli') / (self.receipt + '.run.json')
+        self.result = None
+        self.dispatched = False
+
+    def read(self):
+        try:
+            result = json.loads(self.path.read_text())
+            if not isinstance(result, dict) or type(result.get('ok')) is not bool:
+                return None
+            self.result = result
+            return result
+        except (FileNotFoundError, json.JSONDecodeError):
+            return None
+
+    def dispatch(self, request, provider=None):
+        command = [self.cli, 'run', '--test', '--receipt', self.receipt, '--no-wait']
+        if provider: command += ['--provider', provider]
+        # Mark first: launch failure may happen after the app received the URL.
+        self.dispatched = True
+        result = self.runner(command + [request], capture_output=True, text=True, timeout=15)
+        if result.returncode:
+            raise RuntimeError((result.stdout + result.stderr)[-4000:])
+
+    def wait(self, timeout, stop):
+        deadline = time.monotonic() + timeout
+        while not stop.is_set() and time.monotonic() < deadline:
+            if self.read() is not None: return self.result
+            stop.wait(min(.1, max(0, deadline - time.monotonic())))
+        return None
+
+    def cancel(self, timeout=15):
+        if self.read() is not None or not self.dispatched: return True
+        deadline = time.monotonic() + timeout
+        while True:
+            try:
+                self.runner([self.cli, 'cancel', '--receipt', self.receipt], capture_output=True, text=True, timeout=5)
+            except (OSError, subprocess.TimeoutExpired): pass
+            # A cancellation URL being accepted is not proof of task termination.
+            if self.wait(min(2, max(0, deadline - time.monotonic())), threading.Event()) is not None: return True
+            if time.monotonic() >= deadline: return False
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--clinqy', default=str(Path(__file__).resolve().parents[2] / 'bin/clinqy'))
     parser.add_argument('--case', action='append', choices=[c[0] for c in CASES])
+    parser.add_argument('--browser', default='Google Chrome', choices=['Google Chrome', 'Arc', 'Brave Browser', 'Microsoft Edge'], help='Explicit task browser; never inherit the foreground app')
+    parser.add_argument('--provider', choices=PROVIDERS, help='Per-run provider; leaves global settings unchanged')
     parser.add_argument('--label', default='default', help='Configuration label (do not include secrets)')
     parser.add_argument('--timeout', type=float, default=180)
     parser.add_argument('--out', type=Path, default=Path('benchmark-results.json'))
@@ -67,16 +133,22 @@ def main():
     args = parser.parse_args()
     selected = [case for case in CASES if not args.case or case[0] in args.case]
     if args.dry_run:
-        print(json.dumps([{'name': name, 'task': task, 'expected': expected} for name, task, expected in selected], indent=2)); return 0
+        print(json.dumps([{'name': name, 'task': task_text(args.browser, '<fixture-url>', task, '<attachment>', args.foreground), 'provider': args.provider, 'expected': expected} for name, task, expected in selected], indent=2)); return 0
     if args.timeout <= 0 or not math.isfinite(args.timeout): parser.error('timeout must be positive and finite')
     states, lock = {}, threading.Lock()
+    visual_codes = {}
     fixture = Path(__file__).with_name('site.html').read_bytes()
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *_): pass
         def do_GET(self):
             if not self.path.startswith('/case?'): self.send_error(404); return
-            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(fixture)
+            from urllib.parse import urlparse, parse_qs
+            token = parse_qs(urlparse(self.path).query).get('token', [''])[0]
+            with lock: code = visual_codes.get(token)
+            if code is None: self.send_error(404); return
+            page = fixture.replace(b'MANGO-482', code.encode('ascii'))
+            self.send_response(200); self.send_header('Content-Type', 'text/html; charset=utf-8'); self.end_headers(); self.wfile.write(page)
         def do_POST(self):
             token = self.path.removeprefix('/record/')
             with lock: allowed = token in states
@@ -97,35 +169,58 @@ def main():
     attachment = Path(os.environ.get('TMPDIR', '/tmp')) / ('clinqy-benchmark-' + secrets.token_hex(8) + '.txt')
     attachment.write_text('Clinqy benchmark attachment')
     rows = []
+    stop = threading.Event()
+    old_signals = {sig: signal.signal(sig, lambda *_: stop.set()) for sig in (signal.SIGINT, signal.SIGTERM)}
+    def persist():
+        save_results(args.out, {'label': args.label, 'browser': args.browser, 'provider': args.provider,
+            'mode': 'foreground' if args.foreground else 'background',
+            'scoring': 'fixture outcome independent of agent verdict', 'summary': summary(rows), 'results': rows})
     try:
         for name, task, expected in selected:
+            if stop.is_set(): break
             token = secrets.token_hex(16)
-            with lock: states[token] = None
+            with lock:
+                states[token] = None
+                visual_codes[token] = 'TEST-' + secrets.token_hex(3).upper()
+            if name == 'vision': expected = {'visual': visual_codes[token]}
             url = f'http://127.0.0.1:{server.server_port}/case?token={token}'
-            request = ('' if args.foreground else 'in the background: ') + f'Open {url}. ' + task.format(attachment=attachment)
-            begun = time.monotonic(); timed_out = False
+            request = task_text(args.browser, url, task, attachment, args.foreground)
+            owned = OwnedRun(args.clinqy)
+            begun = time.monotonic(); timed_out = False; reported = False; output = ''; cancelled = None
+            row = {'name': name, 'receipt': owned.receipt, 'status': 'running', 'seconds': 0,
+                   **score(expected, None, False)}
+            rows.append(row)
+            persist()  # Preserve ownership even if launch is interrupted.
             try:
-                result = subprocess.run([args.clinqy, 'run', '--test', request], capture_output=True, text=True, timeout=args.timeout)
-                reported = result.returncode == 0
-                output = result.stdout + result.stderr
-            except subprocess.TimeoutExpired:
-                timed_out = True; reported = False; output = 'Timed out; app task may still be running. Stop it before another run.'
+                if stop.is_set(): break
+                owned.dispatch(request, args.provider)
+                result = owned.wait(args.timeout, stop)
+                timed_out = result is None and not stop.is_set()
+                if result is not None:
+                    reported = result['ok']
+                    output = '\n'.join(result.get('steps', [])) + '\n' + result.get('answer', '')
+            except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+                output = str(error)
+            finally:
+                cancelled = owned.cancel()
+                row['cancellation_confirmed'] = cancelled
+                if not cancelled: output += '\nCancellation unconfirmed; inspect owned receipt ' + owned.receipt
             # Allow already-dispatched fixture reports to reach the independent recorder.
             time.sleep(.2)
             with lock: state = states[token]
-            row = {'name': name, 'reported_success': reported, 'seconds': round(time.monotonic() - begun, 3),
+            row.update({'reported_success': reported, 'seconds': round(time.monotonic() - begun, 3),
+                   'status': 'interrupted' if stop.is_set() else 'timeout' if timed_out else 'finished',
                    'timed_out': timed_out, **score(expected, state, reported),
                    'fixture_state_received': state is not None, 'agent_output': output[-8000:],
-                   'interventions': None, 'recovery_attempts': None, 'model_cost': None, 'foreground_interruptions': None}
-            rows.append(row)
-            print(('PASS' if row['verified_completion'] else 'FAIL') + ' ' + name, flush=True)
-            payload = {'label': args.label, 'mode': 'foreground' if args.foreground else 'background',
-                       'scoring': 'fixture outcome independent of agent verdict', 'summary': summary(rows), 'results': rows}
-            args.out.write_text(json.dumps(payload, indent=2) + '\n')
-            if timed_out: break  # Never launch another task into an unresolved previous run.
+                   'interventions': None, 'recovery_attempts': None, 'model_cost': None, 'foreground_interruptions': None})
+            print(('INTERRUPTED' if row['status'] == 'interrupted' else 'PASS' if row['verified_completion'] else 'FAIL') + ' ' + name, flush=True)
+            persist()
+            if timed_out or stop.is_set() or not cancelled: break
     finally:
+        persist()
+        for sig, handler in old_signals.items(): signal.signal(sig, handler)
         server.shutdown(); server.server_close(); attachment.unlink(missing_ok=True)
     print(json.dumps(summary(rows), indent=2))
-    return 0 if len(rows) == len(selected) and all(r['verified_completion'] and r['reported_success'] for r in rows) else 1
+    return 0 if len(rows) == len(selected) and all(r['verified_completion'] and r.get('reported_success') and r.get('cancellation_confirmed') for r in rows) else 1
 
 if __name__ == '__main__': raise SystemExit(main())

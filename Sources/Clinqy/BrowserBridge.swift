@@ -382,6 +382,19 @@ final class BrowserBridge: ObservableObject {
         taskTabs = []
     }
 
+    /// Capture this test's exact connection and tab IDs before Background.end clears run state.
+    /// A bounded request completes before its receipt, so the harness can safely start the next case.
+    func cleanUpBackgroundTestTabs() -> Task<Void, Never>? {
+        guard let key = taskConnection, let conn = connections[key], !taskTabs.isEmpty else { return nil }
+        let ids = Array(taskTabs)
+        return Task {
+            do {
+                let result = try await request(conn, ["cmd": "clinqyDone", "tabIds": ids, "closeInactive": true], timeout: 5)
+                Agent.writeLog("test tab cleanup: closed \(result["closed"] ?? []), preserved \(result["kept"] ?? [])")
+            } catch { Agent.writeLog("test tab cleanup incomplete: " + error.localizedDescription) }
+        }
+    }
+
     func endBackgroundRun() {
         // Explicit ids prevent late cleanup from detaching the next run's debugger.
         guard let key = taskConnection, let conn = connections[key] else { return }
@@ -551,11 +564,10 @@ final class BrowserBridge: ObservableObject {
         let deadline = start + timeout
         repeat {
             guard !Task.isCancelled else { return false }
-            guard let info = await tabCommand("tabInfo", on: tab) else { return false }
-            let url = info["url"] as? String ?? ""
-            let ready = info["ready"] as? String ?? info["status"] as? String ?? "loading"
-            let changed = url == requested || (url != previous && url != "about:blank" && url.hasPrefix("http"))
-            if changed, ready == "complete" || ready == "interactive",
+            // Navigation can tear down the document while tabInfo is executing. Retry observation only,
+            // never the navigate command; a transient missing response does not prove navigation failed.
+            if let info = await tabCommand("tabInfo", on: tab),
+               BrowserNavigation.isReady(info: info, requested: requested, previous: previous),
                ProcessInfo.processInfo.systemUptime - start >= 0.08 { return true }
             do { try await Task.sleep(for: .milliseconds(80)) } catch { return false }
         } while ProcessInfo.processInfo.systemUptime < deadline

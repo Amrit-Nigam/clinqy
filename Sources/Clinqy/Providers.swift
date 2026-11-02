@@ -218,6 +218,8 @@ final class APIChat: @unchecked Sendable {
     private var closed = false
     /// Set after the provider rejected the reasoning setting for this model, so later turns leave it out.
     private var plain = false
+    private var outputTokenLimit = 8_192
+    private var compactControlSystem = false
 
     init(provider: Provider, system: String, model: String, effort: String? = nil) throws {
         let key = provider.key
@@ -231,6 +233,7 @@ final class APIChat: @unchecked Sendable {
         self.provider = provider
         self.key = key
         self.system = system
+        if system.hasPrefix(AgentPrompt.system) { outputTokenLimit = HTTPRequestBudget.controlOutputTokens }
         self.model = provider.model(model)
         let asked = effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT")
         requestedEffort = asked.map { $0.lowercased() }.flatMap { $0.isEmpty ? nil : $0 }
@@ -287,6 +290,7 @@ final class APIChat: @unchecked Sendable {
     }
 
     func send(_ text: String, image: String?, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
+        let started = ProcessInfo.processInfo.systemUptime
         let task = try lock.withLock { () throws -> Task<String, Error> in
             if closed { throw ClaudeSession.BrainError.died }
             if inFlight != nil { throw ClaudeSession.BrainError.busy }
@@ -303,7 +307,12 @@ final class APIChat: @unchecked Sendable {
         } catch {
             // Drop the unanswered turn so the conversation still alternates.
             lock.withLock { if turns.last?.user == true { turns.removeLast() }; inFlight = nil }
-            if error is CancellationError || (error as? URLError)?.code == .cancelled { throw ClaudeSession.BrainError.died }
+            if Task.isCancelled || error is CancellationError { throw CancellationError() }
+            if (error as? URLError)?.code == .timedOut || (error as? CodexAppServer.Failure)?.timedOut == true
+                || ((error as? URLError)?.code == .cancelled && ProcessInfo.processInfo.systemUptime - started >= 120) {
+                throw ClaudeSession.BrainError.timeout
+            }
+            if (error as? URLError)?.code == .cancelled { throw ClaudeSession.BrainError.died }
             throw error
         }
     }
@@ -337,6 +346,8 @@ final class APIChat: @unchecked Sendable {
             }
             return try await runCLI(history)
         }
+        let usingCompactSystem = lock.withLock { compactControlSystem }
+        let requestSystem = usingCompactSystem ? AgentPrompt.compactControl : system
         var req: URLRequest
         var body: [String: Any]
         switch provider {
@@ -360,7 +371,7 @@ final class APIChat: @unchecked Sendable {
             }
             body = [
                 "model": model, "max_tokens": 8192, "messages": messages,
-                "system": [["type": "text", "text": system, "cache_control": ["type": "ephemeral"]]],
+                "system": [["type": "text", "text": requestSystem, "cache_control": ["type": "ephemeral"]]],
             ]
         case .gemini:
             req = URLRequest(url: URL(string: "\(provider.baseURL)/models/\(model):generateContent")!)
@@ -373,12 +384,12 @@ final class APIChat: @unchecked Sendable {
             }
             var generation: [String: Any] = ["maxOutputTokens": 8192]
             if !plain { generation["thinkingConfig"] = ["thinkingLevel": ModelRoute.geminiLevel(effort)] }
-            body = ["systemInstruction": ["parts": [["text": system]]], "contents": contents, "generationConfig": generation]
+            body = ["systemInstruction": ["parts": [["text": requestSystem]]], "contents": contents, "generationConfig": generation]
         case .openai, .openrouter, .ollama, .compatible:
             req = URLRequest(url: URL(string: provider.baseURL + "/chat/completions")!)
             if let key { req.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization") }
             if provider == .openrouter { req.setValue("Clinqy", forHTTPHeaderField: "X-Title") }
-            var messages: [[String: Any]] = [["role": "system", "content": system]]
+            var messages: [[String: Any]] = [["role": "system", "content": requestSystem]]
             for t in history {
                 if let image = t.image {
                     messages.append(["role": "user", "content": [
@@ -390,6 +401,7 @@ final class APIChat: @unchecked Sendable {
                 }
             }
             body = ["model": model, "messages": messages]
+            if provider == .openai { body["max_completion_tokens"] = lock.withLock { outputTokenLimit } }
             if !plain, provider == .openai, let level = ModelRoute.openAIEffort(model: model, effort: effort) {
                 body["reasoning_effort"] = level
             }
@@ -407,14 +419,62 @@ final class APIChat: @unchecked Sendable {
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
         var received = try await URLSession.shared.bytes(for: req)
-        for attempt in 0..<2 {
-            guard let http = received.1 as? HTTPURLResponse, [429, 503].contains(http.statusCode) else { break }
-            received.0.task.cancel()
-            let requested = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
-            let delay = min(8, max(0.2, requested ?? (pow(2, Double(attempt)) + Double.random(in: 0...0.25))))
-            guard ProcessInfo.processInfo.systemUptime + delay < deadline else { throw ClaudeSession.BrainError.failed("Model request deadline exceeded") }
-            try await Task.sleep(for: .seconds(delay))
+        var transientRetries = 0, reducedOutput = false
+        while let http = received.1 as? HTTPURLResponse, [429, 503].contains(http.statusCode) {
+            // Inspect explicit request-too-large errors before deciding to repeat a rejected request.
+            let errorBytes = received.0
+            let expiry = DispatchWorkItem { errorBytes.task.cancel() }
+            DispatchQueue.global().asyncAfter(deadline: .now() + max(0, deadline - ProcessInfo.processInfo.systemUptime), execute: expiry)
+            var data = Data()
+            do {
+                defer { expiry.cancel(); errorBytes.task.cancel() }
+                for try await byte in errorBytes {
+                    guard data.count < 64_000 else { throw ClaudeSession.BrainError.failed("Oversized model error response") }
+                    data.append(byte)
+                }
+            }
+            let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
+            let message = (json?["error"] as? [String: Any])?["message"] as? String
+                ?? (json?["error"] as? String) ?? String(decoding: data.prefix(300), as: UTF8.self)
+            if provider == .openai, HTTPRequestBudget.isOversizedTPM(status: http.statusCode, message: message) {
+                let current = body["max_completion_tokens"] as? Int ?? HTTPRequestBudget.controlOutputTokens
+                guard let smaller = HTTPRequestBudget.reducedOutput(status: http.statusCode, message: message,
+                    current: current, alreadyReduced: reducedOutput) else {
+                    if !usingCompactSystem, history.count == 1, history[0].user, system == AgentPrompt.system {
+                        // Only the known control catalog can be replaced. Keep the user's entire task
+                        // and image; no completed action/history exists on this first rejected turn.
+                        lock.withLock { compactControlSystem = true }
+                        return try await request(history, deadline: deadline, plain: plain, partial: partial)
+                    }
+                    throw ClaudeSession.BrainError.failed("HTTP 429 from openai: " + message
+                        + " Clinqy cannot fit this request by reducing output alone; task instructions and observation were preserved.")
+                }
+                reducedOutput = true
+                body["max_completion_tokens"] = smaller
+                lock.withLock { outputTokenLimit = min(outputTokenLimit, smaller) }
+                req.httpBody = try JSONSerialization.data(withJSONObject: body)
+            } else {
+                guard transientRetries < 2 else {
+                    throw ClaudeSession.BrainError.failed("HTTP \(http.statusCode) from \(provider.rawValue): \(message)")
+                }
+                let delay: Double
+                if http.statusCode == 429 {
+                    guard let retry = HTTPRequestBudget.rateLimitDelay(status: http.statusCode, message: message,
+                        retryAfter: http.value(forHTTPHeaderField: "Retry-After"), attempt: transientRetries) else {
+                        throw ClaudeSession.BrainError.failed("HTTP 429 from \(provider.rawValue): \(message)")
+                    }
+                    delay = retry
+                } else {
+                    // Preserve the existing bounded unavailable-server retry, distinct from token throttling.
+                    let requested = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+                    delay = min(8, max(0.2, requested ?? pow(2, Double(transientRetries))))
+                }
+                guard ProcessInfo.processInfo.systemUptime + delay < deadline else { throw ClaudeSession.BrainError.timeout }
+                transientRetries += 1
+                try await Task.sleep(for: .seconds(delay))
+            }
             try Task.checkCancellation()
+            guard ProcessInfo.processInfo.systemUptime < deadline else { throw ClaudeSession.BrainError.timeout }
             req.timeoutInterval = max(0.1, deadline - ProcessInfo.processInfo.systemUptime)
             received = try await URLSession.shared.bytes(for: req)
         }

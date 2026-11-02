@@ -6,7 +6,8 @@
 #       .clinqy/ next to the test); later runs replay it with no model, healing only broken steps.
 #       Test files: optional "# Title", then one step per line; lines starting with Expect/Check/Verify
 #       are assertions. Exit code 0 = all passed, 1 = something failed.
-#   clinqy run [--dry|--test] [--agy|--claude] "<task>"
+#   clinqy run [--dry|--test] [--provider name] [--receipt UUID --no-wait] "<task>"
+#   clinqy cancel --receipt UUID     Cancel only the task with that receipt (never global).
 #                                    Do a task like one asked in the app (history, and it carries on by itself when it
 #                                    runs out of steps). --dry: point at each click/keystroke, don't do it. --test: a
 #                                    throwaway run (not saved, no carrying on), as for checking a page. --agy / --claude:
@@ -118,21 +119,42 @@ PY
     done
     exit $failed ;;
   run)
-    ensure_app
-    flags=""
+    flags="" id="" no_wait=0
     while [[ ${1:-} == --* ]]; do
       case $1 in
         --dry) flags+="&dry=1" ;;
         --test) flags+="&test=1" ;;
         --agy|--agy-cli) flags+="&agy=1" ;;
         --claude|--claude-cli) flags+="&claude=1" ;;
+        --provider)
+          shift
+          case ${1:-} in
+            agy|claude|codex|agy-cli|claude-cli|codex-cli|anthropic|openai|gemini|openrouter|ollama|compatible|openai-compatible) flags+="&provider=$(enc "$1")" ;;
+            *) echo "Unsupported per-run provider" >&2; exit 2 ;;
+          esac ;;
+        --receipt) shift; id=${1:-} ;;
+        --no-wait) no_wait=1 ;;
+        *) echo "Unknown run option: $1" >&2; exit 2 ;;
       esac
       shift
     done
-    id=$(uuidgen)
-    open -g "clinqy://run?task=$(enc "$*")$flags&id=$id&token=$TOKEN"
-    wait_receipt "$id"
+    [[ -n "$*" ]] || { echo "Task is required" >&2; exit 2; }
+    if [[ -n $id ]]; then
+      python3 -c 'import sys,uuid;uuid.UUID(sys.argv[1])' "$id" 2>/dev/null || { echo "Receipt must be a UUID" >&2; exit 2; }
+    elif (( no_wait )); then
+      echo "--no-wait requires --receipt UUID so the caller can monitor and cancel its own task" >&2; exit 2
+    else
+      id=$(uuidgen)
+    fi
+    ensure_app
+    open -g "clinqy://run?task=$(enc "$*")$flags&id=$id&token=$TOKEN" || exit 1
+    if (( no_wait )); then print -r -- "$id"; else wait_receipt "$id"; fi
     ;;
+  cancel)
+    [[ ${1:-} == --receipt && -n ${2:-} && $# == 2 ]] || { echo "usage: clinqy cancel --receipt UUID" >&2; exit 2; }
+    id=$2
+    python3 -c 'import sys,uuid;uuid.UUID(sys.argv[1])' "$id" 2>/dev/null || { echo "Receipt must be a UUID" >&2; exit 2; }
+    open -g "clinqy://cancel?receipt=$id&token=$TOKEN" ;;
   workflow)
     ensure_app
     name=${1:-}; shift 2>/dev/null

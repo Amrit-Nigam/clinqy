@@ -45,7 +45,10 @@ import Foundation
         for mode in ["unsafe", "unsafe-ack", "new-server", "drop", "tool", "tool-item", "failed", "wait"] {
             let failing = session(mode, timeout: 0.05)
             do { _ = try await failing.send("Do not replay", image: nil); preconditionFailure("accepted " + mode) }
-            catch { check(true, "fails closed: " + mode) }
+            catch {
+                if mode == "wait" { check((error as? CodexAppServer.Failure)?.timedOut == true, "timeout is typed for observation recovery") }
+                check(true, "fails closed: " + mode)
+            }
             do { _ = try await failing.send("Retry", image: nil); preconditionFailure("restarted closed " + mode) }
             catch { check(true, "never restarts uncertain session: " + mode) }
             let history = try records(mode)
