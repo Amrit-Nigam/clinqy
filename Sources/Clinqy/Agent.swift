@@ -169,6 +169,12 @@ final class Agent: ObservableObject {
     private var snapFolder: URL?
     /// Runs this task continued on its own after running out of steps or stalling (see `finish`).
     private var autoContinues = 0
+    /// Model replies the watchdog gave up on in this task. The first gets one auto-continue on a fresh session; a
+    /// second means the model itself is too slow (or hung), so the run stops and says which model, rather than
+    /// spending up to 12 more 3-minute waits on it. Survives auto-continues; only a new request resets it.
+    private var modelStalls = 0
+    /// The stronger model's session for this run (see `think`), kept so a second question skips agy's 7-10 s start.
+    private var thinkSession: AgySession?
     /// The browser tab this task opened (the only tab it may navigate in place).
     private var ownedTab: Int?
     /// The user already said yes to a confirmation in this run.
@@ -492,7 +498,7 @@ final class Agent: ObservableObject {
             return
         }
         guard !isRunning else { return }
-        if !auto { autoContinues = 0 }
+        if !auto { autoContinues = 0; modelStalls = 0 }
         if unattended {
             targetApp = nil; selectedText = nil; selectedFiles = []; annotation = nil; copied = nil; continuation = nil
         }
@@ -719,7 +725,11 @@ final class Agent: ObservableObject {
         let session: AgySession
         do { session = try Brain.session(model: modelOverride, provider: providerOverride) } catch { return finish(ok: false, error.localizedDescription) }
         self.session = session
-        defer { session.close() }
+        defer {
+            session.close()
+            thinkSession?.close()
+            thinkSession = nil
+        }
 
         let sourceCache = SourceCache()
         defer { Task { await sourceCache.cancelAll() } }
@@ -741,7 +751,7 @@ final class Agent: ObservableObject {
         message += workersEnabled
             ? "\nParallel delegation available: up to \(pool.concurrency) independent worker sessions, model \(workerModel). Split substantial independent research/analysis/drafting/review work with delegate, then continue your own work. Use collect(wait:true) when only worker results remain. Small tasks should stay direct."
             : "\nParallel delegation is disabled; carry out this task directly."
-        let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.model, provider: session.sessionProvider)
+        let fast = FastLane(intro: message, leadModel: modelOverride ?? Brain.defaultModel(for: session.sessionProvider), provider: session.sessionProvider)
         if let helper = fast.helperRoute { log("  \(helper)") }
         defer { fast.close() }
         message += fast.leadNote
@@ -869,6 +879,9 @@ final class Agent: ObservableObject {
                 screen = fresh ? full : Self.screenText(obs, since: shown) ?? full
                 if screen == full { lastFullTurn = turn } else { log("  screen: changes only (\(screen.count) of \(full.count) chars)") }
             }
+            // An empty element list says "ask to look", but this turn already carries the screenshot: point at it
+            // instead, or the model may spend a turn asking for the look it has (7-10 s on agy) or stall on the two.
+            if image != nil { screen = screen.replacingOccurrences(of: "(none readable — ask to look)", with: "(none readable: use the screenshot)") }
             lastScreen = full
             shown = obs
             lookedLastTurn = image != nil
@@ -977,7 +990,7 @@ final class Agent: ObservableObject {
                     + "and they aren't getting anywhere, so they were NOT run again. That approach failed: don't send it again. "
                     + "Use a different method, in this order: the keyboard (tab/shift+tab to reach the control, space or return to press it, "
                     + "arrows in lists, esc to close a popup), then the other id for it (its e-id from Accessibility instead of the w-id, or "
-                    + "the reverse), then click by x/y on the screenshot attached now. If the goal can't be reached, finish with done:true and say what's blocking."
+                    + "the reverse), then click by x/y on this turn's screenshot. If the goal can't be reached, finish with done:true and say what's blocking."
                     + (early.map { " (Only its first step had already started: \(FastLane.brief($0.action)) → \($0.result.summary))" } ?? "")
                 continue
             }
@@ -4375,7 +4388,8 @@ final class Agent: ObservableObject {
 
     /// Hands a hard problem (an algorithm, maths, tricky logic) to a stronger model with more reasoning effort, in a
     /// fresh one-off session: THINK_MODEL (default opus) at THINK_EFFORT (default high). It gets the user's request,
-    /// the text last read and the agent's question, but not the screen.
+    /// the text last read and the agent's question, but not the screen. It follows the run's provider (so an agy test
+    /// run tests agy's opus too), and one session serves every question of the run.
     private func think(_ question: String) async -> ActionResult {
         let model = Config.value("THINK_MODEL") ?? "opus"
         let effort = Config.value("THINK_EFFORT") ?? "high"
@@ -4388,7 +4402,14 @@ final class Agent: ObservableObject {
         var prompt = "The user asked: \(request)\n\n"
         if let readText { prompt += "What's on screen (last read):\n\(readText.prefix(20_000))\n\n" }
         prompt += "The agent asks:\n\(question)"
-        log("  think: \(model) at \(effort) effort")
+        // Log the effort that really applies: on agy only Gemini ids take --effort (AgySession leaves it off the rest),
+        // so for its Claude ids the -thinking model's own effort is what runs, whatever THINK_EFFORT says.
+        let provider = providerOverride ?? Provider.current
+        let id = provider.model(model)
+        let shown = id.isEmpty ? model : id
+        let ownEffort = provider == .agyCLI && AgySession.launchModel(provider: provider, model: model, effort: effort).effort == nil
+        let effortNote = ownEffort ? " (agy: this model's own effort)" : " at \(effort) effort"
+        log("  think: \(shown)\(effortNote)\(thinkSession?.isAlive == true ? " (same session)" : "")")
         // A long think is progress, not a stuck step: keep the watchdog quiet while it runs (up to 10 minutes).
         let heartbeat = Task { @MainActor [weak self] in
             for _ in 0..<60 {
@@ -4400,13 +4421,30 @@ final class Agent: ObservableObject {
         defer { heartbeat.cancel() }
         let thinkStarted = Date()
         do {
-            let session = try AgySession(system: system, model: model, effort: effort)
-            defer { session.close() }
-            let reply = try await withTaskCancellationHandler {
-                try await session.send(prompt)
-            } onCancel: { session.close() }
+            // Reused while alive: a later question then has the earlier ones as context, usually a help.
+            let session: AgySession
+            if let s = thinkSession, s.isAlive { session = s } else {
+                thinkSession?.close()
+                session = try AgySession(system: system, model: model, provider: provider, effort: effort)
+                thinkSession = session
+            }
+            let reply: String
+            do {
+                reply = try await withTaskCancellationHandler {
+                    try await session.send(prompt)
+                } onCancel: { session.close() }
+            } catch {
+                session.close()
+                if thinkSession === session { thinkSession = nil }
+                throw error
+            }
             let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !text.isEmpty else { return fail("the stronger model gave no answer") }
+            guard !text.isEmpty else {
+                // An empty reply may have left the session out of step: start the next question afresh.
+                session.close()
+                if thinkSession === session { thinkSession = nil }
+                return fail("the stronger model gave no answer")
+            }
             log("  think: answered in \(Int(Date().timeIntervalSince(thinkStarted))) s (\(text.count) chars)")
             return .init(ok: true, summary: "the stronger model's answer:\n\(text)")
         } catch {
@@ -4544,9 +4582,29 @@ final class Agent: ObservableObject {
                 guard let self, self.isRunning else { timer.invalidate(); return }
                 if self.externalRun || self.coordinatingBrowserJobs || (self.inputPanelVisible && !self.runBackground) { return } // User input, child agents and external leases own their wait time.
                 // A model reply with a screenshot and a long history can take well over 30 s; that's slow, not stuck.
-                let limit: TimeInterval = self.phase == .thinking ? 180 : 30
+                // MODEL_TIMEOUT raises it for slow models (agy's flash-high or opus-thinking can pass 90 s a turn).
+                let modelLimit = max(60, Config.value("MODEL_TIMEOUT").flatMap { Double($0) } ?? 180)
+                let limit: TimeInterval = self.phase == .thinking ? modelLimit : 30
                 guard self.phase != .waiting, Date().timeIntervalSince(self.lastProgress) > limit else { return }
-                let step = self.phase == .thinking ? "waiting for the model's reply" : self.steps.last?.text ?? "a step"
+                if self.phase == .thinking {
+                    // One retry on a fresh session (a hung CLI); a second miss is the model being too slow, so stop
+                    // and name it instead of auto-continuing into more 3-minute waits.
+                    let model = self.session?.sessionModel ?? "?"
+                    self.task?.cancel()
+                    self.session?.close()
+                    if self.modelStalls == 0 {
+                        self.modelStalls = 1
+                        self.log("watchdog: model \(model) gave no reply in \(Int(limit)) s (retrying once)")
+                        self.finish(ok: false, "I got stuck on “waiting for the model's reply” and stopped")
+                    } else {
+                        self.log("watchdog: model \(model) gave no reply in \(Int(limit)) s")
+                        let wait = limit >= 120 ? "\(Int(limit / 60)) minutes" : "\(Int(limit)) seconds"
+                        self.finish(ok: false, "The model (\(model)) didn't reply within \(wait), so I stopped. "
+                                    + "Try a faster model or lower effort in Settings.")
+                    }
+                    return
+                }
+                let step = self.steps.last?.text ?? "a step"
                 self.log("watchdog: no progress for \(Int(limit)) s on \(step)")
                 self.task?.cancel()
                 self.session?.close()
