@@ -81,7 +81,7 @@ impl Observation {
         let is_browser = platform.is_browser(&app);
         let bridge = crate::bridge::bridge();
         let scanning = platform.scan(&app, 150);
-        let (scan, page, area) = if is_browser && bridge.is_connected() {
+        let (scan, page, area) = if is_browser && bridge.serves(&app.exe) {
             let paging = async {
                 let mut p = bridge.snapshot(Some(&app.exe)).await;
                 // Still arriving (or nothing listed on a page that isn't blocked): give it a moment, once.

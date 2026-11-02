@@ -1,7 +1,19 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  if (window.__clinqy) return;
+  const HELPER_VERSION = 2;
+  if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
+  window.__clinqy?.dispose?.();
+  const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
+    : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
+  let snapshotID = null;
+  let revision = 0;
+  const optionTargets = new Map();
+  let nextOptionTarget = 0;
+  const frameNodes = new WeakMap();
+  let nextFrameNode = 0;
+  const elementNodes = new WeakMap();
+  let nextElementNode = 0;
 
 const squash = (s) => String(s || "").replace(/\s+/g, " ").trim();
 const norm = (s) => squash(s).toLowerCase();
@@ -117,9 +129,13 @@ function matchScore(want, have) {
   return both ? 0.6 * both / Math.max(wt.size, ht.size) : 0;
 }
 function bestMatch(want, items, textOf) {
-  let best = null, score = 0;
-  for (const it of items) { const sc = matchScore(want, textOf(it)); if (sc > score) { best = it; score = sc; } if (sc === 1) break; }
-  return score >= 0.5 ? best : null;
+  let best = null, score = 0, tied = false;
+  for (const it of items) {
+    const sc = matchScore(want, textOf(it));
+    if (sc > score) { best = it; score = sc; tied = false; }
+    else if (sc === score && sc > 0 && it !== best) tied = true;
+  }
+  return score >= 0.5 && !tied ? best : null;
 }
 
 // The element's nearest scrolling ancestor (a modal's body, a side panel), or null when that's the page itself.
@@ -229,16 +245,29 @@ const SEL = [
   "[contenteditable=''], [contenteditable=true]", "[onclick]", "[tabindex]:not([tabindex='-1'])",
 ].join(",");
 
-// Every candidate element, including inside open shadow roots.
+// Cache only the candidate set. Geometry, labels, values and checked states are read fresh on every snapshot.
+let candidateCache = null, shadowHosts = [];
+const candidateObserver = new MutationObserver(() => { candidateCache = null; });
 function candidates() {
-  const nodes = [];
+  if (candidateObserver.takeRecords().length) candidateCache = null;
+  if (candidateCache && shadowHosts.every(([host, root]) => shadowOf(host) === root)) return candidateCache;
+  candidateObserver.disconnect();
+  const nodes = [], hosts = [];
   const walk = (root) => {
+    candidateObserver.observe(root, { subtree: true, childList: true, attributes: true,
+      attributeFilter: ["role", "type", "href", "for", "contenteditable", "onclick", "tabindex"] });
     root.querySelectorAll(SEL).forEach((el) => nodes.push(el));
     const tw = document.createTreeWalker(root, NodeFilter.SHOW_ELEMENT);
-    for (let n = tw.nextNode(); n; n = tw.nextNode()) { const s = shadowOf(n); if (s) walk(s); }
+    for (let n = tw.nextNode(); n; n = tw.nextNode()) {
+      if (n.hasAttribute("data-clinqy-overlay")) continue;
+      const shadow = shadowOf(n);
+      if (n.tagName && n.tagName.includes("-")) hosts.push([n, shadow]);
+      if (shadow) walk(shadow);
+    }
   };
   walk(document);
-  return nodes;
+  shadowHosts = hosts;
+  return candidateCache = nodes;
 }
 
 // What an element is, as listed to the model (null = not worth listing). Shared by snapshot and re-finding.
@@ -288,32 +317,54 @@ function visibleText(listed, budgetMs) {
   return out.join(" · ").slice(0, 1500);
 }
 
-// A key per listed element that stays the same while the page shifts around it (role, name, question; for
-// look-alikes also the link target or nearest label, then an ordinal), so background.js can keep its w-id.
+// Identity follows the actual DOM object across listings, never its ordinal among identical labels.
+// Semantic identity is included so a framework repurposing the same node also invalidates old references.
 function keys(out, picked) {
-  const base = out.map((it) => [it.role, it.text, it.q || ""].join("|"));
-  const count = new Map();
-  base.forEach((b) => count.set(b, (count.get(b) || 0) + 1));
-  const ctx = (el, it) => {
-    if (it.href) { try { return new URL(it.href).pathname; } catch {} }
-    for (let p = el.parentElement, hops = 0; p && hops < 5; p = p.parentElement, hops++) {
-      const l = p.querySelector("label, legend, [role=heading], h1, h2, h3, h4, h5, h6");
-      const t = l && !within(l, el) && squash(l.innerText).slice(0, 40);
-      if (t && t !== it.text) return t;
-    }
-    return "";
-  };
-  const seen = new Map();
   out.forEach((it, k) => {
-    let key = base[k];
-    if (count.get(key) > 1) key += "|" + ctx(picked[k], it);
-    const n = (seen.get(key) || 0) + 1;
-    seen.set(key, n);
-    it.key = n > 1 ? key + "#" + n : key;
+    const el = picked[k];
+    if (!elementNodes.has(el)) elementNodes.set(el, ++nextElementNode);
+    it.key = documentID + ":node:" + elementNodes.get(el) + "|" + nodeIdentity(el, it);
   });
 }
 
+function nodeIdentity(el, d) {
+  return JSON.stringify([d.role, d.text, d.q || "", el.tagName, el.id || "", el.getAttribute("name"),
+    el.getAttribute("type"), el.getAttribute("href"), el.getAttribute("formaction"), el.getAttribute("aria-controls")]);
+}
+
+function frameBoxes() {
+  const vw = innerWidth, vh = innerHeight;
+  const frames = [...document.querySelectorAll("iframe, frame")].map((f) => {
+      const r = f.getBoundingClientRect(), cs = getComputedStyle(f);
+      if (!frameNodes.has(f)) frameNodes.set(f, ++nextFrameNode);
+      // Deterministic identity: the extension API names the frame this element hosts (Chrome 132+), so the bridge
+      // needn't guess from URL/size. Absent API or a detached element leaves it null and the bridge falls back.
+      let frameId = null;
+      try { if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getFrameId) { const id = chrome.runtime.getFrameId(f); if (Number.isInteger(id) && id >= 0) frameId = id; } } catch {}
+      // CSS transforms: a scaled frame draws its content at rect.width / offsetWidth; a rotated or skewed one has
+      // no translation-only placement, which the bridge refuses to guess at.
+      const ow = f.offsetWidth || 0, oh = f.offsetHeight || 0;
+      const sx = ow > 0 && r.width > 0 ? r.width / ow : 1, sy = oh > 0 && r.height > 0 ? r.height / oh : 1;
+      let rotated = false;
+      for (let n = f; n && n.nodeType === 1 && !rotated; n = n.parentElement) {
+        const t = n === f ? cs.transform : getComputedStyle(n).transform;
+        if (!t || t === "none") continue;
+        const m = /^matrix\(([^)]+)\)$/.exec(t);
+        if (!m) { rotated = true; break; }
+        const v = m[1].split(",").map(Number);
+        if (Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6) rotated = true;
+      }
+      const scaleX = Math.abs(sx - 1) < 0.005 ? 1 : sx, scaleY = Math.abs(sy - 1) < 0.005 ? 1 : sy;
+      return { nodeToken: frameNodes.get(f), frameId, src: f.src || "", x: r.left + (f.clientLeft + (parseFloat(cs.paddingLeft) || 0)) * scaleX,
+               y: r.top + (f.clientTop + (parseFloat(cs.paddingTop) || 0)) * scaleY,
+               w: f.clientWidth, h: f.clientHeight, sx: scaleX, sy: scaleY, rotated, hidden: cs.visibility === "hidden" || cs.display === "none" };
+    }).filter((f) => !f.hidden && f.w >= 80 && f.h >= 40 && f.x < vw && f.y < vh && f.x + f.w * f.sx > 0 && f.y + f.h * f.sy > 0);
+  return { frames };
+}
+
 function snapshot() {
+  snapshotID = documentID + ":" + (++revision);
+  optionTargets.clear();
   const started = performance.now();
   const vw = innerWidth, vh = innerHeight;
   const seen = new Set(), listed = new Set();
@@ -400,13 +451,13 @@ function snapshot() {
       out.push(item);
       picked.push(el);
       listed.add(el);
-      sigs.push({ role, text, q: d.q, x: r.left + r.width / 2, y: r.top + r.height / 2 });
+      sigs.push({ role, text, q: d.q, identity: nodeIdentity(el, d), x: r.left + r.width / 2, y: r.top + r.height / 2 });
       if (out.length >= 220) { truncated = true; break; }
     } catch (e) { skipped++; }   // one odd element never costs the whole page
   }
   window.__clinqyList = picked;
   window.__clinqySigs = sigs;
-  try { keys(out, picked); } catch {}
+  keys(out, picked);
   const paneList = [];
   for (const [box, p] of panes) {
     try { paneList.push({ ...paneName(box), above: p.above, below: p.below }); } catch {}
@@ -416,16 +467,10 @@ function snapshot() {
   try { headings = [...document.querySelectorAll("h1,h2,h3")].map((h) => squash(h.innerText)).filter(Boolean).slice(0, 12); } catch {}
   try { messages = pageMessages(); } catch {}
   try { text = visibleText(listed, 120); } catch {}
-  // Embedded pages (Greenhouse/Lever job forms, payment boxes, editors) that are big enough to matter.
-  try {
-    frames = [...document.querySelectorAll("iframe, frame")].map((f) => {
-      const r = f.getBoundingClientRect(), cs = getComputedStyle(f);
-      return { src: f.src || "", x: r.left + f.clientLeft + (parseFloat(cs.paddingLeft) || 0), y: r.top + f.clientTop + (parseFloat(cs.paddingTop) || 0),
-               w: f.clientWidth, h: f.clientHeight, hidden: cs.visibility === "hidden" || cs.display === "none" };
-    }).filter((f) => !f.hidden && f.w >= 80 && f.h >= 40 && f.x < vw && f.y < vh && f.x + f.w > 0 && f.y + f.h > 0);
-  } catch {}
+  try { frames = frameBoxes().frames; } catch {}
   return {
-    url: location.href, title: document.title, focused: document.hasFocus(), ready: document.readyState,
+    documentID, snapshotID,
+    url: location.href, title: window.__clinqyActivity?.pageTitle() || document.title, focused: document.hasFocus(), ready: document.readyState,
     viewport: { w: vw, h: vh },
     // Where the viewport sits on screen (for browsers that don't expose it to Accessibility).
     screen: { x: screenX, y: screenY, ow: outerWidth, oh: outerHeight, zoom: devicePixelRatio },
@@ -436,49 +481,36 @@ function snapshot() {
   };
 }
 
-// The listed element, or — if the page re-rendered it since (React, Google Forms) — the same thing found again
-// by role, name and question, nearest to where it was.
+// A reference names the exact observed node. Replacement or repurposing requires a new snapshot.
 function target(index) {
   const el = (window.__clinqyList || [])[index];
-  if (el && el.isConnected) return el;
   const sig = (window.__clinqySigs || [])[index];
-  if (sig) {
-    // Closest match first: same role, name and question; then same role and name (the question's wording changed);
-    // then the name with its counts ignored ("Messages (3)" → "Messages (4)"). Nearest to where it was wins.
-    const loose = (t) => norm(t).replace(/\d+/g, "#");
-    const tiers = [
-      (d) => d.text === sig.text && (d.q || "") === (sig.q || ""),
-      (d) => d.text === sig.text,
-      (d) => loose(d.text) === loose(sig.text) && (d.q || "") === (sig.q || ""),
-    ];
-    const best = [null, null, null], dist = [Infinity, Infinity, Infinity];
-    for (const c of candidates()) {
-      try {
-        const d = describe(c);
-        if (!d || d.role !== sig.role) continue;
-        const t = tiers.findIndex((f) => f(d));
-        if (t < 0) continue;
-        const r = c.getBoundingClientRect();
-        if (r.width < 1 || r.height < 1) continue;
-        const k = Math.hypot(r.left + r.width / 2 - sig.x, r.top + r.height / 2 - sig.y);
-        if (k < dist[t]) { best[t] = c; dist[t] = k; }
-      } catch {}
-    }
-    const found = best.find(Boolean);
-    if (found) { window.__clinqyList[index] = found; return found; }
-  }
-  throw new Error("element w" + index + " is gone (the page changed); take a new look");
+  const current = el && el.isConnected && describe(el);
+  if (current && sig && nodeIdentity(el, current) === sig.identity) return el;
+  throw new Error("element w" + index + " is stale (the page changed); take a new look");
+}
+
+function validate(expected) {
+  if (!expected || expected.documentID !== documentID || expected.snapshotID !== snapshotID || !snapshotID)
+    throw new Error("stale browser observation; take a new look before acting");
+  return { ok: true, documentID, snapshotID };
+}
+async function invoke(name, args, expected) {
+  validate(expected);
+  const fn = window.__clinqy[name];
+  if (typeof fn !== "function" || ["invoke", "snapshot"].includes(name)) throw new Error("invalid guarded page operation");
+  return await fn(...args);
 }
 
 // Where the element is right now (brought into view first), and whether a real mouse click at its centre would
 // land on it — not on a popup's backdrop, which on LinkedIn/Indeed closes the popup instead.
 // `px`/`py` is the point to click: the centre, or another uncovered spot on it. Waits for it to stop moving first.
-async function locate(index) {
+async function locate(index, shouldReveal = true) {
   let el = target(index);
-  reveal(el);
+  if (shouldReveal) reveal(el);
   const still = await settle(el);
   // Re-rendered while it settled: aim at the new one.
-  if (!el.isConnected) { el = target(index); reveal(el); }
+  if (!el.isConnected) { el = target(index); if (shouldReveal) reveal(el); }
   const r = el.getBoundingClientRect();
   const p = hitPoint(el);
   return { x: r.left, y: r.top, w: r.width, h: r.height, hit: !!p, px: p ? p.x : r.left + r.width / 2, py: p ? p.y : r.top + r.height / 2, still };
@@ -490,6 +522,11 @@ function alive(index) {
 }
 
 // Focuses an element so a key press acts on it (the last fallback when clicks don't take).
+function activityPoint(index) {
+  const rect = target(index).getBoundingClientRect();
+  return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+}
+
 function focusFor(index) {
   const el = target(index);
   reveal(el);
@@ -498,8 +535,8 @@ function focusFor(index) {
   return { focused: !!a && (within(el, a) || within(a, el)) };
 }
 
-function click(index) {
-  const el = target(index);
+function click(index) { return clickNode(target(index)); }
+function clickNode(el) {
   reveal(el);
   const r = el.getBoundingClientRect();
   const opts = { bubbles: true, cancelable: true, composed: true, clientX: r.left + r.width / 2, clientY: r.top + r.height / 2, button: 0 };
@@ -576,7 +613,7 @@ function ownedList(el) {
 // scrolled through to find it.
 async function findOption(text, index) {
   let owner = null;
-  if (index != null && index >= 0) { try { owner = target(index); } catch {} }
+  if (index != null && index >= 0) owner = target(index);
   const list = ownedList(owner);
   const textOf = (o) => optionText(o) || squash(o.innerText);
   const shownIn = (o) => { const cs = getComputedStyle(o); return cs.display !== "none" && cs.visibility !== "hidden" && o.getClientRects().length; };
@@ -601,8 +638,25 @@ async function findOption(text, index) {
   await settle(hit, 250);
   const r = hit.getBoundingClientRect();
   const p = hitPoint(hit);
-  return { found: true, text: textOf(hit), x: r.left, y: r.top, w: r.width, h: r.height,
+  if (!hit.isConnected || !p) return { found: false, options: [...seen].filter(Boolean).slice(0, 40) };
+  const pointToken = documentID + ":option:" + (++nextOptionTarget);
+  optionTargets.set(pointToken, { node: hit, identity: optionIdentity(hit) });
+  // Tokens are short lived and bounded even if the caller repeatedly searches without a new snapshot.
+  if (optionTargets.size > 64) optionTargets.delete(optionTargets.keys().next().value);
+  return { found: true, pointToken, text: textOf(hit), x: r.left, y: r.top, w: r.width, h: r.height,
            px: p ? p.x : r.left + r.width / 2, py: p ? p.y : r.top + r.height / 2 };
+}
+
+function optionIdentity(el) {
+  return JSON.stringify([el.tagName, el.id, el.getAttribute("role"), el.getAttribute("value"),
+    el.getAttribute("data-value"), optionText(el) || squash(el.innerText)]);
+}
+function clickOption(pointToken) {
+  const target = optionTargets.get(pointToken);
+  optionTargets.delete(pointToken); // A delivered option click is never replayed through the same token.
+  if (!target || !target.node.isConnected || optionIdentity(target.node) !== target.identity || !hitPoint(target.node))
+    throw new Error("the option target is stale or covered; take a new look");
+  return clickNode(target.node);
 }
 
 // The option a dropdown has highlighted now (moved with the arrow keys): its active descendant, or a focused option.
@@ -616,22 +670,20 @@ function activeOption(index, want) {
   return { text, score: want && text ? matchScore(want, text) : 0 };
 }
 
-// The file input an element stands for: itself, one inside it, or the nearest one in the page (upload buttons
-// usually sit next to a hidden <input type=file>). index < 0 = the page's only / first file input.
+// Uploads require an explicit input/label/unique container, or the document's sole file input.
+function fileInputCount() { return { count: document.querySelectorAll("input[type=file]").length }; }
 function fileInputFor(index) {
+  if (index >= 0) {
+    const el = target(index);
+    if (el.matches("input[type=file]")) return el;
+    if (el.tagName === "LABEL" && el.control && el.control.type === "file") return el.control;
+    const inner = [...el.querySelectorAll("input[type=file]")];
+    if (inner.length === 1) return inner[0];
+    if (inner.length > 1) throw new Error("ambiguous file upload fields; choose the exact input");
+  }
   const all = [...document.querySelectorAll("input[type=file]")];
   if (!all.length) throw new Error("this page has no file upload field (it may use its own picker, e.g. Google Drive)");
-  if (index < 0) return all[0];
-  const el = target(index);
-  if (el.matches("input[type=file]")) return el;
-  const inner = el.querySelector("input[type=file]");
-  if (inner) return inner;
-  if (el.tagName === "LABEL" && el.control && el.control.type === "file") return el.control;
-  // Closest by DOM: the one sharing the deepest ancestor with the element.
-  for (let p = el.parentElement; p; p = p.parentElement) {
-    const near = p.querySelector("input[type=file]");
-    if (near) return near;
-  }
+  if (all.length !== 1) throw new Error("ambiguous file upload fields; choose the exact input");
   return all[0];
 }
 
@@ -744,7 +796,12 @@ function tables() {
 
 function readText() {
   const main = document.querySelector("main, article, [role=main]") || document.body;
-  return { url: location.href, title: document.title, text: main.innerText.replace(/\n{3,}/g, "\n\n").slice(0, 8000) };
+  // Portalled help/dialog content can sit outside <main>. Read the visible overlay too,
+  // so verification sees the same confirmation the snapshot lists instead of deadlocking.
+  const overlays = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open], [aria-modal="true"]')]
+    .filter(el => !main.contains(el) && visible(el)).map(el => el.innerText || "");
+  const text = [...new Set([...overlays, main.innerText || ""])].join("\n\n").replace(/\n{3,}/g, "\n\n").slice(0, 8000);
+  return { url: location.href, title: document.title, text };
 }
 
 
@@ -761,6 +818,11 @@ function readText() {
     const f = editableOf(el);
     return { value: f.tagName === "SELECT" ? (f.options[f.selectedIndex] ? f.options[f.selectedIndex].text.trim() : "")
                                            : String(f.isContentEditable ? f.innerText : f.value || "").slice(0, 400) };
+  }
+  function values(indices) {
+    const result = {};
+    for (const index of indices.slice(0, 200)) result[String(index)] = value(index).value;
+    return { values: result };
   }
   function activeValue() {
     const el = deepActive();
@@ -843,9 +905,11 @@ function readText() {
   }
   function scroll(dy) {
     const el = scroller();
-    if (el) { el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop }; }
+    // Reports movement, not just a delivered wheel: a page at its boundary (or one that swallows the scroll) says so.
+    if (el) { const before = el.scrollTop; el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop, before, moved: el.scrollTop !== before, container: "element" }; }
+    const before = scrollY;
     window.scrollBy({ top: dy, behavior: "instant" });
-    return { y: scrollY };
+    return { y: scrollY, before, moved: scrollY !== before, container: "page" };
   }
   // The selected text plus where its links go: "Apply here" alone loses the application URL the user meant.
   function selection() {
@@ -872,6 +936,29 @@ function readText() {
     }
     if (!links.size) return text;
     return text + "\n\nLinks in the selection:\n" + [...links].map(([href, label]) => `- ${label ? label + " → " : ""}${href}`).join("\n");
+  }
+
+  // Document order within article content, then other visible content. Skip chrome, trackers and tiny icons.
+  function images() {
+    const root = document.querySelector("#mw-content-text, article, main, [role=main]") || document.body;
+    const found = [], seen = new Set();
+    for (const el of (root ? root.querySelectorAll("img") : [])) {
+      if (el.closest("nav, header, footer, [role=navigation], .advertisement, .ad-slot, [aria-hidden=true]")) continue;
+      const r = el.getBoundingClientRect(), style = getComputedStyle(el);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) <= 0.05) continue;
+      const width = Math.max(el.naturalWidth || 0, r.width), height = Math.max(el.naturalHeight || 0, r.height);
+      if (width < 64 || height < 48 || r.width < 48 || r.height < 32) continue;
+      const lazy = el.getAttribute("data-src") || el.getAttribute("data-original");
+      const raw = el.naturalWidth > 16 ? (el.currentSrc || el.src) : (lazy || el.currentSrc || el.src);
+      let url; try { url = new URL(raw, document.baseURI).href; } catch { continue; }
+      if (!/^https?:/.test(url) || seen.has(url)) continue;
+      seen.add(url);
+      found.push({url, alt: squash(el.alt || el.title || "").slice(0, 200), width, height,
+        visible: visible(el), loaded: el.naturalWidth > 16, page: location.href,
+        rect: el.naturalWidth > 16 ? {x:r.left,y:r.top,width:r.width,height:r.height} : null});
+      if (found.length === 40) break;
+    }
+    return {images: found, url: location.href, title: document.title};
   }
 
   // Resolves as soon as `want` shows in the page's text or title — or, with gone, has stayed gone for half a second —
@@ -905,5 +992,7 @@ function readText() {
     });
   }
 
-  window.__clinqy = { snapshot, locate, alive, focusFor, activeOption, markUpload, click, focus, fill, findOption, chosen, upload, review, readText, tables, isActive, value, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+  window.__clinqy = { version: HELPER_VERSION, dispose: () => candidateObserver.disconnect(), protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
+    focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
+    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText };
 })();

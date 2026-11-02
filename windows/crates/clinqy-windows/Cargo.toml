@@ -29,6 +29,7 @@ features = [
     "Globalization",
     "Graphics_Imaging",
     "Media_Ocr",
+    "Media_SpeechRecognition",
     "Security_Cryptography",
     "Storage_Streams",
     "Win32_Foundation",

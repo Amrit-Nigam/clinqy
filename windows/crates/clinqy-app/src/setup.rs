@@ -47,7 +47,7 @@ pub fn set_start_at_login(on: bool) {
             return;
         }
         if on {
-            let exe = std::env::current_exe().map(|p| format!("\"{}\"", p.display())).unwrap_or_default();
+            let exe = std::env::current_exe().map(|p| format!("\"{}\" --login", p.display())).unwrap_or_default();
             let v: Vec<u8> = wide(&exe).iter().flat_map(|u| u.to_le_bytes()).collect();
             let _ = RegSetValueExW(h, PCWSTR(name.as_ptr()), 0, REG_SZ, Some(&v));
         } else {

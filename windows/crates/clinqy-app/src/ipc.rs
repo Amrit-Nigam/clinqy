@@ -75,13 +75,28 @@ pub async fn app_running() -> bool {
     ClientOptions::new().open(pipe_name()).is_ok() || matches!(ClientOptions::new().open(pipe_name()), Err(e) if e.raw_os_error() == Some(231))
 }
 
+/// Starts the app through the shell: a child of this process inherits its output handles even when redirected, and
+/// whatever reads this process's output would then wait for the app to quit.
+pub fn start_detached(exe: &std::path::Path, login: bool) -> std::io::Result<()> {
+    use std::process::Stdio;
+    let script = format!("Start-Process -FilePath $env:CLINQY_EXE{}", if login { " -ArgumentList '--login'" } else { "" });
+    let status = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-Command", &script])
+        .env("CLINQY_EXE", exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()?;
+    status.success().then_some(()).ok_or_else(|| std::io::Error::other("Start-Process failed"))
+}
+
 /// Starts the app if it isn't running and waits for its pipe.
 pub async fn ensure_app() -> Result<()> {
     if app_running().await {
         return Ok(());
     }
     let exe = app_exe().ok_or_else(|| anyhow!("ClinqyApp.exe isn't installed next to the clinqy command (run the installer again)"))?;
-    std::process::Command::new(&exe).spawn().map_err(|e| anyhow!("couldn't start {}: {e}", exe.display()))?;
+    start_detached(&exe, false).map_err(|e| anyhow!("couldn't start {}: {e}", exe.display()))?;
     for _ in 0..80 {
         tokio::time::sleep(Duration::from_millis(250)).await;
         if app_running().await {

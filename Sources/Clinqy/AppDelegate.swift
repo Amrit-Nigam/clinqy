@@ -2,21 +2,35 @@ import AppKit
 import CryptoKit
 import AVFoundation
 import Carbon
+import Combine
 import Speech
 import ServiceManagement
 
 @MainActor
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
+    private var backgroundMenuItem: NSMenuItem?
     private var onboarding: OnboardingWindow?
     private var buddy: Buddy!
     private var agent: Agent!
     private var voice: Voice!
+    private var cursorStateObservers = Set<AnyCancellable>()
+    private struct RequestTarget {
+        var app: NSRunningApplication?
+        var files: [URL] = []
+        var selection: String?
+    }
+    private var newRequestTarget = RequestTarget()
+    private var queuedNativeTargets: [UUID: RequestTarget] = [:]
     private var panel: CommandPanel!
     private var island: IslandPanel!
     private var resultPanel: ResultPanel!
     private var hotKey: HotKey?
     private var talkHotKey: PushToTalkHotKey?
+    /// fn+⌃: plain dictation. Hold and speak (or tap to start, tap to stop); the words are typed where the cursor is.
+    private var dictateHotKey: HotKey?
+    private var dictating = false
+    private var dictateStarted: Date?
     private var openMenuItem: NSMenuItem?
     private var talkMenuItem: NSMenuItem?
     private var pressedAt: Date?
@@ -29,6 +43,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var followUpOpen = false
 
     func applicationWillTerminate(_ notification: Notification) {
+        defer { TaskPowerAssertions.shared.shutdown() }
+        // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
+        BrowserJobs.shared.shutdown()
+        ChromeWorker.shared.shutdown()
+        AgentScreen.quit()
         Persist.flush()
     }
 
@@ -40,17 +59,67 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         buddy = Buddy()
         agent = Agent(buddy: buddy)
+        agent.enqueueNewRequest = { [weak self] text in self?.enqueueNewRequest(text) ?? false }
+        agent.dispatchBrowserTask = { [weak self] request, test, model, provider, taskID in
+            guard let self else { return false }
+            // Telegram dispatches its own requests to the pool and binds questions to their originating task.
+            if let taskID, TaskStore.shared.record(taskID)?.source == .telegram { return false }
+            let receipt = self.agent.runReceiptID
+            let id = BrowserJobs.shared.submit(request, test: test, model: model, provider: provider, files: self.agent.selectedFiles,
+                taskID: taskID, browser: BrowserTaskRouting.browser(in: request) ?? self.agent.targetApp.flatMap { Launcher.isBrowser($0) ? $0.cleanName : nil }, receipt: receipt)
+            self.agent.runReceiptID = nil
+            if id == nil {
+                let message = "Couldn't queue this browser task. Check Tasks & Recovery or wait for a free queue slot."
+                if let receipt { RunReceipt.write(id: receipt, ok: false, answer: message, steps: []) }
+                self.buddy.bubble(message, for: 5)
+            }
+            return true // A failed background dispatch never falls through to native foreground input.
+        }
         voice = Voice()
+        Publishers.MergeMany([
+            BrowserJobs.shared.objectWillChange.eraseToAnyPublisher(),
+            BrowserBridge.shared.$pageCursorVisible.map { _ in () }.eraseToAnyPublisher(),
+            agent.$inputPanelVisible.map { _ in () }.eraseToAnyPublisher(),
+            agent.$phase.map { _ in () }.eraseToAnyPublisher()
+        ]).receive(on: DispatchQueue.main).sink { [weak self] in self?.updateCursorVisibility() }.store(in: &cursorStateObservers)
         panel = CommandPanel(agent: agent, voice: voice, onMic: { [weak self] in self?.toggleMic() },
                              onWatch: { [weak self] in self?.startWatching() },
                              onCircle: { [weak self] in self?.startCircling() })
         island = IslandPanel(agent: agent, voice: voice)
         resultPanel = ResultPanel(agent: agent)
-        agent.onResult = { [weak self] in if self?.agent.result != nil { self?.resultPanel.show() } }
+        agent.onResult = { [weak self] in
+            guard let self, let result = self.agent.result else { return }
+            Telegram.shared.present(result, from: self.agent)
+            if !self.agent.runBackground { self.resultPanel.show() }
+        }
         // Review before submit: the form's answers come up in the bar; it goes away once the user decides.
         UI.agent = agent
         UI.present = { [weak self] in self?.panel.showCentered(); self?.island.show() }
         UI.dismiss = { [weak self] in self?.panel.orderOut(nil) }
+        // A plain kill (an update, a rebuild, logging out) quits like ⌘Q, so the hidden screen is emptied first.
+        signal(SIGTERM, SIG_IGN)
+        terminateSignal.setEventHandler { NSApp.terminate(nil) }
+        terminateSignal.resume()
+        // A background run's notifications: answered there, or tapped to come here.
+        Notifier.start()
+        Telegram.shared.agent = agent
+        Telegram.shared.submitBrowserTask = { request, files, id in
+            BrowserJobs.shared.submit(request, files: files, taskID: id,
+                browser: BrowserTaskRouting.browser(in: request) ?? BrowserJobs.shared.running.compactMap(\.browser).first) != nil
+        }
+        Telegram.shared.cancelBrowserTask = { BrowserJobs.shared.cancel($0) }
+        Telegram.shared.start()
+        // Switching to an app whose windows are on the hidden screen gets the user a window they can see.
+        Background.onBusyApp = { [weak self] text in self?.buddy.bubble(text, for: 4) }
+        Background.watchSwitches()
+        AgentScreenView.shared.agent = agent
+        Notifier.onAnswer = { [weak self] text in self?.agent.answer(text) }
+        // "Done": show the window it worked in. "Needs you": the bar, to answer.
+        Notifier.onOpen = { [weak self] question in
+            guard let self else { return }
+            if question || self.agent.question != nil { self.panel.showCentered(); self.island.show() }
+            else { AgentScreenView.shared.show() }
+        }
         enableOpenAtLogin()
         _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
         linkCommand()
@@ -86,9 +155,23 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Clipboard.start()
         startScheduler()
 
+        TaskStore.shared.onReady = { [weak self] id in
+            guard let self, let item = TaskStore.shared.record(id) else { return }
+            if item.background, item.source != .telegram {
+                _ = BrowserJobs.shared.submit(item.request, files: item.files.map { URL(fileURLWithPath: $0) }, taskID: id, reviewed: true)
+                return
+            }
+            guard !self.agent.isRunning else { return }
+            if item.source == .telegram { Telegram.shared.startQueued(id, reviewed: true) }
+            else if self.isScheduledTask(item) { self.startScheduledTask(id, reviewed: true) }
+            else if TaskStore.shared.start(id, explicitlyReviewed: true) {
+                self.agent.selectedFiles = item.files.map { URL(fileURLWithPath: $0) }
+                self.agent.submit(item.request, background: item.background, taskID: id)
+            }
+        }
         agent.onStart = { [weak self] in
             guard let self else { return }
-            self.setStatusIcon(running: true)
+            self.setStatusIcon(running: true, background: self.agent.runBackground)
             StepUndo.shared.clear()
             // Keystrokes must reach the target app, and clicks must not land on our windows.
             self.panel.orderOut(nil)
@@ -96,11 +179,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.onFinish = { [weak self] answer, ok in
             guard let self else { return }
+            DispatchQueue.main.async { [weak self] in self?.startNextNativeRequest() }
             UI.cancelReview()
             self.setStatusIcon(running: false)
             self.island.show(for: 4.5)
             // Stopped by the user: bring the bar back so they can say what to do differently ("no, the other one").
-            if !ok, answer == "Stopped", !self.agent.isTest, !self.voiceRun {
+            if !ok, answer == "Stopped", !self.agent.isTest, !self.agent.runBackground, !self.voiceRun {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
                     guard let self, !self.agent.isRunning, !self.panel.isVisible, !Recorder.shared.isRecording else { return }
                     self.panel.showCentered()
@@ -113,6 +197,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Paused for the user's input: bring the bar up with the question; hide it again once answered.
         agent.onQuestion = { [weak self] in
             guard let self else { return }
+            // A background run asks through a notification instead: the bar would take the user's focus.
+            if self.agent.runBackground { self.island.show(); return }
+            if self.panel.isVisible && self.agent.newTaskMode { return }
+            self.agent.newTaskMode = false
             self.panel.showCentered()
             self.island.show()
         }
@@ -121,10 +209,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voice.onFinal = { [weak self] text in
             guard let self else { return }
             self.buddy.mood = .idle
+            if self.dictating {
+                self.dictating = false
+                self.island.hide()
+                self.typeDictation(text)
+                return
+            }
             let followUp = self.followUpOpen
             self.followUpOpen = false
             // A spoken reply to a question answers it; while working it steers; otherwise it's a new request.
-            if self.agent.question != nil {
+            if self.agent.newTaskMode {
+                if self.agent.submitNewRequest(text) { self.panel.orderOut(nil) }
+            } else if self.agent.question != nil {
                 self.agent.answer(text)
             } else if self.agent.isRunning {
                 self.agent.addContext(text)
@@ -139,6 +235,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         voice.onGaveUp = { [weak self] in
             guard let self else { return }
             self.followUpOpen = false
+            self.dictating = false
             if !self.agent.isRunning { self.agent.continuation = nil }
             self.buddy.mood = .idle
             self.island.hide()
@@ -156,6 +253,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(withTitle: "Edit Memory…", action: #selector(openMemory), keyEquivalent: "")
         menu.addItem(withTitle: "Applications…", action: #selector(showApplications), keyEquivalent: "")
         menu.addItem(withTitle: "Job Profile…", action: #selector(openProfile), keyEquivalent: "")
+        menu.addItem(withTitle: "Tasks & Recovery…", action: #selector(showTasks), keyEquivalent: "")
+        menu.addItem(withTitle: "Sign In to Worker Chrome…", action: #selector(workerLogin), keyEquivalent: "")
+        menu.addItem(withTitle: "Finish Worker Chrome Sign-in", action: #selector(finishWorkerLogin), keyEquivalent: "")
         menu.addItem(withTitle: "Stats…", action: #selector(showStats), keyEquivalent: "")
         let schedules = NSMenuItem(title: "Schedules", action: nil, keyEquivalent: "")
         let schedulesMenu = NSMenu()
@@ -166,6 +266,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         menu.addItem(.separator())
         let dry = menu.addItem(withTitle: "Dry Run (show, don't act)", action: #selector(toggleDryRun(_:)), keyEquivalent: "")
         dry.state = agent.dryRun ? .on : .off
+        let background = menu.addItem(withTitle: "Work in the Background", action: #selector(toggleBackground(_:)), keyEquivalent: "")
+        background.state = Background.always ? .on : .off
+        backgroundMenuItem = background
+        // The Dashboard has the same switch.
+        NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated { self?.backgroundMenuItem?.state = Background.always ? .on : .off }
+        }
+        background.toolTip = "Web tasks use Clinqy’s own signed-in browser tabs (or optional headless Chrome). File and supported service tasks run directly; native app tasks ask for foreground access."
+        menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
+        menu.addItem(withTitle: "Telegram…", action: #selector(setUpTelegram), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
         follow.state = buddy.followsMouse ? .on : .off
         let language = NSMenuItem(title: "Voice Language", action: nil, keyEquivalent: "")
@@ -188,12 +298,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         configureHotKeys()
 
-        if !Permissions.allGranted {
+        if !CommandLine.arguments.contains("--background-launch"), !Permissions.allGranted {
             Permissions.requestMissing()
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) { [weak self] in self?.checkPermissions() }
         }
 
-        if OnboardingWindow.isDone {
+        if OnboardingWindow.isDone, !CommandLine.arguments.contains("--background-launch") {
             DispatchQueue.main.async { [weak self] in self?.showDashboard() }
         }
     }
@@ -223,6 +333,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             return true
         }
         for url in urls where url.host == "browser" { Task { await answerBrowserQuery(url) } }
+        for url in urls where url.host == "control-cancel" {
+            if let session = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "session" })?.value {
+                agent.cancelControl(session: session)
+            }
+        }
+        for url in urls where url.host == "control" { Task { await answerControlQuery(url) } }
+        for url in urls where url.host == "task" {
+            let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+            guard let raw = items.first(where: { $0.name == "id" })?.value, let id = UUID(uuidString: raw) else { continue }
+            switch items.first(where: { $0.name == "op" })?.value {
+            case "cancel": BrowserJobs.shared.cancel(id)
+            case "dismiss": BrowserJobs.shared.dismiss(id)
+            case "answer": BrowserJobs.shared.answer(id, text: items.first(where: { $0.name == "text" })?.value)
+            default: break
+            }
+        }
         for url in urls where url.host == "status" { answerStatus(url) }
         for url in urls where url.host == "permissions" { askForPermissions() }
         for url in urls where url.host == "extension-install" {
@@ -234,7 +360,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         for url in urls where url.scheme == "clinqy" && url.host == "answer" {
             agent.answer(URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first { $0.name == "text" }?.value)
         }
-        for url in urls where url.scheme == "clinqy" && url.host == "cancel" { agent.cancel() }
+        for url in urls where url.scheme == "clinqy" && url.host == "cancel" {
+            if let receipt = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "receipt" })?.value {
+                if !BrowserJobs.shared.cancelReceipt(receipt), agent.runReceiptID == receipt { agent.cancel() }
+            } else { agent.cancel() }
+        }
         // Same as the Undo button on the latest reversible step (voice, scripts, tests/run.sh).
         for url in urls where url.scheme == "clinqy" && url.host == "undo" { Task { await StepUndo.shared.undoLast(agent: agent) } }
         for url in urls where url.scheme == "clinqy" && url.host == "add" {
@@ -249,6 +379,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             var params: [String: String] = [:]
             for item in items where item.name != "name" { params[item.name] = item.value ?? "" }
             rememberTarget()
+            let receipt = items.first { $0.name == "id" }?.value
+            if agent.isRunning {
+                if let receipt { RunReceipt.write(id: receipt, ok: false, answer: "The foreground controller is busy", steps: []) }
+                continue
+            }
+            agent.runReceiptID = receipt
             agent.runWorkflow(wf, params: params)
         }
         for url in urls where url.scheme == "clinqy" && url.host == "run" {
@@ -264,11 +400,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             } else if items.first(where: { $0.name == "claude" })?.value == "1" {
                 runProvider = .claudeCLI
             }
+            let receipt = items.first { $0.name == "id" }?.value.flatMap { UUID(uuidString: $0) != nil ? $0 : nil }
+            var modeProbe = task
+            let explicitMode = Background.choice(&modeProbe)
+            let canQueue = !dry && explicitMode != false && (explicitMode == true || Background.always || (!test && BrowserTaskRouting.isBrowserTask(task)))
+            if agent.isRunning && !canQueue {
+                if let receipt { RunReceipt.write(id: receipt, ok: false, answer: "The foreground controller is busy. Browser tasks can run independently; wait or stop the foreground task before another native task.", steps: []) }
+                continue
+            }
+            agent.runReceiptID = receipt
             // Tests skip the review card unless they ask for it (tests/run.sh answers it through clinqy://answer).
             agent.reviewInTests = items.first { $0.name == "review" }?.value == "1"
             agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
             agent.submit(dry ? "dry run: " + task : task, test: test, provider: runProvider)
         }
+    }
+
+    /// The authenticated URL names only an app-owned request file; callers cannot choose an output path.
+    private func answerControlQuery(_ url: URL) async {
+        let items = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        guard let id = items.first(where: { $0.name == "id" })?.value, UUID(uuidString: id) != nil else { return }
+        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/cli", isDirectory: true)
+        let request = dir.appendingPathComponent(id + ".request.json")
+        guard let values = try? request.resourceValues(forKeys: [.isSymbolicLinkKey, .fileSizeKey]),
+              values.isSymbolicLink != true, (values.fileSize ?? 0) <= 200_000,
+              let data = try? Data(contentsOf: request), let body = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
+        // Claim before the first await; duplicate URL delivery cannot execute a second request.
+        try? FileManager.default.removeItem(at: request)
+        guard let deadline = body["deadline"] as? Double, deadline >= Date().timeIntervalSince1970 else { return }
+        let result = await agent.control(body)
+        guard let response = try? JSONSerialization.data(withJSONObject: result, options: [.withoutEscapingSlashes]) else { return }
+        let file = dir.appendingPathComponent(id + ".response.json")
+        do {
+            try response.write(to: file, options: .atomic)
+            try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: file.path)
+        } catch { Agent.writeLog("couldn't deliver control response; inspect task state before retrying input") }
     }
 
     /// `clinqy://browser?cmd=page|read|url&id=…`: what's in the focused browser tab, for the `clinqy page` command
@@ -304,6 +470,55 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         try? out.write(to: dir.appendingPathComponent("\(id).txt"), atomically: true, encoding: .utf8)
     }
 
+    private func updateCursorVisibility() {
+        buddy.suppressed = CursorVisibility.suppressPrimary(browserCursor: BrowserBridge.shared.pageCursorVisible,
+            backgroundIndicators: BrowserJobs.shared.indicators.count, foregroundRunning: agent.isRunning, inputPanelVisible: agent.inputPanelVisible)
+    }
+
+    private func beginNewRequest() {
+        let front = NSWorkspace.shared.frontmostApplication
+        if let front, front.bundleIdentifier != Bundle.main.bundleIdentifier {
+            newRequestTarget = RequestTarget(app: front,
+                files: front.bundleIdentifier == "com.apple.finder" ? AXEngine.copiedFiles(of: front) : [],
+                selection: AXEngine.selectedText(of: front))
+        }
+        agent.newTaskMode = true
+    }
+
+    private func enqueueNewRequest(_ raw: String) -> Bool {
+        var request = raw
+        let explicit = Background.choice(&request)
+        let background = explicit != false && (explicit == true || BrowserTaskRouting.isBrowserTask(request))
+        if background {
+            return BrowserJobs.shared.submit(raw, files: newRequestTarget.files,
+                browser: BrowserTaskRouting.browser(in: request) ?? newRequestTarget.app.flatMap { Launcher.isBrowser($0) ? $0.cleanName : nil }
+                    ?? BrowserJobs.shared.running.compactMap(\.browser).first) != nil
+        }
+        if agent.isRunning {
+            guard let id = TaskStore.shared.enqueue(request, files: newRequestTarget.files, source: .mac, background: false) else { return false }
+            queuedNativeTargets[id] = newRequestTarget
+            return true
+        }
+        agent.targetApp = newRequestTarget.app
+        agent.selectedFiles = newRequestTarget.files
+        agent.selectedText = newRequestTarget.selection
+        agent.continuation = nil
+        agent.submit(raw, background: false)
+        return true
+    }
+
+    private func startNextNativeRequest() {
+        guard !agent.isRunning, !Recorder.shared.isRecording else { return }
+        for item in TaskStore.shared.queued where !item.requiresReview && queuedNativeTargets[item.id] != nil {
+            guard TaskStore.shared.start(item.id) else { continue }
+            guard let target = queuedNativeTargets.removeValue(forKey: item.id) else { continue }
+            agent.targetApp = target.app; agent.selectedFiles = target.files; agent.selectedText = target.selection
+            agent.copied = nil; agent.annotation = nil; agent.continuation = nil
+            agent.submit(item.request, background: false, taskID: item.id)
+            return
+        }
+    }
+
     /// Puts the `clinqy` command on the PATH (~/.local/bin/clinqy → the copy inside the app) when it isn't there yet, so
     /// an app installed from the disk image works from terminals and coding agents too. A repo checkout's link is kept.
     private func linkCommand() {
@@ -332,6 +547,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             "extensionFolder": extensionInstaller?.extensionFolder.path
                 ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension").path,
             "provider": Provider.current.rawValue,
+            "foregroundRunning": agent.isRunning,
+            "backgroundLimit": BrowserJobs.shared.limit,
+            "backgroundIndicators": BrowserJobs.shared.indicators.count,
+            "primaryCursorSuppressed": buddy.suppressed,
+            "browserCursorActive": BrowserBridge.shared.pageCursorVisible,
+            "composingNewTask": agent.newTaskMode && panel.isVisible,
+            "inputPanelVisible": agent.inputPanelVisible,
+            "browserConnections": BrowserBridge.shared.connectedBrowserNames,
+            "backgroundJobs": BrowserJobs.shared.jobs.filter { !$0.finished }.map { ["id": $0.id.uuidString, "started": $0.started, "coordinating": $0.coordinating, "phase": String(describing: $0.agent?.phase ?? .idle)] as [String: Any] },
         ]
         if extensionInstaller?.autoLoad == .gaveUp { status["extensionInstall"] = "the run ended before the extension connected" }
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Clinqy/cli", isDirectory: true)
@@ -366,12 +590,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         model.letClinqyLoadExtension()
     }
 
-    /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
-    private var menu: NSMenu?
+    private let terminateSignal = DispatchSource.makeSignalSource(signal: SIGTERM, queue: .main)
 
-    private func setStatusIcon(running: Bool) {
+    /// While a task runs the menu-bar icon becomes a stop button (one click stops everything).
+    /// A background run gets a small menu instead (watch it or stop it): clicking the icon is how the user looks in on it.
+    private var menu: NSMenu?
+    private var runMenu: NSMenu?
+
+    private func setStatusIcon(running: Bool, background: Bool = false) {
         guard let button = statusItem.button else { return }
-        if running {
+        // A background run: blue, as the corner badge, and saying so (it's working out of sight).
+        button.toolTip = running ? (background ? "Clinqy is working in the background" : "Click to stop Clinqy") : nil
+        if running && background {
+            button.image = NSImage(systemSymbolName: "cursorarrow.rays", accessibilityDescription: "Clinqy (working in the background)")
+            button.contentTintColor = .systemBlue
+            button.action = nil
+            if runMenu == nil {
+                let m = NSMenu()
+                m.delegate = self
+                runMenu = m
+            }
+            statusItem.menu = runMenu
+        } else if running {
             button.image = NSImage(systemSymbolName: "stop.circle.fill", accessibilityDescription: "Stop Clinqy")
             button.contentTintColor = .systemRed
             statusItem.menu = nil
@@ -472,39 +712,84 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                     model: q["model"].flatMap { $0.isEmpty ? nil : $0 }, provider: qaProvider, report: out)
     }
 
-    /// Runs workflows scheduled for this minute (checked every 30 s; once a day each), and scheduled requests
-    /// (Scheduler) once they're due.
+    /// Durable dispatch happens before schedule acknowledgement. Every unattended run uses isolated
+    /// background tools and starts without the foreground application's selection, clipboard or history.
     private var scheduler: Timer?
+    private var lastScheduleIssue: String?
 
     private func startScheduler() {
         scheduler = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
-            MainActor.assumeIsolated {
-                guard let self, !self.agent.isRunning, self.agent.question == nil, !Recorder.shared.isRecording else { return }
-                if let item = Scheduler.takeDue() {
-                    Agent.writeLog("scheduled request: \(item.request) (\(item.rule.label))")
-                    // Whatever is in front when it fires; nothing selected or copied rides along.
-                    let front = NSWorkspace.shared.frontmostApplication
-                    if let front, front.bundleIdentifier != Bundle.main.bundleIdentifier { self.agent.targetApp = front }
-                    self.agent.selectedText = nil
-                    self.agent.selectedFiles = []
-                    self.agent.copied = nil
-                    self.agent.annotation = nil
-                    self.agent.continuation = nil
-                    self.agent.submit(item.request)
-                    return
-                }
-                let now = Date()
-                let hm = now.formatted(.dateTime.hour(.twoDigits(amPM: .omitted)).minute(.twoDigits))
-                for var wf in Workflows.shared.all where wf.schedule == hm {
-                    if let last = wf.lastScheduledRun, Calendar.current.isDate(last, inSameDayAs: now) { continue }
-                    wf.lastScheduledRun = now
-                    Workflows.shared.update(wf)
-                    Agent.writeLog("scheduled: \(wf.name) at \(hm)")
-                    self.agent.runWorkflow(wf)
-                    break
-                }
+            MainActor.assumeIsolated { self?.dispatchSchedules() }
+        }
+    }
+
+    private func dispatchSchedules(now: Date = Date()) {
+        guard !agent.isRunning, agent.question == nil, !Recorder.shared.isRecording, TaskStore.shared.active == nil else { return }
+        let store = TaskStore.shared
+        // A crash requires review, but a task queued by this process can still be started after a
+        // previous handoff/acknowledgement failure. Never create a second occurrence to recover it.
+        if let queued = store.queued.first(where: { self.isScheduledTask($0) && !$0.requiresReview }) {
+            startScheduledTask(queued.id)
+            return
+        }
+        if let dispatch = Scheduler.dispatchDue(now: now, enqueue: { item, key in
+            store.enqueue(item.request, source: .mac, background: true, idempotencyKey: key)
+        }) {
+            Agent.writeLog("scheduled request queued: \(dispatch.item.request) (\(dispatch.item.rule.label))")
+            startScheduledTask(dispatch.taskID)
+            reportScheduleIssue()
+            return
+        }
+        reportScheduleIssue()
+        // Workflow occurrences use the same durable outbox/deduplication rule. Existing workflow schedules
+        // retain minute-only eligibility; already queued task records survive acknowledgement failures.
+        for var workflow in Workflows.shared.all {
+            guard let time = workflow.schedule,
+                  let occurrence = Scheduler.dailyOccurrence(time: time, now: now, lastRun: workflow.lastScheduledRun, catchUp: false) else { continue }
+            let key = "workflow:" + workflow.id.uuidString.lowercased() + ":" + String(Int64(occurrence.timeIntervalSince1970))
+            guard let id = store.enqueue("Workflow: " + workflow.name, source: .mac, background: true, idempotencyKey: key) else {
+                reportScheduleIssue(store.storageError ?? "Scheduled workflow couldn't be saved; it remains due.")
+                return
+            }
+            workflow.lastScheduledRun = now
+            if !Workflows.shared.update(workflow) { reportScheduleIssue(Workflows.shared.storageError) }
+            startScheduledTask(id)
+            return
+        }
+    }
+
+    private func isScheduledTask(_ item: TaskStore.Record) -> Bool {
+        guard let key = item.dispatchKey else { return false }
+        return key.hasPrefix("schedule:") || key.hasPrefix("schedule-now:") || key.hasPrefix("workflow:")
+    }
+
+    private func startScheduledTask(_ id: UUID, reviewed: Bool = false) {
+        let store = TaskStore.shared
+        guard let item = store.record(id), item.state == .queued, !item.requiresReview || reviewed else { return }
+        var workflow: Workflow?
+        if let key = item.dispatchKey, key.hasPrefix("workflow:") {
+            let parts = key.split(separator: ":")
+            workflow = parts.count > 1 ? Workflows.shared.all.first { $0.id.uuidString.lowercased() == parts[1] } : nil
+            guard workflow != nil else {
+                store.update(id, state: .failed, stage: "The scheduled workflow no longer exists. Create a new task.")
+                return
             }
         }
+        guard store.start(id, explicitlyReviewed: reviewed) else { return }
+        agent.targetApp = nil
+        agent.selectedText = nil
+        agent.selectedFiles = []
+        agent.copied = nil
+        agent.annotation = nil
+        agent.continuation = nil
+        if let workflow { agent.runWorkflow(workflow, background: true, taskID: id) }
+        else { agent.submit(item.request, background: true, taskID: id, unattended: true) }
+    }
+
+    private func reportScheduleIssue(_ issue: String? = nil) {
+        let current = issue ?? Scheduler.storageError ?? Workflows.shared.storageError ?? Scheduler.lastNotice
+        if let current, current != lastScheduleIssue { Agent.writeLog(current) }
+        lastScheduleIssue = current
     }
 
     // MARK: - Hotkey
@@ -512,7 +797,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func hotKeyDown() {
         // While watching, ⌃⌥ stops the recording and learns from it.
         if Recorder.shared.isRecording { stopWatching(); return }
-        // While working, ⌃⌥ no longer stops (⏹ does): tap opens the bar to add context, hold talks.
+        // Summon always starts a separate request; existing work keeps its own controller and queue slot.
         guard pressedAt == nil else { return }   // key repeat
         pressedAt = Date()
         // A dedicated push-to-talk shortcut is configured: the summon chord is tap-only.
@@ -521,6 +806,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             MainActor.assumeIsolated {
                 guard let self, self.pressedAt != nil else { return }
                 self.holdToTalk = true
+                self.beginNewRequest()
                 self.rememberTarget()
                 self.panel.orderOut(nil)
                 self.startListening(autoStop: false)
@@ -562,6 +848,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             PushToTalkHotKey(spec: spec, onPress: { [weak self] in self?.dedicatedTalkDown() },
                              onRelease: { [weak self] in self?.dedicatedTalkUp() })
         }
+        let dictate = Config.value("DICTATE_HOTKEY") ?? "fn+ctrl"
+        dictateHotKey = dictate.lowercased() == "off" ? nil
+            : HotKey(spec: dictate, onPress: { [weak self] in self?.dictateDown() },
+                     onRelease: { [weak self] in self?.dictateUp() },
+                     onOtherKey: { [weak self] in self?.dictateAbandoned() })
         openMenuItem?.title = "Open Clinqy  (\(menuShortcutLabel(summon)))"
         let talkLabel = talkHotKey == nil ? menuShortcutLabel(summon) + " · hold" : menuShortcutLabel(Config.value("TALK_HOTKEY") ?? "")
         talkMenuItem?.title = "Talk  (hold \(talkLabel))"
@@ -592,11 +883,65 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         hotKey?.enabled = enabled
         talkHotKey?.enabled = enabled
+        dictateHotKey?.enabled = enabled
+    }
+
+    // MARK: - Dictation
+
+    private func dictateDown() {
+        if dictating {   // tapped on earlier: this press ends it
+            dictateStarted = nil
+            endDictation()
+            return
+        }
+        guard !holdToTalk, !voice.isListening else { return }
+        dictating = true
+        dictateStarted = Date()
+        island.show()
+        startListening(autoStop: false)
+    }
+
+    /// Held: done speaking. A quick tap: keep listening hands-free until the next press.
+    private func dictateUp() {
+        guard dictating, let started = dictateStarted else { return }
+        dictateStarted = nil
+        if Date().timeIntervalSince(started) < 0.35 { return }
+        endDictation()
+    }
+
+    /// Stops listening; nothing heard means nothing typed, so tidy up if no words arrive.
+    private func endDictation() {
+        voice.stop()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self] in
+            guard let self, self.dictating, !self.voice.isListening else { return }
+            self.dictating = false
+            self.island.hide()
+            self.buddy.mood = self.agent.isRunning ? .acting : .idle
+        }
+    }
+
+    /// fn+⌃ was part of another shortcut (fn+⌃+arrow…): drop the dictation.
+    private func dictateAbandoned() {
+        guard dictating, dictateStarted != nil else { return }
+        dictating = false
+        dictateStarted = nil
+        voice.cancel()
+        island.hide()
+        buddy.mood = agent.isRunning ? .acting : .idle
+    }
+
+    /// Types what was said into whatever has the keyboard focus, like the keyboard would.
+    private func typeDictation(_ text: String) {
+        let words = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !words.isEmpty else { return }
+        Agent.writeLog("dictation: typed \(words.count) characters")
+        AXEngine.enter(words)
     }
 
     private func dedicatedTalkDown() {
         guard pressedAt == nil else { return }
         pressedAt = Date()
+        beginNewRequest()
         holdToTalk = true
         rememberTarget()
         panel.orderOut(nil)
@@ -665,7 +1010,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown, .otherMouseDown]) { [weak self] _ in
             MainActor.assumeIsolated {
                 guard let self, self.panel.isVisible, self.agent.question == nil, ReviewCenter.shared.pending == nil,
-                      !self.voice.isListening else { return }
+                      !self.voice.isListening, !self.panel.frame.contains(NSEvent.mouseLocation) else { return }
                 self.panel.orderOut(nil)
             }
         }
@@ -710,8 +1055,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     }
 
     @objc func togglePanel() {
-        if panel.isVisible { panel.orderOut(nil); return }
+        if panel.isVisible && agent.newTaskMode { panel.orderOut(nil); return }
+        beginNewRequest()
         rememberTarget()
+        island.hide()
         panel.showCentered()
     }
 
@@ -726,6 +1073,20 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     @objc func openProfile() { Profile.open() }
 
+    @objc func showTasks() { TasksPanel.shared.show() }
+
+    @objc func workerLogin() {
+        guard !agent.isRunning else { buddy.bubble("Finish or stop the current task before signing in to Worker Chrome", for: 5); return }
+        Task {
+            do { try await ChromeWorker.shared.openLogin() }
+            catch { buddy.bubble(error.localizedDescription, for: 8) }
+        }
+    }
+    @objc func finishWorkerLogin() {
+        guard !agent.isRunning else { return }
+        Task { await ChromeWorker.shared.finishLogin() }
+    }
+
     @objc func showStats() {
         agent.result = StatsCard.card
         agent.onResult()
@@ -735,7 +1096,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     func menuNeedsUpdate(_ menu: NSMenu) {
         menu.removeAllItems()
+        if menu === runMenu { return fillRunMenu(menu) }
         let items = Scheduler.all
+        if let issue = Scheduler.storageError ?? Workflows.shared.storageError ?? Scheduler.lastNotice {
+            let error = menu.addItem(withTitle: issue, action: nil, keyEquivalent: "")
+            error.isEnabled = false
+            menu.addItem(.separator())
+        }
+        let behavior = menu.addItem(withTitle: "Runs locally while Clinqy is open; missed runs follow each schedule's policy.", action: nil, keyEquivalent: "")
+        behavior.isEnabled = false
         if items.isEmpty {
             let none = menu.addItem(withTitle: "Nothing scheduled", action: nil, keyEquivalent: "")
             none.isEnabled = false
@@ -744,6 +1113,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             let title = "\(item.request.prefix(50))\(item.request.count > 50 ? "…" : "")  ·  \(Scheduler.describe(item))"
             let row = NSMenuItem(title: title, action: nil, keyEquivalent: "")
             let sub = NSMenu()
+            sub.addItem(withTitle: item.policy.label, action: nil, keyEquivalent: "").isEnabled = false
             let run = sub.addItem(withTitle: "Run Now", action: #selector(runScheduleNow(_:)), keyEquivalent: "")
             run.representedObject = item.request
             run.target = self
@@ -758,15 +1128,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         add.target = self
     }
 
+    /// The background run's menu: what it's on now, watch it, stop it.
+    private func fillRunMenu(_ menu: NSMenu) {
+        let now = agent.question.map { "Asks: " + $0.text } ?? agent.steps.last?.text ?? "Working…"
+        let status = menu.addItem(withTitle: String(now.prefix(60)) + (now.count > 60 ? "…" : ""), action: nil, keyEquivalent: "")
+        status.isEnabled = false
+        menu.addItem(.separator())
+        menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "").target = self
+        menu.addItem(withTitle: "Stop", action: #selector(stopFromMenuBar), keyEquivalent: "").target = self
+    }
+
     @objc func removeSchedule(_ item: NSMenuItem) {
         guard let id = item.representedObject as? UUID else { return }
-        Scheduler.remove(id)
+        if !Scheduler.remove(id) { reportScheduleIssue() }
     }
 
     @objc func runScheduleNow(_ item: NSMenuItem) {
         guard let request = item.representedObject as? String, !agent.isRunning else { return }
-        agent.continuation = nil
-        agent.submit(request)
+        guard let id = TaskStore.shared.enqueue(request, source: .mac, background: true,
+                                                idempotencyKey: "schedule-now:" + UUID().uuidString) else {
+            reportScheduleIssue(TaskStore.shared.storageError)
+            return
+        }
+        startScheduledTask(id)
     }
 
     /// Asks for a request and when to run it ("every weekday at 9", "tomorrow 8:30", "in 20 minutes").
@@ -778,9 +1162,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         request.placeholderString = "What should I do? e.g. check placement mail"
         let when = NSTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
         when.placeholderString = "When? e.g. every weekday at 9"
-        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 54))
+        request.frame.origin.y = 64
+        when.frame.origin.y = 34
+        let missed = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 320, height: 26))
+        missed.addItems(withTitles: Scheduler.MissedRunPolicy.allCases.map(\.label))
+        let box = NSView(frame: NSRect(x: 0, y: 0, width: 320, height: 88))
         box.addSubview(request)
         box.addSubview(when)
+        box.addSubview(missed)
         alert.accessoryView = box
         alert.window.initialFirstResponder = request
         alert.addButton(withTitle: "Schedule")
@@ -790,8 +1179,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         let text = request.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return }
         let done = NSAlert()
-        if let line = Scheduler.add(request: text, phrase: when.stringValue) {
-            done.messageText = "Scheduled"
+        let policy = Scheduler.MissedRunPolicy.allCases[max(0, missed.indexOfSelectedItem)]
+        if let line = Scheduler.add(request: text, phrase: when.stringValue, missed: policy) {
+            done.messageText = line.hasPrefix("FAILED:") ? "Schedule couldn't be saved" : "Scheduled"
             done.informativeText = line
         } else {
             done.messageText = "I couldn't read “\(when.stringValue)” as a time"
@@ -803,6 +1193,74 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleDryRun(_ item: NSMenuItem) {
         agent.dryRun.toggle()
         item.state = agent.dryRun ? .on : .off
+    }
+
+    @objc func showBackgroundWork() { AgentScreenView.shared.show() }
+
+    /// Connects a Telegram bot (its token from @BotFather), then pairs the user's chat with a one-time link.
+    @objc func setUpTelegram() {
+        let bot = Telegram.shared
+        NSApp.activate(ignoringOtherApps: true)
+        if bot.token != nil {
+            let alert = NSAlert()
+            alert.messageText = "Telegram"
+            alert.informativeText = bot.chatID == nil ? "The bot is set up but no chat is paired yet."
+                : "Paired: tasks you message the bot run on this Mac, in the background unless you say otherwise."
+            alert.addButton(withTitle: "Pair a Chat")
+            alert.addButton(withTitle: "Cancel")
+            alert.addButton(withTitle: "Disconnect")
+            switch alert.runModal() {
+            case .alertFirstButtonReturn: return pairTelegram()
+            case .alertThirdButtonReturn:
+                try? Config.write(["TELEGRAM_BOT_TOKEN": nil, "TELEGRAM_CHAT_ID": nil])
+                bot.start()
+                return
+            default: return
+            }
+        }
+        let alert = NSAlert()
+        alert.messageText = "Message Clinqy from Telegram"
+        alert.informativeText = "In Telegram, message @BotFather, send /newbot and follow its steps. Paste the token it gives you here. "
+            + "Only the chat you pair next can give Clinqy tasks."
+        let field = NSSecureTextField(frame: NSRect(x: 0, y: 0, width: 320, height: 24))
+        field.placeholderString = "123456789:AA…"
+        alert.accessoryView = field
+        alert.window.initialFirstResponder = field
+        alert.addButton(withTitle: "Connect")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        let token = field.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !token.isEmpty else { return }
+        try? Config.write(["TELEGRAM_BOT_TOKEN": token, "TELEGRAM_CHAT_ID": nil])
+        pairTelegram()
+    }
+
+    private func pairTelegram() {
+        Task { @MainActor in
+            let bot = Telegram.shared
+            guard await bot.checkToken() != nil else {
+                let alert = NSAlert()
+                alert.messageText = "Telegram didn't accept that token"
+                alert.informativeText = "Check it in @BotFather (/mybots → API Token) and try again."
+                NSApp.activate(ignoringOtherApps: true)
+                alert.runModal()
+                return
+            }
+            bot.start()
+            let (code, link) = bot.pairLink()
+            let alert = NSAlert()
+            alert.messageText = "Pair your Telegram chat"
+            alert.informativeText = "Open the bot and press Start, or send it:\n/pair \(code)\n\nThe code works for 10 minutes."
+            alert.addButton(withTitle: "Open in Telegram")
+            alert.addButton(withTitle: "Done")
+            NSApp.activate(ignoringOtherApps: true)
+            if alert.runModal() == .alertFirstButtonReturn, let link { NSWorkspace.shared.open(link) }
+        }
+    }
+
+    @objc func toggleBackground(_ item: NSMenuItem) {
+        Background.always.toggle()
+        item.state = Background.always ? .on : .off
     }
 
     @objc func toggleFollowCursor(_ item: NSMenuItem) {

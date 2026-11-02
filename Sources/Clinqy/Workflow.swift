@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// One concrete, replayable step: what was done and how to find its target again — no model needed.
 struct WorkflowStep: Codable, Equatable {
@@ -77,6 +78,7 @@ struct Workflow: Codable, Identifiable, Equatable {
     /// Builds a workflow from a finished run: typed text becomes a named parameter (the field's label),
     /// defaulting to what was typed, so `clinqy workflow <name> "Your name=Priya"` works.
     static func from(_ entry: History.Entry) -> Workflow? {
+        guard entry.requiresFreshWork != true else { return nil }
         guard var steps = entry.trace, !steps.isEmpty else { return nil }
         var params: [String] = []
         var defaults: [String: String] = [:]
@@ -107,22 +109,50 @@ final class Workflows: ObservableObject {
         return dir.appendingPathComponent("workflows.json")
     }()
 
+    @Published private(set) var storageError: String?
+    private var corrupt = false
+
     private init() {
-        if let data = try? Data(contentsOf: url), let saved = try? JSONDecoder.iso8601.decode([Workflow].self, from: data) { all = saved }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+        do { all = try JSONDecoder.iso8601.decode([Workflow].self, from: Data(contentsOf: url)) }
+        catch {
+            corrupt = true
+            storageError = "Workflows couldn't be read safely. The existing file was preserved; scheduled workflows are disabled."
+        }
     }
 
-    func add(_ w: Workflow) { all.insert(w, at: 0); save() }
-    func remove(_ w: Workflow) { all.removeAll { $0.id == w.id }; save() }
-    func update(_ w: Workflow) {
-        guard let i = all.firstIndex(where: { $0.id == w.id }) else { return }
-        all[i] = w
-        save()
+    @discardableResult
+    func add(_ w: Workflow) -> Bool { mutate { $0.insert(w, at: 0) } }
+    @discardableResult
+    func remove(_ w: Workflow) -> Bool { mutate { $0.removeAll { $0.id == w.id } } }
+    @discardableResult
+    func update(_ w: Workflow) -> Bool {
+        guard let i = all.firstIndex(where: { $0.id == w.id }) else { return false }
+        return mutate { $0[i] = w }
     }
     func named(_ name: String) -> Workflow? {
         all.first { $0.name.lowercased() == name.lowercased() } ?? all.first { $0.name.lowercased().contains(name.lowercased()) }
     }
 
-    private func save() { Persist.write(all, to: url, encoder: .iso8601) }
+    /// Schedule acknowledgement must be durable before the caller treats it as saved. Workflow files are
+    /// small; use an atomic synchronous write instead of the best-effort asynchronous history/cache queue.
+    private func mutate(_ change: (inout [Workflow]) -> Void) -> Bool {
+        guard !corrupt else { return false }
+        let previous = all
+        change(&all)
+        do {
+            let fm = FileManager.default
+            try fm.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            try JSONEncoder.iso8601.encode(all).write(to: url, options: .atomic)
+            try fm.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+            storageError = nil
+            return true
+        } catch {
+            all = previous
+            storageError = "Couldn't save workflows. The existing file was preserved; scheduled task records prevent duplicate dispatch."
+            return false
+        }
+    }
 }
 
 /// What a run that worked did, kept so a similar request later starts from the known path instead of exploring.
@@ -149,18 +179,32 @@ struct CachedRoute: Codable, Identifiable, Equatable {
 final class ReplayCache {
     static let shared = ReplayCache()
     private(set) var all: [CachedRoute] = []
-    /// The replay offered to the current run, so its outcome can be booked.
-    private var offered: UUID?
+    /// The replay offered to each run, so its outcome is booked against that run's offer and no other's.
+    private var offers = ReplayOffers()
+    private var currentRun: UUID? { TaskExecution.current?.id }
 
-    private let url: URL = {
+    private static var defaultURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Clinqy", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("replays.json")
-    }()
+    }
+    private let url: URL
+    private var procedures: ProcedureStore?
 
-    private init() {
-        if let data = try? Data(contentsOf: url), let saved = try? JSONDecoder.iso8601.decode([CachedRoute].self, from: data) { all = saved }
+    init(file: URL? = nil) {
+        self.url = file ?? Self.defaultURL
+        switch StoreFile.load(url, decode: { try? JSONDecoder.iso8601.decode([CachedRoute].self, from: $0) }) {
+        case .value(let saved): all = saved
+        case .unreadable: StoreFile.quarantine(url)   // set aside, so the next save can't replace it with an empty cache
+        case .absent: break
+        }
+        do {
+            let store = try ProcedureStore(file: url.appendingPathExtension("sqlite"))
+            try store.save(all, importing: true)
+            all = try store.recent()
+            procedures = store
+        } catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
     }
 
     /// Keeps a successful run's steps. `url`/`title` are the page it started on (nil in an app); typed secrets are blanked.
@@ -187,7 +231,7 @@ final class ReplayCache {
         }
         all.sort { $0.last > $1.last }
         if all.count > 150 { all.removeLast(all.count - 150) }
-        offered = nil
+        offers.clear(run: currentRun)
         Embedder.shared.warm([request])
         save()
     }
@@ -197,6 +241,16 @@ final class ReplayCache {
         let want = Self.words(request)
         guard !want.isEmpty else { return nil }
         let place = Self.place(url: url, app: app), shape = Self.titleShape(title)
+        // Exact, same-place repeats need neither an embedding nor ranking every cached route.
+        if let exact = all.first(where: {
+            Router.normalize($0.request) == Router.normalize(request) && $0.place == place && $0.title == shape
+        }) { return exact }
+        if let cold = try? procedures?.exact(request, place: place, title: shape) {
+            all.removeAll { $0.id == cold.id }
+            all.insert(cold, at: 0)
+            if all.count > 150 { all.removeLast() }
+            return cold
+        }
         let wantVector = Embedder.shared.vector(request)
         let scored = all.compactMap { r -> (CachedRoute, Double)? in
             let have = Set(r.words)
@@ -224,8 +278,8 @@ final class ReplayCache {
 
     /// Text for the lead's first message when a similar run worked before (nil = nothing close).
     func hint(request: String, app: String?, url: String?, title: String?) -> String? {
-        guard let r = match(request: request, app: app, url: url, title: title) else { offered = nil; return nil }
-        offered = r.id
+        guard let r = match(request: request, app: app, url: url, title: title) else { offers.clear(run: currentRun); return nil }
+        offers.offer(r.id, to: currentRun)
         let where_ = r.site ?? r.place
         return "\nYou did a very similar task before (“\(r.request.prefix(80))” on \(where_), worked \(r.uses)×). These steps worked then:\n"
             + r.steps.enumerated().map { "\($0.offset + 1). \($0.element.summary)" }.joined(separator: "\n")
@@ -237,7 +291,7 @@ final class ReplayCache {
     /// Books how the run that was offered a replay went: a failure counts against it, and one that keeps failing is dropped.
     /// (A success is booked by `record`.)
     func outcome(ok: Bool) {
-        defer { offered = nil }
+        let offered = offers.take(run: currentRun)
         guard !ok, let id = offered, let i = all.firstIndex(where: { $0.id == id }) else { return }
         all[i].misses += 1
         if all[i].misses >= 2, all[i].misses >= all[i].uses { all.remove(at: i) }
@@ -250,13 +304,30 @@ final class ReplayCache {
         guard let r = match(request: request, app: app, url: url, title: title), r.uses >= 2, r.misses == 0,
               Router.normalize(r.request) == Router.normalize(request),
               !r.steps.contains(where: Self.isRisky) else { return nil }
-        offered = r.id
+        offers.offer(r.id, to: currentRun)
         return Workflow(name: String(r.request.prefix(60)), summary: "Replayed from an earlier run", params: [], steps: r.steps, created: r.last)
     }
 
-    func remove(_ r: CachedRoute) { all.removeAll { $0.id == r.id }; save() }
+    func remove(_ r: CachedRoute) {
+        do { try procedures?.remove(r.id) } catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
+        all.removeAll { $0.id == r.id }; save()
+    }
 
-    private func save() { Persist.write(all, to: url, encoder: .iso8601) }
+    func corrected(request: String) {
+        let raw = request.replacingOccurrences(of: #"(?i)^(in the background|dry run):\s*"#, with: "", options: .regularExpression)
+        let normalized = Router.normalize(raw)
+        do { try procedures?.corrected(raw) } catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
+        for i in all.indices where Router.normalize(all[i].request) == normalized {
+            all[i].misses += 1
+        }
+        save()
+    }
+
+    private func save() {
+        do { try procedures?.save(all) }
+        catch { NSLog("Clinqy procedures: %@", error.localizedDescription) }
+        if procedures == nil { Persist.write(all, to: url, encoder: .iso8601) }
+    }
 
     // MARK: Keys
 
@@ -300,13 +371,18 @@ final class ReplayCache {
 enum Persist {
     private static let queue = DispatchQueue(label: "clinqy.persist", qos: .utility)
 
-    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder) {
-        guard let data = try? encoder.encode(value) else { return }
-        queue.async { try? data.write(to: url, options: .atomic) }
+    /// `onError` is told when the value couldn't be encoded or written (called off the main thread).
+    static func write<T: Encodable>(_ value: T, to url: URL, encoder: JSONEncoder, onError: (@Sendable (Error) -> Void)? = nil) {
+        let data: Data
+        do { data = try encoder.encode(value) } catch { onError?(error); return }
+        queue.async { if let error = StoreFile.write(data, to: url) { onError?(error) } }
     }
 
     /// Waits for pending writes (before the app quits).
-    static func flush() { queue.sync {} }
+    static func flush() {
+        queue.sync {}
+        TaskMemory.shared.flush()
+    }
 }
 
 extension JSONDecoder {

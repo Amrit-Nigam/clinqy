@@ -32,16 +32,30 @@ enum Router {
             guard !name.isEmpty else { continue }
             // Longest defaults first, so "Amrit Nigam" is a slot before "Amrit".
             let slots = (wf.defaults ?? [:]).filter { $0.value.count >= 2 && name.contains(normalize($0.value)) && !normalize($0.value).isEmpty }
-                .sorted { $0.value.count > $1.value.count }
-            var pattern = NSRegularExpression.escapedPattern(for: name)
-            var order: [String] = []
+                .sorted { $0.value.count != $1.value.count ? $0.value.count > $1.value.count : $0.key < $1.key }
+            // Slots are located in the name itself (longest first, never overlapping), then laid out in the order they
+            // appear in the text: regex capture groups are numbered left to right, not by length.
+            var claimed: [(range: Range<String.Index>, key: String)] = []
             for (key, value) in slots {
-                let lit = NSRegularExpression.escapedPattern(for: normalize(value))
-                guard let r = pattern.range(of: lit) else { continue }
-                pattern.replaceSubrange(r, with: "(.+?)")
-                order.append(key)
+                let lit = normalize(value)
+                var from = name.startIndex
+                while let r = name.range(of: lit, range: from..<name.endIndex) {
+                    if !claimed.contains(where: { $0.range.overlaps(r) }) { claimed.append((r, key)); break }
+                    from = r.upperBound
+                }
             }
-            pattern = "^" + pattern.replacingOccurrences(of: " ", with: #"\s+"#) + "$"
+            claimed.sort { $0.range.lowerBound < $1.range.lowerBound }
+            var pattern = ""
+            var order: [String] = []
+            var cursor = name.startIndex
+            for c in claimed {
+                pattern += NSRegularExpression.escapedPattern(for: String(name[cursor..<c.range.lowerBound])).replacingOccurrences(of: " ", with: #"\s+"#)
+                pattern += "(.+?)"
+                order.append(c.key)
+                cursor = c.range.upperBound
+            }
+            pattern += NSRegularExpression.escapedPattern(for: String(name[cursor...])).replacingOccurrences(of: " ", with: #"\s+"#)
+            pattern = "^" + pattern + "$"
             guard let re = try? NSRegularExpression(pattern: pattern),
                   let m = re.firstMatch(in: want, range: NSRange(want.startIndex..., in: want)) else { continue }
             var params: [String: String] = [:]
@@ -54,7 +68,7 @@ enum Router {
                 params[key] = cased.trimmingCharacters(in: .whitespaces)
             }
             // Prefer the most literal template (fewest slots = least guessing).
-            let literal = name.count - slots.reduce(0) { $0 + $1.value.count }
+            let literal = name.count - claimed.reduce(0) { $0 + name[$1.range].count }
             if best == nil || literal > best!.1 { best = (Match(workflow: wf, params: params), literal) }
         }
         return best?.0
@@ -83,9 +97,15 @@ enum Router {
     /// "continue", "go on", "also make an answer list", "now send it to Rahul", "aur", "phir": builds on the last task.
     static func isFollowUp(_ request: String) -> Bool {
         let t = normalize(request)
-        return t.range(of: #"^(continue|carry on|go on|keep going|resume|finish( it| that)?|complete( it| that)?|try again|retry|"#
+        return isCorrection(request) || t.range(of: #"^(continue|carry on|go on|keep going|resume|finish( it| that)?|complete( it| that)?|try again|retry|"#
                        + #"also|and|now|then|next|after that|same|aur|phir|ab|aage|jari rakho|continue karo)\b"#,
                        options: .regularExpression) != nil
+    }
+
+    /// Explicit corrections should continue the prior task and stop its old route being replayed as proven.
+    static func isCorrection(_ request: String) -> Bool {
+        normalize(request).range(of: #"^(actually\b|instead\b|no[, :]|nope[, :]|not like that\b|that's wrong\b|that is wrong\b|correction for\b|i meant\b)|\b(use|save|export|send)\b.+\binstead\b"#,
+                                 options: .regularExpression) != nil
     }
 
     /// "no thanks", "that's all", "kuch nahi": nothing more to do (an answer to the follow-up mic).

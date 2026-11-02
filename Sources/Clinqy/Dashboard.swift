@@ -4,6 +4,8 @@ import SwiftUI
 @MainActor
 final class DashboardModel: ObservableObject {
     @Published var page = "Overview"
+    /// The window showing the dashboard is on screen (set by its window).
+    var windowVisible: () -> Bool = { true }
     @Published var range = UsageRange.month
     @Published var selectedProvider = Provider.current.rawValue
     @Published var modelChoice = "sonnet"
@@ -72,8 +74,10 @@ final class DashboardModel: ObservableObject {
     var requestLimitValue: Int { Int(requestLimit) ?? 0 }
 
     func refresh(settings: Bool = false) {
-        summary = UsageStore.summary(range: range)
-        monthlySummary = UsageStore.summary(range: .month)
+        let current = UsageStore.summary(range: range)
+        if summary != current { summary = current }
+        let month = range == .month ? current : UsageStore.summary(range: .month)
+        if monthlySummary != month { monthlySummary = month }
         if settings {
             selectedProvider = Provider.current.rawValue
             let latest = ["HOTKEY": Config.value("HOTKEY") ?? "ctrl+alt",
@@ -167,7 +171,11 @@ final class DashboardModel: ObservableObject {
         case .ollama, .compatible: key = "LOCAL_MODEL"
         case .codexCLI: key = "CODEX_MODEL"
         case .agyCLI: key = "AGY_MODEL"
-        default: key = "CLAUDE_MODEL"
+        case .claudeCLI: key = "CLAUDE_MODEL"
+        case .anthropic: key = "ANTHROPIC_MODEL"
+        case .openai: key = "OPENAI_MODEL"
+        case .gemini: key = "GEMINI_MODEL"
+        case .openrouter: key = "OPENROUTER_MODEL"
         }
         do {
             try Config.write([key: value.isEmpty ? nil : value])
@@ -328,7 +336,9 @@ struct DashboardContentView: View {
     @State private var appeared = false
     @State private var chartVisible = false
 
-    private let pages = ["Overview", "Usage", "AI & Model", "Shortcuts"]
+    private let pages = ["Overview", "Usage", "AI & Model", "Background", "Shortcuts"]
+    @AppStorage("backgroundMode") private var backgroundMode = false
+    @AppStorage("backgroundWebMode") private var backgroundWebMode = "extension"
     private let surface = Brand.text.opacity(0.035)
     private let text = Brand.text
     private let muted = Brand.soft
@@ -365,7 +375,9 @@ struct DashboardContentView: View {
             withAnimation(reduceMotion ? nil : .easeOut(duration: 0.22)) { appeared = true }
         }
         .onDisappear { appeared = false }
-        .onReceive(Timer.publish(every: 8, on: .main, in: .common).autoconnect()) { _ in model.refresh() }
+        .onReceive(Timer.publish(every: 8, tolerance: 1, on: .main, in: .common).autoconnect()) { _ in
+            if model.windowVisible() { model.refresh() }
+        }
     }
 
     @ViewBuilder private var pageContent: some View {
@@ -373,7 +385,48 @@ struct DashboardContentView: View {
         case "Usage": usagePage
         case "AI & Model": providerPage
         case "Shortcuts": shortcutsPage
+        case "Background": backgroundPage
         default: overviewPage
+        }
+    }
+
+    private var backgroundPage: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            card {
+                Toggle(isOn: $backgroundMode) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Work in the background").font(.system(size: 15, weight: .semibold))
+                        Text("Web tasks run in Clinqy’s own browser tabs while you keep browsing. File and supported service tasks run directly; native app work asks before switching to foreground. "
+                             + "Either way, a request can choose: say or type “in the background” or “not in the background”.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
+                    }
+                }
+                .toggleStyle(.switch)
+            }
+            card {
+                Picker("Web browser mode", selection: $backgroundWebMode) {
+                    Text("Signed-in browser tabs").tag("extension")
+                    Text("Separate headless Chrome").tag("headless")
+                }
+                Text("Signed-in browser tabs use the Clinqy extension in your connected browser profile. Tabs stay inactive and reuse website sessions, with a Clinqy group where supported. Other tabs stay yours. Password prompts and security dialogs may need your input. Changes apply to the next task.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                Text("Headless Chrome sign-in").font(.system(size: 14, weight: .semibold))
+                Text("The optional headless mode uses a separate Chrome profile. Sign in here once, then finish sign-in before running headless tasks.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                HStack {
+                    Button("Sign in…") { (NSApp.delegate as? AppDelegate)?.workerLogin() }.brand()
+                    Button("Finish sign-in") { (NSApp.delegate as? AppDelegate)?.finishWorkerLogin() }.brand()
+                }
+            }
+            card {
+                Text("Tasks and recovery").font(.system(size: 14, weight: .semibold))
+                Text("Check the current stage and saved results here or in Telegram. Interrupted tasks stay stopped; queued tasks restored after a restart need review before starting.")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                HStack {
+                    Button("Tasks & Recovery") { TasksPanel.shared.show() }.brand()
+                    Button("Show background work") { AgentScreenView.shared.show() }.brand()
+                }
+            }
         }
     }
 

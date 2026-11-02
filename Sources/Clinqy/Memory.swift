@@ -68,8 +68,11 @@ enum Memory {
         var line: String { tagged ? "\(scope!.tag) \(text)" : text }
     }
 
-    private static let url = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.md")
-    private static let metaURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.meta.json")
+    /// Where memory lives (tests point this at a scratch folder).
+    nonisolated(unsafe) static var directoryOverride: URL?
+    private static var directory: URL { directoryOverride ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy") }
+    private static var url: URL { directory.appendingPathComponent("memory.md") }
+    private static var metaURL: URL { directory.appendingPathComponent("memory.meta.json") }
 
     // MARK: Reading (cached until the file changes)
 
@@ -78,10 +81,37 @@ enum Memory {
         let size: Int
         let entries: [Fact]
         let index: Index
-        let graph: MemoryGraph
+        let graph: MemoryGraph?
     }
     nonisolated(unsafe) private static var loaded: Loaded?
     private static let lock = NSLock()
+    private static let graphQueue = DispatchQueue(label: "clinqy.memory-graph", qos: .utility)
+    private final class Batch {
+        var entries: [Fact]
+        var dirty = false
+        var metaDirty = false
+        var changes: [Change] = []
+        init(_ entries: [Fact]) { self.entries = entries }
+    }
+    private static var batch: Batch? { Thread.current.threadDictionary["clinqy.memory.batch"] as? Batch }
+
+    /// Learning produces a small set of edits. Commit it once, then rebuild indexes/metadata once.
+    static func performBatch(_ body: () -> Void) {
+        if batch != nil { body(); return }
+        let staged = Batch(entries)
+        Thread.current.threadDictionary["clinqy.memory.batch"] = staged
+        body()
+        Thread.current.threadDictionary.removeObject(forKey: "clinqy.memory.batch")
+        if staged.dirty { write(staged.entries.map(\.line)) }
+        if staged.metaDirty { saveMeta() }
+        for change in staged.changes { record(old: change.old, new: change.new, why: change.why) }
+    }
+
+    /// False when the memory file couldn't be written (a batched change reports success; the batch's flush reports its own).
+    private static func commit(_ entries: [Fact]) -> Bool {
+        if let batch { batch.entries = entries; batch.dirty = true; return true }
+        return write(entries.map(\.line))
+    }
 
     private static var current: Loaded {
         let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
@@ -89,19 +119,32 @@ enum Memory {
         lock.lock()
         defer { lock.unlock() }
         if let l = loaded, l.stamp == stamp, l.size == size { return l }
-        let entries = parse((try? String(contentsOf: url, encoding: .utf8)) ?? "")
-        let l = Loaded(stamp: stamp, size: size, entries: entries, index: Index(entries.map(\.text)), graph: MemoryGraph(entries))
+        var text = ""
+        switch StoreFile.load(url, decode: { String(data: $0, encoding: .utf8) }) {
+        case .value(let t): text = t
+        case .unreadable: StoreFile.quarantine(url)   // set aside, so the next save can't replace it with an empty memory
+        case .absent: break
+        }
+        let entries = parse(text)
+        let l = Loaded(stamp: stamp, size: size, entries: entries, index: Index(entries.map(\.text)), graph: nil)
         loaded = l
+        graphQueue.async {
+            guard lock.withLock({ loaded?.stamp == stamp && loaded?.size == size && loaded?.entries == entries }) else { return }
+            let graph = MemoryGraph(entries)
+            lock.lock(); defer { lock.unlock() }
+            guard let current = loaded, current.stamp == stamp, current.size == size, current.entries == entries else { return }
+            loaded = Loaded(stamp: stamp, size: size, entries: entries, index: current.index, graph: graph)
+        }
         // New or edited facts get their vectors in the background.
         Embedder.shared.warm(entries.map(\.text))
         return l
     }
 
     /// Every fact, in the order learned (scope tags left off).
-    static var facts: [String] { current.entries.map(\.text) }
-    static var entries: [Fact] { current.entries }
+    static var facts: [String] { entries.map(\.text) }
+    static var entries: [Fact] { batch?.entries ?? current.entries }
     /// The file's lines as written, tags included (for tidy-ups that rewrite the file).
-    static var lines: [String] { current.entries.map(\.line) }
+    static var lines: [String] { entries.map(\.line) }
 
     static func parse(_ text: String) -> [Fact] {
         text.split(separator: "\n").compactMap { raw -> Fact? in
@@ -128,7 +171,7 @@ enum Memory {
     /// The memory format this build writes. Raise it when a change needs existing memory rewritten, and say how
     /// in `upgradeIfNeeded`.
     static let format = 2
-    private static let formatURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.format")
+    private static var formatURL: URL { directory.appendingPathComponent("memory.format") }
 
     /// Brings memory written by an older Clinqy (or edited by hand) to the current format, once, on the first launch
     /// of a newer build (app or `clinqy` command): one "- fact" line each, headings and other list styles cleaned
@@ -139,15 +182,16 @@ enum Memory {
     static func upgradeIfNeeded() -> String? {
         let have = (try? String(contentsOf: formatURL, encoding: .utf8)).flatMap { Int($0.trimmingCharacters(in: .whitespacesAndNewlines)) } ?? 1
         guard have < format else { return nil }
+        var failed = false
         defer {
-            try? FileManager.default.createDirectory(at: formatURL.deletingLastPathComponent(), withIntermediateDirectories: true)
-            try? "\(format)\n".write(to: formatURL, atomically: true, encoding: .utf8)
+            // Marked done only when nothing went wrong, so a failed rewrite is tried again next launch.
+            if !failed { StoreFile.write(Data("\(format)\n".utf8), to: formatURL) }
         }
         guard let text = try? String(contentsOf: url, encoding: .utf8) else { return nil }
         let (lines, merged) = normalized(parse(text))
         let rewritten = lines.map { "- \($0)" }.joined(separator: "\n") + "\n"
         guard rewritten != text else { return nil }
-        replaceAll(with: lines, backup: true)
+        guard replaceAll(with: lines, backup: true) else { failed = true; return nil }
         for fact in merged { record(old: fact, new: nil, why: "upgrade: duplicate") }
         return "memory upgraded to format \(format): \(lines.count) facts\(merged.isEmpty ? "" : ", \(merged.count) duplicates merged")"
     }
@@ -258,20 +302,20 @@ enum Memory {
 
     static func isProfile(_ fact: String) -> Bool { fact.range(of: corePattern, options: .regularExpression) != nil }
 
-    /// Below this size every fact goes along with every request (about 4k tokens); above it the most relevant are picked.
-    private static let sendAllBudget = 16_000
+    /// Only tiny memories go along whole (~500 tokens); growing memory is retrieved instead of taxing every turn.
+    static let sendAllBudget = 2_000
 
     // MARK: Retrieval
 
     /// The facts worth sending for this request: the profile always, know-how for the app or site in use (or named),
     /// and the best matches among the rest. Everything while memory is small.
-    static func relevant(to context: String, app: String? = nil, host: String? = nil, limit: Int = 40) -> (facts: [String], omitted: Int) {
+    static func relevant(to context: String, app: String? = nil, host: String? = nil, limit: Int = 24) -> (facts: [String], omitted: Int) {
         let r = relevantExplained(to: context, app: app, host: host, limit: limit)
         return (r.facts, r.omitted)
     }
 
     /// `relevant`, also naming the facts that came in only through a link to a matching fact (for `clinqy memory`).
-    static func relevantExplained(to context: String, app: String? = nil, host: String? = nil, limit: Int = 40)
+    static func relevantExplained(to context: String, app: String? = nil, host: String? = nil, limit: Int = 24)
         -> (facts: [String], omitted: Int, linked: Set<String>) {
         let l = current
         let all = l.entries
@@ -303,7 +347,7 @@ enum Memory {
         var best = Dictionary(scored, uniquingKeysWith: max)
         var via: Set<Int> = []
         let allowed = Set(among)
-        for (j, a) in l.graph.spread(from: Array(scored.prefix(6)), damping: 0.8) where allowed.contains(j) && a >= strongest * 0.3 {
+        for (j, a) in (l.graph?.spread(from: Array(scored.prefix(6)), damping: 0.8) ?? [:]) where allowed.contains(j) && a >= strongest * 0.3 {
             if best[j] == nil { via.insert(j) }
             best[j] = max(best[j] ?? 0, a)
         }
@@ -495,15 +539,18 @@ enum Memory {
     // MARK: Writing
 
     /// Saves a fact (moved to the end if it was already there, so it reads as the newest).
-    static func add(_ fact: String, scope: Scope? = nil) {
+    /// Returns whether the fact is now stored (false when it was empty or the memory file couldn't be written).
+    @discardableResult
+    static func add(_ fact: String, scope: Scope? = nil) -> Bool {
         let text = fact.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty else { return }
+        guard !text.isEmpty else { return false }
         var all = entries.filter { $0.text != text }
         let kept = scope ?? entries.first { $0.text == text && $0.tagged }?.scope
         all.append(Fact(text: text, scope: kept, tagged: kept != nil))
         // Never drop facts to make room (a cap here once silently deleted the user's email, CGPA and more).
-        write(all.map(\.line))
+        guard commit(all) else { return false }
         touch(text, added: true)
+        return true
     }
 
     /// Rewrites one fact in place (keeping its scope tag), e.g. a newer phone number.
@@ -514,8 +561,8 @@ enum Memory {
         guard !text.isEmpty, let i = all.firstIndex(where: { $0.text == old }) else { return false }
         let fact = Fact(text: text, scope: all[i].tagged ? all[i].scope : nil, tagged: all[i].tagged)
         // The new wording may already be there as another line: keep just this one.
-        let lines = all.indices.compactMap { j -> String? in j == i ? fact.line : (all[j].text == text ? nil : all[j].line) }
-        write(lines)
+        let revised = all.indices.compactMap { j -> Fact? in j == i ? fact : (all[j].text == text ? nil : all[j]) }
+        guard commit(revised) else { return false }
         touch(text, added: true)
         record(old: old, new: text, why: "updated")
         return true
@@ -525,7 +572,7 @@ enum Memory {
     static func remove(_ fact: String, why: String? = nil) -> Bool {
         let all = entries
         guard all.contains(where: { $0.text == fact }) else { return false }
-        write(all.filter { $0.text != fact }.map(\.line))
+        guard commit(all.filter { $0.text != fact }) else { return false }
         record(old: fact, new: nil, why: why ?? "removed")
         return true
     }
@@ -542,13 +589,15 @@ enum Memory {
         let why: String
     }
 
-    private static let historyURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent(".config/clinqy/memory.history.jsonl")
+    private static var historyURL: URL { directory.appendingPathComponent("memory.history.jsonl") }
 
     static func record(old: String, new: String?, why: String) {
+        if let batch { batch.changes.append(Change(at: Date(), old: old, new: new, why: why)); return }
         let encoder = JSONEncoder()
         encoder.dateEncodingStrategy = .iso8601
         guard let data = try? encoder.encode(Change(at: Date(), old: old, new: new, why: why)) else { return }
         let line = data + Data("\n".utf8)
+        try? FileManager.default.createDirectory(at: historyURL.deletingLastPathComponent(), withIntermediateDirectories: true)
         if let handle = try? FileHandle(forWritingTo: historyURL) {
             defer { try? handle.close() }
             _ = try? handle.seekToEnd()
@@ -585,25 +634,30 @@ enum Memory {
     }
 
     /// Replaces every line (memory tidy-up), keeping the previous file as memory.backup-<date>.md (last 3 kept).
-    static func replaceAll(with lines: [String], backup: Bool) {
+    @discardableResult
+    static func replaceAll(with lines: [String], backup: Bool) -> Bool {
         let fm = FileManager.default
         if backup, fm.fileExists(atPath: url.path) {
             let stamp = Date().formatted(.iso8601.year().month().day().dateSeparator(.dash).time(includingFractionalSeconds: false).timeSeparator(.omitted))
             let copy = url.deletingLastPathComponent().appendingPathComponent("memory.backup-\(stamp).md")
-            try? fm.copyItem(at: url, to: copy)
+            do { try fm.copyItem(at: url, to: copy) } catch { return false }   // no backup, no rewrite
             let dir = url.deletingLastPathComponent()
             let old = ((try? fm.contentsOfDirectory(atPath: dir.path)) ?? []).filter { $0.hasPrefix("memory.backup-") }.sorted()
             for name in old.dropLast(3) { try? fm.removeItem(at: dir.appendingPathComponent(name)) }
         }
-        write(lines)
+        return write(lines)
     }
 
-    private static func write(_ lines: [String]) {
-        try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try? (lines.map { "- \($0)" }.joined(separator: "\n") + "\n").write(to: url, atomically: true, encoding: .utf8)
-        lock.lock()
-        loaded = nil
-        lock.unlock()
+    /// Writes the memory file; false when it failed (nothing is then claimed as saved). A file that exists but can't be
+    /// read is set aside first rather than overwritten.
+    private static func write(_ lines: [String]) -> Bool {
+        defer {
+            lock.lock()
+            loaded = nil
+            lock.unlock()
+        }
+        guard StoreFile.clearForWrite(url, decodes: { String(data: $0, encoding: .utf8) != nil }) else { return false }
+        return StoreFile.write(Data((lines.map { "- \($0)" }.joined(separator: "\n") + "\n").utf8), to: url) == nil
     }
 
     // MARK: Duplicates
@@ -648,19 +702,24 @@ enum Memory {
         metaLock.lock()
         defer { metaLock.unlock() }
         if meta == nil {
-            meta = (try? Data(contentsOf: metaURL)).flatMap { try? JSONDecoder.iso8601.decode([String: Meta].self, from: $0) } ?? [:]
+            switch StoreFile.load(metaURL, decode: { try? JSONDecoder.iso8601.decode([String: Meta].self, from: $0) }) {
+            case .value(let m): meta = m
+            case .unreadable: StoreFile.quarantine(metaURL); meta = [:]
+            case .absent: meta = [:]
+            }
         }
         return body(&meta!)
     }
 
     private static func saveMeta() {
+        if let batch { batch.metaDirty = true; return }
         let data = withMeta { m -> Data? in
             // Only facts still in memory.
             let live = Set(facts.map(Embedder.key))
             m = m.filter { live.contains($0.key) }
             return try? JSONEncoder.iso8601.encode(m)
         }
-        if let data { try? data.write(to: metaURL, options: .atomic) }
+        if let data { StoreFile.write(data, to: metaURL) }
     }
 
     private static func touch(_ fact: String, added: Bool) {

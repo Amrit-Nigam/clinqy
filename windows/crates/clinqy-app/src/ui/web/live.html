@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Clinqy — background work</title>
+<style>/*SHARED_CSS*/</style>
+<style>
+  html, body { height: 100%; background: #08090D; }
+  .live { height: 100%; display: flex; flex-direction: column; }
+  .shot { flex: 1; min-height: 0; display: flex; align-items: center; justify-content: center; background: #000; position: relative; }
+  .shot img { max-width: 100%; max-height: 100%; display: block; }
+  .shot .wait { position: absolute; color: var(--secondary); font-size: 13px; text-align: center; padding: 20px; }
+  .bar { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-top: 1px solid var(--hairline); }
+  .state { flex: 1; min-width: 0; font-size: 12px; color: var(--secondary); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  input { flex: 1; min-width: 0; background: rgba(255,255,255,.06); border: 1px solid var(--hairline); border-radius: 7px; padding: 6px 10px; color: var(--text); font: 13px var(--font); outline: none; user-select: text; }
+  input:focus { border-color: var(--accent); }
+  .ib { width: 30px; height: 30px; border-radius: 50%; background: rgba(255,255,255,.08); display: grid; place-items: center; color: #fff; font-size: 12px; flex: none; }
+  .ib:hover { background: rgba(255,255,255,.14); }
+</style>
+</head>
+<body>
+<div class="live">
+  <div class="shot"><img id="img" alt=""><div class="wait" id="wait">Waiting for the first page…</div></div>
+  <div class="bar"><div class="state" id="state"></div></div>
+  <div class="bar"><input id="steer" placeholder="Add to this task or answer it…" autocomplete="off" spellcheck="false"><span id="btns" style="display:flex;gap:6px"></span></div>
+</div>
+<script>/*ICONS_JS*/</script>
+<script>
+const $ = (id) => document.getElementById(id);
+const post = (o) => window.ipc.postMessage(JSON.stringify(o));
+window.clinqy = {
+  frame(jpeg) { if (jpeg) { $("img").src = "data:image/jpeg;base64," + jpeg; $("wait").classList.add("hide"); } },
+  state(s) {
+    $("state").textContent = s.text || "";
+    if (s.waitText) { $("wait").textContent = s.waitText; $("wait").classList.remove("hide"); }
+    $("btns").innerHTML = s.running
+      ? `<button class="ib" data-do="pause" title="${s.paused ? "Resume" : "Pause"}">${icon(s.paused ? "play.fill" : "pause.fill")}</button><button class="ib" data-do="stop" title="Stop now">${icon("stop.fill")}</button>`
+      : "";
+  },
+};
+document.addEventListener("click", (e) => { const b = e.target.closest("button"); if (b) post({ type: b.dataset.do }); });
+$("steer").addEventListener("keydown", (e) => { if (e.key === "Enter" && e.target.value.trim()) { post({ type: "steer", text: e.target.value.trim() }); e.target.value = ""; } });
+post({ type: "ready" });
+</script>
+</body>
+</html>

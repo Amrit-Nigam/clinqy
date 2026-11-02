@@ -163,8 +163,9 @@ enum Replay {
 
     /// Records a live run as a fixture when REPLAY_RECORD=on (env or ~/.config/clinqy/env), into
     /// ~/Library/Logs/Clinqy/replays/. Off by default: snapshots hold whatever the page showed.
-    final class Recorder {
-        static let shared = Recorder()
+    @MainActor final class Recorder {
+        private static let primary = Recorder()
+        static var shared: Recorder { TaskExecution.current?.service(Recorder.self, make: Recorder.init) ?? primary }
         var enabled: Bool { Config.value("REPLAY_RECORD")?.lowercased() == "on" }
         private var fixture: [String: Any]?
         private var turns: [[String: Any]] = []
@@ -197,7 +198,7 @@ enum Replay {
             fixture["turns"] = turns
             let dir = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Logs/Clinqy/replays")
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
-            let name = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + ".json"
+            let name = ISO8601DateFormatter().string(from: Date()).replacingOccurrences(of: ":", with: "-") + "-" + String(UUID().uuidString.prefix(8)) + ".json"
             if let data = try? JSONSerialization.data(withJSONObject: fixture, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]) {
                 try? data.write(to: dir.appendingPathComponent(name))
             }

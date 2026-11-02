@@ -3,6 +3,7 @@
 //! precise clicks and fills. Only browser-extension origins may connect, so web pages can't reach this server.
 
 use crate::page::Page;
+use crate::worker::{self, worker};
 use anyhow::{anyhow, bail, Result};
 use futures_util::{SinkExt, StreamExt};
 use parking_lot::Mutex;
@@ -17,7 +18,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 pub const PORT: u16 = 47823;
 /// The extension version this app expects (extension/manifest.json). An older copy still running is asked to reload.
-pub const EXTENSION_VERSION: &str = "1.8.7";
+pub const EXTENSION_VERSION: &str = "1.9.16";
 
 /// Finds which program is on the other end of a local TCP connection (by its port): "chrome.exe".
 pub type OwnerLookup = Box<dyn Fn(u16) -> Option<String> + Send + Sync>;
@@ -80,6 +81,11 @@ impl Bridge {
         !self.conns.lock().is_empty()
     }
 
+    /// Whether pages of the browser `exe` can be read (the background browser needs no extension).
+    pub fn serves(&self, exe: &str) -> bool {
+        exe == worker::EXE || self.is_connected()
+    }
+
     /// Starts listening (once). Fails if another Clinqy already holds the port.
     pub async fn start(&'static self) -> Result<()> {
         {
@@ -106,6 +112,7 @@ impl Bridge {
 
     async fn serve(&'static self, stream: tokio::net::TcpStream, peer_port: u16) -> Result<()> {
         // Browser pages send their own origin; only extensions are let in.
+        #[allow(clippy::result_large_err)] // tungstenite requires an owned HTTP rejection response.
         let check = |req: &Request, resp: Response| -> std::result::Result<Response, ErrorResponse> {
             let origin = req.headers().get("origin").and_then(|v| v.to_str().ok()).unwrap_or("");
             if origin.starts_with("chrome-extension://") || origin.starts_with("moz-extension://") || origin.starts_with("extension://") {
@@ -196,7 +203,7 @@ impl Bridge {
             let conns = self.conns.lock();
             let c = conns.get(&conn).ok_or_else(|| anyhow!("browser extension not connected"))?;
             self.pending.lock().insert(rid.clone(), tx);
-            if c.tx.send(Message::Text(Value::Object(body).to_string().into())).is_err() {
+            if c.tx.send(Message::Text(Value::Object(body).to_string())).is_err() {
                 self.pending.lock().remove(&rid);
                 bail!("browser extension not connected");
             }
@@ -221,7 +228,8 @@ impl Bridge {
             v
         };
         let Some(exe) = exe else { return all };
-        let own: Vec<u64> = all.iter().copied().filter(|id| conns[id].owner.as_deref().map(|o| o.eq_ignore_ascii_case(exe)).unwrap_or(false)).collect();
+        let own: Vec<u64> =
+            all.iter().copied().filter(|id| conns[id].owner.as_deref().map(|o| o.eq_ignore_ascii_case(exe)).unwrap_or(false)).collect();
         if own.is_empty() {
             all.into_iter().filter(|id| conns[id].owner.is_none() || conns[id].owner.as_deref() == Some("?")).collect()
         } else {
@@ -231,6 +239,9 @@ impl Bridge {
 
     /// The page in the focused window of the browser `exe` (any browser with None).
     pub async fn snapshot(&self, exe: Option<&str>) -> Option<Page> {
+        if exe == Some(worker::EXE) {
+            return worker().snapshot(None).await;
+        }
         let pool = self.candidates(exe);
         for &c in &pool {
             if let Ok(r) = self.request(c, args(json!({"cmd": "snapshot"})), 5.0).await {
@@ -253,14 +264,32 @@ impl Bridge {
         Page::parse(r, conn)
     }
 
-    pub async fn perform(&self, cmd: &str, page: &Page, a: Value, timeout: f64) -> Result<Value> {
+    /// The connection to the user's own browser for a task to work in: Chrome when it's there, else any.
+    pub fn own_browser(&self) -> Option<u64> {
+        let conns = self.conns.lock();
+        let chrome = conns.iter().find(|(_, c)| c.owner.as_deref().unwrap_or("").to_lowercase().contains("chrome")).map(|(id, _)| *id);
+        chrome.or_else(|| conns.keys().min().copied())
+    }
+
+    /// One command on `conn`, for a task working in a tab of the user's browser.
+    pub async fn ask(&self, conn: u64, cmd: &str, a: Value, timeout: f64) -> Result<Value> {
         let mut body = args(a);
         body.insert("cmd".into(), json!(cmd));
-        if page.pinned && !body.contains_key("tabId") {
-            if let Some(t) = page.tab_id {
-                body.insert("tabId".into(), json!(t));
-            }
+        self.request(conn, body, timeout).await
+    }
+
+    pub async fn perform(&self, cmd: &str, page: &Page, a: Value, timeout: f64) -> Result<Value> {
+        if page.connection == worker::CONNECTION {
+            return worker().command(cmd, page.tab_id, a).await;
         }
+        let document = page.document_id.as_ref().ok_or_else(|| anyhow!("Update the browser extension and take a fresh look: missing document token"))?;
+        let snapshot = page.snapshot_id.as_ref().ok_or_else(|| anyhow!("Update the browser extension and take a fresh look: missing snapshot token"))?;
+        let tab = page.tab_id.ok_or_else(|| anyhow!("Take a fresh look: missing tab identity"))?;
+        let mut body = args(a);
+        body.insert("cmd".into(), json!(cmd));
+        body.insert("tabId".into(), json!(tab));
+        body.insert("documentID".into(), json!(document));
+        body.insert("snapshotID".into(), json!(snapshot));
         self.request(page.connection, body, timeout).await
     }
 
@@ -277,6 +306,10 @@ impl Bridge {
     }
 
     pub async fn active_tab(&self, exe: Option<&str>) -> Option<TabInfo> {
+        if exe == Some(worker::EXE) {
+            let r = worker().command("tabInfo", None, json!({})).await.ok()?;
+            return Some(TabInfo { id: r["id"].as_i64()?, url: r["url"].as_str().unwrap_or("").into(), connection: worker::CONNECTION });
+        }
         for c in self.candidates(exe) {
             if let Ok(r) = self.request(c, args(json!({"cmd": "tabInfo"})), 1.5).await {
                 if r["focused"] == true {
@@ -290,6 +323,9 @@ impl Bridge {
     }
 
     pub async fn tab_command(&self, cmd: &str, tab: &TabInfo, a: Value) -> Option<Value> {
+        if tab.connection == worker::CONNECTION {
+            return worker().command(cmd, Some(tab.id), a).await.ok();
+        }
         let mut body = args(a);
         body.insert("cmd".into(), json!(cmd));
         self.request(tab.connection, body, 3.0).await.ok()
@@ -308,8 +344,12 @@ impl Bridge {
     }
 
     pub async fn tabs(&self, exe: Option<&str>) -> Result<Vec<BrowserTab>> {
-        let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
-        let r = self.request(c, args(json!({"cmd": "tabs"})), 3.0).await?;
+        let r = if exe == Some(worker::EXE) {
+            worker().command("tabs", None, json!({})).await?
+        } else {
+            let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
+            self.request(c, args(json!({"cmd": "tabs"})), 3.0).await?
+        };
         Ok(r["tabs"]
             .as_array()
             .map(|a| {
@@ -329,17 +369,26 @@ impl Bridge {
     }
 
     pub async fn switch_tab(&self, id: i64, exe: Option<&str>) -> Result<()> {
+        if exe == Some(worker::EXE) {
+            return worker().command("switchTab", Some(id), json!({})).await.map(|_| ());
+        }
         let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
         self.request(c, args(json!({"cmd": "switchTab", "tabId": id})), 3.0).await.map(|_| ())
     }
 
     pub async fn close_tab(&self, id: i64, exe: Option<&str>) -> Result<()> {
+        if exe == Some(worker::EXE) {
+            return worker().command("closeTab", Some(id), json!({})).await.map(|_| ());
+        }
         let c = self.front_connection(exe).await.ok_or_else(|| anyhow!("browser extension not connected"))?;
         self.request(c, args(json!({"cmd": "closeTab", "tabId": id})), 3.0).await.map(|_| ())
     }
 
     /// Reads tab `id` without bringing it forward; commands on the result go to that tab.
     pub async fn snapshot_tab(&self, id: i64, exe: Option<&str>) -> Option<Page> {
+        if exe == Some(worker::EXE) {
+            return worker().snapshot(Some(id)).await;
+        }
         let c = self.front_connection(exe).await?;
         let r = self.request(c, args(json!({"cmd": "snapshot", "tabId": id})), 5.0).await.ok()?;
         let mut p = self.parse(&r, c);

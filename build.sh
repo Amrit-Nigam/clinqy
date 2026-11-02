@@ -4,7 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")"
 
-swift build -c release --build-system native
+VERSION=$(tr -d '[:space:]' < MAC_VERSION)
+[[ "$VERSION" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || { echo "Invalid MAC_VERSION" >&2; exit 1; }
+IFS=. read -r VERSION_MAJOR VERSION_MINOR VERSION_PATCH <<< "$VERSION"
+BUILD_NUMBER=$((10#$VERSION_MAJOR * 10000 + 10#$VERSION_MINOR * 100 + 10#$VERSION_PATCH))
+swift build -c release
 APP="build/Clinqy.app"
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources"
@@ -15,9 +19,10 @@ cp .build/release/Clinqy "$APP/Contents/MacOS/Clinqy"
 cp -R extension "$APP/Contents/Resources/extension"
 cp bin/clinqy "$APP/Contents/Resources/clinqy"
 cp env.example "$APP/Contents/Resources/env.example"
+cp -R skills "$APP/Contents/Resources/skills"
 cp website/public/fonts/GeistPixel-Square.woff2 website/public/fonts/GeistMono-Variable.woff2 "$APP/Contents/Resources/"
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -27,8 +32,8 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
   <key>CFBundleExecutable</key><string>Clinqy</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>0.2.3</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>$VERSION</string>
+  <key>CFBundleVersion</key><string>$BUILD_NUMBER</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
   <key>NSAppleEventsUsageDescription</key><string>Clinqy controls apps on your behalf.</string>

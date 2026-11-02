@@ -1,4 +1,5 @@
 import AVFoundation
+import ObjCCatch
 import Speech
 
 /// One stretch of speech turned into text by the Mac's own speech models (SpeechAnalyzer, macOS 26) while it's
@@ -170,14 +171,17 @@ final class Transcription: @unchecked Sendable {
         guard let out = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: AVAudioFrameCount(frames.rounded(.up)) + 1024) else { return }
         var given = false
         var error: NSError?
-        converter.convert(to: out, error: &error) { _, status in
-            // nil buffer = the end: flush what the resampler still holds.
-            guard let buffer, !given else { status.pointee = buffer == nil ? .endOfStream : .noDataNow; return nil }
-            given = true
-            status.pointee = .haveData
-            return buffer
+        // A format the converter can't take raises an Objective-C exception on the audio thread; drop that buffer.
+        let failure = ObjCCatch {
+            converter.convert(to: out, error: &error) { _, status in
+                // nil buffer = the end: flush what the resampler still holds.
+                guard let buffer, !given else { status.pointee = buffer == nil ? .endOfStream : .noDataNow; return nil }
+                given = true
+                status.pointee = .haveData
+                return buffer
+            }
         }
-        if error == nil, out.frameLength > 0 { input.yield(AnalyzerInput(buffer: out)) }
+        if failure == nil, error == nil, out.frameLength > 0 { input.yield(AnalyzerInput(buffer: out)) }
     }
 
     /// No more audio: returns the final text once the model has finished with everything it was given.

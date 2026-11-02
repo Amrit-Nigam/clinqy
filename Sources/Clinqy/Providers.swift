@@ -49,33 +49,54 @@ enum Provider: String, CaseIterable {
         return false
     }
 
-    static var isClaudeLoggedIn: Bool {
-        #if os(macOS)
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
-        process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
-        let pipe = Pipe()
-        process.standardOutput = pipe
-        process.standardError = Pipe()
-        do {
-            try process.run()
-            process.waitUntilExit()
-            if process.terminationStatus != 0 { return false }
-            let data = pipe.fileHandleForReading.readDataToEndOfFile()
-            guard let str = String(data: data, encoding: .utf8),
-                  let obj = try? JSONSerialization.jsonObject(with: Data(str.utf8)) as? [String: Any],
-                  let oauth = obj["claudeAiOauth"] as? [String: Any],
-                  let token = oauth["accessToken"] as? String, !token.isEmpty else {
-                return false
+    private final class LoginCache: @unchecked Sendable {
+        let lock = NSLock()
+        var value = UserDefaults.standard.bool(forKey: "claudeLoginAvailable")
+        var checked = Date.distantPast
+        var refreshing = false
+        func read() -> Bool {
+            lock.lock()
+            let result = value
+            let refresh = !refreshing && Date().timeIntervalSince(checked) > 60
+            if refresh { refreshing = true }
+            lock.unlock()
+            if refresh {
+                DispatchQueue.global(qos: .utility).async {
+                    let available = Self.probe()
+                    self.lock.lock(); self.value = available; self.checked = Date(); self.refreshing = false; self.lock.unlock()
+                    UserDefaults.standard.set(available, forKey: "claudeLoginAvailable")
+                }
             }
-            return true
-        } catch {
-            return false
+            return result
         }
-        #else
-        return true
-        #endif
+        private static func probe() -> Bool {
+            #if os(macOS)
+            // No credential bytes leave this process or enter logs/preferences.
+            let process = Process(), output = Pipe()
+            process.executableURL = URL(fileURLWithPath: "/usr/bin/security")
+            process.arguments = ["find-generic-password", "-s", "Claude Code-credentials", "-w"]
+            process.standardOutput = output; process.standardError = FileHandle.nullDevice
+            do {
+                try process.run()
+                let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+                DispatchQueue.global().asyncAfter(deadline: .now() + 3, execute: deadline)
+                defer { deadline.cancel() }
+                let data = output.fileHandleForReading.readDataToEndOfFile()
+                process.waitUntilExit()
+                guard process.terminationStatus == 0,
+                      let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let oauth = object["claudeAiOauth"] as? [String: Any],
+                      let token = oauth["accessToken"] as? String else { return false }
+                return !token.isEmpty
+            } catch { return false }
+            #else
+            return true
+            #endif
+        }
     }
+    private static let loginCache = LoginCache()
+    /// UI and startup never wait on a Keychain subprocess. A short-lived cached availability check refreshes off-main.
+    static var isClaudeLoggedIn: Bool { loginCache.read() }
 
     static var current: Provider {
         if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return .agyCLI }
@@ -176,16 +197,21 @@ enum Provider: String, CaseIterable {
     }
 }
 
-/// One conversation over a provider's HTTP API (or a one-shot `codex exec` per turn), standing in for
-/// the CLI session: it keeps the whole exchange so each turn has the same context the CLI session would.
+/// One conversation over a provider's HTTP API or configured Codex transport. App-server keeps a live
+/// model-only thread; the compatibility exec transport sends the exchange again on each turn.
 final class APIChat: @unchecked Sendable {
-    private struct Turn { var user: Bool; var text: String; var image: String? }
+    private typealias Turn = ConversationBudget.Turn
 
     private let provider: Provider
     private let key: String?
     private let system: String
     private let model: String
     private let effort: String
+    /// The reasoning effort that was asked for (argument or configuration); nil when none was, so a CLI's own default stands.
+    private let requestedEffort: String?
+    private let requestedModel: String
+    private let transport: String
+    private let codexServer: CodexAppServer?
     private let lock = NSLock()
     private var turns: [Turn] = []
     private var inFlight: Task<String, Error>?
@@ -206,7 +232,47 @@ final class APIChat: @unchecked Sendable {
         self.key = key
         self.system = system
         self.model = provider.model(model)
-        self.effort = (effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT") ?? "low").lowercased()
+        let asked = effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT")
+        requestedEffort = asked.map { $0.lowercased() }.flatMap { $0.isEmpty ? nil : $0 }
+        requestedModel = model
+        self.effort = (asked ?? "low").lowercased()
+        let transport = (Config.value("CODEX_TRANSPORT") ?? "exec").lowercased()
+        if provider == .codexCLI, !["exec", "app-server"].contains(transport) {
+            throw AgySession.BrainError.failed("CODEX_TRANSPORT must be exec or app-server")
+        }
+        self.transport = provider == .codexCLI ? transport : "http"
+        codexServer = provider == .codexCLI && transport == "app-server"
+            ? CodexAppServer(executable: provider.cliPath!, system: system, model: provider.model(model),
+                             effort: ModelRoute.codexEffort(requestedEffort)) : nil
+        let route = self.route
+        DispatchQueue.main.async { Agent.writeLog(route.summary) }
+    }
+
+    /// The session's effective configuration (see ModelRoute): requested vs resolved vs sent.
+    var route: ModelRoute {
+        let sent: String?
+        switch provider {
+        case .codexCLI: sent = ModelRoute.codexEffort(requestedEffort)
+        case .gemini: sent = ModelRoute.geminiLevel(effort)
+        case .openai: sent = ModelRoute.openAIEffort(model: model, effort: effort)
+        default: sent = nil
+        }
+        let images: String
+        let tools: String
+        switch (provider, transport) {
+        case (.codexCLI, "app-server"):
+            images = "per-turn (the thread keeps earlier turns; each screenshot is sent once)"
+            tools = "none (environments empty, features/MCP/web search verified disabled)"
+        case (.codexCLI, _):
+            images = "latest-only (text transcript replayed each turn, newest screenshot attached)"
+            tools = "none requested (exec, read-only sandbox)"
+        default:
+            images = "latest-only (earlier screenshots replaced by a note)"
+            tools = "none"
+        }
+        return ModelRoute(provider: provider.rawValue, requestedModel: requestedModel, resolvedModel: model,
+                          requestedEffort: requestedEffort, sentEffort: sent, transport: transport,
+                          imageHistory: images, tools: tools)
     }
 
     var isAlive: Bool { lock.withLock { !closed } }
@@ -217,14 +283,16 @@ final class APIChat: @unchecked Sendable {
         let task = inFlight
         lock.unlock()
         task?.cancel()
+        if let codexServer { Task { await codexServer.close() } }
     }
 
-    func send(_ text: String, image: String?) async throws -> String {
+    func send(_ text: String, image: String?, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         let task = try lock.withLock { () throws -> Task<String, Error> in
             if closed { throw ClaudeSession.BrainError.died }
             if inFlight != nil { throw ClaudeSession.BrainError.busy }
             turns.append(Turn(user: true, text: text, image: image))
-            let task = Task { try await self.complete() }
+            turns = ConversationBudget.compact(turns)
+            let task = Task { try await self.complete(partial: partial) }
             inFlight = task
             return task
         }
@@ -240,7 +308,7 @@ final class APIChat: @unchecked Sendable {
         }
     }
 
-    private func complete() async throws -> String {
+    private func complete(partial: (@Sendable (String) -> Void)?) async throws -> String {
         // Only the newest screenshot is sent again: older ones cost tokens on every turn and are out of date anyway.
         let history = lock.withLock { () -> [Turn] in
             let lastImage = turns.lastIndex { $0.image != nil }
@@ -250,16 +318,25 @@ final class APIChat: @unchecked Sendable {
                 return t
             }
         }
+        let deadline = ProcessInfo.processInfo.systemUptime + 120
         do {
-            return try await request(history, plain: lock.withLock { plain })
+            return try await request(history, deadline: deadline, plain: lock.withLock { plain }, partial: partial)
         } catch ClaudeSession.BrainError.failed(let message) where message.hasPrefix("HTTP 400") && [.openai, .gemini].contains(provider) && !lock.withLock({ plain }) {
             lock.withLock { plain = true }
-            return try await request(history, plain: true)
+            return try await request(history, deadline: deadline, plain: true, partial: partial)
         }
     }
 
-    private func request(_ history: [Turn], plain: Bool) async throws -> String {
-        if provider == .codexCLI { return try await runCLI(history) }
+    private func request(_ history: [Turn], deadline: TimeInterval, plain: Bool, partial: (@Sendable (String) -> Void)?) async throws -> String {
+        if provider == .codexCLI {
+            if let codexServer, let latest = history.last {
+                // Only new input goes to the persistent thread. Never auto-fallback/replay a failed turn.
+                let reply = try await codexServer.send(latest.text, image: latest.image)
+                UsageStore.record(provider: provider, model: model)
+                return reply
+            }
+            return try await runCLI(history)
+        }
         var req: URLRequest
         var body: [String: Any]
         switch provider {
@@ -295,7 +372,7 @@ final class APIChat: @unchecked Sendable {
                 return ["role": t.user ? "user" : "model", "parts": parts]
             }
             var generation: [String: Any] = ["maxOutputTokens": 8192]
-            if !plain { generation["thinkingConfig"] = ["thinkingLevel": effort == "high" || effort == "max" ? "high" : "low"] }
+            if !plain { generation["thinkingConfig"] = ["thinkingLevel": ModelRoute.geminiLevel(effort)] }
             body = ["systemInstruction": ["parts": [["text": system]]], "contents": contents, "generationConfig": generation]
         case .openai, .openrouter, .ollama, .compatible:
             req = URLRequest(url: URL(string: provider.baseURL + "/chat/completions")!)
@@ -313,19 +390,65 @@ final class APIChat: @unchecked Sendable {
                 }
             }
             body = ["model": model, "messages": messages]
-            if !plain, provider == .openai, model.hasPrefix("gpt-5") || model.range(of: #"^o\d"#, options: .regularExpression) != nil {
-                body["reasoning_effort"] = ["min", "minimal", "none"].contains(effort) ? "minimal" : effort == "max" ? "high" : effort
+            if !plain, provider == .openai, let level = ModelRoute.openAIEffort(model: model, effort: effort) {
+                body["reasoning_effort"] = level
             }
         case .agyCLI, .claudeCLI, .codexCLI:
             throw ClaudeSession.BrainError.failed("\(provider.rawValue) isn't an HTTP provider")
         }
+        // Streaming transport also forwards cumulative text to the validated early-action parser.
+        if provider == .gemini {
+            req.url = URL(string: "\(provider.baseURL)/models/\(model):streamGenerateContent?alt=sse")
+        } else { body["stream"] = true }
+        if provider == .openai { body["stream_options"] = ["include_usage": true] }
         req.httpMethod = "POST"
-        req.timeoutInterval = 120
+        req.timeoutInterval = max(0.1, deadline - ProcessInfo.processInfo.systemUptime)
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (data, response) = try await URLSession.shared.data(for: req)
+        var received = try await URLSession.shared.bytes(for: req)
+        for attempt in 0..<2 {
+            guard let http = received.1 as? HTTPURLResponse, [429, 503].contains(http.statusCode) else { break }
+            received.0.task.cancel()
+            let requested = http.value(forHTTPHeaderField: "Retry-After").flatMap(Double.init)
+            let delay = min(8, max(0.2, requested ?? (pow(2, Double(attempt)) + Double.random(in: 0...0.25))))
+            guard ProcessInfo.processInfo.systemUptime + delay < deadline else { throw ClaudeSession.BrainError.failed("Model request deadline exceeded") }
+            try await Task.sleep(for: .seconds(delay))
+            try Task.checkCancellation()
+            req.timeoutInterval = max(0.1, deadline - ProcessInfo.processInfo.systemUptime)
+            received = try await URLSession.shared.bytes(for: req)
+        }
+        let (bytes, response) = received
+        let expiry = DispatchWorkItem { bytes.task.cancel() }
+        DispatchQueue.global().asyncAfter(deadline: .now() + max(0, deadline - ProcessInfo.processInfo.systemUptime), execute: expiry)
+        defer { expiry.cancel(); bytes.task.cancel() }
         let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+        let isStream = response.mimeType?.contains("event-stream") == true || response.mimeType?.contains("ndjson") == true
+        if (200..<300).contains(status), isStream {
+            var events = ServerEvents(), stream = ModelStream()
+            var lastDelivery = DispatchTime.now().uptimeNanoseconds
+            var wireBytes = 0
+            for try await byte in bytes {
+                if wireBytes % 4_096 == 0 { try Task.checkCancellation() }
+                wireBytes += 1
+                guard wireBytes <= 4_000_000 else { throw ClaudeSession.BrainError.failed("Model stream exceeded the response budget") }
+                if let event = try events.byte(byte), try stream.consume(event) {
+                    let now = DispatchTime.now().uptimeNanoseconds
+                    if now - lastDelivery > 20_000_000 { partial?(stream.text); lastDelivery = now }
+                }
+            }
+            if let event = events.flush() { _ = try stream.consume(event) }
+            guard stream.finished, !stream.text.isEmpty else { throw ClaudeSession.BrainError.failed("Model stream ended before a complete answer") }
+            partial?(stream.text)
+            UsageStore.record(provider: provider, model: model, inputTokens: stream.inputTokens, outputTokens: stream.outputTokens)
+            return stream.text
+        }
+        // Compatible servers may ignore streaming. Keep their JSON response path without issuing a second request.
+        var data = Data()
+        for try await byte in bytes {
+            if data.count >= 4_000_000 { throw ClaudeSession.BrainError.failed("Model response exceeded the response budget") }
+            data.append(byte)
+        }
         let json = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any]
         guard (200..<300).contains(status) else {
             let error = json?["error"] as? [String: Any]
@@ -366,8 +489,8 @@ final class APIChat: @unchecked Sendable {
         }
     }
 
-    /// Codex CLI has no long-lived chat mode to talk to, so each turn runs the CLI once with the
-    /// instructions and the conversation so far on stdin, and the screenshot as a file.
+    /// Explicit compatibility transport for CLIs without the model-only app-server protocol.
+    /// Each turn runs once with the conversation so far; failed app-server turns never enter this path.
     private func runCLI(_ history: [Turn]) async throws -> String {
         guard let path = provider.cliPath else { throw ClaudeSession.BrainError.notInstalled }
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-\(provider.rawValue)-\(UUID().uuidString)")
@@ -384,50 +507,27 @@ final class APIChat: @unchecked Sendable {
         var args = ["exec", "--skip-git-repo-check", "--sandbox", "read-only", "--color", "never", "--output-last-message", lastURL.path]
         if hasImage { args += ["--image", imageURL.path] }
         if !model.isEmpty { args += ["--model", model] }
+        // Only an explicitly configured effort is forwarded; otherwise the CLI keeps its own default.
+        if let level = ModelRoute.codexEffort(requestedEffort) { args += ["-c", "model_reasoning_effort=\"\(level)\""] }
         args.append("-")
 
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: path)
-        process.arguments = args
-        var env = ProcessInfo.processInfo.environment
-        let home = FileManager.default.homeDirectoryForCurrentUser.path
-        env["PATH"] = "\(home)/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-        process.environment = env
-        process.currentDirectoryURL = dir
-        let input = Pipe(), output = Pipe(), errors = Pipe()
-        process.standardInput = input
-        process.standardOutput = output
-        process.standardError = errors
+        let promptURL = dir.appendingPathComponent("prompt.txt")
+        try Data(transcript.utf8).write(to: promptURL, options: .atomic)
+        try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: promptURL.path)
+        // A fixed shell wrapper feeds stdin without putting a long/private transcript in process arguments.
+        // exec preserves ProcessRunner's group leader, so cancellation/deadlines terminate CLI descendants too.
+        let command = ["-c", "prompt_file=$1; shift; exec \"$@\" < \"$prompt_file\"", "clinqy-model", promptURL.path, path] + args
+        let output = await ProcessRunner.run("/bin/sh", command, timeout: 120, outputLimit: 4_000_000, directory: dir)
+        try Task.checkCancellation()
+        guard output.status == 0 else { throw ClaudeSession.BrainError.failed("\(provider.rawValue) exited \(output.status): \(output.output.suffix(400))") }
+        if let size = try? lastURL.resourceValues(forKeys: [.fileSizeKey]).fileSize, size > 4_000_000 {
+            throw ClaudeSession.BrainError.failed("Model response exceeded the response budget")
+        }
 
-        let stdout = try await withTaskCancellationHandler {
-            try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Data, Error>) in
-                let name = provider.rawValue
-                DispatchQueue.global().async {
-                    do { try process.run() } catch { continuation.resume(throwing: error); return }
-                    // Drain stderr and feed stdin alongside reading stdout, so no pipe fills up and stalls the CLI.
-                    let errBox = ErrorBox(), group = DispatchGroup()
-                    group.enter()
-                    DispatchQueue.global().async { errBox.data = errors.fileHandleForReading.readDataToEndOfFile(); group.leave() }
-                    DispatchQueue.global().async {
-                        input.fileHandleForWriting.write(Data(transcript.utf8))
-                        try? input.fileHandleForWriting.close()
-                    }
-                    let out = output.fileHandleForReading.readDataToEndOfFile()
-                    group.wait()
-                    process.waitUntilExit()
-                    if process.terminationStatus == 0 { continuation.resume(returning: out); return }
-                    let err = String(decoding: errBox.data.suffix(400), as: UTF8.self)
-                    continuation.resume(throwing: ClaudeSession.BrainError.failed("\(name) exited \(process.terminationStatus): \(err)"))
-                }
-            }
-        } onCancel: { process.terminate() }
-
-        let reply = (try? String(contentsOf: lastURL, encoding: .utf8)) ?? String(decoding: stdout, as: UTF8.self)
+        let reply = (try? String(contentsOf: lastURL, encoding: .utf8)) ?? output.output
         let text = reply.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { throw ClaudeSession.BrainError.failed("Empty reply from \(provider.rawValue)") }
         UsageStore.record(provider: provider, model: model)
         return text
     }
 }
-
-private final class ErrorBox: @unchecked Sendable { var data = Data() }

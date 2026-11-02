@@ -5,7 +5,8 @@ import Foundation
 /// goes; the command bar shows "Undo" on the latest one. Cleared when a new run starts.
 @MainActor
 final class StepUndo: ObservableObject {
-    static let shared = StepUndo()
+    private static let primary = StepUndo()
+    static var shared: StepUndo { TaskExecution.current?.service(StepUndo.self, make: StepUndo.init) ?? primary }
 
     enum Kind: String { case text, toggle, navigation, other }
 

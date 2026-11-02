@@ -104,13 +104,17 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
             agent.set_paused(cmd == "pause");
             out.end(json!({"event": "ok", "text": if cmd == "pause" { "Paused (clinqy resume carries on, clinqy stop ends it)" } else { "Resumed" }})).await
         }
+        "dashboard" => {
+            shared.send(UserEvent::Menu(if s("page") == "live" { "live" } else { "dashboard" }.into()));
+            out.end(json!({"event": "ok"})).await
+        }
         "status" => out.end(json!({"event": "ok", "snapshot": agent.snapshot(), "extension": clinqy_core::bridge::bridge().is_connected()})).await,
         "answer" => {
             agent.answer(Some(s("text")));
             out.end(json!({"event": "ok"})).await
         }
         "add" => {
-            agent.add_context(&s("text"));
+            agent.follow_up(&s("text"));
             out.end(json!({"event": "ok"})).await
         }
         "cancel" => {
@@ -162,7 +166,7 @@ async fn dispatch(cmd: &str, args: Value, shared: Arc<Shared>, out: &mut Out) ->
             }
             let rx = shared.events.subscribe();
             let test = flag(&args, "test");
-            let opts = RunOptions { test, dry: flag(&args, "dry"), provider: provider_of(&args), review_in_tests: flag(&args, "review"), save_in_tests: flag(&args, "save"), ..Default::default() };
+            let opts = RunOptions { test, dry: flag(&args, "dry"), provider: provider_of(&args), review_in_tests: flag(&args, "review"), save_in_tests: flag(&args, "save"), background: flag(&args, "background").then_some(true), ..Default::default() };
             agent.submit(&task, opts);
             follow(rx, out, !test).await
         }
@@ -279,7 +283,7 @@ async fn follow(mut rx: broadcast::Receiver<Event>, out: &mut Out, carry_on: boo
                     out.send(json!({"event": "question", "text": q.text, "options": q.options})).await?;
                 }
             }
-            Event::Finished { answer, ok } => {
+            Event::Finished { answer, ok, .. } => {
                 last_done = Some((answer, ok));
             }
             _ => {}

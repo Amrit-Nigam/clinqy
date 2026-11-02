@@ -90,6 +90,12 @@ final class FastLane {
         model = Self.model.flatMap { provider.model($0).lowercased() == provider.model(leadModel).lowercased() ? nil : $0 }
     }
 
+    /// The helper's identity, for the log: nil when the helper is off.
+    var helperRoute: String? {
+        guard let model else { return nil }
+        return "fast helper: provider=\(provider.rawValue) requested=\(model) model=\(provider.model(model).isEmpty ? "(cli default)" : provider.model(model)) role=helper"
+    }
+
     /// Appended to the lead's first message: how to hand routine steps off (empty when off).
     var leadNote: String {
         guard model != nil else { return "" }
@@ -146,6 +152,7 @@ final class FastLane {
     private func blocker(turnText: String, failures: Int) -> String? {
         guard model != nil, plan != nil else { return "no routine plan" }
         if turnText.hasPrefix("The user added") { return "the user added something" }
+        if turnText.contains("Delegated worker results") { return "the lead must reconcile delegated results" }
         if stintTurns == 0, failures > 0 { return "the lead's last step failed" }
         if stintFailures >= 2 { return "steps failed twice" }
         let most = auto ? Self.maxAutoStint : Self.maxStint

@@ -3,15 +3,18 @@ import SwiftUI
 
 // MARK: - Windows
 
-/// Spotlight-style command bar. Doesn't activate Clinqy, so the app being controlled stays frontmost.
+/// Spotlight-style command bar. Desktop input pauses while it owns keyboard focus.
 final class CommandPanel: NSPanel {
     static let size = NSSize(width: 660, height: 460)
+    private weak var agent: Agent?
+    private var previousApp: NSRunningApplication?
 
     init(agent: Agent, voice: Voice, onMic: @escaping () -> Void, onWatch: @escaping () -> Void = {},
          onCircle: @escaping () -> Void = {}) {
         super.init(contentRect: NSRect(origin: .zero, size: Self.size),
                    styleMask: [.nonactivatingPanel, .borderless, .fullSizeContentView],
                    backing: .buffered, defer: false)
+        self.agent = agent
         level = .floating
         hidesOnDeactivate = false
         collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
@@ -21,7 +24,7 @@ final class CommandPanel: NSPanel {
         isMovableByWindowBackground = true
         appearance = NSAppearance(named: .darkAqua)
         // Kept out of screen captures: Clinqy's screenshots and the user's screen shares show the app, not us.
-        sharingType = .none
+        sharingType = CommandLine.arguments.contains("--ui-testing") ? .readOnly : .none
         var view = CommandView(agent: agent, voice: voice, onMic: onMic, onClose: { [weak self] in self?.orderOut(nil) })
         view.onWatch = onWatch
         view.onCircle = onCircle
@@ -29,9 +32,19 @@ final class CommandPanel: NSPanel {
     }
 
     override var canBecomeKey: Bool { true }
+    override func orderOut(_ sender: Any?) {
+        let wasVisible = isVisible
+        agent?.inputPanelVisible = false
+        super.orderOut(sender)
+        if wasVisible, NSWorkspace.shared.frontmostApplication?.processIdentifier == getpid(),
+           let previousApp, !previousApp.isTerminated { previousApp.activate() }
+    }
     override func cancelOperation(_ sender: Any?) { orderOut(nil) }
 
     func showCentered() {
+        if let front = NSWorkspace.shared.frontmostApplication, front.processIdentifier != getpid() { previousApp = front }
+        agent?.inputPanelVisible = true
+        NSApp.activate(ignoringOtherApps: true)
         if let screen = NSScreen.main {
             let f = screen.visibleFrame
             setFrameOrigin(NSPoint(x: f.midX - frame.width / 2, y: f.maxY - frame.height - f.height * 0.16))
@@ -191,15 +204,49 @@ extension Agent.Phase {
 
 // MARK: - Orb
 
+/// Tracks whether the window hosting a view is on screen, so animations can pause while it's hidden or covered
+/// (Clinqy keeps its panels around ordered out, and a TimelineView in one keeps drawing otherwise).
+struct OnScreen: NSViewRepresentable {
+    @Binding var visible: Bool
+
+    func makeNSView(context: Context) -> Probe { Probe { visible = $0 } }
+    func updateNSView(_ view: Probe, context: Context) {}
+
+    final class Probe: NSView {
+        private let changed: (Bool) -> Void
+        private var observer: NSObjectProtocol?
+        init(_ changed: @escaping (Bool) -> Void) { self.changed = changed; super.init(frame: .zero) }
+        required init?(coder: NSCoder) { nil }
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            if let observer { NotificationCenter.default.removeObserver(observer) }
+            observer = nil
+            guard let window else { report(false); return }
+            observer = NotificationCenter.default.addObserver(forName: NSWindow.didChangeOcclusionStateNotification,
+                                                              object: window, queue: .main) { [weak self, weak window] _ in
+                MainActor.assumeIsolated { self?.report(window?.occlusionState.contains(.visible) == true) }
+            }
+            report(window.occlusionState.contains(.visible))
+        }
+
+        private func report(_ on: Bool) { DispatchQueue.main.async { [changed] in changed(on) } }
+        deinit { if let observer { NotificationCenter.default.removeObserver(observer) } }
+    }
+}
+
 /// The living dot, an Apple Watch–style "breathe" flower: six petals bloom out and back,
 /// faster while working, swelling with your voice; tinted by mood (teal/cyan when idle).
 private struct Orb: View {
     let mood: Buddy.Mood
     var level: CGFloat = 0
     var size: CGFloat = 26
+    @State private var onScreen = true
 
     var body: some View {
-        TimelineView(.animation) { context in
+        // The slow idle breath doesn't need display rate, and nothing at all while its window is hidden.
+        let busy = mood == .thinking || mood == .acting || mood == .listening
+        TimelineView(.animation(minimumInterval: busy ? 1.0 / 30.0 : 1.0 / 20.0, paused: !onScreen)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             let busy = mood == .thinking || mood == .acting
             let period = busy ? 1.4 : 3.0
@@ -224,6 +271,7 @@ private struct Orb: View {
             .frame(width: size, height: size)
             .animation(.easeInOut(duration: 0.35), value: mood)
         }
+        .background(OnScreen(visible: $onScreen))
     }
 
     private var colors: (Color, Color) {
@@ -268,7 +316,7 @@ struct CommandView: View {
     /// The run that just failed or was stopped, which the next thing typed corrects ("no, click the other one").
     private var fixable: History.Entry? {
         // Something newly selected or circled is a new task about it, not a correction of the last run.
-        guard !agent.isRunning, agent.question == nil, review.pending == nil, agent.phase == .failed,
+        guard !agent.newTaskMode, !agent.isRunning, agent.question == nil, review.pending == nil, agent.phase == .failed,
               agent.selectedText == nil, agent.selectedFiles.isEmpty, agent.annotation == nil,
               let last = history.entries.first, !last.ok, last.id != fix.dismissed,
               Date().timeIntervalSince(last.date) < 30 * 60, !last.request.hasPrefix("Dry run:") else { return nil }
@@ -296,7 +344,8 @@ struct CommandView: View {
     }
 
     private func submitInput() {
-        if review.pending != nil { review.decide(false, note: agent.input); agent.input = "" }
+        if agent.newTaskMode { if agent.submitNewRequest(agent.input) { onClose() } }
+        else if review.pending != nil { review.decide(false, note: agent.input); agent.input = "" }
         else if agent.question != nil { agent.answer(agent.input) }
         else if agent.isRunning { agent.addContext(agent.input); onClose() }
         else if let entry = fixable { submitFix(entry, agent.input) }
@@ -304,6 +353,7 @@ struct CommandView: View {
     }
 
     private var placeholder: String {
+        if agent.newTaskMode { return "New task — starts when a slot is free…" }
         if review.pending != nil { return "Type a change, or click Submit" }
         if agent.question != nil { return "Your answer" }
         if agent.isRunning { return "Add to this task or change the plan…" }
@@ -313,8 +363,16 @@ struct CommandView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            if agent.newTaskMode || agent.isRunning {
+                HStack {
+                    Text(agent.newTaskMode ? "New task" : "Current task").font(.system(size: 11, weight: .medium)).foregroundStyle(DS.secondary)
+                    Spacer()
+                    Button(agent.newTaskMode ? "Current task" : "New task") { agent.newTaskMode.toggle() }
+                        .buttonStyle(.plain).font(.system(size: 11)).foregroundStyle(DS.secondary)
+                }.padding(.horizontal, 18).padding(.top, 12)
+            }
             VStack(spacing: 0) {
-                if let r = review.pending {
+                if let r = review.pending, !agent.newTaskMode {
                     ReviewCard(review: r, onSubmit: { review.decide(true) },
                                onEdit: { review.decide(false, note: agent.input); agent.input = "" })
                         .padding(.horizontal, 18)
@@ -327,7 +385,7 @@ struct CommandView: View {
                         .padding(.top, 12)
                         .transition(.opacity)
                 }
-                if let q = agent.question {
+                if let q = agent.question, !agent.newTaskMode {
                     QuestionCard(question: q) { agent.answer($0) }
                         .padding(.horizontal, 18)
                         .padding(.top, 16)
@@ -392,7 +450,10 @@ struct CommandView: View {
         .onReceive(NotificationCenter.default.publisher(for: NSWindow.didBecomeKeyNotification)) { _ in focused = true }
     }
 
-    private var showBody: Bool { historyTab.on || skillsTab.on || skills.isLearning || skills.lastError != nil || voice.isTranscribing || speech.statusText != nil || !agent.steps.isEmpty || !agent.answer.isEmpty || voice.isListening || voice.error != nil || agent.input.isEmpty }
+    private var showBody: Bool {
+        if agent.newTaskMode { return historyTab.on || skillsTab.on || voice.isListening || voice.isTranscribing || voice.error != nil }
+        return historyTab.on || skillsTab.on || skills.isLearning || skills.lastError != nil || voice.isTranscribing || speech.statusText != nil || !agent.steps.isEmpty || !agent.answer.isEmpty || voice.isListening || voice.error != nil || agent.input.isEmpty
+    }
 
     private var bar: some View {
         HStack(spacing: 14) {
@@ -405,7 +466,7 @@ struct CommandView: View {
                         .lineLimit(1)
                         .truncationMode(.head)
                         .contentTransition(.opacity)
-                } else if let q = agent.question, q.sensitive {
+                } else if let q = agent.question, q.sensitive, !agent.newTaskMode {
                     SecureField("", text: $agent.input, prompt: Text("Type it here (kept private)").foregroundStyle(DS.tertiary))
                         .textFieldStyle(.plain)
                         .font(.system(size: 20, weight: .regular))
@@ -423,7 +484,10 @@ struct CommandView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
 
-            if review.pending != nil {
+            if agent.newTaskMode {
+                IconButton(symbol: voice.isListening ? "waveform" : "mic.fill", tint: DS.secondary, action: onMic)
+                IconButton(symbol: "arrow.up", tint: .white, action: submitInput)
+            } else if review.pending != nil {
                 IconButton(symbol: "stop.fill", tint: .white) { agent.cancel() }
             } else if agent.question != nil {
                 IconButton(symbol: voice.isListening ? "waveform" : "mic.fill",
@@ -478,6 +542,8 @@ struct CommandView: View {
                 .foregroundStyle(DS.secondary).symbolEffect(.pulse)
         } else if let error = skills.lastError {
             Label(error, systemImage: "exclamationmark.circle").font(.system(size: 13)).foregroundStyle(DS.secondary)
+        } else if let error = History.shared.saveError {
+            Label(error, systemImage: "exclamationmark.triangle").font(.system(size: 13)).foregroundStyle(DS.secondary)
         }
         if let status = speech.statusText, agent.steps.isEmpty {
             Label(status, systemImage: "waveform.badge.plus").font(.system(size: 12)).foregroundStyle(DS.tertiary)
@@ -869,9 +935,10 @@ private struct Hint: View {
 
 private struct Waveform: View {
     let level: CGFloat
+    @State private var onScreen = true
 
     var body: some View {
-        TimelineView(.animation) { context in
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !onScreen)) { context in
             let t = context.date.timeIntervalSinceReferenceDate
             HStack(alignment: .center, spacing: 3) {
                 ForEach(0..<36, id: \.self) { i in
@@ -885,6 +952,7 @@ private struct Waveform: View {
             }
             .frame(maxWidth: .infinity)
         }
+        .background(OnScreen(visible: $onScreen))
     }
 }
 

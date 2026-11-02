@@ -117,6 +117,9 @@ impl Agent {
         let same_site = before.as_ref().map(|t| !host_of(&t.url).is_empty() && host_of(&t.url) == host).unwrap_or(false);
         let reuse = before.is_some() && (empty || (before.as_ref().map(|t| Some(t.id)) == Some(rs.owned_tab) && same_site));
         let browser = self.platform.open_url(url.as_str(), ctx.app.as_ref(), !reuse).await;
+        if browser.is_none() && self.hands.hidden() {
+            return self.end(line, ActionResult::fail("The background browser couldn't open that. Your own browser wasn't used."));
+        }
         rs.opened_tab = true;
         let exe = browser.as_ref().or(ctx.app.as_ref()).map(|a| a.exe.clone());
         if let (Some(before), Some(after)) = (&before, b.active_tab(exe.as_deref()).await) {
@@ -692,7 +695,7 @@ impl Agent {
                 return self.end(line, ActionResult::ok(format!("attached {name} through {:?} (now holds: {})", el.text.chars().take(40).collect::<String>(), holds.join(", "))));
             }
         }
-        if let Some(app) = ctx.app.clone() {
+        if let Some(app) = ctx.app.clone().filter(|_| !self.hands.hidden()) {
             if let Some(r) = self.upload_through_picker(&file, rect.center(), &app).await {
                 return self.end(line, r);
             }

@@ -151,14 +151,16 @@ private func mix(_ a: CGPoint, _ b: CGPoint, _ t: CGFloat) -> CGPoint { CGPoint(
 private struct Looping: View {
     let period: Double
     let draw: (inout GraphicsContext, CGSize, CGFloat) -> Void
+    @State private var onScreen = true
 
     var body: some View {
-        TimelineView(.animation) { tl in
+        TimelineView(.animation(minimumInterval: 1.0 / 30.0, paused: !onScreen)) { tl in
             Canvas { ctx, size in
                 let t = CGFloat(tl.date.timeIntervalSinceReferenceDate.truncatingRemainder(dividingBy: period) / period)
                 draw(&ctx, size, t)
             }
         }
+        .background(OnScreen(visible: $onScreen))
     }
 }
 

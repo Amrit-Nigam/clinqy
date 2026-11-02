@@ -129,6 +129,39 @@ if SetupCommands.names.contains(command) { MainActor.assumeIsolated { SetupComma
 // `Clinqy mcp`: an MCP server on stdio for other agents (`agy mcp add clinqy -- …/Clinqy mcp`).
 if command == "mcp" { MCPServer.serve() }
 
+// `clinqy control observe|act|verify|wait|release '<JSON>' [--image-out /path.jpg]`.
+// The CLI and MCP share the app relay; it never starts a model for precise actions.
+if command == "control" {
+    let args = Array(CommandLine.arguments.dropFirst(2))
+    guard args.count >= 2, let data = args[1].data(using: .utf8),
+          var body = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+        fputs("usage: clinqy control observe|act|verify|wait|release '<JSON>' [--image-out /path.jpg]\n", stderr); exit(2)
+    }
+    body["op"] = args[0]
+    let imagePath = args.firstIndex(of: "--image-out").flatMap { $0 + 1 < args.count ? args[$0 + 1] : nil }
+    if args[0] == "observe" && imagePath == nil { body["image"] = false }
+    Task {
+        var result = await MCPServer.control(body)
+        if let imagePath, var content = result["content"] as? [[String: Any]],
+           let index = content.firstIndex(where: { $0["type"] as? String == "image" }),
+           let encoded = content[index]["data"] as? String, let image = Data(base64Encoded: encoded) {
+            do {
+                let url = URL(fileURLWithPath: (imagePath as NSString).expandingTildeInPath)
+                try image.write(to: url, options: .atomic)
+                try FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: url.path)
+                content[index] = ["type": "text", "text": "Screenshot saved to " + url.path]
+                result["content"] = content
+            } catch { result["isError"] = true; result["content"] = [["type": "text", "text": "Couldn't save screenshot: " + error.localizedDescription]] }
+        }
+        if let data = try? JSONSerialization.data(withJSONObject: result, options: [.withoutEscapingSlashes, .sortedKeys]) {
+            FileHandle.standardOutput.write(data + Data("\n".utf8))
+        }
+        exit(result["isError"] as? Bool == true ? 1 : 0)
+    }
+    RunLoop.main.run()
+    exit(1)
+}
+
 // `Clinqy stats [days] [--last]`: success rate, model vs action time per turn, top failure reasons.
 if command == "stats" {
     let rest = CommandLine.arguments.dropFirst(2)
@@ -332,8 +365,8 @@ if command == "selftest" {
             }
         }
         print("     memory: \(all) facts · maths sends \(math.facts.count) · food sends \(food.facts.count)")
-        // Below Memory.sendAllBudget (16k characters) every fact goes along by design; filtering starts above it.
-        let small = Memory.facts.joined().count <= 16_000
+        // Only tiny memories go along whole; growing memory is retrieved.
+        let small = Memory.lines.joined().count <= Memory.sendAllBudget
         check(small ? math.omitted == 0 : all < 8 || math.facts.count < all / 2,
               small ? "small memory is sent whole" : "irrelevant facts are left out")
         check(!Memory.facts.contains { $0.contains("Swiggy") } || food.facts.contains { $0.contains("Swiggy") }, "food request brings in Swiggy facts")
@@ -563,7 +596,7 @@ if command == "selftest" {
               "streaming: nothing until the first action is complete")
         let first = Brain.firstAction(inPartial: String(full.prefix(full.range(of: "{\"do\":\"click")!.lowerBound.utf16Offset(in: full))))
         check(first?["do"] as? String == "type" && first?["text"] as? String == "a {brace} and \"quote\"", "streaming: first action parsed past braces and quotes in strings")
-        check(Agent.startsEarly(["do": "click", "id": "w1"]) && !Agent.startsEarly(["do": "ask", "question": "?"]) && !Agent.startsEarly(["do": "email"]),
+        check(Agent.startsEarly(["do": "read"]) && !Agent.startsEarly(["do": "click", "id": "w1"]) && !Agent.startsEarly(["do": "type", "id": "w1", "text": "x"]) && !Agent.startsEarly(["do": "ask", "question": "?"]) && !Agent.startsEarly(["do": "email"]),
               "streaming: only on-screen steps start early")
         check(Agent.canonical(["b": 1, "a": "x"]) == Agent.canonical(["a": "x", "b": 1]), "streaming: actions compare by content")
     }
@@ -642,7 +675,7 @@ if CommandLine.arguments.count >= 2, CommandLine.arguments[1] == "--reload-exten
     RunLoop.main.run()
 }
 
-let app = NSApplication.shared
+let app = ClinqyApplication.shared
 let delegate = MainActor.assumeIsolated { AppDelegate() }
 app.delegate = delegate
 app.setActivationPolicy(.accessory)

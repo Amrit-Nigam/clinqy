@@ -10,21 +10,42 @@ enum Reader {
     /// Text of the document a window has open (its AXDocument file), if it's a readable kind.
     static func documentText(of app: NSRunningApplication) async -> (name: String, text: String)? {
         guard let url = AXEngine.documentURL(of: app) else { return nil }
-        return await fileText(url).map { (url.lastPathComponent, $0) }
+        // The file on disk, which may differ from what the window shows if there are unsaved edits.
+        return await fileText(url).map { (url.lastPathComponent, "[saved copy on disk; unsaved edits in the window are not included]\n" + $0) }
     }
 
     /// Text of a local or downloadable file: PDFs through PDFKit, Word/RTF/HTML/text through AppKit.
     static func fileText(_ url: URL) async -> String? {
+        guard !Task.isCancelled else { return nil }
         var local = url
+        defer { if local != url { try? FileManager.default.removeItem(at: local) } }
         if !url.isFileURL {
             guard let (tmp, _) = try? await URLSession.shared.download(from: url) else { return nil }
             local = tmp
         }
         if url.pathExtension.lowercased() == "pdf" || isPDF(local) {
             guard let doc = PDFDocument(url: local) else { return nil }
-            let text = (0..<doc.pageCount).compactMap { doc.page(at: $0)?.string }.joined(separator: "\n\n")
-            return clean(text)
+            var text = ""
+            var page = 0
+            // Bound scanned/empty PDFs as well as text-rich documents.
+            while page < min(doc.pageCount, 100), text.count < 12_000 {
+                guard !Task.isCancelled else { return nil }
+                text += (doc.page(at: page)?.string ?? "") + "\n\n"
+                page += 1
+            }
+            return clean(text).map { $0 + (page < doc.pageCount ? "\n[excerpt truncated]" : "") }
         }
+        let plain = ["txt", "md", "csv", "tsv", "json", "log", "swift", "py", "js", "ts", "rs", "xml", "yaml", "yml"]
+        if plain.contains(url.pathExtension.lowercased()), let handle = try? FileHandle(forReadingFrom: local) {
+            defer { try? handle.close() }
+            let bytes = handle.readData(ofLength: 64_001)
+            return clean(String(decoding: bytes.prefix(64_000), as: UTF8.self)).map {
+                $0 + (bytes.count > 64_000 ? "\n[excerpt truncated]" : "")
+            }
+        }
+        // Rich document importers allocate the entire document; refuse unbounded input.
+        guard let size = try? local.resourceValues(forKeys: [.fileSizeKey]).fileSize, size <= 20_000_000,
+              !Task.isCancelled else { return nil }
         if let attributed = try? NSAttributedString(url: local, options: [:], documentAttributes: nil) {
             return clean(attributed.string)
         }
@@ -32,8 +53,17 @@ enum Reader {
     }
 
     /// Recognizes the text on the app's frontmost window (works on scans, images, canvases, PDFs as pictures).
-    static func ocr(_ app: NSRunningApplication) async -> String? {
-        guard let image = await windowImage(app) else { return nil }
+    static func ocr(_ app: NSRunningApplication, window: NativeWindowObservation? = nil) async -> String? {
+        guard let capture = await windowCapture(app, window: window) else { return nil }
+        return await ocr(image: capture.image)
+    }
+
+    static func ocr(_ capture: Screenshot.Capture) async -> String? {
+        guard capture.window.staleness(includeContent: true) == nil else { return nil }
+        return await ocr(image: await ocrImage(for: capture))
+    }
+
+    private static func ocr(image: CGImage) async -> String? {
         return await Task.detached(priority: .userInitiated) { () -> String? in
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
@@ -47,8 +77,17 @@ enum Reader {
     /// Each piece of text on the app's window with where it is on screen (global top-left points, like element
     /// frames), for clicking things the Accessibility tree doesn't show (WhatsApp's chats, canvases, custom UI).
     /// `want`, when given, is boxed on its own where a line holds more (the "Archive" in "Archive chat").
-    static func textBoxes(_ app: NSRunningApplication, want: String? = nil) async -> [(text: String, rect: CGRect)]? {
-        guard let (image, frame) = await windowCapture(app) else { return nil }
+    static func textBoxes(_ app: NSRunningApplication, window: NativeWindowObservation? = nil, want: String? = nil) async -> [(text: String, rect: CGRect)]? {
+        guard let capture = await windowCapture(app, window: window) else { return nil }
+        return await textBoxes(image: capture.image, frame: capture.frame, want: want)
+    }
+
+    static func textBoxes(_ capture: Screenshot.Capture, want: String? = nil) async -> [(text: String, rect: CGRect)]? {
+        guard capture.window.staleness(includeContent: true) == nil else { return nil }
+        return await textBoxes(image: await ocrImage(for: capture), frame: capture.window.frame, want: want)
+    }
+
+    private static func textBoxes(image: CGImage, frame: CGRect, want: String?) async -> [(text: String, rect: CGRect)] {
         return await Task.detached(priority: .userInitiated) { () -> [(text: String, rect: CGRect)] in
             let request = VNRecognizeTextRequest()
             request.recognitionLevel = .accurate
@@ -74,27 +113,36 @@ enum Reader {
         }.value
     }
 
-    private static func windowImage(_ app: NSRunningApplication) async -> CGImage? {
-        await windowCapture(app)?.image
+    /// The model's screenshot is downscaled to the vision budget; text recognition does better on the display's own
+    /// pixels. A fresh full-resolution grab of the same exact window is used when the capture is clearly smaller,
+    /// else the capture's own image.
+    private static func ocrImage(for capture: Screenshot.Capture) async -> CGImage {
+        let wanted = Screenshot.backingScale(for: capture.window.frame) * capture.window.frame.width
+        guard Double(capture.rawImage.width) < Double(wanted) * 0.9,
+              let app = NSRunningApplication(processIdentifier: capture.window.pid),
+              let full = await windowCapture(app, window: capture.window) else { return capture.rawImage }
+        return full.image
     }
 
-    /// The app's main window as an image, with its frame on screen.
-    private static func windowCapture(_ app: NSRunningApplication) async -> (image: CGImage, frame: CGRect)? {
-        guard CGPreflightScreenCaptureAccess(),
+    /// Capture only the selected AX window; another, larger window of the app must never substitute for it.
+    private static func windowCapture(_ app: NSRunningApplication, window requested: NativeWindowObservation?) async -> (image: CGImage, frame: CGRect)? {
+        guard let snapshot = requested ?? NativeWindowObservation.capture(app), snapshot.pid == app.processIdentifier,
+              snapshot.staleness(includeContent: true) == nil, CGPreflightScreenCaptureAccess(),
               let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
-              let window = content.windows
-                .filter({ $0.owningApplication?.processID == app.processIdentifier && $0.windowLayer == 0 })
-                .max(by: { $0.frame.width * $0.frame.height < $1.frame.width * $1.frame.height })
+              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }),
+              ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame)
         else { return nil }
         let config = SCStreamConfiguration()
-        // Full resolution: small print (phone numbers, emails) needs every pixel.
-        let scale = NSScreen.main?.backingScaleFactor ?? 2
-        config.width = Int(window.frame.width * scale)
-        config.height = Int(window.frame.height * scale)
+        // Full resolution for OCR. Geometry stays in screen points regardless of the backing pixel scale.
+        // The scale of the display the window is on (not always the main one), bounded so a huge window stays tractable.
+        let scale = min(Screenshot.backingScale(for: window.frame), 8192 / max(window.frame.width, window.frame.height, 1))
+        config.width = max(1, Int(window.frame.width * scale))
+        config.height = max(1, Int(window.frame.height * scale))
         config.showsCursor = false
         guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
-                                                                      configuration: config) else { return nil }
-        return (image, window.frame)
+                                                                      configuration: config),
+              snapshot.staleness(includeContent: true) == nil else { return nil }
+        return (image, snapshot.frame)
     }
 
     private static func isPDF(_ url: URL) -> Bool {
@@ -103,9 +151,13 @@ enum Reader {
         return handle.readData(ofLength: 5) == Data("%PDF-".utf8)
     }
 
+    static let maxCharacters = 12_000
+
     private static func clean(_ text: String) -> String? {
         let t = text.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        return t.isEmpty ? nil : String(t.prefix(12_000))
+        guard !t.isEmpty else { return nil }
+        guard t.count > maxCharacters else { return t }
+        return String(t.prefix(maxCharacters)) + "\n[truncated: showing the first \(maxCharacters) of \(t.count) characters]"
     }
 }

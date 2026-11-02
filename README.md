@@ -12,13 +12,13 @@ Clinqy is a macOS menu-bar assistant that uses your Mac the way you would. Press
 "message mom I'll be late"           "in the background, add a reminder to call Raj"
 ```
 
-> **On Windows?** Clinqy runs there too, with the same browser extension, settings and workflows. [**Download it for Windows**](https://github.com/Amrit-Nigam/clinqy/releases/latest) and see [Setup on Windows](#setup-on-windows).
+> **On Windows?** Clinqy runs there too, with the same browser extension, settings and workflows. [**Download it for Windows**](https://clinqy.vercel.app/api/windows-download) and see [Setup on Windows](#setup-on-windows).
 
 ## Setup guide
 
 Download, paste one prompt into your coding agent, done. It needs macOS 14 or later on Apple silicon.
 
-**1. Download** **[`Clinqy.dmg`](https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.3/Clinqy.dmg)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
+**1. Download** **[`Clinqy.dmg`](https://clinqy.vercel.app/api/mac-download)**, open it and drag Clinqy into Applications. Clinqy isn't notarized by Apple yet, so the first time you open it macOS blocks it: open **System Settings → Privacy & Security**, scroll down and click **Open Anyway**. (You can skip this step: the prompt installs Clinqy too, and then macOS doesn't block it.)
 
 **2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then an API key. It asks for Clinqy's permissions, adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
 
@@ -30,7 +30,7 @@ Set up Clinqy for Mac (https://github.com/Amrit-Nigam/clinqy) on this Mac for me
 commands yourself. Only stop when you need my answer or a click that only I can do.
 
 1. Install Clinqy (this also updates an older copy). It needs macOS 14+ on Apple silicon and no admin rights:
-     curl -fsSL -o /tmp/Clinqy.dmg https://github.com/Amrit-Nigam/clinqy/releases/download/mac-v0.2.3/Clinqy.dmg
+     curl -fsSL -o /tmp/Clinqy.dmg https://clinqy.vercel.app/api/mac-download
      v=$(hdiutil attach -nobrowse /tmp/Clinqy.dmg | grep -o '/Volumes/.*'); pkill -x Clinqy; rm -rf /Applications/Clinqy.app
      ditto "$v/Clinqy.app" /Applications/Clinqy.app; hdiutil detach -quiet "$v"; open /Applications/Clinqy.app
    From then on use the full path: c=/Applications/Clinqy.app/Contents/MacOS/Clinqy
@@ -73,55 +73,122 @@ clinqy doctor             # what's ready
 
 API keys go in the settings file (`clinqy settings` opens it); all the settings are explained in [Choosing the model](#choosing-the-model) and [Configuration](#configuration). Building from source instead? See [Build & run](#build--run).
 
+While a task runs, Clinqy uses an IOKit `PreventUserIdleSystemSleep` assertion to keep the Mac awake. Foreground tasks also prevent idle display sleep. Overlapping tasks share reference-counted assertions; finishing, failing, stopping, or quitting releases the relevant leases. Queued tasks hold none. This prevents idle sleep, not manual locking, lid-close sleep, or shutdown.
+
+Mac releases use `MAC_VERSION` as the version source. `./make-dmg.sh` builds `dist/Clinqy.dmg` and a portable SHA-256 file; `./scripts/verify-mac-release.sh` checks the signed bundle and bundled extension. After committing and pushing release sources, maintainers run `./scripts/stage-mac-release.sh` on the signing Mac to upload a draft using the existing certificate. Merging into `main` runs Mac checks; only a successful main-branch check can publish a staged draft whose Mac sources match the merged commit. Windows stays the repository's latest release. The website, README and setup prompt use a stable Mac download endpoint that selects published Mac releases, so drafts and merge-time publishing do not break download links. No signing private key is uploaded to CI. Windows download buttons and setup commands resolve the latest published `windows-v` ZIP and installer independently; the site displays each platform’s published version. On Windows 0.3.1+, `clinqy update` upgrades in place. Windows 0.3.0 and older should reinstall the latest ZIP, keeping their data.
+
+## Telegram tasks and attachments (Mac)
+
+Open **Telegram…** from Clinqy's menu to connect your bot and pair your private chat. Send a photo or file with a caption such as “send this image to Onik on WhatsApp” or “summarize this PDF”. Clinqy downloads the attachment to your Mac and gives the task its exact local path.
+
+Choose **Normal** (uses the Mac's screen and input) or **Background** (isolated browser tabs and supported file tools) before each new task. Say “use normal mode Clinqy”, `foreground: …`, or `background: …` to choose in the request. The mode-choice message becomes one status card that updates in place and shows the final outcome. Background browser tasks use the same concurrent queue as the Mac UI; desktop work has its own slot.
+
+You can send files first, then an instruction, or reply to an earlier attachment. Album files stay together. New messages start separate requests; reply to a task's status message to add instructions or files to that task. `/new <task>` always creates a separate request. A new application link is never silently appended to another application.
+
+Each file must fit Telegram's 20 MB download limit. Failed or missing attachments prevent execution without blocking the next queued task. Downloaded files stay in `~/Library/Application Support/Clinqy/Telegram/` for follow-ups. `/runs` (also `/tasks`) lists this chat's tasks; `/task <id>` selects one. `/status`, `/result`, `/screenshot` and `/stop` accept a task ID. `/stop` stops only the selected Telegram task; `/stop all` clears Telegram tasks and pending choices without stopping unrelated Mac work.
+
+Questions have task-specific reply buttons that expire after answering. Reply to the question itself when several tasks need input. Passwords and codes stay on the Mac. Asking “how can I do it?” keeps the task paused. **Open task on Mac** or `/open` reveals its pinned tab/window; solve a CAPTCHA yourself there, then reply when done.
+
+`/status` or “how far along?” shows the selected task's mode, stage and completed steps. Automatic progress edits the existing card rather than posting new messages. `/screenshot` captures only the task's pinned tab/window, without selecting unrelated windows, and pauses during private input. Images are sent on request; completion sends no automatic photo or image-error message. Attached images reach the model as actual visual input. For requested page images, Clinqy discovers article sources and sends actual photos; blocked downloads can use a crop of the fully visible image in the owned task tab. Media requests require acknowledged photo delivery before reporting success. Grouped browser work uses one parent card, with child questions routed to the correct task and detailed results available on demand.
+
+`/result` or “what did you fill?” shows the full output, including every form field, warnings and links; long output spans message chunks. Form submission still requires a review of the actual answers with **Submit** or **Edit**. Changed answers or another form require a new review. Completion distinguishes filling from submission and avoids repeating an automatically generated result card. Follow-ups such as “change the location to Pune” retain the previous task's output as context for 30 minutes. Saved text outcomes remain available after restarting.
+
+Run `tests/telegram.sh` and `node tests/telegram-screenshot.mjs` to check conversation routing, attachment handling and screenshot targeting with mocked APIs. `tests/site/telegram-review.html` is a local-only demo form for background conversation checks; it never sends an application anywhere.
+
+## Isolated background work (Mac)
+
+Background web tasks default to **Clinqy's own inactive tabs in your signed-in browser**, controlled through the Clinqy extension. They appear in a **Clinqy** tab group where supported (Arc uses separate tabs) while you continue using other tabs, windows or apps. The task stays pinned to its browser connection and can only read or act on its own tabs. Existing website sessions are shared with that browser profile; password-manager prompts, security dialogs and expired logins may still need your input. Chrome displays its debugging indicator while the task is attached.
+
+Install or reload the extension, then choose **Dashboard → Background → Signed-in browser tabs** (the default). With multiple connected browsers, Clinqy prefers `BACKGROUND_BROWSER` (Google Chrome by default); otherwise it uses the focused connected browser, or the sole connection. Connect only the intended profile if multiple profiles are open in the same browser. A missing or disconnected extension stops browser work instead of switching to a different browser or your desktop. On completion, debugging detaches and result tabs remain available. At the next task, old inactive task tabs close; an active result tab or one playing audio is handed over to you.
+
+While Clinqy works, its tab shows a temporary **◉ Clinqy** title, a blue page-edge halo and a small status badge. A page-local cursor follows targets and shows click ripples without moving your system pointer in background mode. Feedback lets clicks pass through, respects reduced motion and disappears when work finishes or the connection closes. Your page's latest title is restored afterward.
+
+Normal foreground navigation also uses the extension when connected: one request opens one identified tab. Retrying an uncertain open reuses its tab instead of creating a duplicate. Streamed and final actions recognize equivalent address spellings such as `youtube.com` and `https://www.youtube.com/`.
+
+**Separate headless Chrome** remains available in Background settings, or via `BACKGROUND_WEB_MODE=headless` in the settings file (`extension` selects signed-in tabs). This option uses its own data directory at `~/Library/Application Support/Clinqy/ChromeWorker/` and separate sign-ins. Use **Clinqy menu → Sign In to Worker Chrome…**, then **Finish Worker Chrome Sign-in** before running a headless task.
+
+Use **Show Background Work** to open the task tab, or the screenshot view in headless mode. Files, PDFs, media and supported services use direct tools. Finder reveal, native app input, clipboard shortcuts, arbitrary shell/AppleScript and conversions that open iWork require an explicit switch to foreground mode. Background browser control is not a separate macOS desktop or sandbox for native apps.
+
+**Tasks & Recovery…** and Telegram **`/tasks`** read the same persisted task state: current stage, completed steps, last confirmed action and results. Requests, attachment paths and checkpoints are saved in owner-only `~/Library/Application Support/Clinqy/tasks.sqlite`. Existing `tasks.json` records are imported once; the original file is preserved. Writes update a single durable SQLite row per checkpoint; the UI holds recent tasks while older records remain searchable by ID. After a restart, active tasks become **Interrupted**, retaining any in-flight action marker. They never resume or repeat sends/submissions automatically. Check the real outcome and send fresh instructions. Restored queued requests require review: start them in the Mac panel or use **`/run <id>`** in the paired Telegram chat. Missing files and unreadable task storage prevent execution. Downloading/staged attachments and unanswered questions are not resumed; resend any message that did not receive an acceptance reply.
+
+Actions distinguish **confirmed**, **unverified**, **failed** and **refused** outcomes. Input sent to an app is not automatically a confirmed checkpoint. Uncertain sends/submissions stay stopped until the requested outcome is checked with fresh evidence; generic visual changes and closed dialogs do not prove success. Native screenshots, accessibility elements and coordinate actions are bound to one observed window; stale or ambiguous targets require another observation.
+
+Scheduled requests and daily workflows always start in background mode with no foreground selection, clipboard or follow-up context. Each occurrence is saved as a unique task before the schedule advances, so a handoff retry cannot create a duplicate job. Restored queued occurrences require review; interrupted submissions never replay automatically. New schedules default to catching up once after wake/relaunch, coalescing missed repeats. The New Schedule menu also offers skipping runs more than two hours late; older schedules keep that previous skip behavior. Storage failures and skipped runs appear in the Schedules menu. Schedules run locally while Clinqy is open and the Mac is awake; closing the chat window does not quit Clinqy.
+
+Validation: `zsh tests/browser-navigation.sh` checks URL and streamed-action identity. `node tests/extension-background.mjs` checks extension task ownership, inactive tab creation, uncertain-open deduplication across worker restarts, focus emulation, audio-preserving cleanup and failed attachment with mocked browser APIs. `zsh tests/background-tasks.sh` checks persistence, interruption, queue review and capability routing. `zsh tests/chrome-worker.sh` uses two temporary headless Chrome profiles and local dummy pages to check form input, upload bytes and intercepted choosers, screenshots, targeting, orphan cleanup, disconnect handling and unchanged host clipboard/foreground application. It never uses your signed-in browser or submits to an external site.
+
+`zsh tests/scheduler.sh` checks durable schedule dispatch, failed writes, restart deduplication and missed-run policy. `zsh tests/observations.sh` checks screenshot scaling and stale-window geometry without operating your desktop.
+
+`zsh tests/native-compatibility.sh` probes native targeting against two disposable fixture windows only. It checks exact-window observations, moved-window rejection and unchanged foreground app, pointer, clipboard and existing window order. It explicitly skips when Accessibility permission or the graphical session is unavailable; it never prompts for permissions or sends input to your applications. A passing fixture probe does not enable general native background control. Legacy daily workflow schedules still run only during their configured minute; new scheduled requests expose their missed-run policy explicitly.
+
 ## Setup on Windows
 
 Download, paste one prompt into your coding agent, done. It needs Windows 10 (1903 or later) or Windows 11, on x64, and no admin rights.
 
-**1. Download** **`Clinqy-windows-x64.zip`** from the [latest release](https://github.com/Amrit-Nigam/clinqy/releases/latest), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH, opens it at login and starts it. The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. (You can skip this step: the prompt installs Clinqy too.)
+**1. Download** **`Clinqy-windows-x64.zip`** from the [latest Windows download](https://clinqy.vercel.app/api/windows-download), unzip it and double-click **`Install Clinqy.bat`**. It installs Clinqy to `%LOCALAPPDATA%\Programs\Clinqy`, adds it to the Start menu, puts the `clinqy` command on your PATH and starts it. Open at login is off until you turn it on in settings (Dashboard → General). The app isn't code-signed yet, so if Windows SmartScreen warns you, click **More info → Run anyway**. If Microsoft Defender quarantines it, open Windows Security → Protection history, choose the Clinqy entry and allow it on your device. (You can skip this step: the prompt installs Clinqy too.)
 
-**2. Paste this into your coding agent** (Claude Code, Codex, agy, Cursor, Gemini CLI or Windsurf). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It adds the browser extension (Clinqy loads it into your browser itself), connects the agent you pasted it into, and checks everything. Want a particular AI? Change the first line to `claude cli`, `codex cli`, `agy cli`, `ollama qwen3-vl` or `anthropic api key` (or `openai`, `gemini`, `openrouter`).
+**2. Paste this into any AI you use** (Claude Code, Codex, agy, Cursor, Gemini CLI, Windsurf, or a chat with no terminal, which walks you through it). There's nothing to fill in. It uses the AI you already have, in this order: Claude Code, then Codex, then agy, then Ollama. It connects your coding agents, has Clinqy add its own browser extension, and checks everything. Want a particular AI? Change the first line to `claude`, `codex`, `agy`, `ollama` or `anthropic` (or `openai`, `gemini`, `openrouter`).
 
 ````text
 Model: auto
-Connect to: this agent
+Connect to: all
 
-Set up Clinqy for Windows (https://github.com/Amrit-Nigam/clinqy) on this PC for me, using the two lines above. Run
-the commands yourself in PowerShell. Only stop when you need my answer or a click that only I can do.
+Set up Clinqy for Windows (https://github.com/Amrit-Nigam/clinqy) on this PC for me, using the two lines above. Run the
+commands yourself in PowerShell. Only stop when you need my answer or a click that only I can do. If you can't run
+commands here, tell me to open PowerShell, give me one command at a time to paste, and work from what I send back.
 
-1. Install Clinqy, unless it's already installed ($c below exists). It needs no admin rights:
-     powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://github.com/Amrit-Nigam/clinqy/releases/latest/download/install.ps1 | iex"
-   From then on use the full path (PATH only updates in new terminals):
+1. Install Clinqy (this also updates an older copy). It needs Windows 10 or 11 and no admin rights:
+     powershell -NoProfile -ExecutionPolicy Bypass -Command "& ([scriptblock]::Create((irm 'https://clinqy.vercel.app/api/windows-download?asset=installer'))) -Url 'https://clinqy.vercel.app/api/windows-download'"
+   From then on use the full path, because PATH only updates in new terminals:
      $c = "$env:LOCALAPPDATA\Programs\Clinqy\clinqy.exe"
-2. Set up the model with `& $c model <name>`, then read what it prints.
-   - "auto" (or blank): run `& $c model auto`. It uses what this PC has: Claude Code, then Codex, then agy, then Ollama.
-     If it has none of them, install Claude Code (`winget install Anthropic.ClaudeCode`) and run `& $c model claude`.
-   - Otherwise map my choice: claude, codex, agy, ollama <model>, or an API key: anthropic, openai, gemini, openrouter.
-   - It checks that the model really answers. If it says a CLI isn't logged in, ask me to run `claude` (or `codex`,
-     `agy`) once in a new terminal and log in, wait for me, then run `& $c model test`.
-   - API key: don't ask me to paste the key into this chat. Run `& $c settings` (it opens the file), tell me which line
-     to paste the key into, wait until I've saved it, then run `& $c model test`.
-3. Add the browser extension with `& $c extension install`. Clinqy opens the extensions page and loads it by itself
-   (add `edge` or `brave` if I use one of those). If it fails, walk me through it by hand: it prints the folder to pick.
-4. Connect coding agents with `& $c connect <names>` (claude, codex, agy, cursor, gemini, windsurf). "this agent" means
-   you: Claude Code → claude, Codex → codex, Antigravity → agy, Cursor → cursor, Gemini CLI → gemini, Windsurf →
-   windsurf. Skip this if it says none.
-5. Check it: run `& $c doctor`, then `& $c run --dry "open example.com"`, and show me the planned steps. Fix anything
-   that isn't ready (the log is %LOCALAPPDATA%\Clinqy\Logs\agent.log). Finish with a short summary, and tell me: tap
-   Ctrl+Alt to type a request, hold Ctrl+H to say it.
+2. Tell me Clinqy is about to use my mouse for a moment to add its browser extension, then run setup:
+     & $c setup --model <Model> --connect <Connect to>
+   Model is auto, or one of claude, codex, agy, ollama, anthropic, openai, gemini, openrouter. Auto uses what this PC
+   has: Claude Code, then Codex, then agy, then Ollama. Connect to is all, none, or names with commas from claude, codex,
+   agy, cursor, gemini, windsurf. "this agent" means you. Setup does everything it can and ends with what's ready and a
+   "Needs you" list.
+3. Work through "Needs you", then run the same setup command again, until it says everything is ready:
+   - No AI installed: install Claude Code with `winget install Anthropic.ClaudeCode`.
+   - A CLI isn't logged in: ask me to run `claude` (or `codex login`, or `agy`) once in a new terminal, and wait for me.
+   - An API key: don't ask me to paste it into this chat. Run `& $c settings` (it opens the file), tell me which line to
+     paste the key into, and wait until I've saved it.
+   - The extension: walk me through it by hand with the folder setup printed.
+4. Check it: run `& $c doctor`, then `& $c run --background "open example.com and tell me the page title"`, and show me
+   the result. Fix anything that fails (the log is %LOCALAPPDATA%\Clinqy\Logs\agent.log).
+5. Finish with a short summary, and tell me: tap Ctrl+Alt to type a request, hold Ctrl+H to say it, the gear on the bar
+   opens settings (AI and model, background tasks, all the keys), and any coding agent you connected needs a restart to
+   see Clinqy's tools.
 ````
 
 **3. Tap Ctrl+Alt** and ask something.
 
-**No coding agent?** Do the same by hand in a new terminal after installing:
+**Want every step, what you should see and fixes for common problems?** Read the [step-by-step Windows setup guide](windows/SETUP.md).
+
+**No AI to paste it into?** Run this in a new terminal after installing:
 
 ```powershell
-clinqy model              # which AI Clinqy uses; `clinqy model agy` (or claude, codex, ollama…) picks one and checks it answers
-clinqy extension install  # Clinqy loads its own extension into your browser (add edge or brave to choose)
-clinqy connect claude     # add Clinqy to coding agents over MCP: claude, codex, agy, cursor, gemini, windsurf
-clinqy doctor             # what's ready
+clinqy setup
 ```
 
-The tray icon has the same: **Model**, **Browser extension…** and **Check setup…**. API keys go in the settings file (`clinqy settings` opens it), the same file and keys as on the Mac; see [Choosing the model](#choosing-the-model).
+It does the same steps and ends with a "Needs you" list. Each step also works alone: `clinqy model`, `clinqy models`, `clinqy extension install`, `clinqy connect all` and `clinqy doctor`.
+
+### The Clinqy window
+
+Click the gear on the command bar, or the tray icon → **Dashboard…**, for the same setup and dashboard as on the Mac:
+
+- **AI & Model:** switch between Claude Code, Codex, agy and the rest, and choose from the models each one really offers on this device. Each device keeps its own choice. Automatic uses the first one you have.
+- **Background:** the switch for background tasks, signing in to the background browser, and the live view.
+- **Tasks:** what ran, what happened, and what to check after an interruption.
+- **Shortcuts:** change the keys, and see every shortcut in one place.
+- **Overview, Usage, General:** requests and tokens, warnings, Open at login, voice language, memory.
+
+### Background tasks
+
+Say "in the background" in a request, or turn on **Background** on the bar, and Clinqy works in a hidden Chrome or Edge with its own profile while you keep your mouse, keyboard and windows. A small badge shows it's working: click it to watch, pause, steer or stop.
+
+- Web pages, files and PDFs work hidden. Sites that need a login: sign in once under **Background → Sign in…**, because the hidden browser has its own sign-ins.
+- If a task needs a desktop app, a card in the top right says **Clinqy needs the foreground**, with **Run in foreground**, **Keep in background** and **Stop task**. It waits for you, and tells you when it switches.
+- Questions and form reviews come on the same card, which never takes the keyboard from you.
 
 ### Using it
 
@@ -130,10 +197,11 @@ The tray icon has the same: **Model**, **Browser extension…** and **Check setu
 | **Tap Ctrl+Alt** | open the command bar, type what you want, press Enter |
 | **Hold Ctrl+H** | talk: it listens only while you hold it, and sends when you let go (the voice model downloads the first time) |
 | **Ctrl+Alt while it works** | add something or change the plan, **Pause / Resume**, or **Stop** |
+| **Enter** | send your request or answer |
 | **Click the tray icon while it works** | stop at once (the tray menu also has Pause) |
 | **Esc** | close the bar |
 
-The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and **History**, the same as on the Mac. Only the left Alt key counts, so typing with AltGr never opens Clinqy. To use other keys, set `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) or `TALK_HOTKEY=ctrl+shift+space` in the settings file. A quick tap of Ctrl+H still reaches the app in front (Replace, History…).
+The bar's footer has **Dry run**, **Background**, **Circle**, **Watch**, **Skills**, **History** and the settings gear. Only the left Alt key counts, so typing with AltGr never opens Clinqy. To use other keys, set `HOTKEY=ctrl+win` (or `ctrl+shift`, `alt+win`) or `TALK_HOTKEY=ctrl+shift+space` in the settings file. A quick tap of Ctrl+H still reaches the app in front (Replace, History…).
 
 **Updating** means running the installer again; your settings, memory and history are kept. **Uninstalling** means double-clicking `Uninstall Clinqy.bat` in `%LOCALAPPDATA%\Programs\Clinqy`. More detail, including building from source, is in [windows/README.md](windows/README.md).
 
@@ -155,7 +223,7 @@ The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and 
   - Native apps through the Accessibility tree (Electron apps too).
   - Web pages through a **browser extension**: exact elements, verified typing that survives autofill, dropdowns, reading.
   - Documents through PDFKit, and scans or images through on-device OCR.
-  - Scriptable apps through their **AppleScript dictionaries**, used as a fallback or when you ask for "in the background".
+  - Scriptable apps through their **AppleScript dictionaries** in foreground mode; background mode uses supported direct tools and an isolated Chrome worker.
 - **Voice.** Hold ⌃⌥ and talk. On macOS 26 the **Mac's own speech model** (SpeechAnalyzer, the one behind Dictation, Notes and Voice Memos) writes the text on-device as you speak, so it's ready a moment after you stop. Nothing to download into Clinqy. Before macOS 26, Apple dictation does it.
 - **Asks when it needs you.** It asks for details, choices and passwords (hidden input), with quick-choice buttons or a voice answer.
 - **Safety enforced in code:**
@@ -166,6 +234,10 @@ The bar's footer has **Dry run**, **Circle**, **Watch & learn**, **Skills** and 
 - **Result cards.** Options, prices, plans and summaries appear in a card you can copy from.
 - **History.** Every run is saved. You can **Continue** from one or **Run again**.
 - **Memory.** After each task it keeps lasting facts about you (people, preferences, usual apps). It never saves passwords, card numbers or OTPs.
+- **Persistent task memory (Mac).** Runs are also archived in a local SQLite search index, beyond the History window's 200 recent runs. Each new task retrieves a small amount of related experience, including outcomes, steps and linked follow-up corrections. Exact repeats of proven, non-sensitive routes are checked before model-session setup; other matches guide the agent while it checks the current screen. Explicit corrections stop the old route being replayed as proven. A correction to the latest task can attach for up to 24 hours; other automatic follow-ups attach for 20 minutes. Existing retained history is imported automatically; records already discarded by older builds cannot be reconstructed. Clearing History clears the task archive too.
+- **Parallel delegation (Mac).** The lead can assign independent research, analysis, drafting and review jobs to separate model sessions while continuing its own work. Up to three workers run at once by default; dependencies wait for their inputs, and results return automatically or through `collect`. Workers read supplied files/public URLs; `browser:true` reads pages in their own headless Chrome tabs using the worker profile's sign-ins. They return evidence and drafts to the lead, which handles edits, clicks and submissions. Stopping or failing the parent cancels its workers. Worker failures/timeouts stop dependent jobs while independent jobs continue. User corrections cancel outstanding jobs; late results from cancelled jobs are ignored. Worker results and assignments are retained in task memory. Runs that generate content through workers require fresh reasoning and cannot become UI-only replays with stale text. Delegation is chosen for substantial independent work; simple tasks stay direct. Concurrent model requests can use more tokens or encounter provider rate limits.
+- **Windows memory and workers.** The Windows core also keeps a SQLite task archive beyond the recent History menu, retrieves prior outcomes and follow-up corrections, streams API replies, and runs bounded asynchronous workers with dependencies and duplicate reuse. Windows workers currently accept public HTTP text and local text files; browser-authenticated sources use the Mac isolated worker. Worker-generated tasks always require fresh reasoning rather than a UI-only replay.
+- **Runtime efficiency.** HTTP providers stream validated early actions, retain a bounded conversation with explicit historical excerpts, and retry rate limits within a request deadline. Mac actions use direct app/browser navigation and immediate input by default; `HUMAN_MOTION=on` restores decorative waiting. DOM candidate and frame caches invalidate when documents change; geometry and field values remain fresh. Shared source snapshots are scoped to one task. Run logs separate model time from task wall time; Mac logs also record startup, action and checkpoint phases (overlapping phases must not be added as total wall time).
 - **Watch & learn.** Click *Watch & learn*, do a task yourself, and press ⌃⌥ to stop. It becomes a reusable **skill** with fill-in parameters.
 - **Selected text and the clipboard.** Whatever you had highlighted is sent along with your request. With nothing highlighted, something you copied in the last 10 minutes counts as "this" ("translate this", "reply to this", "add this to my tracker"). Clipboard text is only sent when the request points at it, and password-manager copies are never kept.
 - **Saved workflows first.** If a request matches a saved workflow (same words, only the typed values differ: "message mom I'm stuck in traffic" vs. the saved "message mom I'll be late"), it's replayed with no model. The model only steps in to heal a step whose target is gone. Turn it off with `WORKFLOW_FIRST=off`.
@@ -338,6 +410,17 @@ By default Clinqy runs on the Claude Code CLI with your Claude login. To switch 
 | Ollama | `PROVIDER=ollama` and `LOCAL_MODEL=qwen3-vl` |
 | Any OpenAI-compatible server | `PROVIDER=openai-compatible`, `OPENAI_BASE_URL=…`, `OPENAI_COMPATIBLE_API_KEY=…` and `LOCAL_MODEL=…` |
 
+On macOS, Codex also has an opt-in persistent transport:
+
+```bash
+PROVIDER=codex-cli
+CODEX_TRANSPORT=app-server
+```
+
+This uses the installed Codex CLI's existing sign-in and one live, ephemeral conversation per Clinqy session. Each turn sends only its new input and screenshot. Clinqy's outer harness executes actions; the embedded Codex process has no execution environments, inherited MCP servers are explicitly disabled, and app/plugin, shell, browser and computer tools are disabled. The adapter checks effective restrictions before inference and refuses incompatible configurations. It was checked against Codex CLI 0.165.0. The [official app-server protocol](https://learn.chatgpt.com/docs/app-server) changes over time, so this transport remains opt-in. Leave `CODEX_TRANSPORT` unset or choose `exec` for the existing per-turn compatibility transport.
+
+An interrupted, timed-out or disconnected app-server turn is **never replayed or automatically retried through exec**. Start a new task after checking its outcome. `zsh tests/codex-session.sh` exercises a local fake process, including blocked pipes and cancellation, without calling a model. Set `CLINQY_CODEX_PREFLIGHT=/absolute/path/to/codex` when running that test to additionally check the installed CLI's configuration and thread restrictions; this preflight creates no inference turn and changes no sign-in settings.
+
 For example, Antigravity CLI:
 
 ```bash
@@ -389,6 +472,12 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `FAST_EFFORT` (macOS) | `low` | The helper's reasoning effort (or the one in a `FAST_MODEL` id like `gemini-3.8-flash-medium`); not taken from `CLAUDE_EFFORT` / `AGY_EFFORT` |
 | `FAST_TIMEOUT` (macOS) | `20` | Seconds a helper turn may take before the main model answers it instead |
 | `MODEL_TIMEOUT` (macOS) | `180` | Seconds to wait for a model reply before retrying once on a fresh session (at least 60); raise it for slow models such as `opus` on `agy` |
+| `DELEGATION` | on | `off`: disable independent task workers |
+| `DELEGATE_MODEL` | Mac: `FAST_MODEL` or lead; Windows: sonnet tier | Model for independent workers; follows the lead's provider |
+| `DELEGATE_CONCURRENCY` | 3 | Simultaneous independent workers, clamped to 1–6; at most 24 jobs per task |
+| `DELEGATE_TIMEOUT` | 90 | Seconds per running worker, clamped to 10–300; queued jobs wait for a slot/dependencies |
+| `DELEGATE_EFFORT` | low | Mac worker reasoning effort; the lead checks and combines results |
+| `HUMAN_MOTION` | off | Mac: await decorative cursor motion and human-paced launcher/address typing |
 | `WORKFLOW_FIRST` | on | `off`: always ask the model, even when a saved workflow matches |
 | `UPDATE_CHECK` | on | Mac: `off` stops the daily check for a new version on GitHub |
 | `FOLLOW_UP` | on | `off`: don't keep the mic open after a spoken task |
@@ -403,7 +492,10 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 | `~/Library/Application Support/Clinqy/models/bge-small-en-v1.5/` | The on-device retrieval model memory search uses (~130 MB, downloaded once from Hugging Face; nothing about you is sent). `CLINQY_EMBEDDINGS=system` in `~/.config/clinqy/env` keeps the built-in system vectors instead |
 | `~/.config/clinqy/memory.format` | The memory format version. A newer build upgrades older (or hand-edited) memory once on first launch, app or `clinqy` command: list styles and headings cleaned up, exact duplicates merged, the old file kept as `memory.backup-<date>.md` |
 | `~/.config/clinqy/memory.history.jsonl` | Every memory update and removal (old wording, new wording, why), so recall can say what a fact used to be |
-| `~/Library/Application Support/Clinqy/history.json` | Run history |
+| `~/Library/Application Support/Clinqy/history.json` | Recent run history (200 entries in the UI) |
+| `~/Library/Application Support/Clinqy/task-memory.sqlite` | Persistent task archive and full-text index on Mac; includes linked follow-ups, steps, outcomes and full retained History records. SQLite's `-wal` and `-shm` companion files are managed automatically |
+| `~/Library/Application Support/Clinqy/replays.json.sqlite` | Durable learned procedures; the 150-route in-memory window is only a cache |
+| `~/Library/Application Support/Clinqy/tasks.sqlite` | Durable per-task recovery checkpoints; imports legacy `tasks.json` once |
 | `~/Library/Application Support/Clinqy/skills.json` | Learned skills |
 | `~/Library/Application Support/Clinqy/workflows.json` | Saved workflows (and schedules) |
 | `~/Library/Application Support/Clinqy/applications.json` | Job applications Clinqy filled or sent |
@@ -414,10 +506,31 @@ Optional `KEY=value` lines in `~/.config/clinqy/env` (start from [`env.example`]
 
 ```bash
 swift build --build-system native
+zsh tests/background-tasks.sh          # task checkpoints and background routing
+zsh tests/scheduler.sh                 # durable handoff, restart dedupe and missed-run policy
+zsh tests/observations.sh              # immutable capture coordinates and geometry guards
+zsh tests/codex-session.sh             # persistent protocol/isolation tests, no model calls
 .build/debug/Clinqy --selftest     # safety rules, reply parsing, stats parsing, replay fixtures, scripting dictionaries
 .build/debug/Clinqy replay tests/replay   # recorded runs re-checked offline
-tests/run.sh [filter]                 # end-to-end in Chrome against local pages in tests/site
+zsh tests/task-memory.sh              # archive, follow-ups, redaction, retention
+zsh tests/route-memory.sh             # fast reuse, durable procedures, correction invalidation
+zsh tests/delegation.sh               # bounded workers, dependencies, dedup, cancellation
+zsh tests/delegation-worker.sh        # source loading and independent session lifecycle
+zsh tests/efficiency.sh               # 10k checkpoints, network SSE, source sharing, process cancellation
+zsh tests/extraction.sh               # bounded extraction and lossless CSV append
+zsh tests/benchmarks.sh               # synthetic 100–10k tasks and 2k/20k archive benchmark
+zsh tests/background-tasks.sh
+zsh tests/telegram.sh
+zsh tests/chrome-worker.sh            # isolated real Chrome profiles, local dummy pages
+cargo test --manifest-path windows/Cargo.toml -p clinqy-core --lib
+cargo clippy --manifest-path windows/Cargo.toml -p clinqy-core --all-targets -- -D warnings
+(cd website && npm ci && npm run build && npm audit)
+tests/run.sh [filter]                 # live app/model end-to-end tests; requires installed Clinqy
 ```
+
+Website tooling requires Node.js 22.12 or newer.
+
+On the development Mac (optimized synthetic fixtures), 10,000-task checkpoint pairs improved from a 79.3 ms median to 0.17 ms, and a 20,000-task broad memory query from 7,255 ms to 54 ms. Reopening the migrated 10,000-task store took 3.4 ms; the one-time JSON migration took 135 ms. Six simulated 100 ms worker jobs took 625 ms serially and 208 ms with three workers. These measure local overhead and scheduler concurrency, not live-model or website speed. Reproduce with `tests/benchmarks.sh` and `tests/delegation.sh`.
 
 **Replay fixtures** (`tests/replay/*.json`) are recorded runs: the page snapshots the extension sent, plus the model's reply for each turn. Replaying them needs no browser, model or screen. Each turn is checked against pure code:
 - how the reply is parsed into actions
@@ -484,3 +597,10 @@ tests/qa/            example plain-English QA tests (compiled scripts in tests/q
 ## Privacy
 
 Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), or Codex CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
+
+### Direct controls for coding agents
+
+Connect with `clinqy connect claude --skill` or `clinqy connect codex --skill`, then restart the agent.
+The [Clinqy skill](skills/clinqy/SKILL.md) explains `/clinqy`, task delegation, and the direct observe/act/wait/verify/release tools.
+Existing personal skills are preserved; `--replace-skill` explicitly updates one.
+Run local workflow benchmarks with `python3 tests/benchmarks/run.py` (`--help` for options).

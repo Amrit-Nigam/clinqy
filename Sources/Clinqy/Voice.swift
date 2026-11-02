@@ -1,4 +1,5 @@
 import AVFoundation
+import ObjCCatch
 import Speech
 
 /// Push-to-talk speech recognition, on-device. On macOS 26 the Mac's own speech model (SpeechModel, Transcription)
@@ -21,7 +22,7 @@ final class Voice: ObservableObject {
     /// True while the mic is open only for a possible follow-up after a finished task.
     @Published private(set) var isFollowUp = false
 
-    private let engine = AVAudioEngine()
+    private var engine = AVAudioEngine()
     private var request: SFSpeechAudioBufferRecognitionRequest?
     private var recognition: SFSpeechRecognitionTask?
     private var recognizer = SFSpeechRecognizer(locale: Locale.current) ?? SFSpeechRecognizer(locale: Locale(identifier: "en-US"))
@@ -43,6 +44,14 @@ final class Voice: ObservableObject {
     private var lastChange = Date()
     private var silenceTimer: Timer?
     private var delivered = false
+    /// Identity of the recording in progress (bumped by every `begin`). Delayed finalization and recognizer
+    /// callbacks carry the one they started under and are dropped once a newer recording owns the shared state.
+    private var recording = 0
+    /// Identity of the latest `start` request: a permission prompt answered after `cancel()` or a newer `start`
+    /// must not open the mic.
+    private var startRequest = 0
+    /// The recording id of the last delivered/cancelled stop, readable by tests and logs.
+    var currentRecording: Int { recording }
 
     /// Speech works only inside the app bundle (it needs the usage strings in Info.plist).
     static var isSupported: Bool {
@@ -52,11 +61,14 @@ final class Voice: ObservableObject {
     /// `giveUpAfter`: close the mic quietly if nothing is said within that many seconds (follow-up listening).
     func start(autoStop: Bool = true, giveUpAfter: TimeInterval? = nil) {
         guard !isListening else { return }
+        startRequest += 1
+        let requestID = startRequest
         isFollowUp = giveUpAfter != nil
         guard Self.isSupported else { error = "Voice needs the Clinqy app bundle (run ./build.sh run)"; return }
         error = nil
         SFSpeechRecognizer.requestAuthorization { status in
             Task { @MainActor in
+                guard requestID == self.startRequest, !self.isListening else { return }
                 // The Mac's speech model needs only the microphone; Apple dictation also needs Speech Recognition.
                 guard status == .authorized || SpeechModel.shared.isReady else {
                     self.error = "Allow Speech Recognition for Clinqy in System Settings → Privacy & Security"
@@ -64,6 +76,7 @@ final class Voice: ObservableObject {
                 }
                 AVCaptureDevice.requestAccess(for: .audio) { ok in
                     Task { @MainActor in
+                        guard requestID == self.startRequest, !self.isListening else { return }
                         if ok { self.begin(autoStop: autoStop, giveUpAfter: giveUpAfter) } else {
                             self.error = "Allow Microphone for Clinqy in System Settings → Privacy & Security"
                         }
@@ -83,10 +96,11 @@ final class Voice: ObservableObject {
         private var early: [AVAudioPCMBuffer] = []
         private var holding = false
         private var closed = false
+        private var nextLevelUpdate: TimeInterval = 0
 
         func set(_ r: SFSpeechAudioBufferRecognitionRequest?) { lock.withLock { request = r } }
 
-        func reset() { lock.withLock { request = nil; sink = nil; early = []; holding = false; closed = false } }
+        func reset() { lock.withLock { request = nil; sink = nil; early = []; holding = false; closed = false; nextLevelUpdate = 0 } }
 
         /// Keep the audio until `attach`.
         func hold() { lock.withLock { early = []; holding = true } }
@@ -104,11 +118,16 @@ final class Voice: ObservableObject {
         /// The mic is off: take no more audio (what was kept stays for a late `attach`).
         func close() { lock.withLock { closed = true; sink = nil } }
 
-        func append(_ b: AVAudioPCMBuffer) {
+        /// Every audio buffer reaches recognition; only the decorative meter is rate-limited.
+        func append(_ b: AVAudioPCMBuffer) -> Bool {
             lock.withLock {
-                guard !closed else { return }
+                guard !closed else { return false }
                 request?.append(b)
                 if let sink { sink(b) } else if holding, let copy = b.copied { early.append(copy) }
+                let now = ProcessInfo.processInfo.systemUptime
+                guard now >= nextLevelUpdate else { return false }
+                nextLevelUpdate = now + 1.0 / 30.0
+                return true
             }
         }
     }
@@ -123,35 +142,52 @@ final class Voice: ObservableObject {
             recognizer = Self.recognizer(for: SpeechModel.language)
             guard let recognizer, recognizer.isAvailable else { error = "Speech recognition isn't available right now"; return }
         }
+        recording += 1
+        isTranscribing = false
         transcript = ""
         committed = ""
         partial = ""
         delivered = false
 
+        // A fresh engine reads the current mic. A reused one keeps the format of the device it first saw, and after
+        // the input changes (AirPods, another mic) installTap raises an Objective-C exception instead of failing.
+        engine = AVAudioEngine()
+        let engine = self.engine
         let input = engine.inputNode
         let format = input.outputFormat(forBus: 0)
-        input.removeTap(onBus: 0)
+        guard format.sampleRate > 0, format.channelCount > 0 else { error = "No microphone input available"; return }
         let feed = self.feed
         feed.reset()
-        input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
-            feed.append(buffer)
-            guard let data = buffer.floatChannelData?[0] else { return }
-            let n = Int(buffer.frameLength)
-            var sum: Float = 0
-            for i in 0..<n { sum += data[i] * data[i] }
-            let rms = sqrt(sum / Float(max(1, n)))
-            let level = CGFloat(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 40)))
-            Task { @MainActor in
-                guard let self else { return }
-                self.level = self.level * 0.6 + level * 0.4
-                self.onLevel(self.level)
+        let tapFailure = ObjCCatch {
+            input.installTap(onBus: 0, bufferSize: 1024, format: format) { [weak self] buffer, _ in
+                guard feed.append(buffer) else { return }
+                guard let data = buffer.floatChannelData?[0] else { return }
+                let n = Int(buffer.frameLength)
+                var sum: Float = 0
+                for i in 0..<n { sum += data[i] * data[i] }
+                let rms = sqrt(sum / Float(max(1, n)))
+                let level = CGFloat(min(1, max(0, (20 * log10(max(rms, 1e-6)) + 50) / 40)))
+                Task { @MainActor in
+                    guard let self, self.isListening else { return }
+                    self.level = self.level * 0.6 + level * 0.4
+                    self.onLevel(self.level)
+                }
             }
         }
-        do {
+        if let tapFailure {
+            NSLog("Clinqy: mic tap failed: \(tapFailure)")
+            error = "Couldn't open the microphone: \(tapFailure)"
+            return
+        }
+        var startError: Error?
+        let startFailure = ObjCCatch {
             engine.prepare()
-            try engine.start()
-        } catch {
-            self.error = "Couldn't start the microphone: \(error.localizedDescription)"
+            do { try engine.start() } catch { startError = error }
+        }
+        if let failure = startFailure ?? startError?.localizedDescription {
+            input.removeTap(onBus: 0)
+            NSLog("Clinqy: mic start failed: \(failure)")
+            self.error = "Couldn't start the microphone: \(failure)"
             return
         }
         isListening = true
@@ -187,9 +223,18 @@ final class Voice: ObservableObject {
     private func startTranscription() {
         feed.hold()
         let feed = self.feed
+        let id = recording
         transcription = Task {
             let session = await SpeechModel.shared.start { [weak self] text in
-                Task { @MainActor in self?.heard(text) }
+                Task { @MainActor in
+                    guard let self, self.recording == id else { return }
+                    self.heard(text)
+                }
+            }
+            if self.recording != id {
+                // A newer recording owns the feed now: this session is orphaned.
+                (session as? Transcription)?.cancel()
+                return nil
             }
             if let session {
                 feed.attach(session.feed)
@@ -217,9 +262,11 @@ final class Voice: ObservableObject {
         teardownAudio()
         transcription = nil
         isTranscribing = true
+        let id = recording
         Task {
             let session = await pending.value as? Transcription
             let text = await session?.finish() ?? ""
+            guard recording == id else { return }   // a newer recording started: it owns the flags and the text
             isTranscribing = false
             guard !delivered else { return }
             delivered = true
@@ -242,6 +289,7 @@ final class Voice: ObservableObject {
         request.addsPunctuation = true
         request.contextualStrings = NameHints.vocabulary   // the user's people, chats and places
         self.request = request
+        let id = recording
         feed.set(request)
         partial = ""
 
@@ -257,13 +305,13 @@ final class Voice: ObservableObject {
                     }
                     if result.isFinal {
                         self.commitPartial()
-                        if self.isListening { self.startSegment(recognizer) } else { self.deliver() }
+                        if self.isListening { self.startSegment(recognizer) } else { self.deliver(id) }
                         return
                     }
                 }
                 if err != nil {
                     self.commitPartial()
-                    if self.isListening { self.startSegment(recognizer) } else { self.deliver() }
+                    if self.isListening { self.startSegment(recognizer) } else { self.deliver(id) }
                 }
             }
         }
@@ -290,11 +338,13 @@ final class Voice: ObservableObject {
         }
         request?.endAudio()
         // Give the recognizer a moment to finalize the last words (its final result delivers sooner if it comes).
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.deliver() }
+        let id = recording
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) { [weak self] in self?.deliver(id) }
         teardownAudio()
     }
 
     func cancel() {
+        startRequest += 1   // a permission prompt still open must not start this recording after all
         delivered = true
         recognition?.cancel()
         if let transcription {
@@ -317,8 +367,8 @@ final class Voice: ObservableObject {
         onLevel(0)
     }
 
-    private func deliver() {
-        guard !delivered else { return }
+    private func deliver(_ id: Int) {
+        guard id == recording, !delivered else { return }
         delivered = true
         teardownAudio()
         recognition?.cancel()

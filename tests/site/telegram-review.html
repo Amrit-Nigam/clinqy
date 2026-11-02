@@ -1,0 +1,19 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Telegram demo: draft</title>
+<style>body{font:17px system-ui;max-width:620px;margin:40px auto;background:#f7f8fa;color:#17212b}form{background:white;border:1px solid #ccd4dc;border-radius:12px;padding:24px}label{display:block;margin:14px 0 5px}input,select{box-sizing:border-box;width:100%;padding:10px;font:inherit}button{padding:12px 24px;margin-top:24px;font:inherit;background:#2472cb;color:white;border:0;border-radius:6px}.note{color:#586570}#receipt{white-space:pre-wrap;padding:20px;background:#e5f5eb;border-radius:8px}</style>
+</head><body><h1>Telegram demo application</h1><p class="note">Local test only. Dummy data stays in this page; no application is sent anywhere.</p>
+<form id="demo"><label for="name">Test name *</label><input id="name" name="Test name" required>
+<label for="email">Test email *</label><input id="email" name="Test email" type="email" required>
+<label for="region">Demo region *</label><select id="region" name="Demo region" required><option value="">Choose a region</option><option>North</option><option>South</option></select>
+<label for="note">Test note</label><input id="note" name="Test note">
+<button type="submit">Submit application</button></form><div id="receipt" hidden role="status"></div>
+<script>
+document.querySelector('form').addEventListener('submit',event=>{
+ event.preventDefault();
+ const values=Object.fromEntries(new FormData(event.target));
+ const receipt=document.getElementById('receipt');receipt.hidden=false;
+ receipt.textContent='Demo submitted successfully. Confirmation: TELEGRAM-DEMO-OK\n'+Object.entries(values).map(([k,v])=>k+': '+v).join('\n');
+ document.title='Telegram demo: submitted';
+ document.querySelector('button').disabled=true;
+});
+</script></body></html>

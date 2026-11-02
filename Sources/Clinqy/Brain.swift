@@ -229,8 +229,10 @@ final class AgySession: @unchecked Sendable {
     /// Sends one user turn (text plus an optional JPEG) and returns the reply text. `partial` sees the reply text so
     /// far each time it grows (on a background thread). The HTTP and one-shot CLI providers don't stream, so it isn't
     /// called for them.
+    var visionDelivery: VisionPolicy.Delivery { api == nil && isAgy ? .fileReference : .embedded }
+
     func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
-        if let api { return try await api.send(text, image: image) }
+        if let api { return try await api.send(text, image: image, partial: partial) }
 
         var line: Data
         var shotThisTurn = false
@@ -258,7 +260,7 @@ final class AgySession: @unchecked Sendable {
                 // The folder is agy's cwd too; if anything took it away (macOS clears old temp files), make it again.
                 try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
                 do {
-                    try imgData.write(to: screenURL)
+                    try imgData.write(to: screenURL, options: .atomic)
                     shotThisTurn = true
                     let previous = lock.withLock { () -> URL? in let p = lastScreenshot; lastScreenshot = screenURL; return p }
                     if let previous { try? FileManager.default.removeItem(at: previous) }
@@ -541,20 +543,22 @@ enum Brain {
     static func defaultModel(for provider: Provider = Provider.current) -> String {
         switch provider {
         case .agyCLI:
-            return Config.value("AGY_MODEL") ?? tierAlias("CLAUDE_MODEL") ?? "sonnet"
+            return Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet"
         case .codexCLI:
             return Config.value("CODEX_MODEL") ?? ""
         case .claudeCLI:
-            return Config.value("CLAUDE_MODEL") ?? tierAlias("AGY_MODEL") ?? "sonnet"
-        default:
-            return Config.value("CLAUDE_MODEL") ?? tierAlias("AGY_MODEL") ?? "sonnet"
+            return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
+        case .anthropic:
+            return Config.value("ANTHROPIC_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet"
+        case .openai:
+            return Config.value("OPENAI_MODEL") ?? "sonnet"
+        case .gemini:
+            return Config.value("GEMINI_MODEL") ?? "sonnet"
+        case .openrouter:
+            return Config.value("OPENROUTER_MODEL") ?? "sonnet"
+        case .ollama, .compatible:
+            return Config.value("LOCAL_MODEL") ?? "qwen3-vl"
         }
-    }
-
-    /// The other provider's model key, only when it names a tier (haiku/sonnet/opus): a concrete id belongs to one
-    /// side (gemini-3.8-flash means nothing to claude, and an unknown id makes agy refuse to start).
-    static func tierAlias(_ key: String) -> String? {
-        Config.value(key).flatMap { ["haiku", "sonnet", "opus"].contains($0.lowercased()) ? $0 : nil }
     }
     static var model: String { defaultModel(for: Provider.current) }
     private static var warm: AgySession?
@@ -649,6 +653,33 @@ enum Brain {
             i = text.index(after: i)
         }
         return nil
+    }
+
+    /// Every complete top-level {…} in `text` that parses as a JSON object, in order.
+    static func objects(in text: String) -> [[String: Any]] {
+        var found: [[String: Any]] = []
+        var depth = 0, inString = false, escaped = false
+        var start: String.Index?
+        var i = text.startIndex
+        while i < text.endIndex {
+            let c = text[i]
+            if inString {
+                if escaped { escaped = false } else if c == "\\" { escaped = true } else if c == "\"" { inString = false }
+            } else if c == "\"" {
+                inString = depth > 0
+            } else if c == "{" {
+                if depth == 0 { start = i }
+                depth += 1
+            } else if c == "}", depth > 0 {
+                depth -= 1
+                if depth == 0, let s = start,
+                   let obj = try? JSONSerialization.jsonObject(with: Data(text[s...i].utf8)) as? [String: Any] {
+                    found.append(obj)
+                }
+            }
+            i = text.index(after: i)
+        }
+        return found
     }
 
     static func invokes(in reply: String) -> [String: Any]? {

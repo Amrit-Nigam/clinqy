@@ -48,6 +48,13 @@ final class Hand {
     /// Releases any button left down, puts the pointer back if Clinqy moved it and the user hasn't since, and
     /// brings back the app the user was in (unless `keepFrontApp`). Safe to call on cancel and failure.
     func endRun() {
+        // A background run never touched the user's pointer, buttons or front app: nothing to put back.
+        if Background.active {
+            runCursor = nil
+            runFrontApp = nil
+            cursorLeftAt = nil
+            return
+        }
         Self.releaseButtons()
         if let start = runCursor, let left = cursorLeftAt, Self.near(Buddy.mouse(), left, 2) {
             CGWarpMouseCursorPosition(start)
@@ -71,36 +78,51 @@ final class Hand {
         case real
         /// Posted straight to the app (postToPid): the pointer never moves, and the window needn't be frontmost.
         case pid
-        /// Private SkyLight path for Chromium/Electron windows in the background. Only with BACKGROUND_CLICKS=1;
-        /// never picked automatically.
+        /// Private SkyLight path for Chromium/Electron windows in the background. Every click of a background run
+        /// goes this way; other runs only with BACKGROUND_CLICKS=1.
         case background
     }
 
     /// How the last element click went through: "axpress" or "real" (for the click log).
     private(set) var lastMethod = ""
+    private(set) var lastClickUncertain = false
 
-    /// Clicks an element: Accessibility press first, a real click if that did nothing.
-    /// Returns why it didn't click (something else now at that spot), or nil.
+    /// Submit one input delivery. A successful AX request must not be followed by another click merely
+    /// because its visible acknowledgement is slow; the caller owns effect verification.
     @discardableResult
-    func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int) async -> String? {
+    func click(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int, window requested: WindowSnapshot? = nil) async -> String? {
+        lastClickUncertain = false
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID else { return refuse("the element's window cannot be verified; look again") }
+        if let requested, el.observationID != requested.id { return refuse("the element belongs to another observation; look again") }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        guard window.frame.contains(el.center) else { return refuse("the element is outside the observed window; look again") }
         lastMethod = "axpress"
         await buddy.travel(to: el.center, framing: el.frame)
-        try? await Task.sleep(for: .milliseconds(80))   // aim
+        guard !Task.isCancelled else { return "Stopped" }
+        if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(80)) }
+        guard !Task.isCancelled else { return "Stopped" }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
         buddy.click()
         let element = el.element
-        var pressed = await Task.detached { AXEngine.axPress(element) }.value
-        if pressed {
-            pressed = false
-            for _ in 0..<5 {
-                try? await Task.sleep(for: .milliseconds(60))
-                if await AXEngine.fingerprintAsync(of: app) != fingerprint { pressed = true; break }
-            }
+        guard !Task.isCancelled else { return "Stopped" }
+        switch await Task.detached(operation: { AXEngine.axPressDelivery(element) }).value {
+        case .delivered: return nil
+        case .uncertain:
+            lastClickUncertain = true
+            return nil // Observe the effect; never issue a second input after an ambiguous AX reply.
+        case .unsupported: break
         }
-        if !pressed {
-            if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: element) { return refuse(why) }
-            lastMethod = "real"
-            realClick(at: el.center)
+        guard !Task.isCancelled else { return "Stopped" }
+        // An explicitly unsupported AX action permits one checked pixel input.
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        if Background.active {
+            lastMethod = "background"
+            return backgroundClick(at: el.center, pid: app.processIdentifier)
         }
+        lastMethod = "real"
+        realClick(at: el.center)
         return nil
     }
 
@@ -109,10 +131,19 @@ final class Hand {
     /// popup that slid in isn't clicked by mistake. Returns why it didn't click (re-scan and retry), or nil.
     @discardableResult
     func click(at point: CGPoint, pid: pid_t? = nil, window: WindowSnapshot? = nil, mode: ClickMode = .real) async -> String? {
-        if let why = window?.staleness() { return refuse(why) }
+        let mode = Background.active ? .background : mode
+        if let window {
+            guard pid == window.pid, window.frame.contains(point) else { return refuse("the point is outside the observed target window; look again") }
+            if let why = window.staleness(includeContent: true) { return refuse(why) }
+        }
         if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         await buddy.travel(to: point)
-        try? await Task.sleep(for: .milliseconds(80))
+        guard !Task.isCancelled else { return "Stopped" }
+        if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(80)) }
+        guard !Task.isCancelled else { return "Stopped" }
+        // Cursor animation is asynchronous: verify again immediately before input delivery.
+        if let why = window?.staleness(includeContent: true) { return refuse(why) }
+        if let pid, let why = hitCheck(point, pid: pid, window: window?.element) { return refuse(why) }
         buddy.click()
         switch mode {
         case .real:
@@ -121,42 +152,127 @@ final class Hand {
             guard let pid else { return refuse("a click sent to an app needs its pid") }
             Self.postClick(at: point, pid: pid)
         case .background:
-            guard let pid, let (id, frame) = Self.windowInfo(pid: pid, containing: point) else {
-                return refuse("no window of the target app at that point for a background click")
-            }
-            if let why = SkyLight.click(at: point, pid: pid, window: id, frame: frame) { return refuse(why) }
+            guard let pid else { return refuse("a background click needs the app's pid") }
+            if !Background.active, !SkyLight.isEnabled { return refuse("background clicks are off (BACKGROUND_CLICKS=1 enables them)") }
+            return backgroundClick(at: point, pid: pid)
+        }
+        return nil
+    }
+
+    /// A click on `pid`'s window at `point` that leaves the pointer and the front app alone: SkyLight where this macOS
+    /// has it (Chromium and Electron windows take nothing else), else posted to the app.
+    private func backgroundClick(at point: CGPoint, pid: pid_t) -> String? {
+        guard SkyLight.isAvailable else {
+            Self.postClick(at: point, pid: pid)
+            return nil
+        }
+        // On Clinqy's hidden screen whatever window is at the spot is the run's, even one a helper process owns
+        // (the file picker panel belongs to a macOS service, not the app).
+        let target = Self.windowInfo(pid: pid, containing: point).map { (pid, $0.id, $0.frame) }
+            ?? (AgentScreen.bounds?.contains(point) == true ? Self.topWindow(at: point) : nil)
+        guard let (owner, id, frame) = target else {
+            return refuse("no window of the target app at that point for a background click")
+        }
+        if let why = SkyLight.click(at: point, pid: owner, window: id, frame: frame) { return refuse(why) }
+        return nil
+    }
+
+    /// The frontmost normal-level window at `point`, whoever owns it.
+    nonisolated static func topWindow(at point: CGPoint) -> (pid: pid_t, id: CGWindowID, frame: CGRect)? {
+        let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        for info in list where info[kCGWindowLayer as String] as? Int == 0 {
+            guard let pid = (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init), pid != getpid(),
+                  let id = info[kCGWindowNumber as String] as? Int, let bounds = info[kCGWindowBounds as String] as? NSDictionary,
+                  let frame = CGRect(dictionaryRepresentation: bounds), frame.contains(point) else { continue }
+            return (pid, CGWindowID(id), frame)
         }
         return nil
     }
 
     /// Puts the caret in a text box: travel, click, focus. Returns why it didn't, or nil.
     @discardableResult
-    func focus(_ el: UIElementInfo, in app: NSRunningApplication) async -> String? {
+    func focus(_ el: UIElementInfo, in app: NSRunningApplication, window requested: WindowSnapshot? = nil) async -> String? {
+        guard Self.isTextRole(el.role) else { return refuse("the requested element is not a text input; look again before typing") }
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID,
+              requested.map { el.observationID == $0.id } ?? true else { return refuse("the field belongs to another observation; look again") }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
         await buddy.travel(to: el.center, framing: el.frame)
-        try? await Task.sleep(for: .milliseconds(90))
+        guard !Task.isCancelled else { return "Stopped" }
+        if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(90)) }
+        guard !Task.isCancelled else { return "Stopped" }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
         buddy.click()
-        if let why = await hitCheck(el.center, pid: app.processIdentifier, windowOf: el.element) {
-            // Something covers the field: focusing through Accessibility alone is still safe.
+        var settable = DarwinBoolean(false)
+        let canFocus = AXUIElementIsAttributeSettable(el.element, kAXFocusedAttribute as CFString, &settable) == .success && settable.boolValue
+        if canFocus {
             _ = AXEngine.focus(el.element)
-            return Self.isTextRole(AXEngine.focusedRole(of: app)) ? nil : refuse(why)
+        } else {
+            if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+            if Background.active {
+                if let why = backgroundClick(at: el.center, pid: app.processIdentifier) { return refuse(why) }
+            } else { realClick(at: el.center) }
         }
-        realClick(at: el.center)
-        _ = AXEngine.focus(el.element)
         try? await Task.sleep(for: .milliseconds(120))
-        // If the caret didn't land in a text box, click once more like a person would.
-        if !Self.isTextRole(AXEngine.focusedRole(of: app)) {
-            realClick(at: el.center)
-            try? await Task.sleep(for: .milliseconds(150))
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        guard AXEngine.focusedWithin(el.element, in: app) else {
+            return refuse("the requested field did not acquire verifiable focus; look again before typing")
         }
         return nil
     }
 
     static func isTextRole(_ role: String?) -> Bool {
-        guard let role else { return true }   // unknown: don't second-guess
+        guard let role else { return false }
         return ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXWebArea"].contains(role)
     }
 
     /// A real click, with the user's pointer put back afterwards.
+    /// Foreground gestures use the same window provenance and hit checks as clicks. Always release a
+    /// possibly delivered down event, including cancellation and failure during a drag.
+    func gesture(_ plan: PointerGesture, in app: NSRunningApplication, window: WindowSnapshot) async -> String? {
+        guard !Background.active else { return refuse("Native pointer gestures require foreground mode") }
+        let start = CGPoint(x: plan.start.x, y: plan.start.y), end = CGPoint(x: plan.end.x, y: plan.end.y)
+        guard app.processIdentifier == window.pid, window.frame.contains(start), window.frame.contains(end) else {
+            return refuse("gesture endpoints must belong to the observed window")
+        }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        for point in [start, end] {
+            if let why = hitCheck(point, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        }
+        await buddy.travel(to: start)
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        for point in [start, end] {
+            if let why = hitCheck(point, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        }
+        let source = CGEventSource(stateID: .hidSystemState)
+        var held = false, last = start
+        defer {
+            if held {
+                CGEvent(mouseEventSource: source, mouseType: plan.kind == .right_click ? .rightMouseUp : .leftMouseUp,
+                        mouseCursorPosition: last, mouseButton: plan.kind == .right_click ? .right : .left)?.post(tap: .cghidEventTap)
+            }
+            cursorLeftAt = last
+        }
+        for step in plan.events {
+            guard !Task.isCancelled, NSWorkspace.shared.frontmostApplication?.processIdentifier == app.processIdentifier else {
+                return refuse("gesture interrupted; inspect the result before repeating input")
+            }
+            let point = CGPoint(x: step.point.x, y: step.point.y)
+            let type: CGEventType = step.phase == .move ? (held ? .leftMouseDragged : .mouseMoved)
+                : step.phase == .down ? (step.right ? .rightMouseDown : .leftMouseDown) : (step.right ? .rightMouseUp : .leftMouseUp)
+            guard let event = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point,
+                                      mouseButton: step.right ? .right : .left) else { return refuse("couldn't construct pointer event") }
+            event.setIntegerValueField(.mouseEventClickState, value: Int64(step.count))
+            // Treat delivery as possible before posting; cancellation must still release the button.
+            if step.phase == .down { held = true }
+            last = point
+            event.post(tap: .cghidEventTap)
+            if step.phase == .up { held = false }
+            try? await Task.sleep(for: .milliseconds(plan.kind == .drag ? 20 : 35))
+        }
+        return nil
+    }
+
     private func realClick(at point: CGPoint) {
         let saved = Buddy.mouse()
         Self.postRealClick(at: point)
@@ -218,7 +334,16 @@ final class Hand {
     }
 
     private func hitCheck(_ point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
-        Self.hitMismatch(at: point, pid: pid, window: window)
+        Background.active ? Self.hitMismatchInApp(at: point, pid: pid, window: window) : Self.hitMismatch(at: point, pid: pid, window: window)
+    }
+
+    /// hitMismatch for a background run, whose window is expected to sit under the user's: only the app's own
+    /// windows are hit-tested, so another of its windows (a popup that slid in, a moved window) still stops the click.
+    static func hitMismatchInApp(at point: CGPoint, pid: pid_t, window: AXUIElement?) -> String? {
+        var hit: AXUIElement?
+        guard let window, AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &hit) == .success,
+              let hit, let hitWindow: AXUIElement = axAttr(hit, kAXWindowAttribute), !CFEqual(hitWindow, window) else { return nil }
+        return "a different \(NSRunningApplication(processIdentifier: pid)?.cleanName ?? "app") window is at that spot now; look again"
     }
 
     /// Why the element at `point` isn't the target app's (or target window's), or nil. Inconclusive answers
@@ -247,28 +372,17 @@ final class Hand {
         return nil
     }
 
-    /// A window as it was when scanned, to check it's still there and in the same place before clicking into it.
-    struct WindowSnapshot: @unchecked Sendable {
-        let element: AXUIElement
-        let frame: CGRect
-        let pid: pid_t
+    /// Kept as an alias for input callers; observation, capture and execution share one immutable identity.
+    typealias WindowSnapshot = NativeWindowObservation
 
-        /// The app's focused (or first) window, as it is now.
-        static func capture(_ app: NSRunningApplication) -> WindowSnapshot? {
-            let root = AXUIElementCreateApplication(app.processIdentifier)
-            let window: AXUIElement? = axAttr(root, kAXFocusedWindowAttribute)
-                ?? (axAttr(root, kAXWindowsAttribute) as [AXUIElement]?)?.first
-            guard let window, let frame = AXEngine.liveFrame(of: window) else { return nil }
-            return WindowSnapshot(element: window, frame: frame, pid: app.processIdentifier)
-        }
-
-        /// Why the window no longer matches the scan (closed, or moved/resized by more than 2 pt), or nil.
-        func staleness() -> String? {
-            guard let now = AXEngine.liveFrame(of: element) else { return "the window was closed since the last look; look again" }
-            let moved = abs(now.minX - frame.minX) > 2 || abs(now.minY - frame.minY) > 2
-                || abs(now.width - frame.width) > 2 || abs(now.height - frame.height) > 2
-            return moved ? "the window moved or resized since the last look; look again" : nil
-        }
+    /// Numbers of `pid`'s normal-level windows, wherever they are.
+    nonisolated static func windowIDs(pid: pid_t) -> Set<CGWindowID> {
+        let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
+        return Set(list.compactMap { info in
+            guard (info[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == pid, info[kCGWindowLayer as String] as? Int == 0,
+                  let id = info[kCGWindowNumber as String] as? Int else { return nil }
+            return CGWindowID(id)
+        })
     }
 
     /// The on-screen normal-level window of `pid` containing `point`: its number and bounds.
@@ -299,23 +413,189 @@ final class Hand {
     func press(_ keys: String) -> Bool {
         refusal = nil
         if let why = Safety.blockedChord(keys, request: request) { _ = refuse(why); return false }
+        if let why = AXEngine.chordProblem(keys) { _ = refuse(why); return false }
         buddy.click()
         return AXEngine.press(combo: keys)
     }
 
     func scroll(up: Bool, in app: NSRunningApplication) async {
-        if let frame = AXEngine.windowFrame(of: app) {
-            await buddy.travel(to: CGPoint(x: frame.midX, y: frame.midY))
-        }
-        for _ in 0..<4 {
-            AXEngine.scroll(up ? 3 : -3, in: app)
-            try? await Task.sleep(for: .milliseconds(70))
-        }
-        // Scrolling moves the real pointer to the window's middle; the run's end puts it back if the user doesn't.
-        cursorLeftAt = Buddy.mouse()
-        try? await Task.sleep(for: .milliseconds(200))
+        await scroll(ScrollPlan(direction: up ? .up : .down, unit: .lines, amount: 12, isDefault: true), in: app, window: nil)
     }
 
+    /// Scrolls as asked: direction, unit and amount are all honoured. With `anchor` the wheel is aimed at that point
+    /// (which must lie inside the observed `window`); otherwise at the window's middle.
+    /// Returns why it did not scroll, or nil.
+    @discardableResult
+    func scroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint? = nil) async -> String? {
+        refusal = nil
+        if let window {
+            guard window.pid == app.processIdentifier else { return refuse("the scroll target belongs to another application; look again") }
+            if let why = window.staleness() { return refuse(why) }
+            if let anchor, !window.frame.contains(anchor) { return refuse("the scroll anchor is outside the observed window; look again") }
+        }
+        let frame = window?.frame ?? AXEngine.windowFrame(of: app)
+        if let anchor, window == nil, let frame, !frame.contains(anchor) { return refuse("the scroll anchor is outside the window") }
+        let target = anchor ?? frame.map { CGPoint(x: $0.midX, y: $0.midY) }
+        if let target { await buddy.travel(to: target) }
+        let (pixels, steps) = plan.chunks(viewport: frame?.size ?? CGSize(width: 800, height: 600))
+        for step in steps {
+            if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+            AXEngine.scroll(dy: step.dy, dx: step.dx, pixels: pixels, at: target, in: app)
+            try? await Task.sleep(for: .milliseconds(70))
+        }
+        // Scrolling moves the real pointer to the aimed point; the run's end puts it back if the user doesn't.
+        if !Background.active { cursorLeftAt = Buddy.mouse() }
+        try? await Task.sleep(for: .milliseconds(200))
+        return nil
+    }
+
+    // MARK: - Click options
+
+    /// A pixel click with the requested button, count, modifiers and hold, after the same window and hit checks as
+    /// every other click. AXPress cannot express any of these, so it is never used here.
+    @discardableResult
+    func click(at point: CGPoint, options: ClickOptions, pid: pid_t, window: WindowSnapshot) async -> String? {
+        guard !Background.active else { return refuse("button, count, modifier and hold options need foreground mode") }
+        guard pid == window.pid, window.frame.contains(point) else { return refuse("the point is outside the observed target window; look again") }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
+        await buddy.travel(to: point)
+        try? await Task.sleep(for: .milliseconds(80))
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
+        buddy.click()
+        let saved = Buddy.mouse()
+        let source = CGEventSource(stateID: .hidSystemState)
+        var flags: CGEventFlags = []
+        if options.modifiers.contains(.command) { flags.insert(.maskCommand) }
+        if options.modifiers.contains(.shift) { flags.insert(.maskShift) }
+        if options.modifiers.contains(.option) { flags.insert(.maskAlternate) }
+        if options.modifiers.contains(.control) { flags.insert(.maskControl) }
+        let (downType, upType, button): (CGEventType, CGEventType, CGMouseButton) = {
+            switch options.button {
+            case .left: return (.leftMouseDown, .leftMouseUp, .left)
+            case .right: return (.rightMouseDown, .rightMouseUp, .right)
+            case .middle: return (.otherMouseDown, .otherMouseUp, .center)
+            }
+        }()
+        func post(_ type: CGEventType, state: Int) {
+            guard let e = CGEvent(mouseEventSource: source, mouseType: type, mouseCursorPosition: point, mouseButton: button) else { return }
+            e.flags = flags
+            e.setIntegerValueField(.mouseEventClickState, value: Int64(state))
+            e.post(tap: .cghidEventTap)
+        }
+        CGEvent(mouseEventSource: source, mouseType: .mouseMoved, mouseCursorPosition: point, mouseButton: .left)?.post(tap: .cghidEventTap)
+        var held = false
+        defer {
+            if held { post(upType, state: 1) }
+            // Make sure no modifier stays latched, then give the pointer back.
+            CGWarpMouseCursorPosition(saved)
+            CGAssociateMouseAndMouseCursorPosition(1)
+            cursorLeftAt = nil
+        }
+        for step in options.steps {
+            if step.down {
+                held = true
+                post(downType, state: step.clickState)
+                if options.holdMilliseconds > 0 {
+                    try? await Task.sleep(for: .milliseconds(options.holdMilliseconds))
+                    if Task.isCancelled { return refuse("click interrupted; inspect the result before repeating input") }
+                } else { usleep(15_000) }
+            } else {
+                post(upType, state: step.clickState)
+                held = false
+                usleep(30_000)
+            }
+        }
+        lastMethod = "options"
+        return nil
+    }
+
+    // MARK: - Screenshot insertion
+
+    struct SnapPasteReport {
+        /// Indices (into the items given) whose caption and picture were both delivered without interruption.
+        var inserted: [Int] = []
+        /// An item whose caption went in but whose picture did not (so the document holds a lone caption).
+        var partial: Int?
+        var stopped: String?
+    }
+
+    /// Pastes each caption and then its picture at the caret, counting only items delivered start to finish. Delivery is
+    /// keystrokes plus the clipboard: apps like Google Docs do not let Clinqy read the result back, so "inserted"
+    /// means delivered while the target stayed frontmost and the clipboard stayed ours, not independently seen.
+    func pasteSnaps(_ items: [(caption: String, png: Data)], in app: NSRunningApplication) async -> SnapPasteReport {
+        var report = SnapPasteReport()
+        let board = NSPasteboard.general
+        let saved = PasteboardSnapshot(board)
+        var owned = board.changeCount
+        AXEngine.targetPid = app.processIdentifier
+        defer {
+            AXEngine.targetPid = nil
+            saved.restore(to: board, ifUnchangedSince: owned)
+        }
+        func ready() -> String? {
+            if Task.isCancelled { return "the run was cancelled" }
+            if !Background.active, NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+                return "\(app.cleanName ?? "the target app") is no longer in front"
+            }
+            if board.changeCount != owned { return "the clipboard changed while pasting (the user may have copied something)" }
+            return nil
+        }
+        func load(_ write: (NSPasteboard) -> Void) {
+            board.clearContents()
+            write(board)
+            owned = board.changeCount
+        }
+        for (i, item) in items.enumerated() {
+            if let why = ready() { report.stopped = why; return report }
+            load { $0.setString(item.caption, forType: .string) }
+            AXEngine.pressPaste()
+            try? await Task.sleep(for: .milliseconds(250))
+            AXEngine.pressReturn()
+            if let why = ready() { report.partial = i; report.stopped = why; return report }
+            load { $0.setData(item.png, forType: .png) }
+            AXEngine.pressPaste()
+            try? await Task.sleep(for: .milliseconds(1800))   // Google Docs uploads the image
+            AXEngine.pressReturn()
+            AXEngine.pressReturn()
+            try? await Task.sleep(for: .milliseconds(150))
+            report.inserted.append(i)
+        }
+        return report
+    }
+
+    // MARK: - Control state
+
+    /// Sets a checkbox, radio button or range control to the requested state, confirming it by reading it back.
+    func setState(_ el: UIElementInfo, to desired: DesiredState, in app: NSRunningApplication, window requested: WindowSnapshot? = nil) async -> AXEngine.StateOutcome {
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID,
+              requested.map({ el.observationID == $0.id }) ?? true else { return .refused("the control belongs to another observation; look again") }
+        if let why = window.staleness(includeContent: true) { return .refused(why) }
+        await buddy.travel(to: el.center, framing: el.frame)
+        if let why = window.staleness(includeContent: true) { return .refused(why) }
+        buddy.click()
+        let element = el.element
+        return await Task.detached { AXEngine.setState(element, to: desired) }.value
+    }
+
+    // MARK: - Text placement
+
+    /// Inserts or appends text at the real caret instead of replacing the field. Where the field gives Accessibility
+    /// no caret or settable text, says so rather than falling back to select-all-and-replace.
+    func place(_ text: String, mode: TextEditMode, in app: NSRunningApplication) -> AXEngine.EditOutcome {
+        refusal = nil
+        guard mode != .replaceAll else { return .unsupported("replace is what type already does") }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        var focused: CFTypeRef?
+        guard AXUIElementCopyAttributeValue(root, kAXFocusedUIElementAttribute as CFString, &focused) == .success,
+              let field = focused, CFGetTypeID(field) == AXUIElementGetTypeID() else { return .refused("no focused field") }
+        if let why = Safety.secureInputBlock() { _ = refuse(why); return .refused(why) }
+        let outcome = AXEngine.edit(text, mode: mode, field: field as! AXUIElement)
+        if case .refused(let why) = outcome { _ = refuse(why) }
+        return outcome
+    }
 
     // MARK: - Keyboard
 
@@ -332,6 +612,12 @@ final class Hand {
             AXEngine.targetPid = app.processIdentifier
             defer { AXEngine.targetPid = nil }
             AXEngine.paste(text)
+            return true
+        }
+        // In a background run, long or multi-line text goes straight into the field: pasting would borrow the
+        // user's clipboard. Fields that don't take a set value (or don't show it) fall through to the usual ways.
+        if Background.active, text.count > 80 || text.contains("\n"), !Self.codeEditorIDs.contains(app.bundleIdentifier ?? ""),
+           AXEngine.setFocusedValue(text, in: app), await landed(text, in: app) {
             return true
         }
         // Long text (an answer list, a write-up) is pasted: typing 2,000 characters takes minutes and trips the
@@ -448,7 +734,7 @@ final class Hand {
     /// Opens an app like a person: click its Dock icon, or use Spotlight if it isn't in the Dock.
     func openApp(named name: String) async -> NSRunningApplication? {
         let wanted = name.lowercased().replacingOccurrences(of: ".app", with: "")
-        let running = NSWorkspace.shared.runningApplications.first { $0.cleanName?.lowercased() == wanted }
+        let running = Launcher.running(named: wanted)
         let url = running?.bundleURL ?? Launcher.find(named: wanted)
         guard let url else { return nil }
         let appName = url.deletingPathExtension().lastPathComponent
@@ -457,6 +743,9 @@ final class Hand {
            AXEngine.windowFrame(of: running) != nil {
             return running
         }
+        // In a background run the app opens behind the user's (no Dock click, no Spotlight).
+        if Background.active { return await Launcher.launch(url) }
+        if !Efficiency.humanMotion { return await Launcher.launch(url) }
 
         trace("openApp \(appName) dock=\(AXEngine.dockItem(named: appName) != nil)")
         if let dock = AXEngine.dockItem(named: appName) {
@@ -511,6 +800,13 @@ final class Hand {
 
     /// Goes to a website like a person: bring up the browser, open a tab, type the address, press Return.
     func openURL(_ url: URL, current: NSRunningApplication?, newTab: Bool = true) async -> NSRunningApplication? {
+        // A background run without the extension: hand the address to the browser, which opens it without coming
+        // forward. Typing it would send ⌘T and the address to whichever of its windows the user has.
+        if Background.active {
+            await Launcher.openURL(url)
+            let id = NSWorkspace.shared.urlForApplication(toOpen: url).flatMap { Bundle(url: $0)?.bundleIdentifier }
+            return NSWorkspace.shared.runningApplications.first { $0.bundleIdentifier == id && id != nil }
+        }
         var browser: NSRunningApplication?
         if let current, Launcher.isBrowser(current) {
             await Launcher.bringToFront(current)
@@ -521,6 +817,19 @@ final class Hand {
         guard let browser else {
             await Launcher.openURL(url)
             return NSWorkspace.shared.frontmostApplication
+        }
+
+        if !Efficiency.humanMotion {
+            let bridge = BrowserBridge.shared
+            if bridge.isConnected(browser), let tab = await bridge.activeTab(in: browser),
+               await bridge.tabCommand(newTab ? "newTab" : "navigate", on: tab, ["url": url.absoluteString]) != nil {
+                return browser
+            }
+            if newTab, let bundle = browser.bundleURL {
+                let configuration = NSWorkspace.OpenConfiguration()
+                configuration.activates = true
+                if let opened = try? await NSWorkspace.shared.open([url], withApplicationAt: bundle, configuration: configuration) { return opened }
+            }
         }
 
         trace("browser \(browser.cleanName ?? "?") front=\(NSWorkspace.shared.frontmostApplication?.cleanName ?? "-")")
@@ -554,10 +863,13 @@ final class Hand {
         buddy.setTyping(true)
         // Deliver keys straight to the browser so they can't land in some other window.
         AXEngine.targetPid = browser.processIdentifier
-        for ch in address {
-            AXEngine.type(String(ch))
-            try? await Task.sleep(for: .milliseconds(Int.random(in: 22...60)))
-        }
+        if Efficiency.humanMotion {
+            for ch in address {
+                guard !Task.isCancelled else { break }
+                AXEngine.type(String(ch))
+                try? await Task.sleep(for: .milliseconds(Int.random(in: 22...60)))
+            }
+        } else { AXEngine.type(address) }
         AXEngine.targetPid = nil
         buddy.setTyping(false)
         try? await Task.sleep(for: .milliseconds(150))

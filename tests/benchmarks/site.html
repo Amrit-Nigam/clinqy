@@ -1,0 +1,49 @@
+<!doctype html><meta charset="utf-8"><title>Clinqy local benchmark</title>
+<style>body{font:18px system-ui;max-width:1000px;margin:30px}button,input,select,textarea{font:inherit;margin:8px;padding:8px}#drop{display:inline-block;padding:35px;border:2px dashed}#tip,#menu{display:none;background:#e6f3ff;padding:12px}canvas{border:1px solid}iframe{height:70px;border:1px solid}</style>
+<h1>Local practice workspace</h1><p>Use only the controls requested in your task.</p>
+<label>Name<input id="name"></label><label>Message<textarea id="message"></textarea></label>
+<label><input id="check" type="checkbox">Design panel</label>
+<label>City<select id="city"><option>Choose</option><option>Pune</option><option>Mumbai</option></select></label>
+<button id="hover">Show hint</button><span id="tip">Hint: SAPPHIRE</span>
+<button id="context">Open local menu</button><span id="menu">Local menu ready</span>
+<button id="double">Open details twice</button><button id="drag">Drag card</button><div id="drop" role="button" aria-label="Drop zone">Drop zone</div>
+<button id="generate">Generate report</button><button id="rerender">Save draft once</button>
+<label>Attachment<input id="upload" type="file"></label>
+<button id="submit">Submit local sample</button><button id="wrong">Wrong target — leave alone</button>
+<iframe title="Embedded form"></iframe><div id="shadow"></div>
+<p>Visual card:</p><canvas width="260" height="70"></canvas><label>Visual code<input id="visual"></label>
+<a id="next" href="#result">Open result section</a><section id="result"><h2>Result section</h2></section><pre id="status" role="status"></pre>
+<script>
+const token = new URLSearchParams(location.search).get('token');
+const state = {name:'',message:'',checked:false,city:'Choose',hint:false,context:0,details:0,dragged:false,report:false,saved:0,submitted:0,wrong:0,embedded:'',shadow:'',visual:'',attachment:'',navigated:false};
+const $ = id => document.getElementById(id);
+let reporting=Promise.resolve();
+function record() {
+  $('status').textContent = 'Current result: ' + JSON.stringify(state);
+  const body=JSON.stringify(state);
+  reporting=reporting.then(()=>fetch('/record/' + token, {method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{});
+}
+for (const id of ['name','message','visual']) $(id).oninput = () => { state[id] = $(id).value; record(); };
+$('check').onchange = () => {state.checked = $('check').checked; record();};
+$('city').onchange = () => {state.city = $('city').value; record();};
+$('hover').onmouseenter = () => {state.hint=true; $('tip').style.display='inline'; record();};
+$('context').oncontextmenu = e => {e.preventDefault(); state.context++; $('menu').style.display='inline'; record();};
+$('double').ondblclick = () => {state.details++; record();};
+let dragging=false;
+$('drag').onmousedown = e => {if(e.button===0) dragging=true;};
+document.addEventListener('mouseup', e => {if(dragging && $('drop').contains(e.target)){state.dragged=true; record();} dragging=false;});
+$('generate').onclick = () => setTimeout(()=>{state.report=true; record();},1100);
+function save() {state.saved++; $('rerender').outerHTML='<button id="rerender">Save draft once</button>'; $('rerender').onclick=save; record();}
+$('rerender').onclick=save;
+$('submit').onclick = () => {state.submitted++; record();};
+$('wrong').onclick = () => {state.wrong++; record();};
+$('upload').onchange = async () => {state.attachment = await $('upload').files[0].text(); record();};
+$('next').onclick = () => {state.navigated=true; record();};
+const frame = document.querySelector('iframe');
+frame.srcdoc='<label>Embedded name<input oninput="parent.postMessage({embedded:this.value},parent.location.origin)"></label>';
+window.addEventListener('message',e=>{if(e.source===frame.contentWindow && typeof e.data.embedded==='string'){state.embedded=e.data.embedded;record();}});
+const root=$('shadow').attachShadow({mode:'open'});root.innerHTML='<label>Shadow name<input></label>';
+root.querySelector('input').oninput=e=>{state.shadow=e.target.value;record();};
+const canvas=document.querySelector('canvas'),ctx=canvas.getContext('2d');ctx.fillStyle='#fcf4d9';ctx.fillRect(0,0,260,70);ctx.font='bold 30px monospace';ctx.fillStyle='#1b2740';ctx.fillText('MANGO-482',24,44);
+record();
+</script>

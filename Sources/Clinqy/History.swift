@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 
 /// Past runs, newest first, kept in Application Support so the user can revisit or continue them.
 @MainActor
@@ -20,41 +21,89 @@ final class History: ObservableObject {
         var readText: String? = nil
         /// The first request of a chain of "continue"s: its instructions stay in force for every follow-up.
         var task: String? = nil
+        /// Stable links survive restarts and let task retrieval include later user corrections.
+        var threadID: UUID? = nil
+        var parentID: UUID? = nil
+        /// UI steps alone can't replay the fresh research/analysis that generated their typed content.
+        var requiresFreshWork: Bool? = nil
+
+        var episode: TaskMemory.Episode? {
+            guard let data = try? JSONEncoder.iso.encode(self), let safe = Secrets.maskJSON(data),
+                  let payload = String(data: safe, encoding: .utf8),
+                  let entry = try? JSONDecoder.iso.decode(Entry.self, from: safe) else { return nil }
+            return TaskMemory.Episode(id: id, date: date, request: entry.request, answer: entry.answer, ok: ok,
+                                      steps: entry.steps, app: entry.app, threadID: threadID ?? id,
+                                      parentID: parentID, payload: payload)
+        }
     }
 
     @Published private(set) var entries: [Entry] = []
 
-    private let url: URL = {
+    private static var defaultURL: URL {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             .appendingPathComponent("Clinqy", isDirectory: true)
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir.appendingPathComponent("history.json")
-    }()
+    }
+    private let url: URL
+    private let archive: TaskMemory
 
-    private init() {
-        if let data = try? Data(contentsOf: url),
-           let saved = try? JSONDecoder.iso.decode([Entry].self, from: data) {
+    /// Set when the last save failed, so the UI can say history isn't being kept instead of implying it is.
+    @Published private(set) var saveError: String?
+
+    init(file: URL? = nil, archive: TaskMemory = .shared) {
+        self.url = file ?? Self.defaultURL
+        self.archive = archive
+        switch StoreFile.load(url, decode: { try? JSONDecoder.iso.decode([Entry].self, from: $0) }) {
+        case .value(let saved):
             entries = saved
+            // Import retained history once per ID. Older builds only saved the original request of a thread.
+            var roots: [String: UUID] = [:]
+            for i in entries.indices.reversed() {
+                let root = entries[i].threadID ?? entries[i].task.flatMap { roots[$0] } ?? entries[i].id
+                entries[i].threadID = root
+                roots[entries[i].request] = root
+            }
+            archive.record(entries.compactMap(\.episode))
+        case .unreadable:
+            // Set the unreadable file aside, so the next save can't replace it with an empty history.
+            if StoreFile.quarantine(url) == nil { saveError = "History couldn't be read and couldn't be set aside; new runs are not being saved." ; readOnly = true }
+        case .absent: break
         }
     }
 
+    private var readOnly = false
+
     func add(_ entry: Entry) {
-        entries.insert(entry, at: 0)
+        // The archive receives the full redacted record before the UI's recent-history window is trimmed.
+        guard let episode = entry.episode,
+              let safe = try? JSONDecoder.iso.decode(Entry.self, from: Data(episode.payload.utf8)) else { return }
+        archive.record([episode])
+        entries.insert(safe, at: 0)
         if entries.count > 200 { entries.removeLast(entries.count - 200) }
         save()
     }
 
     func remove(_ entry: Entry) {
+        archive.remove(entry.id)
         entries.removeAll { $0.id == entry.id }
         save()
     }
 
     func clear() {
+        archive.clear()
         entries = []
         save()
     }
 
-    private func save() { Persist.write(entries, to: url, encoder: .iso) }
+    private func save() {
+        guard !readOnly else { return }
+        saveError = nil
+        Persist.write(entries, to: url, encoder: .iso) { [weak self] error in
+            let message = "History couldn't be saved: \(error.localizedDescription)"
+            Task { @MainActor in self?.saveError = message }
+        }
+    }
 }
 
 /// Something a task produced for the user to look at: options, a plan, prices, a summary.

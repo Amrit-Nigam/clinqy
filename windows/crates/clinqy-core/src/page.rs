@@ -54,6 +54,8 @@ pub struct Page {
     pub tab_id: Option<i64>,
     /// Read by tab id: commands go to that tab even in the background.
     pub pinned: bool,
+    pub document_id: Option<String>,
+    pub snapshot_id: Option<String>,
 }
 
 fn num(v: &Value) -> f64 {
@@ -152,6 +154,8 @@ impl Page {
             panes,
             tab_id: r["tabId"].as_i64(),
             pinned: false,
+            document_id: r["documentID"].as_str().map(String::from),
+            snapshot_id: r["snapshotID"].as_str().map(String::from),
         }
     }
 
@@ -235,6 +239,7 @@ pub fn same_page(a: &str, b: &str) -> bool {
 pub fn diff(previous: &Page, current: &Page) -> Option<String> {
     if previous.connection != current.connection
         || previous.tab_id != current.tab_id
+        || previous.document_id != current.document_id
         || previous.problem.is_some()
         || current.problem.is_some()
         || !same_page(&previous.url, &current.url)

@@ -28,6 +28,7 @@ final class HotKey {
             case "alt", "option", "opt": flags.insert(.option)
             case "shift": flags.insert(.shift)
             case "cmd", "command": flags.insert(.command)
+            case "fn", "globe": flags.insert(.function)
             default: break
             }
         }
