@@ -122,6 +122,28 @@ enum VisualEvidencePolicy {
     static func exhaustedCompletionAttempts(_ attempts: Int) -> Bool { attempts >= 3 }
 }
 
+/// An owned popup may publish its ordinary click result in its opener before closing. Verify a
+/// new explicit predicate against that opener's own pre-input baseline, never against child text.
+enum OwnedOpenerEvidencePolicy {
+    static func permitsObservation(kind: String, delivery: ActionOutcome.Delivery, consequential: Bool,
+                        sameRun: Bool, sameConnection: Bool, expectedTab: Int?, currentTab: Int?,
+                        expectedDocument: String?, currentDocument: String?) -> Bool {
+        guard kind == "click", delivery == .delivered, !consequential, sameRun, sameConnection,
+              expectedTab != nil, expectedTab == currentTab,
+              VisualEvidencePolicy.sameDocument(expectedDocument, currentDocument) else { return false }
+        return true
+    }
+    static func accepts(kind: String, delivery: ActionOutcome.Delivery, consequential: Bool,
+                        sameRun: Bool, sameConnection: Bool, expectedTab: Int?, currentTab: Int?,
+                        expectedDocument: String?, currentDocument: String?, expected: String,
+                        before: String?, after: String?) -> Bool {
+        permitsObservation(kind: kind, delivery: delivery, consequential: consequential,
+            sameRun: sameRun, sameConnection: sameConnection, expectedTab: expectedTab, currentTab: currentTab,
+            expectedDocument: expectedDocument, currentDocument: currentDocument)
+            && VerificationEvidence.newText(expected, before: before, after: after)
+    }
+}
+
 /// Recovery retries observe again; they never replay an action from a rejected response.
 enum ObservationRecoveryPolicy {
     static func canRetry(attempts: Int) -> Bool { attempts < 2 }

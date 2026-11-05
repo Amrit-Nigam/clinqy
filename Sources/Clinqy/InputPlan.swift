@@ -289,7 +289,8 @@ enum TextEditMode: String, CaseIterable {
             return (value + text, ns.length + (text as NSString).length)
         case .insertAtCaret:
             guard let selection, selection.location != NSNotFound, selection.location >= 0, selection.length >= 0,
-                  selection.location + selection.length <= ns.length else { return nil }
+                  selection.location <= ns.length, selection.length <= ns.length - selection.location,
+                  Range(selection, in: value) != nil else { return nil }
             return (ns.replacingCharacters(in: selection, with: text), selection.location + (text as NSString).length)
         }
     }

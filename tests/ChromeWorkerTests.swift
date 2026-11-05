@@ -311,6 +311,152 @@ import AppKit
             } catch { checks += 1 }
             _ = try await probe.command(worker, "closeTab", tabID: gestureID)
         }
+        func statusBoundaryChecks() async throws {
+            let html = """
+            <title>Semantic status boundaries</title><main><button id="review" onclick="document.querySelector('#status').textContent='Local review confirmed'">Open Review window</button><span id="status" role="status"></span>
+            <button>Payment</button><span role="status">unpaid</span></main>
+            <div role="alert">Independent alert visible</div><div aria-live="polite">Independent live message</div>
+            <div role="status" hidden>Hidden confirmation</div><div aria-hidden="true"><span role="status">ARIA hidden confirmation</span></div>
+            <div style="opacity:0"><span role="status">Transparent confirmation</span></div>
+            <div data-clinqy-overlay><span role="status">Agent overlay confirmation</span></div>
+            """
+            let tab = try await worker.newTab("data:text/html;base64," + Data(html.utf8).base64EncodedString())
+            let observed = try await probe.command(worker, "snapshot", tabID: tab)
+            let before = try await probe.command(worker, "read", tabID: tab)["text"] as? String ?? ""
+            try check(!VerificationEvidence.appears("Local review confirmed", in: before), "absent confirmation is not invented by semantic extraction")
+            let button = (observed["elements"] as! [[String: Any]]).first { $0["text"] as? String == "Open Review window" }!["i"] as! Int
+            _ = try await probe.command(worker, "click", tabID: tab, args: ["index": button])
+            let after = try await probe.command(worker, "read", tabID: tab)["text"] as? String ?? ""
+            try check(VerificationEvidence.newText("Local review confirmed", before: before, after: after), "adjacent inline status has independent word boundaries: " + after)
+            try check(VerificationEvidence.appears("Independent alert visible", in: after), "visible alert outside main remains readable")
+            try check(VerificationEvidence.appears("Independent live message", in: after), "visible live region outside main remains readable")
+            try check(!VerificationEvidence.appears("Paid", in: after), "unpaid never verifies paid after semantic extraction")
+            for hidden in ["Hidden confirmation", "ARIA hidden confirmation", "Transparent confirmation", "Agent overlay confirmation"] {
+                try check(!VerificationEvidence.appears(hidden, in: after), "hidden or agent-owned semantic region excluded: " + hidden)
+            }
+            _ = try await probe.command(worker, "closeTab", tabID: tab)
+        }
+        func autocompleteChecks() async throws {
+            let html = """
+            <title>Autocomplete fixture</title><label>Reviewer<input id="reviewer" role="combobox" aria-autocomplete="list" aria-controls="suggestions" aria-expanded="false"></label>
+            <div id="suggestions" role="listbox" aria-label="Reviewer suggestions" hidden></div><p id="selected">No reviewer selected</p>
+            <div role="listbox" aria-label="Persistent list"><button role="option">Always available</button></div>
+            <div role="listbox" aria-expanded="false"><button role="option">Closed choice</button></div>
+            <script>
+            const field=document.querySelector('#reviewer'),box=document.querySelector('#suggestions');
+            field.oninput=()=>{box.replaceChildren();for(const name of ['Priya Shah','Priya Sharma','Rahul Mehta'].filter(n=>n.toLowerCase().includes(field.value.toLowerCase()))){
+              const button=document.createElement('button');button.role='option';button.textContent=name;
+              button.onclick=()=>{field.value=name;box.hidden=true;field.setAttribute('aria-expanded','false');document.querySelector('#selected').textContent='Selected reviewer: '+name;};box.append(button);
+            }box.hidden=!box.children.length;field.setAttribute('aria-expanded',String(!box.hidden));};
+            </script>
+            """
+            let tab = try await worker.newTab("data:text/html;base64," + Data(html.utf8).base64EncodedString())
+            let initial = try await probe.command(worker, "snapshot", tabID: tab)
+            let controls = initial["elements"] as! [[String: Any]]
+            let field = controls.first { $0["role"] as? String == "combobox" }!["i"] as! Int
+            _ = try await probe.command(worker, "fill", tabID: tab, args: ["index": field, "text": "Priya"])
+            let expanded = try await probe.command(worker, "snapshot", tabID: tab)
+            let choices = expanded["elements"] as! [[String: Any]]
+            let suggestions = choices.filter { $0["role"] as? String == "option" && ($0["text"] as? String ?? "").hasPrefix("Priya") }
+            try check(suggestions.count == 2, "visible autocomplete options are addressable without aria-expanded on listbox: " + String(describing: choices))
+            try check(choices.contains { $0["text"] as? String == "Always available" }, "persistent visible listbox options require no expanded attribute")
+            try check(!choices.contains { $0["text"] as? String == "Closed choice" }, "explicitly collapsed listbox options are not actionable")
+            let chosen = suggestions.first { $0["text"] as? String == "Priya Shah" }!["i"] as! Int
+            _ = try await probe.command(worker, "click", tabID: tab, args: ["index": chosen])
+            let result = try await probe.command(worker, "read", tabID: tab)
+            try check((result["text"] as? String ?? "").contains("Selected reviewer: Priya Shah"), "semantic option click chooses exact autocomplete result")
+            let closed = try await probe.command(worker, "snapshot", tabID: tab)
+            try check(!(closed["elements"] as! [[String: Any]]).contains { $0["role"] as? String == "option" && ($0["text"] as? String ?? "").hasPrefix("Priya") }, "hidden suggestions disappear after selection")
+            _ = try await probe.command(worker, "closeTab", tabID: tab)
+        }
+        func overlayChecks() async throws {
+            let activity = try String(contentsOfFile: "extension/activity.js", encoding: .utf8)
+            let html = """
+            <title>Clinqy overlay fixture</title><style>body{font:18px system-ui;margin:48px;background:#fafbfc;color:#17283b}h1{font-size:36px}button{font:inherit;padding:14px 22px;border:1px solid #ccd5df;border-radius:8px;background:white}#target{position:absolute;right:40px;top:35px}main{margin-top:100px;max-width:720px}input{font:inherit;padding:12px;border:1px solid #ccd5df;border-radius:8px}</style>
+            <button id="target">Target control</button><main><h1>Clinqy browser activity</h1><p>The cursor follows this task's target while your physical pointer stays free.</p><label>Example field <input placeholder="Local fixture only"></label><p id="checks">Waiting for layout</p><button onclick="window.checkOverlay()">Check overlay layout</button></main>
+            <script>
+            const attach=Element.prototype.attachShadow;let overlayRoot;
+            Element.prototype.attachShadow=function(options){const root=attach.call(this,options);if(this.hasAttribute('data-clinqy-overlay'))overlayRoot=root;return root;};
+            \(activity)
+            const target=document.querySelector('#target'),r=target.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+            window.__clinqy={documentID:'fixture',activityPoint:()=>{const b=target.getBoundingClientRect();return {x:b.left+b.width/2,y:b.top+b.height/2}}};
+            window.__clinqyActivity.update({kind:'click',stage:'prepare',x,y,localIndex:1,documentID:'fixture'});
+            window.checkOverlay=()=>{
+              window.__clinqyActivity.update({kind:'click',stage:'prepare',localIndex:1,documentID:'fixture'});
+              const edge=overlayRoot.querySelector('.edge').getBoundingClientRect(),badge=overlayRoot.querySelector('.badge').getBoundingClientRect();
+              const cursor=overlayRoot.querySelector('.cursor').getBoundingClientRect();
+              const bounds=edge.left===0&&edge.top===0&&edge.width===innerWidth&&edge.height===innerHeight;
+              const current=target.getBoundingClientRect();
+              const position=Math.abs(cursor.x-current.left-current.width/2)<1&&Math.abs(cursor.y-current.top-current.height/2)<1;
+              const unobscured=badge.right<=r.left||badge.left>=r.right||badge.bottom<=r.top||badge.top>=r.bottom;
+              const clicks=document.elementFromPoint(x,y)===target;
+              document.querySelector('#checks').textContent=bounds&&position&&unobscured&&clicks&&document.title==='Clinqy overlay fixture'?'Overlay geometry verified':'Overlay geometry FAILED '+JSON.stringify({bounds,position,unobscured,clicks});
+            };
+            </script>
+            """
+            let tab = try await worker.newTab("data:text/html;base64," + Data(html.utf8).base64EncodedString())
+            let observation = try await probe.command(worker, "snapshot", tabID: tab)
+            let layoutButton = (observation["elements"] as! [[String: Any]]).first { $0["text"] as? String == "Check overlay layout" }!["i"] as! Int
+            _ = try await probe.command(worker, "click", tabID: tab, args: ["index": layoutButton])
+            let ready = try await probe.command(worker, "waitText", tabID: tab, args: ["text": "Overlay geometry verified", "ms": 3000])
+            let overlayRead = try await probe.command(worker, "read", tabID: tab)
+            let capture = try await probe.command(worker, "captureTask", tabID: tab)
+            guard let encoded = capture["image"] as? String, let png = Data(base64Encoded: encoded) else { throw WorkerCDP.error("Missing overlay screenshot") }
+            let artifact = URL(fileURLWithPath: ProcessInfo.processInfo.environment["CLINQY_TEST_OVERLAY"] ?? "/tmp/clinqy-overlay-chrome.png")
+            try png.write(to: artifact)
+            print("Chrome overlay screenshot: " + artifact.path); fflush(stdout)
+            try check(ready["met"] as? Bool == true, "real Chrome overlay: " + String(describing: overlayRead["text"] ?? "no page text"))
+            _ = try await probe.command(worker, "closeTab", tabID: tab)
+        }
+        func rangeAndWaitChecks() async throws {
+            let html = """
+            <title>Range and waits</title><label>Even amount<input id="amount" type="range" min="0" max="10" step="2" value="2"
+            oninput="window.inputCount=(window.inputCount||0)+1;document.querySelector('#events').textContent='Input events '+window.inputCount"></label>
+            <label>Locked amount<input id="locked" type="range" min="0" max="10" step="any" value="1" disabled></label>
+            <button onclick="setTimeout(()=>{document.querySelector('#locked').disabled=false;document.querySelector('#ready').textContent='Delayed fixture ready'},200)">Enable later</button>
+            <button onclick="document.querySelector('#amount').hidden=true">Hide range</button>
+            <p id="events">Input events 0</p><p id="ready"></p>
+            """
+            let tab = try await worker.newTab("data:text/html;base64," + Data(html.utf8).base64EncodedString())
+            let observed = try await probe.command(worker, "snapshot", tabID: tab)
+            let items = observed["elements"] as! [[String: Any]]
+            func index(_ label: String) throws -> Int {
+                guard let value = items.first(where: { ($0["text"] as? String ?? "").contains(label) })?["i"] as? Int else {
+                    throw WorkerCDP.error("Missing range fixture control: " + label)
+                }
+                return value
+            }
+            let amount = try index("Even amount"), locked = try index("Locked amount")
+            let metadata = items.first { $0["i"] as? Int == amount }?["range"] as? String ?? ""
+            try check(metadata.contains("min=0") && metadata.contains("max=10") && metadata.contains("step=2"), "range observations expose numeric constraints")
+            for desired in [-1, 3, 12] {
+                let denied = try await probe.command(worker, "setRange", tabID: tab, args: ["index": amount, "state": desired])
+                try check(denied["refused"] as? Bool == true, "range refuses bounds or step violation before dispatch")
+            }
+            let disabled = try await probe.command(worker, "setRange", tabID: tab, args: ["index": locked, "state": 2])
+            try check(disabled["refused"] as? Bool == true, "disabled range refuses dispatch")
+            let changed = try await probe.command(worker, "setRange", tabID: tab, args: ["index": amount, "state": 6])
+            try check(changed["delivered"] as? Bool == true && changed["value"] as? String == "6", "range setter delivers exact valid value")
+            let unchanged = try await probe.command(worker, "setRange", tabID: tab, args: ["index": amount, "state": 6])
+            try check(unchanged["already"] as? Bool == true, "unchanged range sends no repeated input")
+            let value = try await probe.command(worker, "value", tabID: tab, args: ["index": amount])
+            try check(value["value"] as? String == "6", "independent range value readback")
+            let read = try await probe.command(worker, "read", tabID: tab)
+            try check((read["text"] as? String ?? "").contains("Input events 1"), "invalid and duplicate ranges produce no input events")
+            let ready = try await probe.command(worker, "waitCondition", tabID: tab, args: ["condition": ["kind": "ready"], "ms": 1500])
+            try check(ready["met"] as? Bool == true, "ready condition observes browser readiness")
+            _ = try await probe.command(worker, "click", tabID: tab, args: ["index": try index("Enable later")])
+            let enabled = try await probe.command(worker, "waitCondition", tabID: tab, args: ["condition": ["kind": "element", "index": locked, "state": "enabled"], "ms": 3000])
+            try check(enabled["met"] as? Bool == true, "element wait observes delayed enabled state")
+            let decimal = try await probe.command(worker, "setRange", tabID: tab, args: ["index": locked, "state": 2.375])
+            try check(decimal["value"] as? String == "2.375", "step-any range preserves decimal values")
+            let absent = try await probe.command(worker, "waitCondition", tabID: tab, args: ["condition": ["kind": "text", "text": "Never present"], "ms": 200])
+            try check(absent["met"] as? Bool == false && absent["cancelled"] as? Bool == false, "unmet condition times out without claiming success")
+            _ = try await probe.command(worker, "click", tabID: tab, args: ["index": try index("Hide range")])
+            let gone = try await probe.command(worker, "waitCondition", tabID: tab, args: ["condition": ["kind": "element", "index": amount, "state": "gone"], "ms": 1500])
+            try check(gone["met"] as? Bool == true, "gone waits for stable hidden state")
+            _ = try await probe.command(worker, "closeTab", tabID: tab)
+        }
         func lifecycleChecks(id: Int) async throws -> Void {
             let disposable = try await worker.newTab(page("Disposable"))
             let completedRun = worker.generation
@@ -389,13 +535,51 @@ import AppKit
             _ = try await probe.command(worker, "closeTab", tabID: rotatedTab)
         }
         do {
+            print("Chrome checks: setup"); fflush(stdout)
             let (id, otherID) = try await setup()
+            if ProcessInfo.processInfo.environment["CLINQY_CHROME_CHECKS"] == "status-boundaries" {
+                try await statusBoundaryChecks()
+                await worker.stop(); await recovered.stop(); await other.stop()
+                try? FileManager.default.removeItem(at: root)
+                print("PASS: \(checks) targeted Chrome semantic status boundary checks")
+                return
+            }
+            if ProcessInfo.processInfo.environment["CLINQY_CHROME_CHECKS"] == "autocomplete" {
+                try await autocompleteChecks()
+                await worker.stop(); await recovered.stop(); await other.stop()
+                try? FileManager.default.removeItem(at: root)
+                print("PASS: \(checks) targeted Chrome autocomplete checks")
+                return
+            }
+            if ProcessInfo.processInfo.environment["CLINQY_CHROME_CHECKS"] == "new-controls" {
+                try await overlayChecks()
+                try await rangeAndWaitChecks()
+                await worker.stop(); await recovered.stop(); await other.stop()
+                try? FileManager.default.removeItem(at: root)
+                print("PASS: \(checks) targeted Chrome overlay/range/wait checks")
+                return
+            }
+            print("Chrome checks: inputs"); fflush(stdout)
             let name = try await inputChecks(id: id)
+            print("Chrome checks: navigation"); fflush(stdout)
             try await navigationChecks(id: id, otherID: otherID)
+            print("Chrome checks: embedded controls"); fflush(stdout)
             try await embeddedChecks()
+            print("Chrome checks: freshness"); fflush(stdout)
             try await freshnessChecks()
+            print("Chrome checks: gestures"); fflush(stdout)
             try await gestureChecks()
+            print("Chrome checks: semantic status boundaries"); fflush(stdout)
+            try await statusBoundaryChecks()
+            print("Chrome checks: autocomplete"); fflush(stdout)
+            try await autocompleteChecks()
+            print("Chrome checks: overlay"); fflush(stdout)
+            try await overlayChecks()
+            print("Chrome checks: ranges and waits"); fflush(stdout)
+            try await rangeAndWaitChecks()
+            print("Chrome checks: lifecycle"); fflush(stdout)
             try await lifecycleChecks(id: id)
+            print("Chrome checks: cross-origin frames"); fflush(stdout)
             try await crossFrameChecks()
             let recoveredID = try await recovered.newTab(page("Recovered worker"))
             try rememberPID("worker")

@@ -1,0 +1,13 @@
+<!doctype html><meta charset="utf-8"><title>Clinqy local review</title>
+<h1>Local review</h1><p>This is the workspace's disposable review window.</p>
+<button id="confirm">Confirm local review</button><p id="status" role="status"></p>
+<script>
+const token=new URLSearchParams(location.search).get('token');
+document.getElementById('confirm').onclick=()=>{
+ if(!opener){document.getElementById('status').textContent='Workspace unavailable';return;}
+ opener.postMessage({token,review:true},location.origin);
+ document.getElementById('status').textContent='Local review confirmed';
+ // The fixture closes only its own script-created window after feedback has been visible.
+ setTimeout(()=>window.close(),800);
+};
+</script>

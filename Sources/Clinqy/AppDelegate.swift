@@ -45,6 +45,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         defer { TaskPowerAssertions.shared.shutdown() }
         // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
+        Updater.shared.stop()
+        Efficiency.stop()
+        Clipboard.stop()
+        WorkingBadge.shared.hide()
         BrowserJobs.shared.shutdown()
         ChromeWorker.shared.shutdown()
         AgentScreen.quit()
@@ -139,6 +143,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         SpeechModel.shared.prepare()
         BrowserBridge.shared.start()
+        Updater.shared.isBusy = { [weak self] in
+            self?.agent.isRunning == true || !BrowserJobs.shared.running.isEmpty
+        }
         Updater.shared.onChange = { [weak self] in
             guard let item = self?.updateMenuItem else { return }
             item.title = Updater.shared.available.map { "Update to Clinqy \($0.version)…" } ?? "Check for Updates…"
@@ -157,7 +164,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         TaskStore.shared.onReady = { [weak self] id in
             guard let self, let item = TaskStore.shared.record(id) else { return }
-            if item.background, item.source != .telegram {
+            if item.background, item.source != .telegram, BrowserTaskRouting.isBrowserTask(item.request) {
                 _ = BrowserJobs.shared.submit(item.request, files: item.files.map { URL(fileURLWithPath: $0) }, taskID: id, reviewed: true)
                 return
             }
@@ -545,11 +552,21 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private func answerStatus(_ url: URL) {
         guard let id = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "id" })?.value,
               id.range(of: #"^[A-Za-z0-9-]{1,40}$"#, options: .regularExpression) != nil else { return }
-        var perms = Permissions.all.map { ["name": $0.name, "granted": $0.granted()] as [String: Any] }
+        var perms = Permissions.all.map { ["name": $0.name, "granted": $0.granted(), "purpose": $0.why, "settingsURL": $0.settingsURL] as [String: Any] }
         perms.append(["name": "Microphone", "granted": AVCaptureDevice.authorizationStatus(for: .audio) == .authorized])
         perms.append(["name": "Speech Recognition", "granted": SFSpeechRecognizer.authorizationStatus() == .authorized])
         var status: [String: Any] = [
             "permissions": perms,
+            "appVersion": Updater.current,
+            "nativeBackgroundEnabled": NativeBackgroundCapability.enabled,
+            "nativeBackgroundInputAvailable": SkyLight.isAvailable,
+            "recoveryTasks": TaskStore.shared.recovery.count,
+            "taskStorageError": TaskStore.shared.storageError ?? "",
+            "extensionStatuses": BrowserBridge.shared.extensionStatuses.map { [
+                "browser": $0.browser, "version": $0.version, "expectedVersion": $0.expectedVersion,
+                "build": $0.build ?? "Unknown", "expectedBuild": $0.expectedBuild, "compatible": $0.compatible,
+                "capabilities": $0.capabilities, "profileIdentity": $0.profileIdentity ?? ""
+            ] as [String: Any] },
             "extension": BrowserBridge.shared.isConnected,
             "backgroundBrowser": Background.browserName,
             "backgroundUsesExtension": Background.extensionPreferred,

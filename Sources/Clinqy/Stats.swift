@@ -122,6 +122,18 @@ enum Stats {
                                   r["ok"] as? Bool == true ? "✓" : "✗", String(((r["request"] as? String) ?? "").prefix(70))))
             }
         }
+        let measured = rows.compactMap { $0["phase_ms"] as? [String: Any] }
+        if !measured.isEmpty {
+            out.append("Measured phases (milliseconds; missing measurements are omitted):")
+            let names = Set(measured.flatMap { Array($0.keys) }).sorted()
+            for name in names {
+                let values = measured.compactMap { ($0[name] as? NSNumber)?.doubleValue }
+                    .filter { $0.isFinite && $0 >= 0 && $0 < Double(Int.max) }.map { Int($0.rounded()) }
+                guard !values.isEmpty else { continue }
+                out.append("  \(name): n=\(values.count) · avg \(avg(values)) · p50 \(pct(values, 0.5)) · p90 \(pct(values, 0.9))")
+            }
+            out.append("  Phases may overlap; their sum is not total task latency.")
+        }
         // The same runs in agent.log, matched newest-first by request, for per-turn timings and failure reasons.
         var pool = logRuns.filter { $0.end != nil }
         var matched: [LogRun] = []

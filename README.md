@@ -626,3 +626,9 @@ Connect with `clinqy connect claude --skill` or `clinqy connect codex --skill`, 
 The [Clinqy skill](skills/clinqy/SKILL.md) explains `/clinqy`, task delegation, and the direct observe/act/wait/verify/release tools.
 Existing personal skills are preserved; `--replace-skill` explicitly updates one.
 Run local workflow benchmarks with `python3 tests/benchmarks/run.py` (`--help` for options).
+
+### Computer-use implementation and validation
+
+The current improvement branch adds durable action journaling, per-outcome task checklists, stronger browser ownership and cancellation, editor-scoped input, targeted scrolling/condition waits, and viewport-attached cursor feedback. Native background input is explicitly experimental and opt-in with `BACKGROUND_NATIVE=1`; supported operations remain tied to a running app and exact window, with foreground handoff for unsupported controls.
+
+The initial implementation pass deliberately deferred testing. The subsequent [build and test validation](implementation-notes/validation.md) records signed builds, automated regression checks, real Chrome checks, live workflow results and remaining acceptance limits. The [66-item coverage ledger](implementation-notes/backlog.md) distinguishes source coverage from demonstrated behavior. The [evaluation guide](tests/benchmarks/README.md) contains Chrome workflows, provider comparisons, passive interference measurements and result comparison commands. These results do not establish computer-use parity or superiority.

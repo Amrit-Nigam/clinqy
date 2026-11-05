@@ -7,8 +7,9 @@ enum RunReceipt {
         guard UUID(uuidString: id) != nil else { return nil }
         return directory.appendingPathComponent(id + ".run.json")
     }
-    static func write(id: String, ok: Bool, answer: String, steps: [String]) {
-        guard let file = url(id), let data = try? JSONSerialization.data(withJSONObject: ["ok": ok, "answer": answer, "steps": steps]) else { return }
+    static func write(id: String, ok: Bool, answer: String, steps: [String], timings: [String: Double] = [:]) {
+        let metrics = timings.filter { $0.value.isFinite && $0.value >= 0 }
+        guard let file = url(id), let data = try? JSONSerialization.data(withJSONObject: ["ok": ok, "answer": answer, "steps": steps, "phaseMilliseconds": metrics]) else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             try data.write(to: file, options: .atomic)

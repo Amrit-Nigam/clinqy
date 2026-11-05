@@ -173,7 +173,7 @@ final class BrowserJobs: ObservableObject {
     private func complete(_ job: Job, answer: String, ok: Bool) {
         guard !job.finished else { return }
         job.finished = true; job.ok = ok; job.answer = answer; job.status = ok ? "Done — click to check" : "Stopped — click for details"
-        if let receipt = job.receipt { RunReceipt.write(id: receipt, ok: ok, answer: answer, steps: job.agent?.steps.map(\.text) ?? []) }
+        if let receipt = job.receipt { RunReceipt.write(id: receipt, ok: ok, answer: answer, steps: job.agent?.steps.map(\.text) ?? [], timings: job.agent?.runtimeTimings ?? [:]) }
         if let parentID = job.parent, let parent = jobs.first(where: { $0.id == parentID }),
            parent.children.allSatisfy({ id in jobs.first(where: { $0.id == id })?.finished == true }) {
             let waiters = parent.waiters; parent.waiters = []; waiters.forEach { $0.resume() }

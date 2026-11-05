@@ -28,6 +28,30 @@ final class TaskStore: ObservableObject {
         var satisfied = false
         var evidence: String?
     }
+    /// Outcomes, not gestures. Only explicit verification can complete a checklist entry.
+    struct ChecklistItem: Codable, Equatable, Identifiable {
+        var id: String
+        var title: String
+        var evidence: String?
+        var verifiedAt: Date?
+        var supersededAt: Date?
+        var supersededReason: String?
+        var complete: Bool { evidence != nil && verifiedAt != nil }
+    }
+    /// Redacted dispatch metadata. Arguments and entered text never enter the journal.
+    struct ActionEntry: Codable, Equatable, Identifiable {
+        enum State: String, Codable { case prepared, confirmed, unverified, unknown, rejected, resolved }
+        var id: UUID
+        var taskID: UUID
+        var runID: String
+        var kind: String
+        var fingerprint: String
+        var target: String
+        var state: State
+        var startedAt: Date
+        var finishedAt: Date?
+        var evidence: String?
+    }
     /// Where an unresolved input happened, retained across continuation so the barrier survives a rebuilt run.
     struct PendingProvenance: Codable, Equatable {
         var kind: String
@@ -64,6 +88,10 @@ final class TaskStore: ObservableObject {
         var outputs: [String]?
         var requirements: [Requirement]?
         var pendingProvenance: PendingProvenance?
+        var pendingActionID: UUID?
+        var checklist: [ChecklistItem]?
+        var phaseTimings: [String: Double]?
+        var openChecklist: [ChecklistItem] { (checklist ?? []).filter { !$0.complete && $0.supersededAt == nil } }
         var openRequirements: [Requirement] { (requirements ?? []).filter { !$0.satisfied } }
 
         var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
@@ -74,6 +102,9 @@ final class TaskStore: ObservableObject {
             if let unverifiedAction { lines.append("Unverified outcome: " + unverifiedAction + ". Check the real state before retrying.") }
             if !openRequirements.isEmpty {
                 lines.append("Still required: " + openRequirements.map { $0.kind.rawValue + " " + $0.text }.joined(separator: "; "))
+            }
+            if let checklist, !checklist.isEmpty {
+                lines.append("Outcomes:\n" + checklist.map { ($0.supersededAt != nil ? "– " : $0.complete ? "✓ " : "○ ") + $0.id + ": " + $0.title }.joined(separator: "\n"))
             }
             if let result { lines.append(result) }
             if requiresReview { lines.append(reviewReason ?? "Review this queued task before starting it after a restart.") }
@@ -95,6 +126,7 @@ final class TaskStore: ObservableObject {
             let db = try SQLiteDatabase(file: file)
             database = db
             try db.execute("CREATE TABLE IF NOT EXISTS tasks(id TEXT PRIMARY KEY COLLATE NOCASE, state TEXT NOT NULL, updated REAL NOT NULL, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS tasks_updated ON tasks(updated DESC); CREATE INDEX IF NOT EXISTS tasks_state ON tasks(state); CREATE TABLE IF NOT EXISTS metadata(key TEXT PRIMARY KEY,value TEXT NOT NULL);")
+            try db.execute("CREATE TABLE IF NOT EXISTS action_journal(id TEXT PRIMARY KEY, task_id TEXT NOT NULL, state TEXT NOT NULL, started REAL NOT NULL, payload TEXT NOT NULL); CREATE INDEX IF NOT EXISTS action_journal_task ON action_journal(task_id, started);")
             let legacy = legacyFile ?? (file.lastPathComponent == "tasks.sqlite" ? file.deletingLastPathComponent().appendingPathComponent("tasks.json") : nil)
             if try db.rows("SELECT value FROM metadata WHERE key='legacy_imported'").isEmpty {
                 try db.transaction {
@@ -112,6 +144,22 @@ final class TaskStore: ObservableObject {
                 for index in records.indices {
                     switch records[index].state {
                     case .running, .waiting, .needsAttention:
+                        // A process can die after dispatch but before acknowledgment. Recover every unfinished
+                        // dispatch as unknown, never as a retryable failure or a successful action.
+                        let unknown = try db.rows("SELECT payload FROM action_journal WHERE task_id=? AND state='prepared'", [records[index].id.uuidString])
+                        for row in unknown {
+                            var entry = try JSONDecoder().decode(ActionEntry.self, from: Data(row[0].utf8))
+                            entry.state = .unknown
+                            try persistEntry(entry, in: db)
+                        }
+                        if let pending = records[index].pendingAction {
+                            records[index].unverifiedAction = records[index].unverifiedAction ?? pending
+                            if records[index].pendingProvenance == nil {
+                                records[index].pendingProvenance = PendingProvenance(kind: pending, startedAt: records[index].updatedAt,
+                                    url: nil, tabID: nil, visualOK: false, delivery: .unknown)
+                            }
+                            records[index].pendingAction = nil
+                        }
                         records[index].state = .interrupted
                         records[index].stage = "Clinqy stopped before this task finished. Check the real outcome before sending new instructions."
                         records[index].updatedAt = Date()
@@ -124,6 +172,8 @@ final class TaskStore: ObservableObject {
                     }
                 }
             }
+            // Retention only removes resolved history of terminal tasks; uncertain dispatches are never pruned.
+            try db.execute("DELETE FROM action_journal WHERE state IN ('confirmed','rejected','resolved') AND task_id IN (SELECT id FROM tasks WHERE state IN ('succeeded','failed','cancelled')) AND (started < ? OR id IN (SELECT id FROM action_journal WHERE state IN ('confirmed','rejected','resolved') ORDER BY started DESC LIMIT -1 OFFSET 10000))", [String(Date().addingTimeInterval(-30 * 86400).timeIntervalSince1970)])
             rebuildPositions()
         } catch {
             corrupt = true
@@ -182,6 +232,30 @@ final class TaskStore: ObservableObject {
         return change(id) { $0.state = .running; $0.stage = "Getting started"; $0.requiresReview = false; $0.reviewReason = nil }
     }
 
+    /// Explicit user resumption keeps the same durable identity and uncertainty barrier. No old
+    /// action is replayed: startup takes a fresh observation and requires evidence for unresolved input.
+    @discardableResult
+    func requestResume(_ id: UUID) -> Bool {
+        guard let item = record(id), [.interrupted, .failed, .cancelled].contains(item.state),
+              item.reviewReason?.contains("Private values") != true else { return false }
+        guard change(id, { record in
+            record.state = .queued
+            record.stage = "Queued to inspect the existing outcome before continuing"
+            record.requiresReview = false
+            record.reviewReason = nil
+            if let pending = record.pendingAction {
+                record.unverifiedAction = record.unverifiedAction ?? pending
+                if record.pendingProvenance == nil {
+                    record.pendingProvenance = PendingProvenance(kind: pending, startedAt: record.updatedAt,
+                        url: nil, tabID: nil, visualOK: false, delivery: .unknown)
+                }
+                record.pendingAction = nil
+            }
+        }) else { return false }
+        onReady?(id)
+        return true
+    }
+
     /// Explicitly review a restored queued request without consuming a slot before it can run.
     @discardableResult
     func reviewQueued(_ id: UUID) -> Bool {
@@ -201,33 +275,82 @@ final class TaskStore: ObservableObject {
         }
     }
 
-    /// Must succeed before executing an action, otherwise fail closed instead of losing the recovery checkpoint.
-    func beginAction(_ id: UUID?, kind: String) -> Bool {
-        guard let id else { return true } // Unattended/test runs do not enter user history.
-        guard let item = record(id), !item.state.terminal else { return false }
-        return change(id) { $0.state = .running; $0.pendingAction = kind; $0.stage = "Working: " + kind }
+    /// The task checkpoint and action reservation share one durable transaction. Reusing an ID is
+    /// refused even if its previous result was lost; the caller must observe instead of dispatching again.
+    func beginAction(_ id: UUID?, kind: String, actionID: UUID = UUID(), runID: String = "legacy",
+                     fingerprint: String = "", target: String = "", mutation: Bool = true,
+                     provenance: PendingProvenance? = nil) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal,
+              !mutation || (item.pendingAction == nil && item.unverifiedAction == nil) else { return false }
+        let entry = ActionEntry(id: actionID, taskID: id, runID: runID, kind: kind,
+            fingerprint: fingerprint, target: target, state: .prepared, startedAt: Date())
+        return change(id, journal: mutation ? { db in
+            guard try db.rows("SELECT id FROM action_journal WHERE id=?", [actionID.uuidString]).isEmpty else {
+                throw NSError(domain: "Clinqy.Actions", code: 1, userInfo: [NSLocalizedDescriptionKey: "Action already reserved"])
+            }
+            try self.persistEntry(entry, in: db)
+        } : nil) {
+            $0.state = .running
+            if mutation {
+                $0.pendingAction = kind; $0.pendingActionID = actionID
+                if $0.unverifiedAction == nil { $0.pendingProvenance = provenance }
+            }
+            $0.stage = "Working: " + kind
+        }
     }
     @discardableResult
-    func endAction(_ id: UUID?, kind: String, outcome: ActionOutcome, completedSteps: Int, provenance: PendingProvenance? = nil) -> Bool {
+    func endAction(_ id: UUID?, kind: String, outcome: ActionOutcome, completedSteps: Int,
+                   provenance: PendingProvenance? = nil, actionID: UUID? = nil) -> Bool {
         guard let id else { return true }
         guard let item = record(id), !item.state.terminal else { return false }
-        return change(id) {
-            $0.pendingAction = nil
+        // Legacy callers omit the dispatch ID. A readback must never borrow the reservation of
+        // an earlier uncertain mutation merely because that reservation is still pending.
+        let ticket = actionID ?? (item.pendingAction == kind ? item.pendingActionID : nil)
+        return change(id, journal: { db in
+            if let ticket, let row = try db.rows("SELECT payload FROM action_journal WHERE id=? AND task_id=?", [ticket.uuidString, id.uuidString]).first {
+                var entry = try JSONDecoder().decode(ActionEntry.self, from: Data(row[0].utf8))
+                entry.state = outcome.isConfirmed ? .confirmed : outcome.delivery == .unknown ? .unknown : outcome.needsVerification ? .unverified : .rejected
+                entry.finishedAt = Date()
+                try self.persistEntry(entry, in: db)
+            }
+        }) {
+            if (actionID == nil && $0.pendingAction == kind) || (actionID != nil && $0.pendingActionID == actionID) { $0.pendingAction = nil }
             $0.completedSteps = completedSteps
             $0.lastActionOutcome = outcome
             if outcome.isConfirmed { $0.lastConfirmedStep = kind }
-            if outcome.needsVerification { $0.unverifiedAction = kind; $0.pendingProvenance = provenance }
+            if outcome.needsVerification { $0.unverifiedAction = kind; $0.pendingProvenance = provenance; $0.pendingActionID = ticket }
+            else if $0.unverifiedAction == nil, $0.pendingActionID == ticket { $0.pendingActionID = nil; $0.pendingProvenance = nil }
         }
+    }
+    func actionHistory(_ id: UUID, limit: Int = 100) -> [ActionEntry] {
+        guard let rows = try? database?.rows("SELECT payload FROM action_journal WHERE task_id=? ORDER BY started DESC LIMIT ?", [id.uuidString, String(min(500, max(1, limit)))]) else { return [] }
+        return rows.compactMap { try? JSONDecoder().decode(ActionEntry.self, from: Data($0[0].utf8)) }
+    }
+    private func persistEntry(_ entry: ActionEntry, in db: SQLiteDatabase) throws {
+        let payload = String(decoding: try JSONEncoder().encode(entry), as: UTF8.self)
+        try db.execute("INSERT INTO action_journal VALUES(?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET state=excluded.state,payload=excluded.payload",
+            [entry.id.uuidString, entry.taskID.uuidString, entry.state.rawValue, String(entry.startedAt.timeIntervalSince1970), payload])
+    }
+    private func resolveJournal(_ id: UUID, evidence: String, confirmed: Bool, in db: SQLiteDatabase) throws {
+        // Resolve only this task's latest unresolved dispatch. Older uncertain entries remain auditable.
+        guard let ticket = record(id)?.pendingActionID,
+              let row = try db.rows("SELECT payload FROM action_journal WHERE id=? AND task_id=?", [ticket.uuidString, id.uuidString]).first else { return }
+        var entry = try JSONDecoder().decode(ActionEntry.self, from: Data(row[0].utf8))
+        entry.state = confirmed ? .confirmed : .resolved
+        entry.evidence = redact(evidence); entry.finishedAt = Date()
+        try persistEntry(entry, in: db)
     }
     /// Only a successful, explicit state assertion resolves an uncertain side effect.
     @discardableResult
     func confirmAction(_ id: UUID?, evidence: String) -> Bool {
         guard let id else { return true }
         guard let item = record(id), !item.state.terminal else { return false }
-        return change(id) {
+        return change(id, journal: { try self.resolveJournal(id, evidence: evidence, confirmed: true, in: $0) }) {
             if let action = $0.unverifiedAction { $0.lastConfirmedStep = action + " (" + redact(evidence) + ")" }
             $0.unverifiedAction = nil
             $0.pendingProvenance = nil
+            $0.pendingActionID = nil
         }
     }
     /// The user (or another explicit non-evidence route) reports that the uncertain effect did not happen: the barrier
@@ -236,11 +359,52 @@ final class TaskStore: ObservableObject {
     func resolveAction(_ id: UUID?, evidence: String) -> Bool {
         guard let id else { return true }
         guard let item = record(id), !item.state.terminal else { return false }
-        return change(id) {
+        return change(id, journal: { try self.resolveJournal(id, evidence: evidence, confirmed: false, in: $0) }) {
+            $0.pendingActionID = nil
             $0.stage = redact(evidence)
             $0.unverifiedAction = nil
             $0.pendingProvenance = nil
         }
+    }
+
+    // MARK: Outcome checklist
+
+    /// Plans are additive: a later model turn cannot erase unfinished outcomes to make completion pass.
+    func addChecklist(_ id: UUID?, titles: [String]) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal else { return false }
+        var list = item.checklist ?? []
+        for title in titles {
+            let clean = redact(title.trimmingCharacters(in: .whitespacesAndNewlines))
+            guard !clean.isEmpty, clean.utf8.count <= 500 else { return false }
+            if !list.contains(where: { $0.title == clean }) {
+                guard list.count < 32 else { return false }
+                list.append(ChecklistItem(id: "s\(list.count + 1)", title: clean))
+            }
+        }
+        return change(id) { $0.checklist = list }
+    }
+    func verifyChecklist(_ id: UUID?, step: String, evidence: String) -> Bool {
+        guard let id else { return true }
+        guard let item = record(id), !item.state.terminal,
+              let index = item.checklist?.firstIndex(where: { $0.id == step && $0.supersededAt == nil }),
+              !evidence.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+        return change(id) { $0.checklist?[index].evidence = redact(evidence); $0.checklist?[index].verifiedAt = Date() }
+    }
+    func supersedeChecklist(_ id: UUID?, ids: [String], reason: String) -> Bool {
+        guard !ids.isEmpty, let id else { return true }
+        guard let item = record(id), !item.state.terminal else { return false }
+        return change(id) {
+            guard var list = $0.checklist else { return }
+            for index in list.indices where ids.contains(list[index].id) {
+                list[index].supersededAt = Date(); list[index].supersededReason = redact(reason)
+            }
+            $0.checklist = list
+        }
+    }
+    func setTimings(_ id: UUID?, milliseconds: [String: Double]) {
+        guard let id else { return }
+        _ = change(id) { $0.phaseTimings = milliseconds.filter { $0.value.isFinite && $0.value >= 0 } }
     }
 
     // MARK: Requirements ledger
@@ -271,16 +435,46 @@ final class TaskStore: ObservableObject {
             $0.requirements = all
         }
     }
+    /// File evidence resolves only the normalized path it actually inspected.
+    @discardableResult
+    func satisfyDeliverable(_ id: UUID?, path: String, evidence: String) -> Bool {
+        guard let id else { return true }
+        func normalized(_ path: String) -> String {
+            URL(fileURLWithPath: (path as NSString).expandingTildeInPath).standardizedFileURL.resolvingSymlinksInPath().path
+        }
+        guard let item = record(id) else { return false }
+        let target = normalized(path)
+        let matches = (item.requirements ?? []).filter {
+            !$0.satisfied && $0.kind == .deliverable && ($0.text.hasPrefix("/") || $0.text.hasPrefix("~")) && normalized($0.text) == target
+        }.map(\.id)
+        guard !matches.isEmpty else { return true }
+        return change(id) {
+            guard var requirements = $0.requirements else { return }
+            for index in requirements.indices where matches.contains(requirements[index].id) {
+                requirements[index].satisfied = true
+                requirements[index].evidence = redact(evidence)
+            }
+            $0.requirements = requirements
+        }
+    }
     func setOutputs(_ id: UUID?, files: [URL]) {
         guard let id else { return }
         _ = change(id) { $0.outputs = files.map(\.path) }
     }
-    func finish(_ id: UUID?, ok: Bool, answer: String) {
-        guard let id else { return }
-        _ = change(id) {
-            $0.state = answer == "Stopped" ? .cancelled : ok && $0.pendingAction == nil && $0.unverifiedAction == nil ? .succeeded : .failed
-            let checked = ok && ($0.pendingAction != nil || $0.unverifiedAction != nil)
-                ? "Outcome not confirmed. Check the real application before retrying. " + answer : answer
+    @discardableResult
+    func finish(_ id: UUID?, ok: Bool, answer: String) -> Bool {
+        guard let id else { return true }
+        return change(id, journal: { db in
+            for row in try db.rows("SELECT payload FROM action_journal WHERE task_id=? AND state='prepared'", [id.uuidString]) {
+                var entry = try JSONDecoder().decode(ActionEntry.self, from: Data(row[0].utf8))
+                entry.state = .unknown; entry.finishedAt = Date()
+                try self.persistEntry(entry, in: db)
+            }
+        }) {
+            let missingDeliverable = $0.openRequirements.contains { $0.kind == .deliverable && ($0.text.hasPrefix("/") || $0.text.hasPrefix("~")) }
+            $0.state = answer == "Stopped" ? .cancelled : ok && $0.pendingAction == nil && $0.unverifiedAction == nil && $0.openChecklist.isEmpty && !missingDeliverable ? .succeeded : .failed
+            let checked = ok && ($0.pendingAction != nil || $0.unverifiedAction != nil || !$0.openChecklist.isEmpty || missingDeliverable)
+                ? "Outcome not confirmed. Check the remaining task outcomes before retrying. " + answer : answer
             $0.stage = redact(checked)
             $0.result = redact(checked)
             // Preserve an in-flight checkpoint when cancellation races with a side effect.
@@ -292,11 +486,14 @@ final class TaskStore: ObservableObject {
     }
     func requestStart(_ id: UUID) { guard record(id)?.state == .queued else { return }; onReady?(id) }
 
-    private func change(_ id: UUID, _ action: (inout Record) -> Void) -> Bool {
+    private func change(_ id: UUID, journal: ((SQLiteDatabase) throws -> Void)? = nil, _ action: (inout Record) -> Void) -> Bool {
         guard !corrupt, var item = record(id) else { return false }
         action(&item); item.updatedAt = Date()
         do {
-            try persist(item) // Durable acknowledgement comes before publishing or executing a side effect.
+            if let journal, let database {
+                try database.transaction { try journal(database); try persist(item) }
+            } else { try persist(item) }
+            // Durable acknowledgment comes before publishing or executing a side effect.
             if let index = positions[id] { records[index] = item }
             else { records.append(item); positions[id] = records.count - 1 }
             trimPublishedRecords()

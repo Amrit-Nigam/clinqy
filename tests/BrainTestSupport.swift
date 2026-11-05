@@ -5,7 +5,11 @@ enum Provider { case agyCLI, claudeCLI, codexCLI, anthropic, openai, gemini, ope
     func model(_ model: String) -> String { model }
 }
 enum Config { static func value(_ key: String) -> String? { ProcessInfo.processInfo.environment[key] } }
-enum AgentPrompt { static let system = "Test agent" }
+enum AgentPrompt {
+    static let system = "Test agent"
+    static let compactControl = "Compact test agent"
+    static var controlSystem: String { system }
+}
 enum Agent { @MainActor static func writeLog(_ text: String) {} }
 enum VisionPolicy { enum Delivery { case fileReference, embedded } }
 enum UsageStore { static func record(provider: Provider, model: String, inputTokens: Int?, outputTokens: Int?) {} }

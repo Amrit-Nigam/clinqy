@@ -1,0 +1,108 @@
+{
+  "schema_version": 2,
+  "fixture_sha256": "a14b1182874292b2b6693a5f2d0b2035c2d323afda33261282ab6eff21b42a87",
+  "environment": {
+    "os": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "app_bundle": "/Applications/Clinqy.app",
+    "installed_app_version": "0.3.1",
+    "installed_extension_version": "1.9.16",
+    "connected_extension_status": [
+      {
+        "browser": "Arc",
+        "version": "1.9.16",
+        "build": "2026-11-browser-reliability-2",
+        "expectedVersion": "1.9.16",
+        "expectedBuild": "2026-11-browser-reliability-2",
+        "compatible": true
+      },
+      {
+        "browser": "Google Chrome",
+        "version": "1.9.16",
+        "build": "2026-11-browser-reliability-2",
+        "expectedVersion": "1.9.16",
+        "expectedBuild": "2026-11-browser-reliability-2",
+        "compatible": true
+      }
+    ]
+  },
+  "label": "default",
+  "browser": "Google Chrome",
+  "provider": "codex",
+  "mode": "background",
+  "repeat": 1,
+  "cancellation_experiment": null,
+  "scoring": "fixture outcome independent of agent verdict",
+  "summary": {
+    "tasks": 1,
+    "verified_completions": 0,
+    "finished_tasks": 1,
+    "cancelled_tasks": 0,
+    "interrupted_tasks": 0,
+    "verified_completion_rate": 0.0,
+    "false_successes": 0,
+    "wrong_target_actions": 0,
+    "duplicate_effects": 0,
+    "median_seconds": 14.876,
+    "p95_seconds": 14.876
+  },
+  "results": [
+    {
+      "name": "popup",
+      "iteration": 1,
+      "receipt": "fc4cc69d-883b-4733-9ac1-4a4ebb0d47c7",
+      "status": "finished",
+      "seconds": 14.876,
+      "task_template": "Open Review window once, click Confirm local review in that new window once, then return to the workspace. Do not submit the workspace.",
+      "expected": {
+        "popup_opened": 1,
+        "popup_confirmed": 1,
+        "submitted": 0
+      },
+      "verified_completion": false,
+      "false_success": false,
+      "wrong_target_actions": 0,
+      "duplicate_effects": 0,
+      "cancellation_confirmed": true,
+      "reported_success": false,
+      "timed_out": false,
+      "fixture_state_received": true,
+      "fixture_state": {
+        "project": "",
+        "draft": "Replace this draft",
+        "other": "Leave this editor alone",
+        "reviewer": "",
+        "final_checked": false,
+        "attachment": "",
+        "preview_count": 0,
+        "preview_ready": false,
+        "submitted": 0,
+        "accepted": false,
+        "popup_opened": 0,
+        "popup_confirmed": 0,
+        "download_requested": 0,
+        "session_signed_in": false,
+        "session_report": false,
+        "session_attempts": 0,
+        "wrong": 0
+      },
+      "agent_output": "Go to 127.0.0.1\nStopped",
+      "phase_milliseconds": {
+        "checkpoint": 0.21670831483788788,
+        "total": 14176.630973815918,
+        "model": 9432.342124986462,
+        "observation": 45,
+        "startup_observation_and_retrieval": 51.51550000300631,
+        "action": 375.7356249989243
+      },
+      "phase_metrics_source": "app receipt",
+      "desktop_observation": null,
+      "desktop_monitor_error": null,
+      "download_path": null,
+      "interventions": null,
+      "recovery_attempts": null,
+      "model_cost": null,
+      "foreground_interruptions": null
+    }
+  ]
+}

@@ -1,0 +1,82 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Clinqy local workflow workspace</title>
+<style>
+  body{font:17px/1.5 system-ui;max-width:900px;margin:30px auto;padding:0 24px}
+  input,button,textarea{font:inherit;padding:8px;margin:6px}label{display:block}
+  [contenteditable]{border:1px solid #777;padding:12px;min-height:60px;margin:8px 0}
+  #suggestions{border:1px solid #999;padding:8px}#suggestions[hidden]{display:none}
+  #checklist{height:180px;overflow:auto;border:1px solid #999;padding:12px}
+  #status{white-space:pre-wrap;overflow-wrap:anywhere}
+</style>
+<h1>Local workflow workspace</h1>
+<p>All submission, review, attachment, and download controls here are disposable local fixtures.</p>
+<label>Project name<input id="project"></label>
+<label for="draft">Draft editor</label><div id="draft" contenteditable="true" role="textbox" aria-multiline="true">Replace this draft</div>
+<label for="other">Other editor</label><div id="other" contenteditable="true" role="textbox">Leave this editor alone</div>
+<label>Reviewer<input id="reviewer" role="combobox" aria-autocomplete="list" aria-controls="suggestions" aria-expanded="false" autocomplete="off"></label>
+<div id="suggestions" role="listbox" aria-label="Reviewer suggestions" hidden></div><p id="selected">No reviewer selected</p>
+<h2>Checklist panel</h2><div id="checklist" role="region" aria-label="Checklist panel" tabindex="0"></div>
+<label>Attachment<input id="attachment" type="file" accept="text/plain"></label>
+<button id="prepare">Prepare preview</button><span id="preview" role="status">Preview not ready</span>
+<button id="submit">Submit local workflow</button><span id="accepted" role="status"></span>
+<button id="popup">Open Review window</button><span id="popup-status" role="status"></span>
+<a id="download">Download local report</a>
+<button id="session-report">Open session report</button><button id="session-login" hidden>Sign in local session</button><span id="session-status" role="status"></span>
+<button id="wrong">Wrong target — leave alone</button>
+<pre id="status" role="status"></pre>
+<script>
+const token=new URLSearchParams(location.search).get('token'), $=id=>document.getElementById(id);
+const state={project:'',draft:'Replace this draft',other:'Leave this editor alone',reviewer:'',final_checked:false,
+ attachment:'',preview_count:0,preview_ready:false,submitted:0,accepted:false,popup_opened:0,popup_confirmed:0,download_requested:0,
+ session_signed_in:false,session_report:false,session_attempts:0,wrong:0};
+let reporting=Promise.resolve(), reviewWindow=null;
+function record(){
+ $('status').textContent='Current result: '+JSON.stringify(state);
+ const body=JSON.stringify(state);
+ reporting=reporting.then(()=>fetch('/record/'+token,{method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{});
+}
+$('project').oninput=()=>{state.project=$('project').value;record();};
+for(const id of ['draft','other']) $(id).oninput=()=>{state[id]=$(id).innerText;record();};
+const reviewers=['Priya Shah','Priya Sharma','Rahul Mehta'];
+$('reviewer').oninput=()=>{
+ state.reviewer='';$('selected').textContent='No reviewer selected';
+ const query=$('reviewer').value.toLowerCase(), box=$('suggestions');box.replaceChildren();
+ for(const name of reviewers.filter(name=>name.toLowerCase().includes(query))){
+  const button=document.createElement('button');button.type='button';button.role='option';button.textContent=name;
+  button.onclick=()=>{state.reviewer=name;$('reviewer').value=name;$('selected').textContent='Selected reviewer: '+name;
+    box.hidden=true;$('reviewer').setAttribute('aria-expanded','false');record();};box.append(button);
+ }
+ box.hidden=!box.children.length;$('reviewer').setAttribute('aria-expanded',String(!box.hidden));record();
+};
+for(let i=1;i<=35;i++){const row=document.createElement('p');row.textContent='Reference checklist row '+i;$('checklist').append(row);}
+const final=document.createElement('label');final.innerHTML='<input type="checkbox">Final checklist item';$('checklist').append(final);
+final.querySelector('input').onchange=e=>{state.final_checked=e.target.checked;record();};
+$('attachment').onchange=async()=>{const file=$('attachment').files[0];state.attachment=file?await file.text():'';record();};
+function prepare(){
+ state.preview_count++;state.preview_ready=false;$('preview').textContent='Preparing preview';
+ // Replace the clicked node so stale handles cannot be replayed after a successful dispatch.
+ $('prepare').outerHTML='<button id="prepare">Prepare preview</button>';$('prepare').onclick=prepare;record();
+ setTimeout(()=>{state.preview_ready=true;$('preview').textContent='Preview ready';record();},1800);
+}
+$('prepare').onclick=prepare;
+$('submit').onclick=()=>{
+ state.submitted++;state.accepted=state.project==='Release draft'&&state.draft==='Ready for review'
+  &&state.reviewer==='Priya Shah'&&state.final_checked&&state.attachment==='Clinqy benchmark attachment'&&state.preview_ready;
+ $('accepted').textContent=state.accepted?'Workflow accepted':'Workflow incomplete';record();
+};
+$('popup').onclick=()=>{state.popup_opened++;reviewWindow=window.open('/popup?token='+encodeURIComponent(token),'_blank','popup,width=500,height=400');
+ $('popup-status').textContent=reviewWindow?'Review window opened':'Popup blocked';record();};
+addEventListener('message',event=>{
+ if(event.origin!==location.origin||event.source!==reviewWindow||event.data?.token!==token||event.data?.review!==true)return;
+ state.popup_confirmed++;$('popup-status').textContent='Local review confirmed';record();
+});
+$('download').href='/download?token='+encodeURIComponent(token);
+$('download').onclick=()=>{state.download_requested++;record();};
+$('session-report').onclick=()=>{state.session_attempts++;state.session_report=state.session_signed_in;
+ $('session-status').textContent=state.session_signed_in?'Session report ready':'Local session expired';
+ $('session-login').hidden=state.session_signed_in;record();};
+$('session-login').onclick=()=>{state.session_signed_in=true;$('session-login').hidden=true;$('session-status').textContent='Local session signed in';record();};
+$('wrong').onclick=()=>{state.wrong++;record();};
+record();
+</script>

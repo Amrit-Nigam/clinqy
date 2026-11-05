@@ -9,31 +9,47 @@ final class WorkingBadge {
 
     private var panel: NSPanel?
     private let spinner = NSProgressIndicator()
+    private let label = NSTextField(labelWithString: "Working in background")
+    private var visibilityGeneration = 0
+    private var waiting = false
+
+    func update(status: String, waiting: Bool = false) {
+        self.waiting = waiting
+        label.stringValue = String(status.prefix(90))
+        label.setAccessibilityLabel(status)
+        panel?.contentView?.toolTip = status + " — click to view this task"
+        if waiting || NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { spinner.stopAnimation(nil) }
+        else if panel?.isVisible == true { spinner.startAnimation(nil) }
+    }
 
     func show() {
         if TaskExecution.current != nil { return } // Parallel jobs have their own colored task dock.
+        visibilityGeneration += 1
         if panel == nil { build() }
         guard let panel, let screen = NSScreen.screens.first(where: { $0.frame.origin == .zero }) ?? NSScreen.main else { return }
         let visible = screen.visibleFrame
         panel.setFrameOrigin(NSPoint(x: visible.maxX - panel.frame.width - 12, y: visible.minY + 12))
-        spinner.startAnimation(nil)
+        if !waiting && !NSWorkspace.shared.accessibilityDisplayShouldReduceMotion { spinner.startAnimation(nil) }
         panel.alphaValue = 0
         panel.orderFrontRegardless()
-        NSAnimationContext.runAnimationGroup { $0.duration = 0.25; panel.animator().alphaValue = 1 }
+        NSAnimationContext.runAnimationGroup { $0.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2; panel.animator().alphaValue = 1 }
     }
 
     func hide() {
         guard let panel, panel.isVisible else { return }
-        NSAnimationContext.runAnimationGroup({ $0.duration = 0.25; panel.animator().alphaValue = 0 }) { [weak self] in
+        visibilityGeneration += 1
+        let generation = visibilityGeneration
+        NSAnimationContext.runAnimationGroup({ $0.duration = NSWorkspace.shared.accessibilityDisplayShouldReduceMotion ? 0 : 0.2; panel.animator().alphaValue = 0 }) { [weak self] in
             MainActor.assumeIsolated {
-                self?.spinner.stopAnimation(nil)
-                self?.panel?.orderOut(nil)
+                guard let self, self.visibilityGeneration == generation else { return }
+                self.spinner.stopAnimation(nil)
+                self.panel?.orderOut(nil)
             }
         }
     }
 
     private func build() {
-        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 172, height: 30),
+        let panel = NSPanel(contentRect: NSRect(x: 0, y: 0, width: 240, height: 30),
                             styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: false)
         panel.level = .statusBar
         panel.isOpaque = false
@@ -47,10 +63,10 @@ final class WorkingBadge {
         spinner.style = .spinning
         spinner.controlSize = .small
         spinner.frame = NSRect(x: 10, y: 7, width: 16, height: 16)
-        let label = NSTextField(labelWithString: "Working in background")
         label.font = .systemFont(ofSize: 11.5, weight: .medium)
         label.textColor = .white
-        label.frame = NSRect(x: 32, y: 7, width: 136, height: 16)
+        label.lineBreakMode = .byTruncatingTail
+        label.frame = NSRect(x: 32, y: 7, width: 198, height: 16)
         pill.addSubview(spinner)
         pill.addSubview(label)
         pill.toolTip = "Clinqy is working on its hidden screen — click to watch"

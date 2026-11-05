@@ -85,6 +85,17 @@ import CryptoKit
             if case .attention = BackgroundPolicy.route(["do": kind, "id": "e1"], hasWorkerPage: true) { checks += 1 }
             else { preconditionFailure("native gesture leaked into background") }
         }
+        check(BackgroundPolicy.route(["do": "set_state", "id": "w2", "state": 6], hasWorkerPage: true) == .browser,
+              "range state uses the owned browser page")
+        for action: [String: Any] in [["do": "set_state", "id": "e2", "state": 6], ["do": "set_state", "state": 6]] {
+            if case .attention = BackgroundPolicy.route(action, hasWorkerPage: true) { checks += 1 }
+            else { preconditionFailure("range accepted a native or missing target") }
+        }
+        let conditionWait: [String: Any] = ["do": "wait", "condition": ["kind": "ready"]]
+        check(BackgroundPolicy.route(conditionWait, hasWorkerPage: true) == .browser, "structured waits require browser routing")
+        if case .attention = BackgroundPolicy.route(conditionWait, hasWorkerPage: false) { checks += 1 }
+        else { preconditionFailure("structured wait accepted absent owned page") }
+        check(BackgroundPolicy.route(["do": "wait", "ms": 100], hasWorkerPage: false) == .api, "plain delay requires no browser")
         var goal = CompletionEvidence()
         check(!goal.needsVerification, "read-only goal needs no mutation proof")
         goal.record(kind: "files", outcome: .confirmed, op: "list")

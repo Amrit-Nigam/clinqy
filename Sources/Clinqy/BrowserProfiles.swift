@@ -1,6 +1,6 @@
 import Foundation
 
-/// Profiles of Chromium browsers (Chrome, Brave, Edge), read from their own settings files.
+/// Profiles discovered from Chromium preferences. Discovery never selects an unrelated last-used profile.
 @MainActor
 enum BrowserProfiles {
     private static let folders = [
@@ -8,25 +8,45 @@ enum BrowserProfiles {
         "com.microsoft.edgemac": "Microsoft Edge",
     ]
 
-    /// The profile folder ("Default", "Profile 2"…) that has Clinqy's extension loaded, else the one used last;
-    /// nil for a browser without profiles to pick.
-    static func withExtension(_ browser: URL) -> String? {
-        guard let id = Bundle(url: browser)?.bundleIdentifier, let sub = folders[id] else { return nil }
+    struct Profile: Equatable {
+        let directory: String
+        let displayName: String
+    }
+
+    static func profilesWithExtension(_ browser: URL) -> [Profile] {
+        guard let id = Bundle(url: browser)?.bundleIdentifier, let sub = folders[id] else { return [] }
         let root = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/\(sub)")
-        let data: Data
-        do { data = try Data(contentsOf: root.appendingPathComponent("Local State")) } catch {
-            Agent.writeLog("    couldn't read \(sub)'s profiles: \(error.localizedDescription)")
+        guard let data = try? Data(contentsOf: root.appendingPathComponent("Local State")),
+              let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let profile = state["profile"] as? [String: Any], let cache = profile["info_cache"] as? [String: [String: Any]] else { return [] }
+        return cache.keys.sorted().compactMap { name in
+            guard !name.contains("/"), name != ".", name != ".." else { return nil }
+            for file in ["Secure Preferences", "Preferences"] {
+                guard let data = try? Data(contentsOf: root.appendingPathComponent(name).appendingPathComponent(file)),
+                      let prefs = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      let extensions = prefs["extensions"] as? [String: Any],
+                      let settings = extensions["settings"] as? [String: [String: Any]] else { continue }
+                let found = settings.values.contains { setting in
+                    guard (setting["state"] as? Int ?? 1) == 1 else { return false }
+                    if let manifest = setting["manifest"] as? [String: Any], manifest["name"] as? String == "Clinqy",
+                       let background = manifest["background"] as? [String: Any], background["service_worker"] as? String == "bridge.js" { return true }
+                    // Unpacked extensions may omit a cached manifest. Inspect that path's manifest structurally.
+                    guard let path = setting["path"] as? String, path.hasPrefix("/"),
+                          let manifestData = try? Data(contentsOf: URL(fileURLWithPath: path).appendingPathComponent("manifest.json")),
+                          let manifest = try? JSONSerialization.jsonObject(with: manifestData) as? [String: Any],
+                          manifest["name"] as? String == "Clinqy", let background = manifest["background"] as? [String: Any] else { return false }
+                    return background["service_worker"] as? String == "bridge.js"
+                }
+                if found { return Profile(directory: name, displayName: cache[name]?["name"] as? String ?? name) }
+            }
             return nil
         }
-        guard let state = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let profile = state["profile"] as? [String: Any] else { return nil }
-        let names = ((profile["info_cache"] as? [String: Any])?.keys).map(Array.init) ?? []
-        for name in names.sorted() {
-            for file in ["Secure Preferences", "Preferences"] {
-                guard let text = try? String(contentsOf: root.appendingPathComponent("\(name)/\(file)"), encoding: .utf8) else { continue }
-                if text.contains("Clinqy/extension") || text.contains("Clinqy\\/extension") { return name }
-            }
-        }
-        return profile["last_used"] as? String
+    }
+
+    /// Returns only an unambiguous extension profile. The connected focused profile remains the runtime authority.
+    static func withExtension(_ browser: URL) -> String? {
+        let profiles = profilesWithExtension(browser)
+        if profiles.count > 1 { Agent.writeLog("Multiple Clinqy browser profiles are available; choose the connected profile explicitly.") }
+        return profiles.count == 1 ? profiles[0].directory : nil
     }
 }

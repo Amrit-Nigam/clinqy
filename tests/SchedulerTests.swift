@@ -47,7 +47,8 @@ enum Agent { static func writeLog(_ line: String) {} }
         check(restoredTasks.records.count == 1, "no duplicate task after crash")
         check(restoredTasks.record(recovered.taskID)?.state == .interrupted, "uncertain send remains interrupted")
         check(!restoredTasks.start(recovered.taskID, explicitlyReviewed: true), "interrupted side effect cannot replay")
-        check(restoredTasks.record(recovered.taskID)?.pendingAction == "send", "uncertain outcome retained")
+        check(restoredTasks.record(recovered.taskID)?.unverifiedAction == "send", "uncertain outcome retained")
+        check(restoredTasks.record(recovered.taskID)?.pendingProvenance?.delivery == .unknown, "restart does not invent delivery acknowledgement")
 
         // Crash before execution retains a reviewable queue rather than silently losing or replaying it.
         let second = item("Queued before crash")

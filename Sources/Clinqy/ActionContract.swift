@@ -24,18 +24,20 @@ enum ActionContract {
         "type": Spec(keys: ["id", "text", "submit", "mode"]),
         "set_state": Spec(keys: ["id", "state"]),
         "key": Spec(keys: ["keys"]),
-        "scroll": Spec(keys: ["dir", "direction", "unit", "amount"]),
+        "scroll": Spec(keys: ["id", "dir", "direction", "unit", "amount"]),
         "open_app": Spec(keys: ["name"]),
         "open_url": Spec(keys: ["url"]),
         "menu": Spec(keys: ["path"]),
         "delegate": Spec(keys: ["jobs"]),
         "collect": Spec(keys: ["ids", "wait", "timeout"]),
-        "look": Spec(keys: []),
+        "look": Spec(keys: ["query", "role"]),
+        "plan": Spec(keys: ["steps", "supersede"]),
+        "capabilities": Spec(keys: ["query"]),
         "paste_snaps": Spec(keys: []),
-        "verify": Spec(keys: ["text", "url", "value", "id", "path", "contains", "seconds", "visual", "user_confirms", "sha256", "min_bytes"]),
+        "verify": Spec(keys: ["text", "url", "value", "id", "path", "contains", "seconds", "visual", "user_confirms", "sha256", "min_bytes", "step"]),
         "shell": Spec(keys: ["cmd"]),
         "applescript": Spec(keys: ["script"]),
-        "wait": Spec(keys: ["ms", "for", "gone", "timeout", "seconds"]),
+        "wait": Spec(keys: ["ms", "for", "gone", "timeout", "seconds", "condition"]),
         "application": Spec(keys: ["op", "query", "company", "role", "url", "status", "resume", "notes"],
                             ops: ["find", "check", "list", "show", "record", "update"]),
         "window": Spec(keys: ["op", "x", "y", "w", "h", "width", "height", "title", "on"],
@@ -49,13 +51,41 @@ enum ActionContract {
         "menu", "window", "tab", "point", "mark", "read", "images", "image", "ask", "show", "verify", "assert", "snap",
         "paste_snaps", "pdf", "media", "upload", "review", "application", "email", "extract", "table", "event", "reminder",
         "files", "look", "wait", "recall", "remember", "remember_answer", "autofill", "think", "schedule", "dictionary",
-        "applescript", "shell", "parallel_browser", "calendar", "set_state", "delegate", "collect",
+        "applescript", "shell", "parallel_browser", "calendar", "set_state", "delegate", "collect", "plan", "capabilities",
     ]
 
     /// Operations that only read. Only these two actions have a read-only `info` operation; `op` on anything else
     /// does not change what the action does and must never lower its classification.
     static func readsOnly(kind: String, op: String) -> Bool {
         (kind == "pdf" || kind == "media") && op.lowercased() == "info"
+    }
+
+    static func matchingKinds(_ query: String) -> [String] {
+        let terms = query.lowercased().split(whereSeparator: { !$0.isLetter && !$0.isNumber }).map(String.init)
+        var ranked: [(kind: String, score: Int)] = []
+        for kind in supportedKinds.sorted() {
+            let spec = specs[kind]
+            let aliases = kind == "set_state" ? "slider range checkbox switch numeric value" : kind == "look" ? "search filter observation role screenshot" : ""
+            var searchable = [kind, aliases]
+            searchable.append(contentsOf: spec?.keys ?? [])
+            searchable.append(contentsOf: spec?.ops ?? [])
+            let words = searchable.joined(separator: " ")
+            var score = 0
+            for term in terms where words.contains(term) { score += 1 }
+            if terms.isEmpty || score > 0 { ranked.append((kind, score)) }
+        }
+        ranked.sort { left, right in
+            left.score == right.score ? left.kind < right.kind : left.score > right.score
+        }
+        return ranked.prefix(12).map(\.kind)
+    }
+
+    static func describe(matching query: String) -> String {
+        matchingKinds(query).map { kind in
+            guard let spec = specs[kind] else { return kind + ": use the documented example below; unknown fields are not authorized." }
+            return kind + " arguments: " + (spec.keys ?? []).sorted().joined(separator: ", ")
+                + (spec.ops.map { "; operations: " + $0.sorted().joined(separator: ", ") } ?? "")
+        }.joined(separator: "\n")
     }
 
     private static func isBool(_ value: Any?) -> Bool {
@@ -100,12 +130,39 @@ enum ActionContract {
                 guard let name = (mode as? String)?.lowercased(), TextEditMode(rawValue: name) != nil else { return "type mode must be replace, insert or append" }
                 if name != "replace", action["submit"] as? Bool == true { return "type mode \(name) cannot submit; press return in a separate key action" }
             }
+        case "look":
+            for key in ["query", "role"] where action[key] != nil {
+                guard let text = action[key] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.count <= 200 else { return "look \(key) must be a nonempty string of at most 200 characters" }
+            }
         case "set_state":
             guard action["id"] is String else { return "set_state needs the control's id" }
-            guard action["state"] != nil else { return "set_state needs state: on, off or a number" }
+            guard isBool(action["state"]) || isNumber(action["state"]) || (action["state"] as? String).map({ !$0.isEmpty && $0.count <= 128 }) == true else { return "set_state needs state: on, off or a finite number" }
+            if (action["id"] as? String)?.hasPrefix("w") == true, !isNumber(action["state"]) { return "Browser set_state requires a finite numeric HTML range value" }
         case "wait":
+            for key in ["ms", "seconds", "timeout"] where action[key] != nil {
+                guard isNumber(action[key]), ((action[key] as? NSNumber)?.doubleValue ?? -1) >= 0 else { return "wait \(key) must be a finite non-negative number" }
+            }
+            if action["seconds"] != nil, action["timeout"] != nil { return "wait takes seconds or timeout, not both" }
             if action["gone"] != nil, !isBool(action["gone"]) { return "wait gone must be true or false" }
-            if action["gone"] != nil, action["for"] == nil { return "wait gone needs a for text" }
+            if let raw = action["condition"] {
+                guard action["for"] == nil, action["gone"] == nil, action["ms"] == nil,
+                      let condition = raw as? [String: Any], let type = condition["kind"] as? String,
+                      ["ready", "url", "element"].contains(type) else { return "wait condition needs kind ready, url or element; do not combine with for/gone/ms" }
+                let allowed: Set<String> = type == "ready" ? ["kind"] : type == "url" ? ["kind", "text"] : ["kind", "id", "state"]
+                guard Set(condition.keys).isSubset(of: allowed) else { return "wait condition contains unsupported arguments" }
+                if type == "url", (condition["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false {
+                    return "wait url condition needs a nonempty URL substring in text"
+                }
+                if type == "element" {
+                    guard let id = condition["id"] as? String, id.hasPrefix("w"), let index = Int(id.dropFirst()), index >= 0,
+                          let state = condition["state"] as? String, ["visible", "enabled", "gone"].contains(state) else {
+                        return "wait element condition needs a current w-id and state visible, enabled or gone"
+                    }
+                }
+            } else {
+                if action["gone"] != nil, action["for"] == nil { return "wait gone needs a for text" }
+                if let text = action["for"], (text as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false { return "wait for must be nonempty text" }
+            }
         case "click", "hover", "right_click", "double_click", "drag":
             let byID = action["id"] != nil, byText = action["text"] != nil
             let byPoint = action["x"] != nil || action["y"] != nil
@@ -117,7 +174,16 @@ enum ActionContract {
             if kind == "drag", action["to_id"] != nil, action["to_x"] != nil || action["to_y"] != nil {
                 return "drag needs one destination: to_id or to_x+to_y"
             }
+        case "plan":
+            guard let steps = action["steps"] as? [String], (!steps.isEmpty || action["supersede"] != nil), steps.count <= 32,
+                  steps.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && $0.utf8.count <= 500 }) else {
+                return "plan needs 1–32 short outcome strings (at most 500 bytes each)"
+            }
+            if let supersede = action["supersede"], !(supersede is [String]) { return "plan supersede must contain checklist ids" }
+        case "capabilities":
+            if let query = action["query"], !(query is String) { return "capabilities query must be text" }
         case "verify":
+            if let step = action["step"], !(step is String) { return "verify step must be a checklist id" }
             return verifyPredicate(action)
         default: break
         }

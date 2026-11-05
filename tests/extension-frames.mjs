@@ -34,7 +34,7 @@ const hiddenDialog={...dialog,innerText:'Hidden old confirmation',style:{display
 context.location={href:'https://course.test/lab'};
 context.document.title='Course lab';context.document.body=main;
 context.document.querySelector=()=>main;
-context.document.querySelectorAll=()=>[dialog,hiddenDialog];
+context.document.querySelectorAll=selector=>selector.includes('[role="status"]') ? [] : [dialog,hiddenDialog];
 const text=context.window.__clinqy.readText().text;
 assert.ok(text.includes('Editor project content'));
 assert.ok(text.includes('Lab Help'));

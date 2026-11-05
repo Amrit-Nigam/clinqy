@@ -20,6 +20,11 @@ enum Clipboard {
         timer?.tolerance = 0.2
     }
 
+    static func stop() {
+        timer?.invalidate(); timer = nil
+        lastText = nil; lastFiles = []; copiedAt = nil
+    }
+
     private static func poll() {
         let board = NSPasteboard.general
         guard board.changeCount != lastCount else { return }

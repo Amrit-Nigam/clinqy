@@ -903,6 +903,7 @@ final class ChromeWorker {
             return try await call(tab, frame: frame, function: "clickOption", args: [token])
         case "activeOption": return try await indexed(command, [args["want"] ?? ""])
         case "fill": return try await indexed(command, [args["text"] ?? ""])
+        case "setRange": return try await indexed(command, [args["state"] ?? NSNull()])
         case "locate", "findOption":
             var result = command == "locate" ? try await indexed(command, [args["reveal"] as? Bool ?? true]) : try await call(tab, frame: element?.frame ?? top, function: command, args: [args["text"] ?? "", element?.local ?? -1])
             if command == "findOption" { result["pointFrame"] = element?.frame ?? top }
@@ -958,7 +959,20 @@ final class ChromeWorker {
             }
             return try await call(tab, frame: top, function: "activeValue")
         case "fillActive": return try await call(tab, frame: tab.focusedFrame ?? top, function: "fillActive", args: [args["text"] ?? ""])
-        case "scroll": return try await call(tab, frame: top, function: "scroll", args: [args["dy"] ?? 0])
+        case "scroll":
+            if args["index"] != nil {
+                guard let element else { throw WorkerCDP.error("The scroll target is stale. Take a fresh look.") }
+                return try await call(tab, frame: element.frame, function: "scroll", args: [args["dy"] ?? 0, element.local, args["dx"] ?? 0])
+            }
+            return try await call(tab, frame: top, function: "scroll", args: [args["dy"] ?? 0, NSNull(), args["dx"] ?? 0])
+        case "waitCondition":
+            var condition = args["condition"] as? [String: Any] ?? [:]
+            var frame = top
+            if condition["kind"] as? String == "element" {
+                guard let index = condition["index"] as? Int, let target = tab.elements[index] else { throw WorkerCDP.error("The wait target is stale. Take a fresh look.") }
+                frame = target.frame; condition["index"] = target.local
+            }
+            return try await call(tab, frame: frame, function: "waitCondition", args: [condition, args["ms"] ?? 10000])
         case "waitText": return try await call(tab, frame: top, function: "waitText", args: [args["text"] ?? "", args["gone"] ?? false, args["ms"] ?? 10000])
         default: throw WorkerCDP.error("Unsupported worker command: " + command)
         }

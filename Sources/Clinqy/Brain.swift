@@ -157,7 +157,7 @@ final class AgySession: @unchecked Sendable {
         isAgy = (provider == .agyCLI) || (execName == "agy")
         // The agent's sessions (Brain's and FastLane's rules start with the agent prompt) get the agent addendum;
         // the rest (think, memory tidy, skills, connection checks) are only told not to use the CLI's tools.
-        if isAgy { systemPrompt = system + (system.hasPrefix(AgentPrompt.system) ? Self.agyAddendum : Self.agyPlainAddendum) }
+        if isAgy { systemPrompt = system + ((system.hasPrefix(AgentPrompt.system) || system.hasPrefix(AgentPrompt.compactControl)) ? Self.agyAddendum : Self.agyPlainAddendum) }
 
         // The session's own folder: the CLI's working directory, and where its screenshots go. Nothing else goes in
         // it. The rules used to be written there as AGENTS.md too (agy loads that as workspace rules), but a rules
@@ -610,6 +610,7 @@ enum Brain {
     }
     static var model: String { defaultModel(for: Provider.current) }
     private static var warm: AgySession?
+    private static var warmPrompt: String?
 
     static func reloadModel() {
         warm?.close()
@@ -618,8 +619,11 @@ enum Brain {
     }
 
     static func prewarm() {
-        if warm?.isAlive == true { return }
-        warm = try? AgySession(system: AgentPrompt.system, model: model)
+        let prompt = AgentPrompt.controlSystem
+        if warm?.isAlive == true, warmPrompt == prompt { return }
+        warm?.close()
+        warm = try? AgySession(system: prompt, model: model)
+        warmPrompt = prompt
     }
 
     /// Hands out the warm session (or a fresh one) and starts warming the next.
@@ -629,15 +633,15 @@ enum Brain {
         let effectiveModel = override ?? defaultM
         // Another provider or model than the default: a session of its own, and the warm one stays for the next run.
         if currentProvider != Provider.current || (override != nil && override != defaultM) {
-            return try AgySession(system: AgentPrompt.system, model: effectiveModel, provider: currentProvider)
+            return try AgySession(system: AgentPrompt.controlSystem, model: effectiveModel, provider: currentProvider)
         }
         let s: AgySession
         // The model check is only a guard: Config is read once per process, so for agy it can't change under a session.
-        if let w = warm, w.isAlive, w.sessionProvider == currentProvider, w.sessionModel == currentProvider.model(effectiveModel) {
+        if let w = warm, w.isAlive, warmPrompt == AgentPrompt.controlSystem, w.sessionProvider == currentProvider, w.sessionModel == currentProvider.model(effectiveModel) {
             s = w
         } else {
             warm?.close()
-            s = try AgySession(system: AgentPrompt.system, model: effectiveModel, provider: currentProvider)
+            s = try AgySession(system: AgentPrompt.controlSystem, model: effectiveModel, provider: currentProvider)
         }
         warm = nil
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { prewarm() }

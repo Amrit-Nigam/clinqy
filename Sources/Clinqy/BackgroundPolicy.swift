@@ -21,7 +21,7 @@ enum BackgroundPolicy {
             let destinationIsWeb = (action["to_id"] as? String)?.hasPrefix("w") == true
             return hasWorkerPage && webID && (kind != "drag" || destinationIsWeb) ? .browser
                 : .attention("Gestures need current element ids on the owned browser page; native gestures require foreground mode.")
-        case "click", "type", "choose", "fill":
+        case "click", "type", "choose", "fill", "set_state":
             if hasWorkerPage, !(webID || (action["id"] == nil && kind == "type")) {
                 // The task's own tab exists; this action just has no page-element target in background mode.
                 return .attention(action["text"] != nil || action["x"] != nil
@@ -50,7 +50,7 @@ enum BackgroundPolicy {
                 ? .attention("Revealing files opens Finder on your desktop. I can return their paths in the results instead.") : .api
         case "table":
             return (action["to"] as? String ?? "csv").lowercased() == "csv" ? .api : .attention("Write a CSV file in background mode. Spreadsheet windows and the shared clipboard need foreground access.")
-        case "wait" where action["for"] == nil: return .api
+        case "wait" where action["for"] == nil && action["condition"] == nil: return .api
         case "upload", "autofill", "review", "scroll", "tab", "look", "snap", "wait":
             return hasWorkerPage ? .browser : .attention("This action needs an owned browser task page. Open its URL first.")
         case "pdf":

@@ -233,7 +233,7 @@ final class APIChat: @unchecked Sendable {
         self.provider = provider
         self.key = key
         self.system = system
-        if system.hasPrefix(AgentPrompt.system) { outputTokenLimit = HTTPRequestBudget.controlOutputTokens }
+        if system.hasPrefix(AgentPrompt.system) || system.hasPrefix(AgentPrompt.compactControl) { outputTokenLimit = HTTPRequestBudget.controlOutputTokens }
         self.model = provider.model(model)
         let asked = effort ?? Config.value("AGY_EFFORT") ?? Config.value("CLAUDE_EFFORT")
         requestedEffort = asked.map { $0.lowercased() }.flatMap { $0.isEmpty ? nil : $0 }

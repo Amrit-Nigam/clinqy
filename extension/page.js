@@ -1,13 +1,16 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  const HELPER_VERSION = 3;
+  const HELPER_VERSION = 7;
+  const waits = new Set();
+  function cancelWaits() { for (const cancel of [...waits]) cancel(); }
   if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
   window.__clinqy?.dispose?.();
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
     : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
   let snapshotID = null;
   let revision = 0;
+  let observedGeometry = null;
   const optionTargets = new Map();
   let nextOptionTarget = 0;
   const frameNodes = new WeakMap();
@@ -283,8 +286,10 @@ function describe(el) {
     (tag === "input" && el.type === "submit" ? el.value : "") || "").slice(0, 100);
   const editable = tag === "input" || tag === "textarea" || el.isContentEditable || /textbox|combobox|searchbox/.test(role);
   if (!text && !editable && !listbox) return null;
-  // Closed dropdown options aren't targets: the dropdown itself lists them.
-  if (role === "option") { const lb = el.closest("[role=listbox]"); if (lb && lb.getAttribute("aria-expanded") !== "true" && lb !== el) return null; }
+  // Expanded state normally belongs to the controlling combobox, not its listbox. A visible
+  // listbox without that attribute (including a persistent list) still exposes selectable options.
+  // Explicitly collapsed lists remain non-actionable; hidden lists are excluded by geometry.
+  if (role === "option") { const lb = el.closest("[role=listbox]"); if (lb && lb.getAttribute("aria-expanded") === "false" && lb !== el) return null; }
   // A label is listed through its control (one line per field or choice, not two) — unless the control is hidden
   // (styled checkboxes), when the label is the thing to click.
   if (tag === "label" && el.querySelector("[role=radio], [role=checkbox], [role=switch], input[type=radio], input[type=checkbox]")) return null;
@@ -374,6 +379,7 @@ function snapshot() {
   optionTargets.clear();
   const started = performance.now();
   const vw = innerWidth, vh = innerHeight;
+  observedGeometry={width:vw,height:vh,x:scrollX,y:scrollY};
   const seen = new Set(), listed = new Set();
   const out = [], picked = [], sigs = [];
   const act = deepActive();
@@ -381,7 +387,16 @@ function snapshot() {
   const boxOf = new Map(), boxRects = new Map(), panes = new Map();
   const countable = (el) => el.getClientRects().length && (/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName)
     || /^(listbox|radio|checkbox|textbox|combobox|switch|button)$/.test(el.getAttribute("role") || ""));
-  for (const el of candidates()) {
+  const allCandidates = candidates();
+  // Controls come before long link/list collections so a large navigation list cannot hide Cancel or Submit.
+  // Bounds limit sorting work; the explicit truncation flag is carried to the agent.
+  const priority = [], ordinary = [];
+  for (const el of allCandidates.slice(0, 10000)) {
+    if (/^(BUTTON|INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || /^(button|textbox|combobox|checkbox|radio|switch)$/.test(el.getAttribute("role") || "")) priority.push(el);
+    else ordinary.push(el);
+  }
+  if (allCandidates.length > 10000) truncated = true;
+  for (const el of [...priority, ...ordinary]) {
     if (seen.has(el)) continue;
     seen.add(el);
     if (performance.now() - started > 700) { truncated = true; break; }   // huge pages: list what we have
@@ -425,6 +440,10 @@ function snapshot() {
         const v = el.isContentEditable ? el.innerText : el.value;
         if (v && el.type !== "password") item.value = String(v).slice(0, 80);
         if (el.getAttribute("placeholder")) item.placeholder = el.getAttribute("placeholder").slice(0, 60);
+      }
+      if (tag === "input" && el.type === "range") {
+        item.value = el.value;
+        item.range = `min=${el.min || "0"} max=${el.max || "100"} step=${el.step || "1"}`;
       }
       if (tag === "select") {
         item.editable = true;
@@ -497,6 +516,14 @@ function target(index) {
   throw new Error("element w" + index + " is stale (the page changed); take a new look");
 }
 
+function coordinateGuard(x,y) {
+  const geometry=observedGeometry;
+  if(!geometry || geometry.width!==innerWidth || geometry.height!==innerHeight || geometry.x!==scrollX || geometry.y!==scrollY)
+    throw Error("the viewport moved or resized; observe again before coordinate input");
+  if(!Number.isFinite(x) || !Number.isFinite(y) || x<0 || y<0 || x>=innerWidth || y>=innerHeight)
+    throw Error("the coordinate is outside the observed viewport");
+  return {ok:true};
+}
 function validate(expected) {
   if (!expected || expected.documentID !== documentID || expected.snapshotID !== snapshotID || !snapshotID)
     throw new Error("stale browser observation; take a new look before acting");
@@ -557,6 +584,16 @@ function clickNode(el) {
 }
 
 // The real text input for an element: itself, or the input inside a wrapper (search boxes are often wrapped).
+function replaceEditableText(el, text) {
+  if (!el.isConnected || !el.isContentEditable) throw Error("the editable field changed; observe again");
+  el.focus({preventScroll:true});
+  if (!within(el, deepActive())) throw Error("the editor did not accept focus");
+  // Scope selection to this editor; document-wide selectAll can select unrelated page content.
+  const selection = window.getSelection(), range = document.createRange();
+  range.selectNodeContents(el);
+  selection.removeAllRanges(); selection.addRange(range);
+  if (!document.execCommand("insertText", false, text)) throw Error("the editor rejected text insertion; observe before another attempt");
+}
 function editableOf(el) {
   const isEdit = (e) => e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName));
   if (isEdit(el)) return el;
@@ -575,9 +612,33 @@ function focus(index) {
   return { focused: !!a && within(el, a) };
 }
 
-// Sets text the way frameworks (React etc.) notice, for when keystrokes don't land.
+// Range controls expose numeric constraints; arbitrary ARIA/canvas sliders need their own interaction.
+function setRange(index, desired) {
+  const el = target(index);
+  if (el.tagName !== "INPUT" || el.type !== "range") return { refused: true, why: "Only native HTML range inputs support numeric set_state" };
+  if (el.disabled || el.matches(":disabled") || el.getAttribute("aria-disabled") === "true" || !hitPoint(el))
+    return { refused: true, why: "The range input is disabled or covered" };
+  if (typeof desired !== "number" || !Number.isFinite(desired)) return { refused: true, why: "Range state must be a finite number" };
+  const number = (raw, fallback) => raw !== "" && Number.isFinite(Number(raw)) ? Number(raw) : fallback;
+  const min = number(el.min, 0), max = number(el.max, 100);
+  const rawStep = number(el.step, 1), step = rawStep > 0 ? rawStep : 1;
+  const base = el.hasAttribute("min") ? number(el.min, 0) : number(el.getAttribute("value") || "", 0);
+  const units = (desired - base) / step;
+  if (desired < min || desired > max || max < min || (el.step !== "any" && Math.abs(units - Math.round(units)) > 1e-7))
+    return { refused: true, why: "Value violates the range minimum, maximum or step" };
+  if (el.valueAsNumber === desired) return { already: true, value: el.value };
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, String(desired));
+  el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { delivered: true, value: el.isConnected ? el.value : null, matches: el.isConnected && el.valueAsNumber === desired };
+}
+
+// Sets text the way frameworks (React etc.) notice, for when keystrokes do not land.
 function fill(index, text) {
   const el = editableOf(target(index));
+  if (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true") throw Error("the field is disabled or read-only");
+  if (el.type === "file" || el.type === "password") throw Error("this field requires its dedicated input path");
+  if (editorKind(el) && !el.isContentEditable) throw Error("use keyboard input for this code editor");
   el.focus({ preventScroll: true });
   if (el.tagName === "SELECT") {
     // Dropdowns: pick the option whose text (or value) matches.
@@ -591,8 +652,7 @@ function fill(index, text) {
     return { value: opt.text };
   }
   if (el.isContentEditable) {
-    document.execCommand("selectAll", false);
-    document.execCommand("insertText", false, text);
+    replaceEditableText(el, String(text));
   } else {
     const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, "value").set.call(el, text);
@@ -716,7 +776,9 @@ function upload(index, name, type, b64) {
   input.files = dt.files;
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  return { ok: input.files.length > 0, files: [...input.files].map((f) => f.name), accept: input.accept || "" };
+  const files = [...(input.files || [])];
+  return { ok: files.some(f => f.name === name && f.size === bytes.length), files:files.map(f => f.name),
+    attached:files.map(f=>({name:f.name,size:f.size,type:f.type})), verified:"file-input-readback", serverAccepted:false, accept:input.accept || "" };
 }
 
 // Every question on the page (not just the visible part) with its current answer, for a check before submitting.
@@ -807,7 +869,24 @@ function readText() {
   // so verification sees the same confirmation the snapshot lists instead of deadlocking.
   const overlays = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open], [aria-modal="true"]')]
     .filter(el => !main.contains(el) && visible(el)).map(el => el.innerText || "");
-  const text = [...new Set([...overlays, main.innerText || ""])].join("\n\n").replace(/\n{3,}/g, "\n\n").slice(0, 8000);
+  // Adjacent inline controls and status spans concatenate in innerText ("ReviewLocal review
+  // confirmed"). Preserve each visible semantic message as its own text boundary instead of
+  // weakening whole-word verification, which must still distinguish "paid" from "unpaid".
+  const messages = [];
+  let messageChars = 0;
+  for (const el of [...document.querySelectorAll('[role="status"], [role="alert"], [aria-live="polite"], [aria-live="assertive"]')].slice(0, 80)) {
+    if (!visible(el) || el.closest('[hidden], [aria-hidden="true"], [data-clinqy-overlay]')) continue;
+    let hidden = false;
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) <= 0.05) { hidden = true; break; }
+    }
+    if (hidden) continue;
+    const message = squash(el.innerText);
+    if (!message || messages.includes(message) || message.length > 2000 || messageChars + message.length > 3000) continue;
+    messages.push(message); messageChars += message.length;
+  }
+  const text = [...new Set([...messages, ...overlays, main.innerText || ""])].join("\n\n").replace(/\n{3,}/g, "\n\n").slice(0, 8000);
   return { url: location.href, title: document.title, text };
 }
 
@@ -853,8 +932,9 @@ function readText() {
     // A code editor's hidden textarea isn't its text: setting it would corrupt the editor. Leave it be.
     const ed = editorKind(el);
     if (ed && !el.isContentEditable) return { value: editorText(ed).slice(0, 400), skipped: true };
-    if (el.isContentEditable) { document.execCommand("selectAll", false); document.execCommand("insertText", false, text); }
+    if (el.isContentEditable) { replaceEditableText(el, String(text)); }
     else if (/^(INPUT|TEXTAREA)$/.test(el.tagName)) {
+      if (el.disabled || el.readOnly || /^(file|password)$/.test(el.type)) throw Error("this field cannot be filled through the active-value path");
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       Object.getOwnPropertyDescriptor(proto, "value").set.call(el, text);
       el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -865,9 +945,8 @@ function readText() {
     let el = null; try { el = target(i); } catch {}
     if (!el) return { ok: false };
     const field = editableOf(el);
-    const all = field.form ? [...field.form.querySelectorAll("input, textarea")] : [field];
-    all.forEach((f) => { if (f.type !== "password") f.setAttribute("autocomplete", "off"); });
-    return { ok: true };
+    // Preparation must not rewrite autocomplete on unrelated user fields.
+    return { ok: !field.disabled && !field.readOnly };
   }
   function state(i) {
     let el = null; try { el = target(i); } catch {}
@@ -910,13 +989,22 @@ function readText() {
     }
     return best;
   }
-  function scroll(dy) {
-    const el = scroller();
-    // Reports movement, not just a delivered wheel: a page at its boundary (or one that swallows the scroll) says so.
-    if (el) { const before = el.scrollTop; el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop, before, moved: el.scrollTop !== before, container: "element" }; }
-    const before = scrollY;
-    window.scrollBy({ top: dy, behavior: "instant" });
-    return { y: scrollY, before, moved: scrollY !== before, container: "page" };
+  function scroll(dy, index = null, dx = 0) {
+    if (!Number.isFinite(dy) || !Number.isFinite(dx)) throw Error("scroll distances must be finite");
+    let el = Number.isInteger(index) ? target(index) : scroller();
+    if (el && Number.isInteger(index)) {
+      while (el && el !== document.documentElement) {
+        const style=getComputedStyle(el);
+        if ((dy && el.scrollHeight > el.clientHeight+2 && /auto|scroll|overlay/.test(style.overflowY)) ||
+            (dx && el.scrollWidth > el.clientWidth+2 && /auto|scroll|overlay/.test(style.overflowX))) break;
+        el=el.parentElement || el.getRootNode()?.host;
+      }
+    }
+    const box=el || document.scrollingElement || document.documentElement;
+    const before=box.scrollTop, beforeX=box.scrollLeft;
+    box.scrollBy({top:dy,left:dx,behavior:"instant"});
+    return {y:box.scrollTop,x:box.scrollLeft,before,beforeX,moved:box.scrollTop!==before || box.scrollLeft!==beforeX,
+      container:box===document.scrollingElement?"page":"element",atStart:box.scrollTop<=0,atEnd:box.scrollTop+box.clientHeight>=box.scrollHeight-1};
   }
   // The selected text plus where its links go: "Apply here" alone loses the application URL the user meant.
   function selection() {
@@ -970,36 +1058,53 @@ function readText() {
 
   // Resolves as soon as `want` shows in the page's text or title — or, with gone, has stayed gone for half a second —
   // woken by the page's own changes (a MutationObserver) rather than polled; { met: false } at the timeout.
-  function waitText(want, gone, ms) {
-    const w = norm(want);
-    const has = () => norm(document.title + " " + (document.body ? document.body.innerText : "")).includes(w);
-    return new Promise((resolve) => {
-      let done = false, queued = false, goneTimer = null, obs = null, timer = null;
-      const finish = (met) => {
-        if (done) return;
-        done = true;
-        if (obs) obs.disconnect();
-        clearTimeout(timer); clearTimeout(goneTimer);
-        resolve({ met });
+  function waitCondition(condition, ms = 10000) {
+    if (!condition || !["text", "url", "ready", "element"].includes(condition.kind)) throw Error("unsupported wait condition");
+    if (["text","url"].includes(condition.kind) && !String(condition.text || "").trim()) throw Error("wait text must not be empty");
+    const expectedDocument=documentID;
+    const matches = () => {
+      if (condition.kind === "ready") return document.readyState === "interactive" || document.readyState === "complete";
+      if (condition.kind === "url") return location.href.includes(String(condition.text));
+      if (condition.kind === "element") {
+        let el;
+        try { el=target(condition.index); } catch { return condition.state === "gone"; }
+        if (condition.state === "gone") return !visible(el);
+        if (condition.state === "enabled") return visible(el) && !el.disabled && el.getAttribute("aria-disabled") !== "true";
+        return visible(el);
+      }
+      const content=norm(pageTitle()+" "+(document.body?.innerText || ""));
+      const present=content.includes(norm(condition.text));
+      return condition.gone ? !present : present;
+    };
+    return new Promise(resolve => {
+      let done=false,observer,timer,poll,mutationTimer,stableSince=null;
+      const started=performance.now();
+      const finish=(met,cancelled=false)=>{
+        if(done)return; done=true; observer?.disconnect(); clearTimeout(timer); clearTimeout(mutationTimer); clearInterval(poll); waits.delete(cancel);
+        resolve({met,cancelled,documentID:expectedDocument,elapsedMs:Math.round(performance.now()-started)});
       };
-      const check = () => {
-        queued = false;
-        if (done) return;
-        const seen = has();
-        if (!gone) { if (seen) finish(true); return; }
-        if (seen) { clearTimeout(goneTimer); goneTimer = null; }
-        else if (!goneTimer) goneTimer = setTimeout(() => { goneTimer = null; if (!has()) finish(true); }, 500);
+      const cancel=()=>finish(false,true);
+      const check=()=>{
+        if(done)return;
+        let met=false; try {met=matches();} catch {}
+        if(!met){stableSince=null;return;}
+        if(stableSince===null)stableSince=performance.now();
+        const stableMs=condition.gone || condition.state==="gone" ? 400 : 80;
+        if(performance.now()-stableSince>=stableMs)finish(true);
       };
-      // Bursts of changes are read once (innerText lays the page out): at most every 80 ms.
-      obs = new MutationObserver(() => { if (!queued) { queued = true; setTimeout(check, 80); } });
-      obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true,
-                                              attributeFilter: ["hidden", "style", "class", "aria-hidden", "open"] });
-      timer = setTimeout(() => finish(false), Math.max(100, ms));
+      waits.add(cancel);
+      observer=new MutationObserver(()=>{if(!mutationTimer)mutationTimer=setTimeout(()=>{mutationTimer=null;check();},80);});
+      observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true,attributes:true,
+        attributeFilter:["hidden","style","class","aria-hidden","disabled","aria-disabled","open"]});
+      poll=setInterval(check,100); // URL/ready/value changes need not mutate the DOM.
+      timer=setTimeout(()=>finish(false),Math.max(100,Math.min(30000,Number(ms)||10000)));
       check();
     });
   }
+  function pageTitle() { return window.__clinqyActivity?.pageTitle?.() || document.title; }
+  function waitText(want,gone,ms) { return waitCondition({kind:"text",text:want,gone},ms); }
 
-  window.__clinqy = { version: HELPER_VERSION, dispose: () => candidateObserver.disconnect(), protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { version: HELPER_VERSION, dispose: () => { candidateObserver.disconnect(); cancelWaits(); }, protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+    frameBoxes, snapshot, coordinateGuard, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, setRange, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText, waitCondition, cancelWaits };
 })();

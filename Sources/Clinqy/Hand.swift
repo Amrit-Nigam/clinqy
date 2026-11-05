@@ -45,9 +45,10 @@ final class Hand {
         runFrontApp = front?.processIdentifier == getpid() ? nil : front
     }
 
-    /// Releases any button left down, puts the pointer back if Clinqy moved it and the user hasn't since, and
-    /// brings back the app the user was in (unless `keepFrontApp`). Safe to call on cancel and failure.
+    /// Releases held input and restores the pointer only when the user has not moved it.
+    /// Never changes foreground focus during cancellation or completion.
     func endRun() {
+        _ = SkyLight.retryPendingCleanup()
         // A background run never touched the user's pointer, buttons or front app: nothing to put back.
         if Background.active {
             runCursor = nil
@@ -60,11 +61,8 @@ final class Hand {
             CGWarpMouseCursorPosition(start)
             CGAssociateMouseAndMouseCursorPosition(1)
         }
-        if !keepFrontApp, let app = runFrontApp, !app.isTerminated,
-           NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
-            // Plain activate() is ignored while Clinqy isn't frontmost; bringToFront opens it, which always works.
-            Task { await Launcher.bringToFront(app) }
-        }
+        // No activation during cleanup: a foreground change may be the user's choice.
+        // We cannot establish ownership of that focus change from the final frontmost PID.
         runCursor = nil
         runFrontApp = nil
         cursorLeftAt = nil
@@ -119,7 +117,7 @@ final class Hand {
         if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
         if Background.active {
             lastMethod = "background"
-            return backgroundClick(at: el.center, pid: app.processIdentifier)
+            return backgroundClick(at: el.center, pid: app.processIdentifier, window: window)
         }
         lastMethod = "real"
         realClick(at: el.center)
@@ -154,26 +152,21 @@ final class Hand {
         case .background:
             guard let pid else { return refuse("a background click needs the app's pid") }
             if !Background.active, !SkyLight.isEnabled { return refuse("background clicks are off (BACKGROUND_CLICKS=1 enables them)") }
-            return backgroundClick(at: point, pid: pid)
+            return backgroundClick(at: point, pid: pid, window: window)
         }
         return nil
     }
 
     /// A click on `pid`'s window at `point` that leaves the pointer and the front app alone: SkyLight where this macOS
     /// has it (Chromium and Electron windows take nothing else), else posted to the app.
-    private func backgroundClick(at point: CGPoint, pid: pid_t) -> String? {
-        guard SkyLight.isAvailable else {
-            Self.postClick(at: point, pid: pid)
-            return nil
+    private func backgroundClick(at point: CGPoint, pid: pid_t, window: WindowSnapshot?) -> String? {
+        guard SkyLight.isAvailable else { return refuse("background pointer input is unavailable on this macOS; use a semantic control or foreground handoff") }
+        guard let window, window.pid == pid, window.frame.contains(point) else {
+            return refuse("background input needs the exact observed window; observe again")
         }
-        // On Clinqy's hidden screen whatever window is at the spot is the run's, even one a helper process owns
-        // (the file picker panel belongs to a macOS service, not the app).
-        let target = Self.windowInfo(pid: pid, containing: point).map { (pid, $0.id, $0.frame) }
-            ?? (AgentScreen.bounds?.contains(point) == true ? Self.topWindow(at: point) : nil)
-        guard let (owner, id, frame) = target else {
-            return refuse("no window of the target app at that point for a background click")
-        }
-        if let why = SkyLight.click(at: point, pid: owner, window: id, frame: frame) { return refuse(why) }
+        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        // Never substitute another window or a helper process merely because it occupies the same coordinates.
+        if let why = SkyLight.click(at: point, pid: pid, window: window.windowID, frame: window.frame) { return refuse(why) }
         return nil
     }
 
@@ -210,7 +203,7 @@ final class Hand {
         } else {
             if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
             if Background.active {
-                if let why = backgroundClick(at: el.center, pid: app.processIdentifier) { return refuse(why) }
+                if let why = backgroundClick(at: el.center, pid: app.processIdentifier, window: window) { return refuse(why) }
             } else { realClick(at: el.center) }
         }
         try? await Task.sleep(for: .milliseconds(120))
@@ -418,6 +411,29 @@ final class Hand {
         return AXEngine.press(combo: keys)
     }
 
+    /// Exact-window keyboard route used by native tasks, including the opt-in background capability.
+    @discardableResult
+    func press(_ keys: String, in app: NSRunningApplication, window: WindowSnapshot) -> Bool {
+        refusal = nil
+        if let why = Safety.blockedChord(keys, request: request) ?? AXEngine.chordProblem(keys) { _ = refuse(why); return false }
+        guard window.pid == app.processIdentifier, window.staleness() == nil, !Task.isCancelled else {
+            _ = refuse("the keyboard target changed; observe again"); return false
+        }
+        if let why = Safety.secureInputBlock() { _ = refuse(why); return false }
+        let session: SkyLight.KeyboardSession
+        switch SkyLight.beginKeyboard(in: window) {
+        case .failure(let error): _ = refuse(error.reason); return false
+        case .success(let value): session = value
+        }
+        let delivered = AXEngine.press(combo: keys, in: app, window: window)
+        guard session.finish() else { _ = refuse("keyboard delivery is uncertain because temporary focus cleanup failed"); return false }
+        switch delivered {
+        case .delivered: buddy.click(); return true
+        case .unsupported: _ = refuse("the target cannot deliver this shortcut without a foreground handoff"); return false
+        case .uncertain: _ = refuse("the shortcut may have taken effect; inspect before repeating it"); return false
+        }
+    }
+
     func scroll(up: Bool, in app: NSRunningApplication) async {
         await scroll(ScrollPlan(direction: up ? .up : .down, unit: .lines, amount: 12, isDefault: true), in: app, window: nil)
     }
@@ -428,6 +444,7 @@ final class Hand {
     @discardableResult
     func scroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint? = nil) async -> String? {
         refusal = nil
+        guard !Background.active else { return refuse("native scrolling needs foreground mode until its scroll container can be verified") }
         if let window {
             guard window.pid == app.processIdentifier else { return refuse("the scroll target belongs to another application; look again") }
             if let why = window.staleness() { return refuse(why) }
@@ -440,6 +457,7 @@ final class Hand {
         let (pixels, steps) = plan.chunks(viewport: frame?.size ?? CGSize(width: 800, height: 600))
         for step in steps {
             if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+            if let why = window?.staleness() { return refuse(why) }
             AXEngine.scroll(dy: step.dy, dx: step.dx, pixels: pixels, at: target, in: app)
             try? await Task.sleep(for: .milliseconds(70))
         }
@@ -599,71 +617,77 @@ final class Hand {
 
     // MARK: - Keyboard
 
-    /// Replaces the focused field's text, typed at a human rhythm, and confirms it landed.
-    /// Falls back to pasting once; never leaves half a message behind for a Return to send.
-    func type(_ text: String, in app: NSRunningApplication) async -> Bool {
+    /// Replaces exactly one verified focused field. Once a mutation is dispatched, a missing readback
+    /// is uncertainty, never permission to clear, paste again, or append a second copy.
+    func type(_ text: String, in app: NSRunningApplication, window requested: WindowSnapshot? = nil) async -> Bool {
         refusal = nil
+        guard !Task.isCancelled,
+              let window = requested ?? WindowSnapshot.capture(app, windowID: Background.active ? Background.nativeWindowID : nil, followAttachedSheet: true),
+              window.pid == app.processIdentifier, window.staleness(includeContent: true) == nil else {
+            _ = refuse("the text target is unavailable; observe again"); return false
+        }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let field: AXUIElement = AXEngine.attribute(root, kAXFocusedUIElementAttribute),
+              window.containsElement(field), Self.isTextRole(AXEngine.attribute(field, kAXRoleAttribute)) else {
+            _ = refuse("no verified text field in the observed window"); return false
+        }
+        guard !Safety.isSecureField(field), Safety.secureInputBlock() == nil else {
+            _ = refuse("secure input is active; no text was sent"); return false
+        }
         buddy.setTyping(true)
         defer { buddy.setTyping(false) }
-        // Browser editors whose text Accessibility can't see (Google Docs shows only zero-width spaces): typing
-        // can't be checked, and the check-then-clear fallback would wipe the document. Paste it once, fast.
-        let invisible = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{FEFF}"))
-        if Launcher.isBrowser(app), (AXEngine.focusedValue(of: app) ?? "").trimmingCharacters(in: invisible).isEmpty {
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            AXEngine.paste(text)
-            return true
+        guard window.staleness(includeContent: true) == nil, AXEngine.focusedWithin(field, in: app), !Task.isCancelled else {
+            _ = refuse("the target changed before text delivery; observe again"); return false
         }
-        // In a background run, long or multi-line text goes straight into the field: pasting would borrow the
-        // user's clipboard. Fields that don't take a set value (or don't show it) fall through to the usual ways.
-        if Background.active, text.count > 80 || text.contains("\n"), !Self.codeEditorIDs.contains(app.bundleIdentifier ?? ""),
-           AXEngine.setFocusedValue(text, in: app), await landed(text, in: app) {
-            return true
+        switch AXEngine.edit(text, mode: .replaceAll, field: field) {
+        case .done: return true
+        case .refused(let why), .unverified(let why): _ = refuse(why); return false
+        case .unsupported: break
         }
-        // Long text (an answer list, a write-up) is pasted: typing 2,000 characters takes minutes and trips the
-        // watchdog halfway, leaving half a message behind. Pasted line breaks don't send in chat apps.
-        if text.count > 300, !Self.codeEditorIDs.contains(app.bundleIdentifier ?? "") {
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            if !(AXEngine.focusedValue(of: app) ?? "").isEmpty {
-                AXEngine.selectAll()
-                try? await Task.sleep(for: .milliseconds(60))
+        guard let before: String = AXEngine.attribute(field, kAXValueAttribute) else {
+            _ = refuse("the field exposes no readable text for safe replacement; use a page editor tool or a verified insertion action"); return false
+        }
+        guard window.staleness() == nil, AXEngine.focusedWithin(field, in: app) else {
+            _ = refuse("the field changed before typing; observe again"); return false
+        }
+        let keyboard: SkyLight.KeyboardSession
+        switch SkyLight.beginKeyboard(in: window) {
+        case .success(let session): keyboard = session
+        case .failure(let error): _ = refuse(error.reason); return false
+        }
+        defer { if !keyboard.finish() { _ = refuse("text may have been delivered, but temporary keyboard state could not be released") } }
+        if !before.isEmpty {
+            guard case .delivered = AXEngine.press(combo: "cmd+a", in: app, window: window) else {
+                _ = refuse("select-all was not confirmed; no replacement text was sent"); return false
             }
-            AXEngine.paste(text)
-            return await landed(text, in: app)
+            try? await Task.sleep(for: .milliseconds(60))
+            // A menu shortcut can be accepted without selecting this field. Do not overwrite until its
+            // selection is visible, including UTF-16 length for emoji and non-Latin text.
+            guard AXEngine.selection(of: field) == NSRange(location: 0, length: (before as NSString).length) else {
+                _ = refuse("the field did not confirm select-all; no replacement text was sent"); return false
+            }
         }
-        // Multi-line text is still typed (that's the point of watching it), with Shift+Return for line breaks.
-        if text.contains("\n") {
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            AXEngine.selectAll()
-            try? await Task.sleep(for: .milliseconds(80))
-            let code = Self.codeEditorIDs.contains(app.bundleIdentifier ?? "")
-            await enterText(text, codeEditor: code)
-            return await landed(text, in: app)
+        let characters = Array(text)
+        for offset in stride(from: 0, to: characters.count, by: 16) {
+            let chunk = String(characters[offset..<min(characters.count, offset + 16)])
+            guard !Task.isCancelled, window.staleness() == nil, AXEngine.focusedWithin(field, in: app),
+                  !Safety.isSecureField(field), Safety.secureInputBlock() == nil else {
+                _ = refuse("typing stopped after partial delivery; inspect the field before continuing"); return false
+            }
+            AXEngine.type(chunk, to: app.processIdentifier)
+            try? await Task.sleep(for: .milliseconds(20))
         }
-        // Replace existing text only when there is some: ⌘A where there's nothing to select just beeps.
-        if let existing = AXEngine.focusedValue(of: app), !existing.isEmpty {
-            AXEngine.selectAll()
+        // Empty replacement still needs one edit when the AX value setter is unavailable.
+        if text.isEmpty, !before.isEmpty { _ = AXEngine.press(combo: "backspace", in: app, window: window) }
+        for _ in 0..<10 {
+            guard !Task.isCancelled else { _ = refuse("typing interrupted; inspect the existing text before continuing"); return false }
+            if (AXEngine.attribute(field, kAXValueAttribute) as String?) == text {
+                guard keyboard.finish() else { _ = refuse("text matches, but temporary keyboard state could not be released"); return false }
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(60))
         }
-
-        // Keys go only to the target app, never to whatever else might grab focus meanwhile.
-        AXEngine.targetPid = app.processIdentifier
-        defer { AXEngine.targetPid = nil }
-        await keystrokes(text)
-        if Task.isCancelled || refusal != nil { return false }
-        if await landed(text, in: app) { return true }
-
-        // Some apps only accept keys through the system stream: retry by pasting that way,
-        // replacing (never appending to) what's there.
-        AXEngine.targetPid = nil
-        AXEngine.selectAll()
-        try? await Task.sleep(for: .milliseconds(60))
-        AXEngine.paste(text)
-        if await landed(text, in: app) { return true }
-        AXEngine.selectAll()
-        AXEngine.press(0x33)
+        _ = refuse("text was sent once but exact readback was not confirmed; inspect before retrying")
         return false
     }
 
@@ -713,6 +737,7 @@ final class Hand {
         refusal = nil
         for ch in text {
             if Task.isCancelled { return }
+            if let why = Safety.secureInputBlock() { _ = refuse(why); return }
             AXEngine.type(String(ch))
             var ms = base + Double.random(in: 0...(base * 0.9))
             if ch == " " { ms += base * 0.5 }

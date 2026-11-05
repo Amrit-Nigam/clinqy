@@ -405,6 +405,15 @@ enum SetupCommands {
         if args.contains("--check") { return 0 }
         let target = URL(fileURLWithPath: args.firstIndex(of: "--to").flatMap { args.indices.contains($0 + 1) ? args[$0 + 1] : nil }
                          ?? "/Applications/Clinqy.app")
+        let runningTarget = NSRunningApplication.runningApplications(withBundleIdentifier: "com.amritnigam.clinqy")
+            .first { $0.processIdentifier != getpid() && $0.bundleURL == target }
+        if runningTarget != nil {
+            guard let current = status() else { return failed("the running app could not confirm it is idle; finish its tasks and quit it before updating") }
+            let jobs = current["backgroundJobs"] as? [[String: Any]] ?? []
+            guard current["foregroundRunning"] as? Bool != true, jobs.isEmpty else {
+                return failed("Clinqy is running tasks. Finish or stop them before installing the update.")
+            }
+        }
         print("Downloading…")
         nonisolated(unsafe) var staged: Result<URL, Error> = .failure(NSError(domain: "Clinqy", code: 1))
         Task.detached { do { staged = .success(try await Updater.download(release)) } catch { staged = .failure(error) }; sem.signal() }
@@ -413,7 +422,16 @@ enum SetupCommands {
         case .failure(let e): return failed("the update failed: \(e.localizedDescription)")
         case .success(let app):
             let running = NSRunningApplication.runningApplications(withBundleIdentifier: "com.amritnigam.clinqy").first { $0.processIdentifier != getpid() && $0.bundleURL == target }
+            // The download may outlast a new task starting; check again before terminating the app.
+            if running != nil {
+                guard let current = status(), current["foregroundRunning"] as? Bool != true,
+                      (current["backgroundJobs"] as? [[String: Any]] ?? []).isEmpty else {
+                    try? FileManager.default.removeItem(at: app.deletingLastPathComponent())
+                    return failed("Clinqy is no longer idle. The installed app was left unchanged; finish its tasks before updating.")
+                }
+            }
             do { try Updater.swapInAndReopen(app, replacing: target, waitingFor: running?.processIdentifier, reopen: running != nil) } catch {
+                try? FileManager.default.removeItem(at: app.deletingLastPathComponent())
                 return failed("couldn't install it: \(error.localizedDescription)")
             }
             running?.terminate()
@@ -449,7 +467,31 @@ enum SetupCommands {
                 let browser = s["backgroundBrowser"] as? String ?? "configured browser"
                 print("✗ Background browser: connect the Clinqy extension in \(browser). A connection in another browser does not satisfy this route.")
             }
-            if s["extension"] as? Bool == true { print("✓ Browser extension: connected") } else {
+            for permission in s["permissions"] as? [[String: Any]] ?? [] where permission["granted"] as? Bool != true {
+                if let purpose = permission["purpose"] as? String {
+                    print("  · " + (permission["name"] as? String ?? "Permission") + " enables: " + purpose)
+                }
+            }
+            let extensionStates = s["extensionStatuses"] as? [[String: Any]] ?? []
+            for state in extensionStates {
+                let browser = state["browser"] as? String ?? "Browser"
+                if state["compatible"] as? Bool == true {
+                    print("✓ " + browser + " extension: compatible (" + (state["version"] as? String ?? "?") + ")")
+                } else {
+                    ok = false
+                    let have = state["build"] as? String ?? "Unknown"
+                    let expected = state["expectedBuild"] as? String ?? "current app build"
+                    print("✗ " + browser + " extension build: " + have + "; expected " + expected + ". Reload Clinqy in this browser's extensions page. If it stays outdated, reinstall the extension bundled with this app.")
+                }
+            }
+            if let error = s["taskStorageError"] as? String, !error.isEmpty { ok = false; print("✗ Task recovery: " + error) }
+            if let count = s["recoveryTasks"] as? Int, count > 0 { print("· \(count) interrupted or restored tasks are available in Tasks & Recovery.") }
+            if s["nativeBackgroundEnabled"] as? Bool == true {
+                print(s["nativeBackgroundInputAvailable"] as? Bool == true
+                    ? "· Native background input is enabled for supported targets; application compatibility still varies."
+                    : "· Native background input is enabled but unavailable on this macOS; unsupported operations require foreground access.")
+            }
+            if s["extension"] as? Bool == true { if extensionStates.isEmpty { print("✓ Browser extension: connected (build details unavailable)") } } else {
                 ok = false
                 print("✗ Browser extension: not connected — run: Clinqy extension install")
             }

@@ -72,6 +72,37 @@ final class BrowserBridge: ObservableObject {
         var unreadFrames: [String] = []
     }
 
+    struct ExtensionStatus {
+        let browser: String
+        let version: String
+        let expectedVersion: String
+        let build: String?
+        let expectedBuild: String
+        let profileIdentity: String?
+        let capabilities: [String]
+        var compatible: Bool { version == expectedVersion && build == expectedBuild }
+    }
+    private struct ExtensionHandshake {
+        let version: String
+        let build: String?
+        let profileIdentity: String?
+        let capabilities: [String]
+    }
+    private var handshakeStorage: [ObjectIdentifier: ExtensionHandshake] = [:]
+    private var handshakes: [ObjectIdentifier: ExtensionHandshake] {
+        get { transport?.handshakes ?? handshakeStorage }
+        set { if let transport { transport.handshakes = newValue } else { handshakeStorage = newValue } }
+    }
+    /// Installation identity is opaque; it is never presented as a Chrome account or profile directory.
+    var extensionStatuses: [ExtensionStatus] {
+        connections.keys.map { key in
+            let hello = handshakes[key]
+            return ExtensionStatus(browser: owners[key].map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "Identifying browser",
+                version: hello?.version ?? "Unknown", expectedVersion: Self.extensionVersion,
+                build: hello?.build, expectedBuild: Self.extensionBuild, profileIdentity: hello?.profileIdentity, capabilities: hello?.capabilities ?? [])
+        }.sorted { $0.browser < $1.browser }
+    }
+
     private var listener: NWListener?
     private var connectionStorage: [ObjectIdentifier: NWConnection] = [:]
     private var connections: [ObjectIdentifier: NWConnection] {
@@ -134,6 +165,7 @@ final class BrowserBridge: ObservableObject {
                 case .failed, .cancelled:
                     self?.connections[key] = nil
                     self?.owners[key] = nil
+                    self?.handshakes[key] = nil
                     self?.failPending(on: key)
                 default: break
                 }
@@ -148,8 +180,10 @@ final class BrowserBridge: ObservableObject {
             MainActor.assumeIsolated {
                 guard let self else { return }
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any], msg["type"] as? String == "hello" {
-                    self.checkVersion(msg["version"] as? String ?? "", on: conn)
-                    if msg["version"] as? String == Self.extensionVersion { self.tidyAfterRestart(conn) }
+                    self.handshakes[ObjectIdentifier(conn)] = ExtensionHandshake(version: msg["version"] as? String ?? "", build: msg["build"] as? String,
+                        profileIdentity: msg["profileIdentity"] as? String, capabilities: msg["capabilities"] as? [String] ?? [])
+                    self.checkVersion(msg["version"] as? String ?? "", build: msg["build"] as? String, on: conn)
+                    if msg["version"] as? String == Self.extensionVersion, msg["build"] as? String == Self.extensionBuild { self.tidyAfterRestart(conn) }
                 }
                 // A response is honoured only on the connection its request went to, so a delayed answer from a
                 // retired connection can never complete a request that is waiting on another one.
@@ -163,6 +197,8 @@ final class BrowserBridge: ObservableObject {
                 }
                 if error == nil { self.receive(conn) } else {
                     self.connections[ObjectIdentifier(conn)] = nil
+                    self.handshakes[ObjectIdentifier(conn)] = nil
+                    self.owners[ObjectIdentifier(conn)] = nil
                     self.failPending(on: ObjectIdentifier(conn))
                 }
             }
@@ -174,8 +210,22 @@ final class BrowserBridge: ObservableObject {
     }
 
     private func request(_ conn: NWConnection, _ body: [String: Any], timeout: Double = 2.5) async throws -> [String: Any] {
-        if let transport { return try await transport.request(conn, body, timeout: timeout) }
+        var scopedBody = body
+        if body["workOnly"] as? Bool == true || body["cmd"] as? String == "clinqyTab" { scopedBody["runID"] = taskRunID }
+        if let transport { return try await transport.requestTransport(conn, scopedBody, timeout: timeout) }
+        return try await requestTransport(conn, scopedBody, timeout: timeout)
+    }
+
+    private func requestTransport(_ conn: NWConnection, _ body: [String: Any], timeout: Double) async throws -> [String: Any] {
         let owner = ObjectIdentifier(conn)
+        let command = body["cmd"] as? String ?? ""
+        let maintenance = ["version", "reload", "tabInfo", "clinqyDone", "closeTab", "closeAgentWindow", "releaseAgentWindow"]
+        if handshakes[owner] == nil, !maintenance.contains(command) {
+            throw BridgeError.failed("Waiting for this browser extension to identify its version and capabilities. Take a fresh look after it connects.")
+        }
+        if let hello = handshakes[owner], (hello.version != Self.extensionVersion || hello.build != Self.extensionBuild), !maintenance.contains(command) {
+            throw BridgeError.failed("Clinqy browser extension v\(hello.version) (build \(hello.build ?? "unknown")) needs build \(Self.extensionBuild). Reload the extension in this browser profile before continuing.")
+        }
         let closing = ["closeTab", "closeAgentWindow"].contains(body["cmd"] as? String ?? "")
         let issued = IssuedID()
         return try await withTaskCancellationHandler {
@@ -221,17 +271,21 @@ final class BrowserBridge: ObservableObject {
     /// The extension version this app was built with (extension/manifest.json). A browser still running an older
     /// copy is told to reload it from disk, once per version, so updates never need a manual reload.
     static let extensionVersion = "1.9.16"
+    static let extensionBuild = "2026-11-browser-reliability-2"
     /// Reloads asked for, per old version. Each browser on that version needs its own (asking once per version left a
     /// second browser running its old worker); the cap keeps a browser that stays old from being reloaded forever.
     private var reloadAsked: [String: Int] = [:]
 
-    private func checkVersion(_ version: String, on conn: NWConnection) {
-        guard version != Self.extensionVersion, reloadAsked[version, default: 0] < 3 else { return }
-        reloadAsked[version, default: 0] += 1
+    private func checkVersion(_ version: String, build: String?, on conn: NWConnection) {
         let key = ObjectIdentifier(conn)
+        let identity = handshakes[key]?.profileIdentity ?? "unidentified"
+        let revision = version + ":" + (build ?? "unknown") + ":" + identity
+        guard version != Self.extensionVersion || build != Self.extensionBuild else { return }
+        guard reloadAsked[revision, default: 0] < 3 else { return }
+        reloadAsked[revision, default: 0] += 1
         DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
             let browser = self?.owners[key].map { URL(fileURLWithPath: $0).deletingPathExtension().lastPathComponent } ?? "a browser"
-            Agent.writeLog("browser extension v\(version) connected in \(browser), app expects v\(Self.extensionVersion): reloading it")
+            Agent.writeLog("browser extension v\(version) connected in \(browser), app expects v\(Self.extensionVersion) build \(Self.extensionBuild): reloading it")
         }
         Self.refreshInstalledCopy()
         Task { _ = try? await request(conn, ["cmd": "reload"], timeout: 5) }
@@ -243,8 +297,10 @@ final class BrowserBridge: ObservableObject {
     private let started = Date()
 
     private func tidyAfterRestart(_ conn: NWConnection) {
-        guard Date().timeIntervalSince(started) < 60, AgentScreen.bounds == nil, !Background.active else { return }
+        guard Date().timeIntervalSince(started) < 60, AgentScreen.bounds == nil, !Background.active,
+              TaskStore.shared.activeBackground.isEmpty else { return }
         Task {
+            guard AgentScreen.bounds == nil, !Background.active, TaskStore.shared.activeBackground.isEmpty else { return }
             do {
                 let r = try await request(conn, ["cmd": "closeAgentWindow"], timeout: 3)
                 if let id = r["closed"] as? Int { Agent.writeLog("closed a background window an earlier Clinqy left open (window \(id))") }
@@ -265,7 +321,7 @@ final class BrowserBridge: ObservableObject {
         let fm = FileManager.default
         let installed = fm.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/Clinqy/extension")
         guard let bundled = Bundle.main.url(forResource: "extension", withExtension: nil), fm.fileExists(atPath: installed.path) else { return }
-        let unchanged = ["manifest.json", "bridge.js", "page.js"].allSatisfy {
+        let unchanged = ["manifest.json", "bridge.js", "page.js", "activity.js"].allSatisfy {
             fm.contentsEqual(atPath: installed.appendingPathComponent($0).path, andPath: bundled.appendingPathComponent($0).path)
         }
         guard !unchanged else { return }
@@ -279,6 +335,7 @@ final class BrowserBridge: ObservableObject {
 
     /// Asks every connected browser to reload the extension (after it's been updated on disk).
     func reloadAll() async -> Int {
+        Self.refreshInstalledCopy()
         var n = 0
         for (_, conn) in connections where (try? await request(conn, ["cmd": "reload"], timeout: 5)) != nil { n += 1 }
         return n
@@ -337,6 +394,19 @@ final class BrowserBridge: ObservableObject {
     }
     func useNativeCursor() { pageCursorVisible = false }
 
+    /// Status-only feedback; it does not act on or observe page controls.
+    func updateActivityStatus(_ phase: String) async {
+        guard activityRunning, ["observing", "planning", "waiting", "verifying", "paused", "error", "working"].contains(phase) else { return }
+        let generation = activityGeneration
+        for (key, tabs) in activityTabs {
+            guard let conn = connections[key], generation == activityGeneration, activityRunning else { continue }
+            for tab in tabs {
+                guard generation == activityGeneration, activityRunning else { return }
+                _ = try? await request(conn, ["cmd": "activityStatus", "tabId": tab, "phase": phase], timeout: 1)
+            }
+        }
+    }
+
     func endActivityRun() {
         activityRunning = false
         let ended = activityTabs, requests = activityRequests
@@ -372,13 +442,19 @@ final class BrowserBridge: ObservableObject {
         return result
     }
 
+    private var taskRunID = UUID().uuidString
     private var taskGeneration = 0
     private var taskConnection: ObjectIdentifier?
+    private var taskProfileIdentity: String?
+    private var taskBrowserOwner: String?
+    private var retiredTaskConnections: Set<ObjectIdentifier> = []
     private var taskTabs: Set<Int> = []
 
     func beginBackgroundRun() {
+        taskRunID = UUID().uuidString
         taskGeneration += 1
         taskConnection = nil
+        taskProfileIdentity = nil; taskBrowserOwner = nil; retiredTaskConnections = []
         taskTabs = []
     }
 
@@ -433,6 +509,8 @@ final class BrowserBridge: ObservableObject {
                 guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
                 key = selected.0; conn = selected.1
                 taskConnection = key
+                taskProfileIdentity = handshakes[key]?.profileIdentity
+                taskBrowserOwner = owners[key]
                 // Each job cleans up only its own tabs; global cleanup would detach parallel jobs.
             }
             guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
@@ -479,7 +557,52 @@ final class BrowserBridge: ObservableObject {
         return nil
     }
 
-    private func snapshotOnce(of tab: TabInfo) async throws -> Page {
+    /// Reconnection is read-only: match the installation AND browser process owner, confirm the task's
+    /// ownership token still exists, then take a fresh snapshot. Never replay the interrupted action.
+    private func reconnectForObservation(_ tab: TabInfo) async throws -> TabInfo {
+        guard Background.active, Background.usesExtension, taskTabs.contains(tab.id),
+              tab.connection == taskConnection || retiredTaskConnections.contains(tab.connection) else { return tab }
+        if let current = taskConnection, connections[current] != nil {
+            return TabInfo(id: tab.id, url: tab.url, connection: current)
+        }
+        guard let identity = taskProfileIdentity, let browser = taskBrowserOwner else { throw BridgeError.notConnected }
+        let generation = taskGeneration
+        for attempt in 0..<8 {
+            try Task.checkCancellation()
+            guard generation == taskGeneration else { throw CancellationError() }
+            if attempt > 0 { try await Task.sleep(for: .milliseconds(250)) }
+            let matches = connections.keys.filter { key in
+                handshakes[key]?.profileIdentity == identity && owners[key] == browser &&
+                    handshakes[key]?.version == Self.extensionVersion && handshakes[key]?.build == Self.extensionBuild
+            }
+            guard matches.count <= 1 else { throw BridgeError.failed("Multiple connections claim this browser profile; reconnect the intended profile before continuing.") }
+            guard let key = matches.first, let conn = connections[key] else { continue }
+            let result = try await request(conn, ["cmd": "tabs", "workOnly": true], timeout: 2)
+            guard (result["tabs"] as? [[String: Any]] ?? []).contains(where: { $0["id"] as? Int == tab.id }) else {
+                throw BridgeError.failed("The browser reconnected, but this task's tab ownership was not preserved. Start from a fresh observation; the interrupted action was not replayed.")
+            }
+            guard generation == taskGeneration else { throw CancellationError() }
+            if let old = taskConnection { retiredTaskConnections.insert(old) }
+            taskConnection = key
+            Agent.writeLog("Reconnected the same browser installation; observing the owned tab before further input.")
+            return TabInfo(id: tab.id, url: tab.url, connection: key)
+        }
+        throw BridgeError.notConnected
+    }
+
+    /// Proof for migrating verification provenance after read-only reconnection. Callers must
+    /// additionally require the same tab and document; this never authorizes replaying old input.
+    func reconnectedTaskConnection(from old: ObjectIdentifier, to page: Page) -> Bool {
+        guard Background.active, Background.usesExtension, retiredTaskConnections.contains(old),
+              let current = taskConnection, current == page.connection, connections[current] != nil,
+              let tab = page.tabId, taskTabs.contains(tab), ownsBackgroundPage(page),
+              let profile = taskProfileIdentity, let owner = taskBrowserOwner else { return false }
+        return handshakes[current]?.profileIdentity == profile && owners[current] == owner
+            && handshakes[current]?.version == Self.extensionVersion && handshakes[current]?.build == Self.extensionBuild
+    }
+
+    private func snapshotOnce(of originalTab: TabInfo) async throws -> Page {
+        let tab = try await reconnectForObservation(originalTab)
         if tab.connection == ChromeWorker.shared.identity {
             let raw = try await ChromeWorker.shared.command("snapshot", tabID: tab.id)
             var page = parse(raw, connection: tab.connection)
@@ -492,6 +615,7 @@ final class BrowserBridge: ObservableObject {
         let r = try await request(conn, ["cmd": "snapshot", "tabId": tab.id, "workOnly": Background.active && Background.usesExtension], timeout: 5)
         var page = parse(r, connection: tab.connection)
         page.pinned = true
+        if Background.active, Background.tab?.id == tab.id { Background.tab = tab }
         return page
     }
 
@@ -610,7 +734,8 @@ final class BrowserBridge: ObservableObject {
         let all = connections.map { ($0.key, $0.value) }
         guard let bundle = app?.bundleURL?.resolvingSymlinksInPath().path else { return all }
         let own = all.filter { owners[$0.0] == bundle }
-        return own.isEmpty ? all.filter { owners[$0.0] == nil } : own
+        // Unknown owners must never be treated as the requested browser (e.g. Chrome versus Arc).
+        return own
     }
 
     func snapshot(for app: NSRunningApplication? = nil) async -> Page? {
@@ -651,11 +776,21 @@ final class BrowserBridge: ObservableObject {
     /// scroll) is an answer, not a failure; a thrown error means delivery itself failed or is unknown.
     struct ScrollResult { let moved: Bool?; let before: Double?; let after: Double?; let container: String?; let events: [[String: Any]] }
 
-    func scroll(on page: Page, dy: Double) async throws -> ScrollResult {
-        let r = try await perform("scroll", on: page, ["dy": dy])
+    func scroll(on page: Page, dy: Double, index: Int? = nil, dx: Double = 0) async throws -> ScrollResult {
+        var args: [String: Any] = ["dy": dy, "dx": dx]
+        if let index { args["index"] = index }
+        let r = try await perform("scroll", on: page, args)
         func d(_ k: String) -> Double? { (r[k] as? NSNumber)?.doubleValue }
         return ScrollResult(moved: r["moved"] as? Bool, before: d("before"), after: d("y"), container: r["container"] as? String,
                             events: r["events"] as? [[String: Any]] ?? [])
+    }
+
+    /// Bounded condition wait against the observed document. A timeout is not successful completion.
+    func waitForCondition(on page: Page, condition: [String: Any], milliseconds: Int = 10000) async throws -> Bool {
+        let duration = min(30000, max(100, milliseconds))
+        let result = try await perform("waitCondition", on: page, ["condition": condition, "ms": duration], timeout: Double(duration) / 1000 + 1)
+        if result["cancelled"] as? Bool == true { throw CancellationError() }
+        return result["met"] as? Bool == true
     }
 
     // MARK: - Tabs
@@ -664,7 +799,15 @@ final class BrowserBridge: ObservableObject {
 
     /// The browser in front (its connection), as for snapshots: the one reporting a focused window, else the only one.
     private func frontConnection(for app: NSRunningApplication?) async -> (ObjectIdentifier, NWConnection)? {
-        let pool = candidates(for: app)
+        var pool = candidates(for: app)
+        // Process ownership lookup is asynchronous. Wait briefly instead of borrowing an unidentified browser.
+        if app != nil && pool.isEmpty {
+            for _ in 0..<3 where pool.isEmpty {
+                try? await Task.sleep(for: .milliseconds(100))
+                if Task.isCancelled { return nil }
+                pool = candidates(for: app)
+            }
+        }
         for (key, conn) in pool {
             if let r = try? await request(conn, ["cmd": "tabInfo"], timeout: 1.5), r["focused"] as? Bool == true { return (key, conn) }
         }
@@ -672,6 +815,25 @@ final class BrowserBridge: ObservableObject {
     }
 
     /// Tabs of the front browser window, in strip order. `opened` = Clinqy opened it (only those can be closed).
+    /// Read-only alternate evidence target for a popup. Both entries must be returned by the
+    /// extension's current run-filtered ownership list; browser opener IDs alone are insufficient.
+    func ownedOpener(of child: Page) async -> Page? {
+        guard Background.active, Background.usesExtension, ownsBackgroundPage(child),
+              let childID = child.tabId, let key = taskConnection, key == child.connection,
+              let conn = connections[key] else { return nil }
+        let generation = taskGeneration
+        guard let reply = try? await request(conn, ["cmd": "tabs", "workOnly": true], timeout: 3),
+              generation == taskGeneration, !Task.isCancelled,
+              let entries = reply["tabs"] as? [[String: Any]],
+              let entry = entries.first(where: { $0["id"] as? Int == childID }),
+              entry["inherited"] as? Bool == true, let opener = entry["openerTabId"] as? Int,
+              opener != childID, taskTabs.contains(opener), entries.contains(where: { $0["id"] as? Int == opener }),
+              let page = await snapshot(of: TabInfo(id: opener, url: "", connection: key)),
+              generation == taskGeneration, page.connection == key, page.documentID != nil,
+              ownsBackgroundPage(page), !Task.isCancelled else { return nil }
+        return page
+    }
+
     func tabs(in app: NSRunningApplication? = nil) async throws -> [BrowserTab] {
         if Background.active && Background.usesExtension {
             let generation = taskGeneration
@@ -682,11 +844,16 @@ final class BrowserBridge: ObservableObject {
                 guard let browser, let selected = await frontConnection(for: browser),
                       generation == taskGeneration, !Task.isCancelled else { return [] }
                 taskConnection = selected.0
+                taskProfileIdentity = handshakes[selected.0]?.profileIdentity
+                taskBrowserOwner = owners[selected.0]
             }
             guard let key = taskConnection, let conn = connections[key] else { return [] }
             let raw = try await request(conn, ["cmd": "tabs", "workOnly": !allowsExistingTabDiscovery], timeout: 3)
             return (raw["tabs"] as? [[String: Any]] ?? []).compactMap { t in
-                guard let id = t["id"] as? Int, allowsExistingTabDiscovery || taskTabs.contains(id) else { return nil }
+                guard let id = t["id"] as? Int else { return nil }
+                if !allowsExistingTabDiscovery, t["inherited"] as? Bool == true,
+                   let opener = t["openerTabId"] as? Int, taskTabs.contains(opener) { taskTabs.insert(id) }
+                guard allowsExistingTabDiscovery || taskTabs.contains(id) else { return nil }
                 return BrowserTab(id: id, title: t["title"] as? String ?? "", url: t["url"] as? String ?? "", active: id == Background.tab?.id, opened: taskTabs.contains(id))
             }
         }
@@ -824,6 +991,7 @@ final class BrowserBridge: ObservableObject {
             if let q = e["q"] as? String { extra.append("in “\(q)”") }
             if let frame = e["frame"] as? String { extra.append("inside \(frame)") }
             if e["dropdown"] as? Bool == true { extra.append("dropdown") }
+            if let range = e["range"] as? String { extra.append("range " + range) }
             if let v = e["value"] as? String { extra.append("value=\(v.debugDescription)") }
             if let p = e["placeholder"] as? String, (e["text"] as? String) != p { extra.append("placeholder=\(p.debugDescription)") }
             if let o = e["options"] as? String { extra.append("options: \(o)") }

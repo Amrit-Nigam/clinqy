@@ -4,6 +4,8 @@ const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
 const SCRIPT_VERSION = "1.9.16";
+const SCRIPT_BUILD = "2026-11-browser-reliability-2";
+const CAPABILITIES = ["document-tokens", "task-ownership", "condition-waits", "activity-phases", "cooperative-cancellation", "upload-readback", "html-range-state"];
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
@@ -14,9 +16,31 @@ let connectionEpoch = 0;
 // Requests the app gave up on (timeout/cancel) before they started running. Bounded; entries are tiny.
 const cancelledIDs = new Set();
 const runningIDs = new Set();
+const runningRequests = new Map();
+const tabRequestsInFlight = new Map();
+function assertRequestLive(tabId) {
+  const request = tabRequestsInFlight.get(tabId);
+  if (request && (request.cancelled || request.epoch !== connectionEpoch || Date.now() > request.deadline))
+    throw new Error("operation interrupted; observe the result before retrying any input");
+}
+async function connectionHello() {
+  const stored = await chrome.storage.local.get("clinqyProfileIdentity");
+  const profileIdentity = stored.clinqyProfileIdentity || crypto.randomUUID();
+  if (!stored.clinqyProfileIdentity) await chrome.storage.local.set({clinqyProfileIdentity:profileIdentity});
+  // This identifies an extension installation, not a Chrome profile directory or account.
+  return {type:"hello",agent:navigator.userAgent,version:SCRIPT_VERSION,manifest:chrome.runtime.getManifest().version,
+    profileIdentity, build:SCRIPT_BUILD, capabilities:CAPABILITIES, protocolVersion:7};
+}
 const NOT_DISPATCHED = "cancelled before dispatch";
 function markCancelled(id) {
-  if (typeof id !== "string" || runningIDs.has(id)) return false;   // already running: its outcome is reported, never undone
+  if (typeof id !== "string") return false;
+  const running = runningRequests.get(id);
+  if (running) {
+    running.cancelled = true;
+    if (Number.isInteger(running.tabId)) void chrome.scripting.executeScript({target:{tabId:running.tabId,allFrames:true},
+      func:() => window.__clinqy?.cancelWaits?.()}).catch(() => {});
+    return true; // Delivered input is never undone; remaining input and waits are cancelled.
+  }
   cancelledIDs.add(id);
   if (cancelledIDs.size > 500) cancelledIDs.delete(cancelledIDs.values().next().value);
   return true;
@@ -34,8 +58,17 @@ function serializedHandle(msg, origin = {}) {
     if (msg.id != null && cancelledIDs.delete(msg.id)) throw new Error(NOT_DISPATCHED + ": the app stopped waiting for it");
     if (origin.epoch != null && origin.epoch !== connectionEpoch) throw new Error(NOT_DISPATCHED + ": its connection was replaced");
     if (ttl != null && Date.now() - receivedAt > ttl) throw new Error(NOT_DISPATCHED + ": it expired while queued");
-    if (msg.id != null) runningIDs.add(msg.id);
-    return handle(msg).finally(() => { if (msg.id != null) runningIDs.delete(msg.id); });
+    let finishRequest;
+    const finished = new Promise(resolve => {finishRequest=resolve;});
+    const request = {finished,cancelled:false, epoch:origin.epoch ?? connectionEpoch, deadline:ttl == null ? Infinity : receivedAt+ttl,
+      command:msg.cmd, tabId:msg.tabId == null ? null : Number(msg.tabId)};
+    if (msg.id != null) { runningIDs.add(msg.id); runningRequests.set(msg.id,request); }
+    if (Number.isInteger(request.tabId)) tabRequestsInFlight.set(request.tabId,request);
+    return handle(msg).finally(() => {
+      if (msg.id != null) { runningIDs.delete(msg.id); runningRequests.delete(msg.id); }
+      if (tabRequestsInFlight.get(request.tabId) === request) tabRequestsInFlight.delete(request.tabId);
+      finishRequest();
+    });
   });
   const tail = next.catch(() => {});
   commandQueues.set(key, tail);
@@ -51,9 +84,9 @@ function connect() {
   const epoch = ++connectionEpoch;
   // Replies go out on the socket the request arrived on, and only while it is still the current connection.
   const reply = (obj) => { if (ws === socket && epoch === connectionEpoch && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
-  ws.onopen = () => {
+  ws.onopen = async () => {
     retry = 1000;
-    reply({ type: "hello", agent: navigator.userAgent, version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version });
+    try { reply(await connectionHello()); } catch { reply({type:"hello",version:SCRIPT_VERSION,build:SCRIPT_BUILD,capabilities:CAPABILITIES}); }
   };
   ws.onmessage = async (event) => {
     let msg;
@@ -68,7 +101,7 @@ function connect() {
   };
   // Back quickly when the app restarts or Chrome wakes the worker (1 s, doubling to 10 s).
   ws.onclose = () => {
-    if (ws === socket) { socket = null; queueActivity(() => clinqyDone()); setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); }
+    if (ws === socket) { for (const id of runningRequests.keys()) markCancelled(id); socket = null; queueActivity(() => clinqyDone()); setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); }
   };
   ws.onerror = () => {};
 }
@@ -130,7 +163,9 @@ const pickerUpload = async (name, type, b64) => {
   caught.files = dt.files;
   caught.dispatchEvent(new Event("input", { bubbles: true }));
   caught.dispatchEvent(new Event("change", { bubbles: true }));
-  return { ok: caught.files.length > 0, files: [...caught.files].map((f) => f.name) };
+  const files=[...(caught.files || [])];
+  return {ok:files.some(f=>f.name===name && f.size===bytes.length),files:files.map(f=>f.name),
+    attached:files.map(f=>({name:f.name,size:f.size,type:f.type})),verified:"file-input-readback",serverAccepted:false};
 };
 
 async function inject(target) {
@@ -138,10 +173,12 @@ async function inject(target) {
 }
 
 async function call(tabId, frameId, name, args = []) {
+  assertRequestLive(tabId);
   const target = { tabId, frameIds: [frameId] };
   await inject(target);
   let res;
   const token = (await mapFor(tabId)).frameTokens?.[frameId] || null;
+  assertRequestLive(tabId);
   try { [res] = await chrome.scripting.executeScript({ target, func: runner, args: [name, args, token] }); }
   catch (e) { throw new Error("the page can't be scripted: " + String(e && e.message || e)); }
   const out = res && res.result;
@@ -152,11 +189,13 @@ async function call(tabId, frameId, name, args = []) {
 
 // Every frame's answer that worked: [{frameId, result}].
 async function callAll(tabId, name, args = []) {
+  assertRequestLive(tabId);
   const target = { tabId, allFrames: true };
   await inject(target);
   let res = [];
   const frameTokens = (await mapFor(tabId)).frameTokens || {};
   const tokens = Object.fromEntries(Object.values(frameTokens).map((t) => [t.documentID, t]));
+  assertRequestLive(tabId);
   try { res = await chrome.scripting.executeScript({ target, func: runner, args: [name, args, tokens] }); } catch {}
   return res.filter((r) => r && r.result && !r.result.__error).map((r) => ({ frameId: r.frameId, result: r.result.__ok }));
 }
@@ -472,7 +511,19 @@ async function clinqyGroup(tabId, windowId) {
   if (!group) await chrome.tabGroups.update(id, { title: "Clinqy", color: "blue", collapsed: false });
 }
 
-async function clinqyTab(url, width, height) {
+// All task ownership storage changes share a lane, including asynchronously opened popups.
+let ownershipQueue = Promise.resolve();
+function withOwnership(update) {
+  const next = ownershipQueue.then(update);
+  ownershipQueue = next.catch(() => {});
+  return next;
+}
+const endingTaskTabs = new Set();
+async function clinqyTab(url, width, height, runID) {
+  return withOwnership(() => createClinqyTab(url, width, height, runID));
+}
+async function createClinqyTab(url, width, height, runID) {
+  if (runID != null && (typeof runID !== "string" || !runID.length || runID.length > 128)) throw Error("invalid task ownership token");
   const [front] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   const t = await chrome.tabs.create({ ...(front ? { windowId: front.windowId } : {}), url, active: false });
   const mine = await openedTabs();
@@ -494,6 +545,7 @@ async function clinqyTab(url, width, height) {
     await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => id !== t.id) });
     throw error;
   }
+  if (runID) await chrome.storage.session.set({["owner"+t.id]:runID});
   await showActivity(t.id);
   return { id: t.id };
 }
@@ -512,6 +564,35 @@ async function prepareWorkTab(tabId) {
 
 // The task ended: Chrome's debugging bar goes, and the tab behaves normally if the user looks at it.
 async function clinqyDone(tabIds, closeInactive = false) {
+  // Stop new descendants inheriting ownership before draining already queued adoptions.
+  const roots = tabIds || await activityTabs();
+  for (const id of roots) endingTaskTabs.add(id);
+  await Promise.all([...popupAdoptions]);
+  return withOwnership(() => finishClinqyTabs(tabIds, closeInactive));
+}
+async function finishClinqyTabs(tabIds, closeInactive = false) {
+  if(Array.isArray(tabIds)) {
+    const ids=new Set(tabIds), owned=await workTabs();
+    const records=await chrome.storage.session.get(owned.flatMap(id=>["popup"+id,"owner"+id]));
+    // Include only descendants whose recorded owner still matches their parent's task.
+    for(let depth=0;depth<8;depth++) {
+      let added=false;
+      for(const id of owned) {
+        const popup=records["popup"+id];
+        if(!ids.has(id) && popup && ids.has(popup.opener) && popup.runID===records["owner"+popup.opener] && popup.runID===records["owner"+id]) {ids.add(id);added=true;}
+      }
+      if(!added)break;
+    }
+    tabIds=[...ids];
+  }
+  const affected=tabIds || await activityTabs();
+  for (const id of affected) endingTaskTabs.add(id);
+  const finishing=[];
+  for(const [id,request] of runningRequests) if(affected.includes(request.tabId)) {
+    markCancelled(id); finishing.push(request.finished);
+  }
+  // Let key/button release cleanup run before detaching. A wedged renderer cannot hold cleanup indefinitely.
+  if(finishing.length)await Promise.race([Promise.all(finishing),new Promise(resolve=>setTimeout(resolve,1500))]);
   await finishActivity(tabIds);
   const owned = await workTabs();
   for (const tabId of tabIds ? owned.filter(id => tabIds.includes(id)) : owned) {
@@ -537,6 +618,7 @@ async function clinqyDone(tabIds, closeInactive = false) {
     await setOpened(current);
     await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => !closed.includes(id)) });
   }
+  for (const id of affected) endingTaskTabs.delete(id);
   return { done: true, closed, kept };
 }
 
@@ -614,6 +696,9 @@ function onDebuggerEvent(source, method, params = {}) {
     const known = downloads.get(params.guid) || { tabId, state: "started" };
     known.state = params.state; known.received = params.receivedBytes; known.total = params.totalBytes;
     downloads.set(params.guid, known);
+    if (downloads.size > 200) {
+      for (const [guid, download] of downloads) if (["completed","canceled"].includes(download.state) && guid !== params.guid) {downloads.delete(guid);break;}
+    }
     if (params.state !== "inProgress") {
       recordEvent(known.tabId ?? tabId, { kind: "download", phase: params.state === "completed" ? "completed" : params.state, guid: params.guid,
                                           url: known.url, filename: known.filename, bytes: params.totalBytes ?? params.receivedBytes });
@@ -626,6 +711,7 @@ if (chrome.debugger) {
 }
 
 async function cdp(tabId, method, params = {}) {
+  assertRequestLive(tabId);
   if (!attached.has(tabId)) {
     const mine = await openedTabs();
     if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
@@ -635,6 +721,7 @@ async function cdp(tabId, method, params = {}) {
     attached.add(tabId);
     if ((await workTabs()).includes(tabId)) await prepareWorkTab(tabId);
   }
+  assertRequestLive(tabId);
   return await chrome.debugger.sendCommand({ tabId }, method, params);
 }
 
@@ -666,17 +753,26 @@ async function cdpKey(tabId, combo) {
   const commands = modifiers === 4 && COMMANDS[name] ? [COMMANDS[name]]
     : modifiers === 12 && name === "z" ? ["redo"] : undefined;
   const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers };
-  await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: text ? "keyDown" : "rawKeyDown", text, unmodifiedText: text, commands });
-  await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+  try {
+    await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: text ? "keyDown" : "rawKeyDown", text, unmodifiedText: text, commands });
+  } finally {
+    // Releasing an already dispatched key is cleanup, even after cancellation.
+    await chrome.debugger.sendCommand({tabId}, "Input.dispatchKeyEvent", {...base,type:"keyUp"});
+  }
   return { pressed: combo };
 }
 
 async function cdpClick(tabId, x, y, count = 1) {
   const at = { x: Number(x), y: Number(y) };
+  if (!Number.isFinite(at.x) || !Number.isFinite(at.y) || at.x < 0 || at.y < 0 || !Number.isInteger(count) || count < 1 || count > 2)
+    throw Error("invalid click coordinates or count");
   await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...at });
   for (let i = 1; i <= count; i++) {
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: i });
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: i });
+    try {
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: i });
+    } finally {
+      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...at,button:"left",buttons:0,clickCount:i});
+    }
   }
   return { clicked: at };
 }
@@ -710,6 +806,7 @@ async function cdpGesture(tabId, msg) {
         if (destination) for (let step = 1; step <= 12; step++) {
           last = { x: start.x + (destination.x - start.x) * step / 12, y: start.y + (destination.y - start.y) * step / 12 };
           await post({ type: "mouseMoved", ...last, button, buttons });
+          if (msg._activity && step % 4 === 0) await renderActivity(tabId,{kind:"drag",...last});
           await new Promise(resolve => setTimeout(resolve, 20));
         }
         await post({ type: "mouseReleased", ...last, button, buttons: 0, clickCount: count });
@@ -717,7 +814,11 @@ async function cdpGesture(tabId, msg) {
       }
     }
   } finally {
-    if (held) await post({ type: "mouseReleased", ...last, button, buttons: 0, clickCount: 1 }).catch(() => {});
+    if (held) await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", { type: "mouseReleased", ...last, button, buttons: 0, clickCount: 1 }).catch(() => {});
+  }
+  if (destination && msg._activityState) {
+    Object.assign(msg._activityState,destination);
+    delete msg._activityState.localIndex;
   }
   return { delivered: true, verified: false };
 }
@@ -734,16 +835,41 @@ if (chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, change) => 
   });
 });
 
+const popupAdoptions = new Set();
+chrome.tabs.onCreated?.addListener(tab => {
+  if(tab.openerTabId == null)return;
+  const opener=tab.openerTabId, request=tabRequestsInFlight.get(opener);
+  recordEvent(opener,{kind:"popup",tabId:tab.id,url:tab.pendingUrl || tab.url || "",state:"opened; observation required"});
+  // Only a popup produced while dispatching input to an owned task tab can inherit that task.
+  if(!request || request.cancelled || !["click","clickOption","cdpClick","cdpKey","cdpGesture"].includes(request.command))return;
+  const adoption=withOwnership(async()=>{
+    const owner=(await chrome.storage.session.get("owner"+opener))["owner"+opener];
+    if(!owner || endingTaskTabs.has(opener) || !(await activityTabs()).includes(opener) || request.cancelled)return;
+    const current=await chrome.tabs.get(tab.id);
+    if(current.openerTabId!==opener)return;
+    await chrome.storage.session.set({["owner"+tab.id]:owner,["popup"+tab.id]:{opener,runID:owner}});
+    const mine=await openedTabs(); mine.add(tab.id); await setOpened(mine);
+    await chrome.storage.session.set({workTabs:[...new Set([...await workTabs(),tab.id])]});
+    // No tabs.update(active:true) or windows.update(focused:true): selection is logical and explicit.
+    recordEvent(opener,{kind:"popup",tabId:tab.id,openerTabId:opener,state:"task-owned; select explicitly",owned:true});
+  }).catch(error=>recordEvent(opener,{kind:"popup",tabId:tab.id,state:"not adopted",error:String(error?.message || error)}));
+  popupAdoptions.add(adoption); void adoption.finally(()=>popupAdoptions.delete(adoption));
+});
 chrome.tabs.onRemoved.addListener((tabId) => queueActivity(async () => {
   await finishActivity([tabId]);
+  endingTaskTabs.delete(tabId);
   attached.delete(tabId);
   maps.delete(tabId);
   focusFrames.delete(tabId);
   tabEvents.delete(tabId);
   dialogPolicy.delete(tabId);
-  try { await chrome.storage.session.remove("map" + tabId); } catch {}
-  const mine = await openedTabs();
-  if (mine.delete(tabId)) await setOpened(mine);
+  for (const [guid,download] of downloads) if (download.tabId === tabId) downloads.delete(guid);
+  await withOwnership(async () => {
+    try { await chrome.storage.session.remove(["map" + tabId,"owner"+tabId,"popup"+tabId]); } catch {}
+    const mine = await openedTabs();
+    if (mine.delete(tabId)) await setOpened(mine);
+    await chrome.storage.session.set({workTabs:(await workTabs()).filter(id => id !== tabId)});
+  });
 }));
 
 async function tabCommand(msg) {
@@ -776,12 +902,33 @@ async function tabCommand(msg) {
 
 // Tokens and page-initiated events travel with every tab-scoped result, so a caller never has to guess which
 // observation an outcome belongs to or whether a dialog/download happened while it ran.
+function activityKind(msg) {
+  if (/^(cdpClick|click|clickOption)$/.test(msg.cmd)) return "click";
+  if (/^(cdpType|fill|fillActive|cdpKey|setRange)$/.test(msg.cmd)) return "type";
+  if (/^(scroll|cdpScroll)$/.test(msg.cmd)) return "scroll";
+  if (/^(upload|uploadVia)$/.test(msg.cmd)) return "upload";
+  if (/^(navigate|goBack)$/.test(msg.cmd)) return "navigating";
+  if (/^(waitText|waitCondition)$/.test(msg.cmd)) return "waiting";
+  if (msg.cmd === "cdpGesture") return msg.gesture === "drag" ? "drag" : msg.gesture === "hover" ? "hover" : "click";
+  return "observing";
+}
 async function handle(msg) {
-  const out = await handleCommand(msg);
+  msg._startedAt=Date.now();
+  let out;
+  try {
+    out = await handleCommand(msg);
+    if (msg._activity && msg.tabId != null && msg._activityState && !["observing","waiting"].includes(msg._activityState.kind))
+      await showActivity(Number(msg.tabId), {...msg._activityState,stage:out?.ok===false || out?.skipped || out?.cancelled ? "failed" : "delivered",
+        ...(out?.ok===false || out?.skipped || out?.cancelled ? {kind:"error"} : {})});
+  } catch(error) {
+    if (msg._activity && msg.tabId != null) await showActivity(Number(msg.tabId),{kind:"error"});
+    throw error;
+  }
   const id = msg.tabId != null && msg.tabId !== "" ? Number(msg.tabId) : null;
   if (id == null || !Number.isInteger(id) || !out || typeof out !== "object" || Array.isArray(out)) return out;
   const events = drainEvents(id);
   if (events.length && out.events === undefined) out.events = events;
+  out.elapsedMs = Math.max(0, Date.now() - (msg._startedAt || Date.now()));
   if (!["snapshot", "tabs", "tabInfo", "newTab", "clinqyTab", "switchTab", "closeTab", "clinqyDone"].includes(msg.cmd) && out.observation === undefined) {
     const map = maps.get(id);
     if (map && map.documentID) out.observation = { documentID: map.documentID, snapshotID: map.snapshotID };
@@ -791,16 +938,28 @@ async function handle(msg) {
 
 async function handleCommand(msg) {
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
-  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
+  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version, build:SCRIPT_BUILD, capabilities:CAPABILITIES, protocolVersion:7 };
   // Task commands are explicitly scoped: they cannot fall through to the user's active tab.
   if (msg.workOnly) {
-    const owned = await workTabs();
+    let owned = await workTabs();
+    if (msg.runID) {
+      const owners = await chrome.storage.session.get(owned.map(id => "owner"+id));
+      owned = owned.filter(id => owners["owner"+id] === msg.runID);
+    }
     if (msg.cmd === "tabs") {
+      // A popup's tab event can trail its opener action; wait only for already-known ownership checks.
+      await Promise.all([...popupAdoptions]);
+      if (msg.runID) {
+        const all=await workTabs(), ownership=await chrome.storage.session.get(all.map(id=>"owner"+id));
+        owned=all.filter(id=>ownership["owner"+id]===msg.runID);
+      }
       const tabs = [];
       for (const id of owned) {
         try {
           const t = await chrome.tabs.get(id);
-          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true });
+          const popup=(await chrome.storage.session.get("popup"+id))["popup"+id];
+          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true,
+            inherited:!!popup && popup.runID===msg.runID, openerTabId:popup?.opener });
         } catch {}
       }
       return { tabs };
@@ -812,7 +971,7 @@ async function handleCommand(msg) {
   }
   if (/^(tabs|switchTab|closeTab)$/.test(msg.cmd)) return await tabCommand(msg);
   if (msg.cmd === "backgroundTab") return await backgroundTab(msg.url, msg.at);
-  if (msg.cmd === "clinqyTab") return await clinqyTab(msg.url, Number(msg.width) || 1280, Number(msg.height) || 900);
+  if (msg.cmd === "clinqyTab") return await clinqyTab(msg.url, Number(msg.width) || 1280, Number(msg.height) || 900, msg.runID);
   if (msg.cmd === "clinqyDone") {
     let ids = msg.tabIds;
     if (msg.operationIDs?.length) {
@@ -832,21 +991,32 @@ async function handleCommand(msg) {
   if (msg.cmd === "newTab") return await foregroundTab(msg);
   // Every action is pinned to its explicit observed tab when available.
   const tab = msg.tabId != null ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
-  if (msg.activity || (await activityTabs()).includes(tab.id)) {
-    const kind = /^(cdpClick|click|clickOption)$/.test(msg.cmd) ? "click"
-      : /^(cdpType|fill|fillActive)$/.test(msg.cmd) ? "type"
-      : /^(scroll|cdpScroll)$/.test(msg.cmd) ? "scroll" : "working";
-    const state = { kind };
-    if (msg.x != null && msg.y != null) { state.x = Number(msg.x); state.y = Number(msg.y); }
-    else if (Number.isInteger(msg.index) && ["locate", "focus", "focusFor", "click", "fill", "prepare", "upload"].includes(msg.cmd)) {
+  const request = runningRequests.get(msg.id);
+  if(request && request.tabId == null) {
+    if(tabRequestsInFlight.has(tab.id)) throw Error("this tab is busy with another request; observe again after it finishes");
+    request.tabId=tab.id; tabRequestsInFlight.set(tab.id,request);
+  }
+  assertRequestLive(tab.id);
+  if (msg.cmd === "activityStatus") {
+    if (!(await activityTabs()).includes(tab.id)) return {updated:false};
+    await showActivity(tab.id,{kind:msg.phase}); return {updated:true};
+  }
+  msg._activity = msg.activity || (await activityTabs()).includes(tab.id);
+  if (msg._activity) {
+    const kind = activityKind(msg);
+    const state = {kind,stage:"prepare"};
+    if (Number.isFinite(msg.x) && Number.isFinite(msg.y)) {state.x=msg.x;state.y=msg.y;}
+    else if (Number.isInteger(msg.index)) {
       try {
-        const { frameId, local } = await route(tab.id, msg.index);
-        const point = await call(tab.id, frameId, "activityPoint", [local]);
-        const offset = (await mapFor(tab.id)).offsets?.[frameId];
-        if (point && offset) { const p = toTop(offset, point.x, point.y); state.x = p.x; state.y = p.y; }
-      } catch {}
+        const {frameId,local} = await route(tab.id,msg.index);
+        const point = await call(tab.id,frameId,"activityPoint",[local]);
+        const map = await mapFor(tab.id), offset = map.offsets?.[frameId];
+        if (point && offset) Object.assign(state,toTop(offset,point.x,point.y));
+        if (frameId===0) {state.localIndex=local;state.documentID=map.documentID;}
+      } catch {} // Feedback never substitutes for the action's actual target validation below.
     }
-    await showActivity(tab.id, state);
+    msg._activityState=state;
+    await showActivity(tab.id,state);
   }
   if (msg.cmd === "selection") {
     const win = await chrome.windows.get(tab.windowId);
@@ -909,6 +1079,7 @@ async function handleCommand(msg) {
     if (msg.documentID !== map.documentID || msg.snapshotID !== map.snapshotID || !map.documentID || !map.snapshotID)
       throw new Error("stale browser observation; update the extension and take a new look");
     await call(tab.id, 0, "check");
+    if (msg.cmd === "cdpClick" && !Number.isInteger(msg.index)) await call(tab.id,0,"coordinateGuard",[Number(msg.x),Number(msg.y)]);
     if (["cdpKey", "cdpType", "cdpScroll"].includes(msg.cmd)) {
       // A child can reload without changing its parent's URL or document token.
       for (const frame of Object.keys(map.frameTokens || {}).map(Number)) await call(tab.id, frame, "check");
@@ -1019,6 +1190,7 @@ async function handleCommand(msg) {
       return (res && res.result) || { ok: false, why: "the page didn't answer" };
     }
     case "fill": return await indexed("fill", [msg.text]);
+    case "setRange": return await indexed("setRange", [msg.state]);
     case "waitText": return await call(tab.id, 0, "waitText", [msg.text, !!msg.gone, Number(msg.ms) || 10000]);
     case "upload": {
       if (msg.index >= 0) return await indexed("upload", [msg.name, msg.type, msg.data]);
@@ -1089,7 +1261,20 @@ async function handleCommand(msg) {
       return info;
     }
     case "fillActive": return await call(tab.id, focusFrames.get(tab.id) || 0, "fillActive", [msg.text]);
-    case "scroll": return await call(tab.id, 0, "scroll", [msg.dy]);
+    case "scroll": {
+      if (Number.isInteger(msg.index)) {
+        const {frameId,local}=await route(tab.id,msg.index);
+        return await call(tab.id,frameId,"scroll",[msg.dy,local,msg.dx || 0]);
+      }
+      return await call(tab.id,0,"scroll",[msg.dy,null,msg.dx || 0]);
+    }
+    case "waitCondition": {
+      const condition={...msg.condition}; let frameId=0;
+      if(condition.kind === "element") {
+        const target=await route(tab.id,condition.index); frameId=target.frameId; condition.index=target.local;
+      }
+      return await call(tab.id,frameId,"waitCondition",[condition,Math.min(30000,Number(msg.ms)||10000)]);
+    }
     default: throw new Error("unknown command " + msg.cmd);
   }
 }
@@ -1101,6 +1286,6 @@ chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 setInterval(() => {
   connect(); send({ type: "ping" });
-  if (socket?.readyState === WebSocket.OPEN) queueActivity(async () => { for (const id of await activityTabs()) await renderActivity(id, { kind: "working" }); });
+  if (socket?.readyState === WebSocket.OPEN) queueActivity(async () => { for (const id of await activityTabs()) await renderActivity(id, { heartbeat: true }); });
 }, 20000);
 connect();
