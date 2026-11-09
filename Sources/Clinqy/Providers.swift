@@ -35,7 +35,8 @@ enum Provider: String, CaseIterable, Sendable {
         switch self {
         case .claudeCLI: return AgySession.claudePath != nil && Self.isClaudeLoggedIn
         case .agyCLI: return cliPath != nil
-        case .codexCLI: return cliPath != nil && Self.codexLoginCache.isLoggedIn(path: cliPath)
+        // Until the first login probe finishes, an installed CLI counts as usable, so selection doesn't skip it.
+        case .codexCLI: return cliPath != nil && (Self.codexLoginCache.isLoggedIn(path: cliPath) ?? true)
         case .opencodeCLI:
             return cliPath != nil && (Config.value("OPENCODE_API_KEY")?.isEmpty == false || Self.openCodeAuthExists)
         case .cursorCLI: return cliPath != nil && Self.cursorAuthExists
@@ -120,16 +121,18 @@ enum Provider: String, CaseIterable, Sendable {
         private let queue = DispatchQueue(label: "clinqy.login-probe", qos: .utility)
         private let probe: (String) -> Bool
         private var lastPath: String?
-        private var value = false
+        /// nil until the first probe for the current path finishes.
+        private var value: Bool?
         private var checked = Date.distantPast
         private var refreshing = false
 
         init(probe: @escaping (String) -> Bool) { self.probe = probe }
 
-        func isLoggedIn(path: String?) -> Bool {
+        /// nil while the first probe for this path is still running: the caller decides what "unknown" means.
+        func isLoggedIn(path: String?) -> Bool? {
             guard let path else { return false }
             return lock.withLock {
-                if path != lastPath { lastPath = path; value = false; checked = .distantPast }
+                if path != lastPath { lastPath = path; value = nil; checked = .distantPast }
                 if !refreshing && Date().timeIntervalSince(checked) > 30 {
                     refreshing = true
                     queue.async { [self] in
@@ -296,7 +299,7 @@ enum Provider: String, CaseIterable, Sendable {
     }
     private static var cursorAuthExists: Bool {
         if ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].contains(where: { Config.value($0)?.isEmpty == false }) { return true }
-        return cursorLoginCache.isLoggedIn(path: Provider.cursorCLI.cliPath)
+        return cursorLoginCache.isLoggedIn(path: Provider.cursorCLI.cliPath) ?? true
     }
 
     /// The CLI's executable, for the CLI providers (AGY_PATH / CLAUDE_PATH / CODEX_PATH, else the usual install spots).

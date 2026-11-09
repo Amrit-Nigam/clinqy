@@ -400,7 +400,8 @@ enum CursorAuthStatus { SignedIn, SignedOut, Unknown }
 struct Probed<T> {
     key: String,
     checked: Option<std::time::Instant>,
-    value: T,
+    /// None until the first probe for `key` finishes.
+    value: Option<T>,
     refreshing: bool,
 }
 
@@ -408,14 +409,13 @@ struct Probed<T> {
 fn probe_cached<T: Copy + Send + 'static>(
     cell: &'static std::sync::Mutex<Probed<T>>,
     key: String,
-    fallback: T,
     probe: impl FnOnce() -> T + Send + 'static,
-) -> T {
+) -> Option<T> {
     let mut state = cell.lock().unwrap();
     if state.key != key {
         state.key = key.clone();
         state.checked = None;
-        state.value = fallback;
+        state.value = None;
     }
     let stale = state.checked.map_or(true, |at| at.elapsed() > std::time::Duration::from_secs(60));
     if stale && !state.refreshing {
@@ -425,7 +425,7 @@ fn probe_cached<T: Copy + Send + 'static>(
             let mut state = cell.lock().unwrap();
             // Drop the result if the CLI path changed while the probe ran.
             if state.key == key {
-                state.value = value;
+                state.value = Some(value);
                 state.checked = Some(std::time::Instant::now());
             }
             state.refreshing = false;
@@ -435,15 +435,17 @@ fn probe_cached<T: Copy + Send + 'static>(
 }
 
 static CODEX_LOGIN: std::sync::Mutex<Probed<bool>> =
-    std::sync::Mutex::new(Probed { key: String::new(), checked: None, value: false, refreshing: false });
+    std::sync::Mutex::new(Probed { key: String::new(), checked: None, value: None, refreshing: false });
 
 /// Check Codex's supported non-interactive login status command without retaining or logging its output.
 fn codex_logged_in(provider: Provider) -> bool {
     let key = provider.cli().map(|cli| cli.program.display().to_string()).unwrap_or_default();
-    probe_cached(&CODEX_LOGIN, key, false, move || {
+    // Until the first probe finishes, an installed Codex counts as usable, so selection doesn't skip it.
+    probe_cached(&CODEX_LOGIN, key, move || {
         run_cli_status(provider, &["login", "status"])
             .is_some_and(|output| codex_chatgpt_login_status(output.status.success(), &output.stdout, &output.stderr))
     })
+    .unwrap_or(true)
 }
 
 fn codex_chatgpt_login_status(success: bool, stdout: &[u8], stderr: &[u8]) -> bool {
@@ -456,7 +458,7 @@ fn codex_chatgpt_login_status(success: bool, stdout: &[u8], stderr: &[u8]) -> bo
 static CURSOR_LOGIN: std::sync::Mutex<Probed<CursorAuthStatus>> = std::sync::Mutex::new(Probed {
     key: String::new(),
     checked: None,
-    value: CursorAuthStatus::Unknown,
+    value: None,
     refreshing: false,
 });
 
@@ -465,11 +467,12 @@ fn cursor_auth_status(provider: Provider) -> CursorAuthStatus {
         return CursorAuthStatus::SignedIn;
     }
     let key = provider.cli().map(|cli| cli.program.display().to_string()).unwrap_or_default();
-    probe_cached(&CURSOR_LOGIN, key, CursorAuthStatus::Unknown, move || {
+    probe_cached(&CURSOR_LOGIN, key, move || {
         run_cli_status(provider, &["status"])
             .map(|output| cursor_status_from_output(output.status.success(), &output.stdout, &output.stderr))
             .unwrap_or(CursorAuthStatus::Unknown)
     })
+    .unwrap_or(CursorAuthStatus::Unknown)
 }
 
 fn cursor_status_from_output(success: bool, stdout: &[u8], stderr: &[u8]) -> CursorAuthStatus {
