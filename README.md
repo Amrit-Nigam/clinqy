@@ -621,7 +621,7 @@ tests/qa/            example plain-English QA tests (compiled scripts in tests/q
 
 ## Privacy
 
-Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Requests and screen summaries go only to the model provider you chose: your Claude, Antigravity (`agy`), Codex, OpenCode or Cursor CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
+Everything except the model calls stays on your Mac. That covers screen reading, voice (the Mac's own speech model, on-device), memory, history, skills and logs. Each request sends the text of the screen (the element list and your task) and, when Clinqy takes a screenshot, the screenshot image. Both go only to the model provider you chose: your Claude, Antigravity (`agy`), Codex, OpenCode or Cursor CLI login, the API you gave a key for, or a local model, in which case nothing leaves your Mac.
 
 ### Direct controls for coding agents
 

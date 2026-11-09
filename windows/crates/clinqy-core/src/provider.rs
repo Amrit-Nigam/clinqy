@@ -395,33 +395,52 @@ enum CursorAuthStatus { SignedIn, SignedOut, Unknown }
 
 /// A login check starts a CLI, which can take seconds. The last result is returned at once and refreshed on a
 /// background thread, so status and dashboard refreshes never wait on a provider process.
+/// A login check starts a CLI, which can take seconds. The last result for the same CLI path is returned at once and
+/// refreshed on a background thread, so status and dashboard refreshes never wait on a provider process.
 struct Probed<T> {
+    key: String,
     checked: Option<std::time::Instant>,
     value: T,
     refreshing: bool,
 }
 
-fn probe_cached<T: Copy + Send + 'static>(cell: &'static std::sync::Mutex<Probed<T>>, probe: impl FnOnce() -> T + Send + 'static) -> T {
+/// `key` is the CLI path the result belongs to. A result from another path is never returned for this one.
+fn probe_cached<T: Copy + Send + 'static>(
+    cell: &'static std::sync::Mutex<Probed<T>>,
+    key: String,
+    fallback: T,
+    probe: impl FnOnce() -> T + Send + 'static,
+) -> T {
     let mut state = cell.lock().unwrap();
+    if state.key != key {
+        state.key = key.clone();
+        state.checked = None;
+        state.value = fallback;
+    }
     let stale = state.checked.map_or(true, |at| at.elapsed() > std::time::Duration::from_secs(60));
     if stale && !state.refreshing {
         state.refreshing = true;
         std::thread::spawn(move || {
             let value = probe();
             let mut state = cell.lock().unwrap();
-            state.value = value;
-            state.checked = Some(std::time::Instant::now());
+            // Drop the result if the CLI path changed while the probe ran.
+            if state.key == key {
+                state.value = value;
+                state.checked = Some(std::time::Instant::now());
+            }
             state.refreshing = false;
         });
     }
     state.value
 }
 
-static CODEX_LOGIN: std::sync::Mutex<Probed<bool>> = std::sync::Mutex::new(Probed { checked: None, value: false, refreshing: false });
+static CODEX_LOGIN: std::sync::Mutex<Probed<bool>> =
+    std::sync::Mutex::new(Probed { key: String::new(), checked: None, value: false, refreshing: false });
 
 /// Check Codex's supported non-interactive login status command without retaining or logging its output.
 fn codex_logged_in(provider: Provider) -> bool {
-    probe_cached(&CODEX_LOGIN, move || {
+    let key = provider.cli().map(|cli| cli.program.display().to_string()).unwrap_or_default();
+    probe_cached(&CODEX_LOGIN, key, false, move || {
         run_cli_status(provider, &["login", "status"])
             .is_some_and(|output| codex_chatgpt_login_status(output.status.success(), &output.stdout, &output.stderr))
     })
@@ -434,14 +453,19 @@ fn codex_chatgpt_login_status(success: bool, stdout: &[u8], stderr: &[u8]) -> bo
 
 /// Cursor supports both an existing browser login and API-key auth. Its installed binary owns the credential store;
 /// only parse the documented status command and never retain its account details.
-static CURSOR_LOGIN: std::sync::Mutex<Probed<CursorAuthStatus>> =
-    std::sync::Mutex::new(Probed { checked: None, value: CursorAuthStatus::Unknown, refreshing: false });
+static CURSOR_LOGIN: std::sync::Mutex<Probed<CursorAuthStatus>> = std::sync::Mutex::new(Probed {
+    key: String::new(),
+    checked: None,
+    value: CursorAuthStatus::Unknown,
+    refreshing: false,
+});
 
 fn cursor_auth_status(provider: Provider) -> CursorAuthStatus {
     if ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].iter().any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty())) {
         return CursorAuthStatus::SignedIn;
     }
-    probe_cached(&CURSOR_LOGIN, move || {
+    let key = provider.cli().map(|cli| cli.program.display().to_string()).unwrap_or_default();
+    probe_cached(&CURSOR_LOGIN, key, CursorAuthStatus::Unknown, move || {
         run_cli_status(provider, &["status"])
             .map(|output| cursor_status_from_output(output.status.success(), &output.stdout, &output.stderr))
             .unwrap_or(CursorAuthStatus::Unknown)

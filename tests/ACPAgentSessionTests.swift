@@ -112,6 +112,7 @@ private final class CollectedText: @unchecked Sendable {
         check(timedOut, "A stalled turn fails with a timeout")
         let recovered = try await stalled.send("Second", image: nil)
         check(recovered == "Hello from ACP", "ACP session survives a timed-out turn and answers the next one")
+        check(!recovered.contains("LATE"), "Output from the cancelled turn never reaches the next answer")
         await stalled.close()
         print("PASS: \(checks) ACP provider/session checks (fake local agents; no account or model calls)")
     }

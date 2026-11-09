@@ -70,7 +70,9 @@ for line in sys.stdin:
     record(message)
     method = message.get("method")
     if method == "session/cancel" and stalled_id is not None:
-        # Like a real agent: answer the stalled prompt as cancelled once asked.
+        # Like a real agent: output already started for the turn arrives first, then the cancelled reply.
+        send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fake-session",
+              "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": "LATE"}}}})
         send({"jsonrpc": "2.0", "id": stalled_id, "result": {"stopReason": "cancelled"}})
         stalled_id = None
         continue

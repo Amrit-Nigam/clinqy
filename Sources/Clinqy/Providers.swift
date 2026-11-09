@@ -134,7 +134,11 @@ enum Provider: String, CaseIterable, Sendable {
                     refreshing = true
                     queue.async { [self] in
                         let result = probe(path)
-                        lock.withLock { value = result; checked = Date(); refreshing = false }
+                        lock.withLock {
+                            // A result for a path that is no longer current is dropped.
+                            if path == lastPath { value = result; checked = Date() }
+                            refreshing = false
+                        }
                     }
                 }
                 return value
