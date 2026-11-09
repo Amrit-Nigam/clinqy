@@ -6,6 +6,8 @@ import os
 import sys
 
 provider, log_path = sys.argv[1:3]
+mode = sys.argv[3] if len(sys.argv) > 3 else ""
+prompts = 0
 
 
 def record(value):
@@ -76,6 +78,9 @@ for line in sys.stdin:
     elif method == "session/new":
         response(message, {"sessionId": "fake-session"})
     elif method == "session/prompt":
+        prompts += 1
+        if mode == "stall" and prompts == 1:
+            continue  # never answer the first turn, so the client must time it out
         reject_id = "reject" if provider == "opencode-cli" else "reject-once"
         send({"jsonrpc": "2.0", "id": 77, "method": "session/request_permission", "params": {
             "sessionId": "fake-session",

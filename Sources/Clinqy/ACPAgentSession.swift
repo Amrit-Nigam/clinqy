@@ -6,6 +6,8 @@ import Foundation
 actor ACPAgentSession {
     private struct Failure: LocalizedError {
         let message: String
+        /// True when the agent process is still usable after this error (e.g. one turn timed out).
+        var keepsSession = false
         var errorDescription: String? { message }
     }
 
@@ -28,9 +30,12 @@ actor ACPAgentSession {
     private var sending = false
     private var responseText = ""
     private var partial: (@Sendable (String) -> Void)?
+    private var timers: [Int: Task<Void, Never>] = [:]
+    private let promptTimeout: TimeInterval
 
-    init(provider: Provider, executable: String, system: String, model: String) {
+    init(provider: Provider, executable: String, system: String, model: String, promptTimeout: TimeInterval = 120) {
         self.provider = provider
+        self.promptTimeout = promptTimeout
         self.executable = executable
         self.system = system
         self.model = model
@@ -53,15 +58,16 @@ actor ACPAgentSession {
                 guard Data(base64Encoded: image) != nil else { throw Failure(message: "Invalid screenshot encoding") }
                 content.append(["type": "image", "mimeType": "image/jpeg", "data": image])
             }
-            let result = try await request("session/prompt", ["sessionId": sessionID, "prompt": content], timeout: 120)
+            let result = try await request("session/prompt", ["sessionId": sessionID, "prompt": content], timeout: promptTimeout)
             guard result["stopReason"] as? String != "cancelled" else {
-                throw Failure(message: "\(provider.displayName) cancelled the turn")
+                throw Failure(message: "\(provider.displayName) cancelled the turn", keepsSession: true)
             }
             let answer = responseText.trimmingCharacters(in: .whitespacesAndNewlines)
             guard !answer.isEmpty else { throw Failure(message: "Empty reply from \(provider.displayName)") }
             return answer
         } catch {
-            stop(error)
+            // Only errors that leave the agent unusable tear the session down; a timed-out or cancelled turn does not.
+            if (error as? Failure)?.keepsSession != true { stop(error) }
             throw error
         }
     }
@@ -152,7 +158,12 @@ actor ACPAgentSession {
         child.standardInput = stdin
         child.standardOutput = stdout
         child.standardError = FileHandle.nullDevice
-        var environment = ProcessInfo.processInfo.environment
+        let inherited = ProcessInfo.processInfo.environment
+        // Pass only what the agent needs, not all of Clinqy's environment.
+        var environment: [String: String] = [:]
+        for key in ["HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "LC_CTYPE", "TMPDIR", "TERM", "SHELL"] {
+            if let value = inherited[key] { environment[key] = value }
+        }
         let providerEnvironmentKeys: [String]
         if provider == .cursorCLI {
             providerEnvironmentKeys = ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]
@@ -170,7 +181,7 @@ actor ACPAgentSession {
             environment["OPENCODE_CONFIG_CONTENT"] = try enforcedOpenCodeConfigContent(Config.value("OPENCODE_CONFIG_CONTENT"))
         }
         let home = FileManager.default.homeDirectoryForCurrentUser.path
-        let existingPath = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+        let existingPath = inherited["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
         environment["PATH"] = ["\(home)/.local/bin", "\(home)/.opencode/bin", "/opt/homebrew/bin", "/usr/local/bin", existingPath]
             .joined(separator: ":")
         child.environment = environment
@@ -243,9 +254,10 @@ actor ACPAgentSession {
         return try await withCheckedThrowingContinuation { continuation in
             pending[id] = continuation
             do { try notify(["id": id, "method": method, "params": params]) }
-            catch { pending.removeValue(forKey: id)?.resume(throwing: error) }
-            Task { [weak self] in
+            catch { pending.removeValue(forKey: id)?.resume(throwing: error); return }
+            timers[id] = Task { [weak self] in
                 try? await Task.sleep(for: .seconds(timeout))
+                guard !Task.isCancelled else { return }
                 await self?.expire(id, token: token, method: method)
             }
         }
@@ -293,7 +305,7 @@ actor ACPAgentSession {
                 } else {
                     event(method, object["params"] as? [String: Any] ?? [:])
                 }
-            } else if let id = object["id"] as? Int, let waiter = pending.removeValue(forKey: id) {
+            } else if let id = object["id"] as? Int, let waiter = takeWaiter(id) {
                 if let error = object["error"] as? [String: Any] {
                     let message = error["message"] as? String ?? "request failed"
                     if provider == .opencodeCLI && message.lowercased().contains("auth") {
@@ -322,10 +334,24 @@ actor ACPAgentSession {
         partial?(responseText)
     }
 
+    private func takeWaiter(_ id: Int) -> CheckedContinuation<[String: Any], Error>? {
+        timers.removeValue(forKey: id)?.cancel()
+        return pending.removeValue(forKey: id)
+    }
+
     private func expire(_ id: Int, token: UUID, method: String) {
+        timers.removeValue(forKey: id)
         guard token == generation, let waiter = pending.removeValue(forKey: id) else { return }
-        waiter.resume(throwing: Failure(message: "Timed out waiting for \(provider.displayName) during \(method)"))
-        Task { stop(Failure(message: "ACP request timed out")) }
+        let message = "Timed out waiting for \(provider.displayName) during \(method)"
+        if method == "session/prompt" {
+            // The agent may still be working on this turn. Ask it to stop, fail only this call, and keep the session.
+            try? notify(["method": "session/cancel", "params": ["sessionId": sessionID ?? ""]])
+            waiter.resume(throwing: Failure(message: message, keepsSession: true))
+        } else {
+            // Handshake calls (initialize, authenticate, session/new) leave the session unusable.
+            waiter.resume(throwing: Failure(message: message))
+            stop(Failure(message: "ACP request timed out"))
+        }
     }
 
     private func stop(_ error: Error) {
@@ -333,6 +359,8 @@ actor ACPAgentSession {
         closed = true
         for (_, waiter) in pending { waiter.resume(throwing: error) }
         pending.removeAll()
+        for (_, timer) in timers { timer.cancel() }
+        timers.removeAll()
         tearDown()
         try? FileManager.default.removeItem(at: directory)
     }

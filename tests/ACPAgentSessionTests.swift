@@ -98,6 +98,21 @@ private final class CollectedText: @unchecked Sendable {
                       "Cursor project config denies MCP, shell, and file-write tools")
             }
         }
+        // A turn that never finishes must fail only that call. The session should still answer the next turn.
+        let stallLog = root.appendingPathComponent("stall.jsonl")
+        let stallWrapper = root.appendingPathComponent("stall-fake")
+        let stallBody = "#!/bin/sh\nexec /usr/bin/python3 \"\(fake)\" \"cursor-cli\" \"\(stallLog.path)\" stall\n"
+        try stallBody.write(to: stallWrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: stallWrapper.path)
+        let stalled = ACPAgentSession(provider: .cursorCLI, executable: stallWrapper.path,
+                                      system: "Do not use tools. Return plain text.", model: "vendor/model-test",
+                                      promptTimeout: 1)
+        var timedOut = false
+        do { _ = try await stalled.send("First", image: nil) } catch { timedOut = error.localizedDescription.contains("Timed out") }
+        check(timedOut, "A stalled turn fails with a timeout")
+        let recovered = try await stalled.send("Second", image: nil)
+        check(recovered == "Hello from ACP", "ACP session survives a timed-out turn and answers the next one")
+        await stalled.close()
         print("PASS: \(checks) ACP provider/session checks (fake local agents; no account or model calls)")
     }
 }

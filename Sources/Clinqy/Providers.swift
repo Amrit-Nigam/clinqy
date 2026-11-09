@@ -113,42 +113,51 @@ enum Provider: String, CaseIterable, Sendable {
     /// UI and startup never wait on a Keychain subprocess. A short-lived cached availability check refreshes off-main.
     static var isClaudeLoggedIn: Bool { loginCache.read() }
 
-    /// Codex exposes a non-interactive login-status command. Cache the result because provider choices are refreshed
-    /// several times while the dashboard and task bar are open.
-    private final class CodexLoginCache {
+    /// Login checks spawn a CLI that can take seconds. They answer from the last result at once and refresh in the
+    /// background, so availability checks (dashboard and task bar, called often) never block the caller.
+    private final class ProbeCache: @unchecked Sendable {
         private let lock = NSLock()
+        private let queue = DispatchQueue(label: "clinqy.login-probe", qos: .utility)
+        private let probe: (String) -> Bool
         private var lastPath: String?
         private var value = false
         private var checked = Date.distantPast
+        private var refreshing = false
+
+        init(probe: @escaping (String) -> Bool) { self.probe = probe }
 
         func isLoggedIn(path: String?) -> Bool {
             guard let path else { return false }
             return lock.withLock {
-                guard path != lastPath || Date().timeIntervalSince(checked) > 30 else { return value }
-                let process = Process(), output = Pipe()
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = ["login", "status"]
-                process.standardOutput = output
-                process.standardError = output
-                do {
-                    try process.run()
-                    let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: deadline)
-                    defer { deadline.cancel() }
-                    let status = output.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    let text = String(data: status, encoding: .utf8)?.lowercased() ?? ""
-                    value = process.terminationStatus == 0 && text.contains("logged in using chatgpt")
-                } catch {
-                    value = false
+                if path != lastPath { lastPath = path; value = false; checked = .distantPast }
+                if !refreshing && Date().timeIntervalSince(checked) > 30 {
+                    refreshing = true
+                    queue.async { [self] in
+                        let result = probe(path)
+                        lock.withLock { value = result; checked = Date(); refreshing = false }
+                    }
                 }
-                lastPath = path
-                checked = Date()
                 return value
             }
         }
     }
-    private static let codexLoginCache = CodexLoginCache()
+
+    /// Codex exposes a non-interactive login-status command.
+    private static let codexLoginCache = ProbeCache { path in
+        let process = Process(), output = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["login", "status"]
+        process.standardOutput = output
+        process.standardError = output
+        do { try process.run() } catch { return false }
+        let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 3, execute: deadline)
+        let status = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        deadline.cancel()
+        let text = String(data: status, encoding: .utf8)?.lowercased() ?? ""
+        return process.terminationStatus == 0 && text.contains("logged in using chatgpt")
+    }
 
     static var current: Provider {
         if CommandLine.arguments.contains("--agy") || CommandLine.arguments.contains("--agy-cli") { return .agyCLI }
@@ -257,52 +266,33 @@ enum Provider: String, CaseIterable, Sendable {
         return result.get()
     }
 
-    private final class CursorLoginCache {
-        private let lock = NSLock()
-        private var lastPath: String?
-        private var value = false
-        private var checked = Date.distantPast
-
-        func isLoggedIn(path: String?) -> Bool {
-            guard let path else { return false }
-            if ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].contains(where: { Config.value($0)?.isEmpty == false }) { return true }
-            return lock.withLock {
-                guard path != lastPath || Date().timeIntervalSince(checked) > 30 else { return value }
-                let process = Process(), output = Pipe()
-                process.executableURL = URL(fileURLWithPath: path)
-                process.arguments = ["status"]
-                process.standardOutput = output
-                process.standardError = output
-                do {
-                    try process.run()
-                    let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
-                    DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2, execute: deadline)
-                    defer { deadline.cancel() }
-                    let data = output.fileHandleForReading.readDataToEndOfFile()
-                    process.waitUntilExit()
-                    let status = String(data: data, encoding: .utf8)?.lowercased() ?? ""
-                    if status.contains("not authenticated") || status.contains("unauthenticated") ||
-                        status.contains("not signed in") || status.contains("not logged in") {
-                        value = false
-                    } else if process.terminationStatus == 0 &&
-                        (status.contains("authenticated") || status.contains("signed in") || status.contains("logged in")) {
-                        value = true
-                    } else {
-                        // Some CLI builds crash or omit status output. Let ACP validate the local login when used.
-                        value = true
-                    }
-                } catch {
-                    value = true
-                }
-                lastPath = path
-                checked = Date()
-                return value
-            }
+    private static let cursorLoginCache = ProbeCache { path in
+        let process = Process(), output = Pipe()
+        process.executableURL = URL(fileURLWithPath: path)
+        process.arguments = ["status"]
+        process.standardOutput = output
+        process.standardError = output
+        do { try process.run() } catch { return true }
+        let deadline = DispatchWorkItem { if process.isRunning { process.terminate() } }
+        DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 2, execute: deadline)
+        let data = output.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        deadline.cancel()
+        let status = String(data: data, encoding: .utf8)?.lowercased() ?? ""
+        if status.contains("not authenticated") || status.contains("unauthenticated") ||
+            status.contains("not signed in") || status.contains("not logged in") {
+            return false
         }
+        if process.terminationStatus == 0 &&
+            (status.contains("authenticated") || status.contains("signed in") || status.contains("logged in")) {
+            return true
+        }
+        // Some CLI builds crash or omit status output. Let ACP validate the local login when used.
+        return true
     }
-    private static let cursorLoginCache = CursorLoginCache()
     private static var cursorAuthExists: Bool {
-        cursorLoginCache.isLoggedIn(path: Provider.cursorCLI.cliPath)
+        if ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].contains(where: { Config.value($0)?.isEmpty == false }) { return true }
+        return cursorLoginCache.isLoggedIn(path: Provider.cursorCLI.cliPath)
     }
 
     /// The CLI's executable, for the CLI providers (AGY_PATH / CLAUDE_PATH / CODEX_PATH, else the usual install spots).
