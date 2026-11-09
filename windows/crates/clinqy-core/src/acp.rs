@@ -13,6 +13,41 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{Mutex, mpsc};
 
+/// What every ACP agent gets from the environment, besides its own provider keys. Clinqy's other settings stay private.
+const BASE_ENVIRONMENT_KEYS: &[&str] = &[
+    "PATH",
+    "PATHEXT",
+    "SYSTEMROOT",
+    "SYSTEMDRIVE",
+    "WINDIR",
+    "COMSPEC",
+    "USERPROFILE",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+    "TEMP",
+    "TMP",
+    "USERNAME",
+    "COMPUTERNAME",
+    "PROCESSOR_ARCHITECTURE",
+    "NUMBER_OF_PROCESSORS",
+];
+
+/// A turn that failed without breaking the agent process: a stalled turn we cancelled, or a cancelled turn.
+/// The session stays open for the next turn.
+#[derive(Debug)]
+struct RecoverableTurn(String);
+
+impl std::fmt::Display for RecoverableTurn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for RecoverableTurn {}
+
 pub struct AcpSession {
     provider: Provider,
     model: String,
@@ -64,6 +99,13 @@ impl AcpSession {
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .kill_on_drop(true);
+        // Start from an empty environment: the agent gets only what it needs plus its own provider keys.
+        command.env_clear();
+        for key in BASE_ENVIRONMENT_KEYS {
+            if let Ok(value) = std::env::var(key) {
+                command.env(key, value);
+            }
+        }
         for key in provider_environment_keys(provider) {
             if let Some(value) = crate::config::value(key) {
                 command.env(key, value);
@@ -121,8 +163,11 @@ impl AcpSession {
         partial: Option<mpsc::UnboundedSender<String>>,
     ) -> Result<String> {
         let result = self.send_inner(text, image, partial).await;
-        if result.is_err() {
-            self.close();
+        // A stalled or cancelled turn leaves the agent process usable; anything else closes the session.
+        if let Err(error) = &result {
+            if error.downcast_ref::<RecoverableTurn>().is_none() {
+                self.close();
+            }
         }
         result
     }
@@ -157,7 +202,11 @@ impl AcpSession {
             )
             .await?;
         if result["stopReason"] == "cancelled" {
-            bail!("{} cancelled the turn", self.provider.display_name());
+            return Err(RecoverableTurn(format!(
+                "{} cancelled the turn",
+                self.provider.display_name()
+            ))
+            .into());
         }
         if answer.trim().is_empty() {
             bail!("Empty reply from {}", self.provider.display_name());
@@ -286,20 +335,14 @@ impl AcpSession {
         loop {
             let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
             if remaining.is_zero() {
-                bail!(
-                    "Timed out waiting for {} during {method}",
-                    self.provider.display_name()
-                );
+                return Err(self.timed_out(id, method).await);
             }
-            let message = tokio::time::timeout(remaining, self.messages.lock().await.recv())
-                .await
-                .map_err(|_| {
-                    anyhow!(
-                        "Timed out waiting for {} during {method}",
-                        self.provider.display_name()
-                    )
-                })?
-                .ok_or_else(|| anyhow!("{} ACP process ended", self.provider.display_name()))?;
+            let received = tokio::time::timeout(remaining, self.messages.lock().await.recv()).await;
+            let message = match received {
+                Ok(message) => message
+                    .ok_or_else(|| anyhow!("{} ACP process ended", self.provider.display_name()))?,
+                Err(_) => return Err(self.timed_out(id, method).await),
+            };
             if message["method"] == "session/update"
                 && message["params"]["update"]["sessionUpdate"] == "agent_message_chunk"
             {
@@ -344,6 +387,40 @@ impl AcpSession {
                 answer,
             ));
         }
+    }
+
+    /// A request ran out of time. A stalled prompt is cancelled and its late output drained, so the session can take the
+    /// next turn. Any other timeout leaves the agent in an unknown state, so the session closes.
+    async fn timed_out(&self, id: u64, method: &str) -> anyhow::Error {
+        let message = format!(
+            "Timed out waiting for {} during {method}",
+            self.provider.display_name()
+        );
+        if method == "session/prompt" && self.cancel_stalled_turn(id).await {
+            return RecoverableTurn(message).into();
+        }
+        anyhow!(message)
+    }
+
+    /// Ask the agent to stop the turn, then read and discard its output until the cancelled prompt answers.
+    async fn cancel_stalled_turn(&self, id: u64) -> bool {
+        let session_id = self.session_id.lock().await.clone().unwrap_or_default();
+        let cancel = json!({"method":"session/cancel", "params":{"sessionId":session_id}});
+        if self.write(&cancel).await.is_err() {
+            return false;
+        }
+        let mut messages = self.messages.lock().await;
+        let wait_for_answer = async {
+            while let Some(message) = messages.recv().await {
+                if message["id"] == json!(id) && message.get("method").is_none() {
+                    return true;
+                }
+            }
+            false
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(10), wait_for_answer)
+            .await
+            .unwrap_or(false)
     }
 
     async fn write(&self, object: &Value) -> Result<()> {
@@ -467,6 +544,24 @@ fn write_cursor_isolation(directory: &std::path::Path, system: &str) -> Result<(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_stalled_or_cancelled_turn_keeps_the_session() {
+        let recoverable: anyhow::Error = RecoverableTurn("Timed out".into()).into();
+        assert!(recoverable.downcast_ref::<RecoverableTurn>().is_some());
+        let fatal = anyhow!("ACP process ended");
+        assert!(fatal.downcast_ref::<RecoverableTurn>().is_none());
+    }
+
+    #[test]
+    fn agent_environment_is_an_allowlist_without_clinqy_secrets() {
+        assert!(BASE_ENVIRONMENT_KEYS.contains(&"PATH"));
+        assert!(
+            BASE_ENVIRONMENT_KEYS.iter().all(|key| !key.contains("KEY")
+                && !key.contains("TOKEN")
+                && !key.contains("SECRET"))
+        );
+    }
 
     #[test]
     fn permission_response_only_selects_advertised_rejection() {

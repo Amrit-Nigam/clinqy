@@ -31,6 +31,8 @@ actor ACPAgentSession {
     private var responseText = ""
     private var partial: (@Sendable (String) -> Void)?
     private var timers: [Int: Task<Void, Never>] = [:]
+    /// A prompt that timed out but hasn't answered yet. Its late output must not reach the next turn.
+    private var staleTurnID: Int?
     private let promptTimeout: TimeInterval
 
     init(provider: Provider, executable: String, system: String, model: String, promptTimeout: TimeInterval = 120) {
@@ -45,6 +47,11 @@ actor ACPAgentSession {
 
     func send(_ text: String, image: String?, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         guard !closed, !sending else { throw Failure(message: "The \(provider.displayName) session is closed or busy") }
+        // Give the agent a few seconds to answer the cancelled turn before refusing the next one.
+        for _ in 0..<50 where staleTurnID != nil { try await Task.sleep(for: .milliseconds(100)) }
+        guard staleTurnID == nil else {
+            throw Failure(message: "\(provider.displayName) is still finishing the timed-out turn. Try again shortly.", keepsSession: true)
+        }
         sending = true
         defer { sending = false; self.partial = nil }
         do {
@@ -285,6 +292,7 @@ actor ACPAgentSession {
                 Task { stop(Failure(message: "Invalid ACP response from \(provider.displayName)")) }
                 return
             }
+            if let id = object["id"] as? Int, id == staleTurnID, object["method"] == nil { staleTurnID = nil }
             if let method = object["method"] as? String {
                 if let id = object["id"] {
                     if method == "session/request_permission" {
@@ -323,7 +331,7 @@ actor ACPAgentSession {
     }
 
     private func event(_ method: String, _ params: [String: Any]) {
-        guard method == "session/update", params["sessionId"] as? String == sessionID,
+        guard staleTurnID == nil, method == "session/update", params["sessionId"] as? String == sessionID,
               let update = params["update"] as? [String: Any],
               update["sessionUpdate"] as? String == "agent_message_chunk" else { return }
         let chunk: String?
@@ -344,7 +352,8 @@ actor ACPAgentSession {
         guard token == generation, let waiter = pending.removeValue(forKey: id) else { return }
         let message = "Timed out waiting for \(provider.displayName) during \(method)"
         if method == "session/prompt" {
-            // The agent may still be working on this turn. Ask it to stop, fail only this call, and keep the session.
+            // The agent may still be working on this turn. Ask it to stop, ignore its late output, fail only this call.
+            staleTurnID = id
             try? notify(["method": "session/cancel", "params": ["sessionId": sessionID ?? ""]])
             waiter.resume(throwing: Failure(message: message, keepsSession: true))
         } else {

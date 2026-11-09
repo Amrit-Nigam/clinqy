@@ -393,17 +393,38 @@ fn open_code_auth_file_has_credentials(path: &Path) -> bool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CursorAuthStatus { SignedIn, SignedOut, Unknown }
 
+/// A login check starts a CLI, which can take seconds. The last result is returned at once and refreshed on a
+/// background thread, so status and dashboard refreshes never wait on a provider process.
+struct Probed<T> {
+    checked: Option<std::time::Instant>,
+    value: T,
+    refreshing: bool,
+}
+
+fn probe_cached<T: Copy + Send + 'static>(cell: &'static std::sync::Mutex<Probed<T>>, probe: impl FnOnce() -> T + Send + 'static) -> T {
+    let mut state = cell.lock().unwrap();
+    let stale = state.checked.map_or(true, |at| at.elapsed() > std::time::Duration::from_secs(60));
+    if stale && !state.refreshing {
+        state.refreshing = true;
+        std::thread::spawn(move || {
+            let value = probe();
+            let mut state = cell.lock().unwrap();
+            state.value = value;
+            state.checked = Some(std::time::Instant::now());
+            state.refreshing = false;
+        });
+    }
+    state.value
+}
+
+static CODEX_LOGIN: std::sync::Mutex<Probed<bool>> = std::sync::Mutex::new(Probed { checked: None, value: false, refreshing: false });
+
 /// Check Codex's supported non-interactive login status command without retaining or logging its output.
 fn codex_logged_in(provider: Provider) -> bool {
-    static LAST: std::sync::Mutex<Option<(std::time::Instant, bool)>> = std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
-    if let Some((at, ready)) = *last {
-        if at.elapsed() < std::time::Duration::from_secs(60) { return ready; }
-    }
-    let ready = run_cli_status(provider, &["login", "status"])
-        .is_some_and(|output| codex_chatgpt_login_status(output.status.success(), &output.stdout, &output.stderr));
-    *last = Some((std::time::Instant::now(), ready));
-    ready
+    probe_cached(&CODEX_LOGIN, move || {
+        run_cli_status(provider, &["login", "status"])
+            .is_some_and(|output| codex_chatgpt_login_status(output.status.success(), &output.stdout, &output.stderr))
+    })
 }
 
 fn codex_chatgpt_login_status(success: bool, stdout: &[u8], stderr: &[u8]) -> bool {
@@ -413,20 +434,18 @@ fn codex_chatgpt_login_status(success: bool, stdout: &[u8], stderr: &[u8]) -> bo
 
 /// Cursor supports both an existing browser login and API-key auth. Its installed binary owns the credential store;
 /// only parse the documented status command and never retain its account details.
+static CURSOR_LOGIN: std::sync::Mutex<Probed<CursorAuthStatus>> =
+    std::sync::Mutex::new(Probed { checked: None, value: CursorAuthStatus::Unknown, refreshing: false });
+
 fn cursor_auth_status(provider: Provider) -> CursorAuthStatus {
     if ["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"].iter().any(|key| std::env::var(key).is_ok_and(|value| !value.trim().is_empty())) {
         return CursorAuthStatus::SignedIn;
     }
-    static LAST: std::sync::Mutex<Option<(std::time::Instant, CursorAuthStatus)>> = std::sync::Mutex::new(None);
-    let mut last = LAST.lock().unwrap();
-    if let Some((at, status)) = *last {
-        if at.elapsed() < std::time::Duration::from_secs(60) { return status; }
-    }
-    let status = run_cli_status(provider, &["status"])
-        .map(|output| cursor_status_from_output(output.status.success(), &output.stdout, &output.stderr))
-        .unwrap_or(CursorAuthStatus::Unknown);
-    *last = Some((std::time::Instant::now(), status));
-    status
+    probe_cached(&CURSOR_LOGIN, move || {
+        run_cli_status(provider, &["status"])
+            .map(|output| cursor_status_from_output(output.status.success(), &output.stdout, &output.stderr))
+            .unwrap_or(CursorAuthStatus::Unknown)
+    })
 }
 
 fn cursor_status_from_output(success: bool, stdout: &[u8], stderr: &[u8]) -> CursorAuthStatus {

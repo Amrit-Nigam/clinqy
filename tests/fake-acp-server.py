@@ -8,6 +8,7 @@ import sys
 provider, log_path = sys.argv[1:3]
 mode = sys.argv[3] if len(sys.argv) > 3 else ""
 prompts = 0
+stalled_id = None
 
 
 def record(value):
@@ -68,6 +69,11 @@ for line in sys.stdin:
     message = json.loads(line)
     record(message)
     method = message.get("method")
+    if method == "session/cancel" and stalled_id is not None:
+        # Like a real agent: answer the stalled prompt as cancelled once asked.
+        send({"jsonrpc": "2.0", "id": stalled_id, "result": {"stopReason": "cancelled"}})
+        stalled_id = None
+        continue
     if not method or "id" not in message:
         continue
     if method == "initialize":
@@ -80,6 +86,7 @@ for line in sys.stdin:
     elif method == "session/prompt":
         prompts += 1
         if mode == "stall" and prompts == 1:
+            stalled_id = message["id"]
             continue  # never answer the first turn, so the client must time it out
         reject_id = "reject" if provider == "opencode-cli" else "reject-once"
         send({"jsonrpc": "2.0", "id": 77, "method": "session/request_permission", "params": {
