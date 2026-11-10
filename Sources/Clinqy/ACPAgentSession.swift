@@ -356,11 +356,21 @@ actor ACPAgentSession {
             staleTurnID = id
             try? notify(["method": "session/cancel", "params": ["sessionId": sessionID ?? ""]])
             waiter.resume(throwing: Failure(message: message, keepsSession: true))
+            // If the agent never acknowledges the cancel, its state is unknown: close the session rather than wedge it.
+            Task { [weak self] in
+                try? await Task.sleep(for: .seconds(10))
+                await self?.abandonIfStillStale(id)
+            }
         } else {
             // Handshake calls (initialize, authenticate, session/new) leave the session unusable.
             waiter.resume(throwing: Failure(message: message))
             stop(Failure(message: "ACP request timed out"))
         }
+    }
+
+    private func abandonIfStillStale(_ id: Int) {
+        guard staleTurnID == id else { return }
+        stop(Failure(message: "\(provider.displayName) didn't acknowledge the cancelled turn, so the session was closed"))
     }
 
     private func stop(_ error: Error) {

@@ -114,6 +114,24 @@ private final class CollectedText: @unchecked Sendable {
         check(recovered == "Hello from ACP", "ACP session survives a timed-out turn and answers the next one")
         check(!recovered.contains("LATE"), "Output from the cancelled turn never reaches the next answer")
         await stalled.close()
+        // A provider that never acknowledges cancellation must not wedge the session: it is closed, and the next call fails fast.
+        let deafWrapper = root.appendingPathComponent("deaf-fake")
+        let deafBody = "#!/bin/sh\nexec /usr/bin/python3 \"\(fake)\" \"cursor-cli\" \"\(root.appendingPathComponent("deaf.jsonl").path)\" deaf\n"
+        try deafBody.write(to: deafWrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: deafWrapper.path)
+        let deaf = ACPAgentSession(provider: .cursorCLI, executable: deafWrapper.path,
+                                   system: "Do not use tools. Return plain text.", model: "vendor/model-test",
+                                   promptTimeout: 1)
+        var firstTimedOut = false
+        do { _ = try await deaf.send("First", image: nil) } catch { firstTimedOut = error.localizedDescription.contains("Timed out") }
+        check(firstTimedOut, "A turn the provider never cancels still times out")
+        try await Task.sleep(for: .seconds(11))
+        var closedError = ""
+        let started = ContinuousClock.now
+        do { _ = try await deaf.send("Second", image: nil) } catch { closedError = error.localizedDescription }
+        check(closedError.contains("closed") && started.duration(to: .now) < .seconds(1),
+              "An unacknowledged cancel closes the session instead of wedging it")
+        await deaf.close()
         print("PASS: \(checks) ACP provider/session checks (fake local agents; no account or model calls)")
     }
 }

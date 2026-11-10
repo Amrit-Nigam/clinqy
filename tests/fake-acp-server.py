@@ -69,6 +69,8 @@ for line in sys.stdin:
     message = json.loads(line)
     record(message)
     method = message.get("method")
+    if method == "session/cancel" and stalled_id is not None and mode == "deaf":
+        continue  # a provider that never acknowledges cancellation
     if method == "session/cancel" and stalled_id is not None:
         # Like a real agent: output already started for the turn arrives first, then the cancelled reply.
         send({"jsonrpc": "2.0", "method": "session/update", "params": {"sessionId": "fake-session",
@@ -87,7 +89,7 @@ for line in sys.stdin:
         response(message, {"sessionId": "fake-session"})
     elif method == "session/prompt":
         prompts += 1
-        if mode == "stall" and prompts == 1:
+        if mode in ("stall", "deaf") and prompts == 1:
             stalled_id = message["id"]
             continue  # never answer the first turn, so the client must time it out
         reject_id = "reject" if provider == "opencode-cli" else "reject-once"
