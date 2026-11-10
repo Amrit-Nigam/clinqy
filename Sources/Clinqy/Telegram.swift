@@ -898,8 +898,11 @@ final class Telegram {
     private func updateCard(_ run: Run) {
         if run.parentID != nil { updateCard(rootRun(run)); return }
         guard chatID != nil else { return }
-        switch run.coalescer.request(at: Date()) {
-        case .merged: return
+        schedule(run, run.coalescer.request(at: Date()))
+    }
+    private func schedule(_ run: Run, _ decision: EditCoalescer.Decision?) {
+        switch decision {
+        case .merged, nil: return
         case .now: enqueue { [weak self, weak run] in await self?.flushCard(run) }
         case .after(let delay):
             Task { [weak self, weak run] in
@@ -913,12 +916,15 @@ final class Telegram {
         guard let run, runs[run.id] === run, let chatID else {
             run?.coalescer.flushed(at: Date(), sent: false); return
         }
+        // State read below is what this edit sends; anything that changes while it is in flight gets a follow-up edit
+        // (on a slow network the thumbnail can arrive while the card's first message is still being sent).
+        run.coalescer.began()
         let photo = run.pendingPhoto
         let model = cardModel(run)
         let html = RunCard.render(model, limit: run.cardPhoto || photo != nil ? RunCard.captionLimit : RunCard.textLimit)
         let markup = TGButton.markup(RunCard.keyboard(model))
         let signature = html + "\u{1}" + (String(data: (try? JSONSerialization.data(withJSONObject: markup, options: .sortedKeys)) ?? Data(), encoding: .utf8) ?? "")
-        guard photo != nil || signature != run.rendered else { run.coalescer.flushed(at: Date(), sent: false); return }
+        guard photo != nil || signature != run.rendered else { schedule(run, run.coalescer.flushed(at: Date(), sent: false)); return }
         var reply: APIReply
         if let message = run.message {
             if let photo {
@@ -939,7 +945,7 @@ final class Telegram {
             }
         } else {
             // An unknown send outcome must not produce another unsolicited message on the next tick.
-            guard !run.cardAttempted else { run.coalescer.flushed(at: Date(), sent: false); return }
+            guard !run.cardAttempted else { schedule(run, run.coalescer.flushed(at: Date(), sent: false)); return }
             run.cardAttempted = true
             if let image = photo ?? (run.cardPhoto ? run.cardImage : nil) {
                 reply = await upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": html, "parse_mode": "HTML",
@@ -975,7 +981,7 @@ final class Telegram {
         } else if photo != nil {
             run.pendingPhoto = nil // Don't retry an image the API refused; the next meaningful change brings a new one.
         }
-        run.coalescer.flushed(at: Date(), sent: reply.ok)
+        schedule(run, run.coalescer.flushed(at: Date(), sent: reply.ok))
     }
 
     /// Sends the card again at the bottom of the chat (from /status, a reply or "Open card") and removes the old copy.

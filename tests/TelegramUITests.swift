@@ -169,6 +169,12 @@ struct TelegramUITests {
         check(coalescer.request(at: t0.addingTimeInterval(10)) == .now, "after a quiet period edits go now")
         coalescer.flushed(at: t0.addingTimeInterval(10), sent: false)
         check(coalescer.lastEdit == t0.addingTimeInterval(3), "skipped (unchanged) flushes don't consume the interval")
+        var racing = EditCoalescer(minInterval: 3)
+        check(racing.request(at: t0) == .now, "first card send goes now")
+        racing.began()
+        check(racing.request(at: t0) == .merged, "a change during the in-flight send waits for it")
+        check(racing.flushed(at: t0.addingTimeInterval(1), sent: true) == .after(3), "a change during an in-flight edit gets a follow-up edit")
+        check(racing.flushed(at: t0.addingTimeInterval(4), sent: true) == nil, "no follow-up without a change in flight")
         var burst = EditCoalescer(minInterval: 3); var sent = 0
         for i in 0..<100 {
             let now = t0.addingTimeInterval(Double(i) * 0.1)

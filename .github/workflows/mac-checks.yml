@@ -62,6 +62,3 @@ jobs:
           node tests/extension-popup.mjs
           node tests/telegram-screenshot.mjs
           node tests/mac-download.mjs
-      - name: Website build
-        working-directory: website
-        run: npm ci && npm run build

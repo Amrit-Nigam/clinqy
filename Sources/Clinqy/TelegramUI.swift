@@ -512,20 +512,32 @@ struct EditCoalescer: Equatable {
     var minInterval: TimeInterval
     private(set) var lastEdit: Date?
     private(set) var scheduled = false
+    /// The edit has started (it already read the card's state) and hasn't finished.
+    private(set) var inFlight = false
+    /// A change arrived while the edit was in flight: it needs one more edit once that one finishes.
+    private(set) var dirty = false
 
     init(minInterval: TimeInterval) { self.minInterval = minInterval }
 
     mutating func request(at now: Date) -> Decision {
+        if inFlight { dirty = true; return .merged }
         if scheduled { return .merged }
         scheduled = true
         guard let lastEdit else { return .now }
         let wait = lastEdit.addingTimeInterval(minInterval).timeIntervalSince(now)
         return wait > 0 ? .after(wait) : .now
     }
-    /// The scheduled edit ran (or was skipped as unchanged); later requests schedule a new one.
-    mutating func flushed(at now: Date, sent: Bool) {
-        scheduled = false
+    /// The scheduled edit is about to read the card's state; changes from now on need another edit.
+    mutating func began() { inFlight = true }
+    /// The scheduled edit ran (or was skipped as unchanged); later requests schedule a new one. Returns the follow-up
+    /// edit owed to changes that arrived while it was in flight, or nil.
+    @discardableResult
+    mutating func flushed(at now: Date, sent: Bool) -> Decision? {
+        scheduled = false; inFlight = false
         if sent { lastEdit = now }
+        guard dirty else { return nil }
+        dirty = false
+        return request(at: now)
     }
 }
 

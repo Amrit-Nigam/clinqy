@@ -68,6 +68,8 @@ final class TelegramAPI: URLProtocol {
     static var rawRequests: [(String, Data)] = []
     static var nextMessage = 100
     static var failPhotos = false
+    /// Seconds to hold the response to the next call of a method after recording it (a slow network / CI runner).
+    static var slowNext: [String: Double] = [:]
     static var rateLimited = 0
     static var limitedHits = 0
     /// Text fields of a multipart upload; JSON fields (reply_markup, media) decoded; files recorded as "_file_<name>".
@@ -120,6 +122,7 @@ final class TelegramAPI: URLProtocol {
             Self.requests.append((method, recorded)); Self.rawRequests.append((method, data ?? Data()))
             return Self.nextMessage
         }
+        if let delay = Self.lock.withLock({ Self.slowNext.removeValue(forKey: method) }) { Thread.sleep(forTimeInterval: delay) }
         let payload: Data; var status = 200
         if method == "getFile" {
             let file = body["file_id"] as! String
@@ -587,6 +590,8 @@ final class TelegramAPI: URLProtocol {
 
         // Live card: thumbnail refreshes only on meaningful change; replies steer the replied-to run.
         let (live, liveWorker, liveStore) = bridge()
+        // CI regression: the card's first message is still in flight when the thumbnail arrives; it must not be dropped.
+        TelegramAPI.lock.withLock { TelegramAPI.slowNext["sendMessage"] = 1 }
         live.handle(message("background: tidy my downloads folder")); try await wait { liveWorker.submitted.count == 1 }
         let liveID = liveWorker.taskRecordID!, liveShort = String(liveID.uuidString.prefix(8)).lowercased()
         try await wait { TelegramAPI.bodies("sendMessage").contains { ($0["text"] as? String)?.contains("#" + liveShort) == true } }
