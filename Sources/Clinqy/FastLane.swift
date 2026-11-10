@@ -48,6 +48,7 @@ final class FastLane {
     }
 
     private let model: String?
+    private let requestedModel: String?
     private let provider: Provider
     private let intro: String
     private var session: AgySession?
@@ -82,18 +83,25 @@ final class FastLane {
     /// Who answered the last turn, for the log: "fast · ", "lead ← fast (why) · ", or "".
     private(set) var tag = ""
 
-    init(intro: String, leadModel: String, provider: Provider = Provider.current) {
+    init(intro: String, leadModel: String, provider leadProvider: Provider = Provider.current) {
         self.intro = intro
-        self.provider = provider
-        // Compared as the ids they resolve to: AGY_MODEL=gemini-3.8-flash is the same model as haiku there, and a
-        // second process of it would only add a cold start and hand-offs.
-        model = Self.model.flatMap { provider.model($0).lowercased() == provider.model(leadModel).lowercased() ? nil : $0 }
+        // FAST_PROVIDER can route the helper to another provider; it falls back to the lead's.
+        let route = Provider.routed("FAST_PROVIDER", fallback: leadProvider)
+        provider = route
+        let fast = Self.model
+        requestedModel = fast
+        // Compared as the ids they resolve to (see above): a helper on the very same model as the lead is not a helper.
+        model = fast.flatMap { name in
+            // A different provider is never the same helper, even when the model name matches.
+            route == leadProvider && (name == leadModel || route.model(name) == route.model(leadModel)) ? nil : name
+        }
     }
 
     /// The helper's identity, for the log: nil when the helper is off.
     var helperRoute: String? {
         guard let model else { return nil }
-        return "fast helper: provider=\(provider.rawValue) requested=\(model) model=\(provider.model(model).isEmpty ? "(cli default)" : provider.model(model)) role=helper"
+        let requested = requestedModel ?? model
+        return "fast helper: provider=\(provider.rawValue) requested=\(requested) model=\(model.isEmpty ? "(cli default)" : model) role=helper"
     }
 
     /// Appended to the lead's first message: how to hand routine steps off (empty when off).

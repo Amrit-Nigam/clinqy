@@ -60,6 +60,9 @@ final class AgySession: @unchecked Sendable {
     private var lastStderr: String?
     /// Set when PROVIDER is an HTTP API (see Providers.swift): turns go there instead of to a CLI process.
     private var api: APIChat?
+    /// OpenCode and Cursor are model sessions over their official ACP CLI transport.
+    private var acp: ACPAgentSession?
+    private var acpClosed: ACPClosedFlag?
     private var isAgy = true
     private var sessionDir: URL?
     private var systemPrompt = ""
@@ -139,10 +142,18 @@ final class AgySession: @unchecked Sendable {
     }
 
     /// `effort` overrides the configured reasoning effort (AGY_EFFORT / CLAUDE_EFFORT) for this session.
-    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil) throws {
+    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil, promptTimeout: TimeInterval = 120) throws {
         self.systemPrompt = system
         self.sessionProvider = provider
         self.sessionModel = provider.model(model)
+        if provider.isACP {
+            guard let path = provider.cliPath else {
+                throw BrainError.failed("\(provider.displayName) CLI not found. Install it or set \(provider == .opencodeCLI ? "OPENCODE_PATH" : "CURSOR_AGENT_PATH") in ~/.config/clinqy/env")
+            }
+            acp = ACPAgentSession(provider: provider, executable: path, system: system, model: provider.model(model), promptTimeout: promptTimeout)
+            acpClosed = acp?.closedFlag
+            return
+        }
         if provider != .agyCLI && provider != .claudeCLI {
             api = try APIChat(provider: provider, system: system, model: model, effort: effort)
             effortArg = effort
@@ -223,15 +234,27 @@ final class AgySession: @unchecked Sendable {
 
     var isAlive: Bool {
         if let api { return api.isAlive }
+        // A recoverable timeout keeps the ACP session open, so the wrapper stays usable; only a closed session is dead.
+        if acp != nil { return lock.withLock { !dead } && acpClosed?.isSet != true }
         return lock.withLock { !dead } && process.isRunning
     }
 
     /// Sends one user turn (text plus an optional JPEG) and returns the reply text. `partial` sees the reply text so
     /// far each time it grows (on a background thread). The HTTP and one-shot CLI providers don't stream, so it isn't
     /// called for them.
-    var visionDelivery: VisionPolicy.Delivery { api == nil && isAgy ? .fileReference : .embedded }
+    var visionDelivery: VisionPolicy.Delivery { acp != nil ? .embedded : api == nil && isAgy ? .fileReference : .embedded }
 
     func send(_ text: String, image: String? = nil, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
+        if let acp {
+            do {
+                let reply = try await acp.send(text, image: image, partial: partial)
+                UsageStore.record(provider: sessionProvider, model: sessionModel)
+                return reply
+            } catch {
+                if acpClosed?.isSet == true { lock.withLock { dead = true } }
+                throw error
+            }
+        }
         if let api { return try await api.send(text, image: image, partial: partial) }
 
         var line: Data
@@ -382,6 +405,11 @@ final class AgySession: @unchecked Sendable {
     }
 
     func close() {
+        if let acp {
+            lock.withLock { dead = true }
+            Task { await acp.close() }
+            return
+        }
         if let api { api.close(); return }
         output.fileHandleForReading.readabilityHandler = nil
         errorPipe.fileHandleForReading.readabilityHandler = nil
@@ -546,6 +574,10 @@ enum Brain {
             return Config.value("AGY_MODEL") ?? Config.value("CLAUDE_MODEL") ?? "sonnet"
         case .codexCLI:
             return Config.value("CODEX_MODEL") ?? ""
+        case .opencodeCLI:
+            return Config.value("OPENCODE_MODEL") ?? ""
+        case .cursorCLI:
+            return Config.value("CURSOR_MODEL") ?? ""
         case .claudeCLI:
             return Config.value("CLAUDE_MODEL") ?? Config.value("AGY_MODEL") ?? "sonnet"
         case .anthropic:

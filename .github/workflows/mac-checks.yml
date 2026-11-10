@@ -36,6 +36,10 @@ jobs:
           bash tests/data-stores.sh
       - name: Build the Mac app sources
         run: swift build -c release
+      - name: OpenCode MCP registration
+        run: bash tests/opencode-connect.sh "$PWD/.build/release/Clinqy"
+      - name: OpenCode and Cursor ACP sessions (mock agents)
+        run: bash tests/acp-session.sh
       - name: Extension and download routing
         run: |
           node tests/extension-version.mjs
