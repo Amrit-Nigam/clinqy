@@ -142,7 +142,7 @@ final class AgySession: @unchecked Sendable {
     }
 
     /// `effort` overrides the configured reasoning effort (AGY_EFFORT / CLAUDE_EFFORT) for this session.
-    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil) throws {
+    init(system: String, model: String, provider: Provider = Provider.current, effort: String? = nil, promptTimeout: TimeInterval = 120) throws {
         self.systemPrompt = system
         self.sessionProvider = provider
         self.sessionModel = provider.model(model)
@@ -150,7 +150,7 @@ final class AgySession: @unchecked Sendable {
             guard let path = provider.cliPath else {
                 throw BrainError.failed("\(provider.displayName) CLI not found. Install it or set \(provider == .opencodeCLI ? "OPENCODE_PATH" : "CURSOR_AGENT_PATH") in ~/.config/clinqy/env")
             }
-            acp = ACPAgentSession(provider: provider, executable: path, system: system, model: provider.model(model))
+            acp = ACPAgentSession(provider: provider, executable: path, system: system, model: provider.model(model), promptTimeout: promptTimeout)
             acpClosed = acp?.closedFlag
             return
         }
