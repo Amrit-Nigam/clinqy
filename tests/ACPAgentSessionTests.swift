@@ -125,12 +125,13 @@ private final class CollectedText: @unchecked Sendable {
         var firstTimedOut = false
         do { _ = try await deaf.send("First", image: nil) } catch { firstTimedOut = error.localizedDescription.contains("Timed out") }
         check(firstTimedOut, "A turn the provider never cancels still times out")
-        try await Task.sleep(for: .seconds(11))
+        // Call during the wait for the stale turn: the close at 10 seconds must end that wait, not leave it running.
+        try await Task.sleep(for: .seconds(9))
         var closedError = ""
         let started = ContinuousClock.now
         do { _ = try await deaf.send("Second", image: nil) } catch { closedError = error.localizedDescription }
-        check(closedError.contains("closed") && started.duration(to: .now) < .seconds(1),
-              "An unacknowledged cancel closes the session instead of wedging it")
+        check(closedError.contains("closed") && started.duration(to: .now) < .seconds(4),
+              "An unacknowledged cancel closes the session instead of wedging it, even for a call made during the wait")
         await deaf.close()
         print("PASS: \(checks) ACP provider/session checks (fake local agents; no account or model calls)")
     }

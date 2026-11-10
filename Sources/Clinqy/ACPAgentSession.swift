@@ -3,7 +3,16 @@ import Foundation
 /// A model-only ACP session over a vendor CLI's existing local login. OpenCode runs with a temporary primary
 /// agent that denies every tool; Cursor runs in its documented read-only Ask mode. Clinqy remains the only executor
 /// of computer actions.
+/// Set once a session is closed for any reason; readable without awaiting the actor.
+final class ACPClosedFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value = false
+    var isSet: Bool { lock.withLock { value } }
+    func set() { lock.withLock { value = true } }
+}
+
 actor ACPAgentSession {
+    nonisolated let closedFlag = ACPClosedFlag()
     private struct Failure: LocalizedError {
         let message: String
         /// True when the agent process is still usable after this error (e.g. one turn timed out).
@@ -47,8 +56,9 @@ actor ACPAgentSession {
 
     func send(_ text: String, image: String?, partial: (@Sendable (String) -> Void)? = nil) async throws -> String {
         guard !closed, !sending else { throw Failure(message: "The \(provider.displayName) session is closed or busy") }
-        // Give the agent a few seconds to answer the cancelled turn before refusing the next one.
-        for _ in 0..<50 where staleTurnID != nil { try await Task.sleep(for: .milliseconds(100)) }
+        // Give the agent a few seconds to answer the cancelled turn before refusing the next one. A close during that wait ends it early.
+        for _ in 0..<50 where staleTurnID != nil && !closed { try await Task.sleep(for: .milliseconds(100)) }
+        guard !closed else { throw Failure(message: "The \(provider.displayName) session is closed or busy") }
         guard staleTurnID == nil else {
             throw Failure(message: "\(provider.displayName) is still finishing the timed-out turn. Try again shortly.", keepsSession: true)
         }
@@ -376,6 +386,7 @@ actor ACPAgentSession {
     private func stop(_ error: Error) {
         guard !closed else { return }
         closed = true
+        closedFlag.set()
         for (_, waiter) in pending { waiter.resume(throwing: error) }
         pending.removeAll()
         for (_, timer) in timers { timer.cancel() }

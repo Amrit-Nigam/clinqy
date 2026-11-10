@@ -62,6 +62,7 @@ final class AgySession: @unchecked Sendable {
     private var api: APIChat?
     /// OpenCode and Cursor are model sessions over their official ACP CLI transport.
     private var acp: ACPAgentSession?
+    private var acpClosed: ACPClosedFlag?
     private var isAgy = true
     private var sessionDir: URL?
     private var systemPrompt = ""
@@ -150,6 +151,7 @@ final class AgySession: @unchecked Sendable {
                 throw BrainError.failed("\(provider.displayName) CLI not found. Install it or set \(provider == .opencodeCLI ? "OPENCODE_PATH" : "CURSOR_AGENT_PATH") in ~/.config/clinqy/env")
             }
             acp = ACPAgentSession(provider: provider, executable: path, system: system, model: provider.model(model))
+            acpClosed = acp?.closedFlag
             return
         }
         if provider != .agyCLI && provider != .claudeCLI {
@@ -232,7 +234,8 @@ final class AgySession: @unchecked Sendable {
 
     var isAlive: Bool {
         if let api { return api.isAlive }
-        if acp != nil { return lock.withLock { !dead } }
+        // A recoverable timeout keeps the ACP session open, so the wrapper stays usable; only a closed session is dead.
+        if acp != nil { return lock.withLock { !dead } && acpClosed?.isSet != true }
         return lock.withLock { !dead } && process.isRunning
     }
 
@@ -248,7 +251,7 @@ final class AgySession: @unchecked Sendable {
                 UsageStore.record(provider: sessionProvider, model: sessionModel)
                 return reply
             } catch {
-                lock.withLock { dead = true }
+                if acpClosed?.isSet == true { lock.withLock { dead = true } }
                 throw error
             }
         }

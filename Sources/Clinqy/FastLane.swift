@@ -92,7 +92,8 @@ final class FastLane {
         requestedModel = fast
         // Compared as the ids they resolve to (see above): a helper on the very same model as the lead is not a helper.
         model = fast.flatMap { name in
-            name == leadModel || (route == leadProvider && route.model(name) == route.model(leadModel)) ? nil : name
+            // A different provider is never the same helper, even when the model name matches.
+            route == leadProvider && (name == leadModel || route.model(name) == route.model(leadModel)) ? nil : name
         }
     }
 
