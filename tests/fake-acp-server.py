@@ -111,5 +111,8 @@ for line in sys.stdin:
                 "update": {"sessionUpdate": "agent_message_chunk", "content": {"type": "text", "text": chunk}},
             }})
         response(message, {"stopReason": "end_turn"})
+        if mode == "exitidle":
+            # Exit while idle, after answering: the client must notice on its own and report the session dead.
+            sys.exit(0)
     else:
         response(message, {})

@@ -1,9 +1,17 @@
 #!/bin/zsh
 # End-to-end tests for Clinqy in a native app (TextEdit): typing, menus by path, window control, waiting.
 # Needs: Clinqy.app running. Opens its own TextEdit documents and closes them without saving.
-# Usage: tests/desktop.sh [name-filter]
+# Usage: CLINQY_DESKTOP_TESTS=1 tests/desktop.sh [name-filter]
+#
+# This is a live test. Every task goes to the model Clinqy is configured with, it types into and closes TextEdit
+# documents, and the schedule test writes a real entry to schedules.json. It refuses to run unless
+# CLINQY_DESKTOP_TESTS=1 is set, and it is not part of CI. The schedule test also needs CLINQY_DESKTOP_SCHEDULE=1.
 set -u
 cd "$(dirname "$0")"
+if [[ ${CLINQY_DESKTOP_TESTS:-} != 1 ]]; then
+  echo "tests/desktop.sh is a live test (real model calls, TextEdit, your Clinqy app). Set CLINQY_DESKTOP_TESTS=1 to run it."
+  exit 2
+fi
 LOG=~/Library/Logs/Clinqy/agent.log
 FILTER=${1:-}
 PASS=0; FAIL=0
@@ -14,13 +22,16 @@ pgrep -x Clinqy >/dev/null || { echo "Clinqy isn't running (./build.sh run)"; ex
 te() { osascript -e "tell application \"TextEdit\" to $1" 2>/dev/null; }
 frontmost() { osascript -e 'tell application "System Events" to get name of first process whose frontmost is true'; }
 enc() { python3 -c 'import sys,urllib.parse;print(urllib.parse.quote(sys.argv[1]))' "$1"; }
-cleanup() { te "close every document saving no" >/dev/null; osascript -e 'tell application "TextEdit" to quit saving no' >/dev/null 2>&1; }
+# Only the TextEdit documents this script created are closed, by id. The user's other documents and TextEdit itself
+# are left alone (the script used to close every document and quit TextEdit, discarding unsaved work).
+TEST_DOCS=()
+cleanup() { for d in $TEST_DOCS; do te "close (first document whose id is $d) saving no" >/dev/null; done; }
 trap cleanup EXIT
 
 # A fresh TextEdit document in front, with optional starting text.
 fresh_doc() {
-  te "close every document saving no" >/dev/null
   te "make new document" >/dev/null
+  TEST_DOCS+=($(te "id of front document"))
   [[ -n ${1:-} ]] && te "set text of front document to \"$1\"" >/dev/null
   for i in 1 2 3 4 5 6; do open -a TextEdit; sleep 0.5; [[ $(frontmost) == TextEdit ]] && return 0; done
   return 1
@@ -89,8 +100,9 @@ fi
 if want dialog; then
   fresh_doc "unsaved text that should be thrown away"
   run "close this TextEdit document without saving it"; answer=$ANSWER
-  n=$(te "count documents")
-  (( n == 0 )); result dialog $(( $? == 0 )) "documents left=$n · $answer"
+  d=${TEST_DOCS[-1]}
+  open=$(te "exists (first document whose id is $d)")
+  [[ $open == false ]]; result dialog $(( $? == 0 )) "test document still open=$open · $answer"
 fi
 
 if want restore-front; then
@@ -104,12 +116,19 @@ if want restore-front; then
 fi
 
 if want schedule; then
-  SCHED=~/Library/Application\ Support/Clinqy/schedules.json
-  cp "$SCHED" /tmp/clinqy-schedules-backup.json 2>/dev/null || rm -f /tmp/clinqy-schedules-backup.json
-  run "remind me every weekday at 9:15 to check placement emails"; answer=$ANSWER
-  grep -q "placement" "$SCHED" 2>/dev/null; ok=$(( $? == 0 ))
-  if [[ -f /tmp/clinqy-schedules-backup.json ]]; then cp /tmp/clinqy-schedules-backup.json "$SCHED"; else rm -f "$SCHED"; fi
-  result schedule $ok "$answer"
+  if [[ ${CLINQY_DESKTOP_SCHEDULE:-} != 1 ]]; then
+    printf "SKIP  %-16s needs CLINQY_DESKTOP_SCHEDULE=1 (it adds a real entry to schedules.json)\n" schedule
+  else
+    # Back up the user's real schedules.json to a private temp file, and restore it afterwards. If the file didn't
+    # exist before, the entry this test adds is removed again.
+    SCHED=~/Library/Application\ Support/Clinqy/schedules.json
+    BACKUP=$(mktemp); had=0
+    if [[ -e $SCHED ]]; then cp "$SCHED" "$BACKUP"; had=1; fi
+    run "remind me every weekday at 9:15 to check placement emails"; answer=$ANSWER
+    grep -q "placement" "$SCHED" 2>/dev/null; ok=$(( $? == 0 ))
+    if (( had )); then cp "$BACKUP" "$SCHED"; else rm -f "$SCHED"; fi
+    result schedule $ok "$answer"
+  fi
 fi
 
 if want mcp; then

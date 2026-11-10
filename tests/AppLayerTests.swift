@@ -15,6 +15,7 @@ import Foundation
         }
 
         try await recoverableTimeoutKeepsWrapperAlive(fake: fake, check: check)
+        try await closedSessionIsDead(fake: fake, check: check)
         await fastLaneRouting(check: check)
 
         print("PASS \(checks) app-layer checks")
@@ -52,6 +53,56 @@ import Foundation
         check(answer == "Hello from ACP", "The next turn is served by the same session after the timeout")
         check(session.isAlive, "The wrapper stays alive after the recovered turn")
         session.close()
+    }
+
+    /// A session whose process has exited, or that was explicitly closed, must be reported dead so callers replace it.
+    static func closedSessionIsDead(fake: String, check: (Bool, String) -> Void) async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-app-dead-" + UUID().uuidString)
+        try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // Process exits as soon as it starts: the ACP session closes on its own.
+        let exiting = root.appendingPathComponent("cursor-agent-exits")
+        try "#!/bin/sh\nexit 0\n".write(to: exiting, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: exiting.path)
+        setenv("CURSOR_AGENT_PATH", exiting.path, 1)
+        let exited = try AgySession(system: "Return plain text.", model: "vendor/model-test", provider: .cursorCLI, promptTimeout: 1)
+        var failed = false
+        do { _ = try await exited.send("Hello") } catch { failed = true }
+        check(failed, "A session whose process exits fails the turn")
+        check(await waitUntilDead(exited), "A session whose process exited is reported dead")
+
+        // The process exits while the session is idle, after a good turn: no later send reports it, so the
+        // session must still be reported dead on its own.
+        let idleExit = root.appendingPathComponent("cursor-agent-idle-exit")
+        try "#!/bin/sh\nexec /usr/bin/python3 \"\(fake)\" \"cursor-cli\" \"\(root.appendingPathComponent("idle.jsonl").path)\" exitidle\n"
+            .write(to: idleExit, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: idleExit.path)
+        setenv("CURSOR_AGENT_PATH", idleExit.path, 1)
+        let idle = try AgySession(system: "Return plain text.", model: "vendor/model-test", provider: .cursorCLI, promptTimeout: 1)
+        check(try await idle.send("Hello") == "Hello from ACP", "A turn answered before the agent exits while idle")
+        check(await waitUntilDead(idle), "A session whose agent exits while idle is reported dead without another send")
+
+        // Explicit close of a healthy session.
+        let healthy = root.appendingPathComponent("cursor-agent-healthy")
+        let log = root.appendingPathComponent("healthy.jsonl")
+        try "#!/bin/sh\nexec /usr/bin/python3 \"\(fake)\" \"cursor-cli\" \"\(log.path)\"\n"
+            .write(to: healthy, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: healthy.path)
+        setenv("CURSOR_AGENT_PATH", healthy.path, 1)
+        let closing = try AgySession(system: "Return plain text.", model: "vendor/model-test", provider: .cursorCLI, promptTimeout: 1)
+        check(try await closing.send("Hello") == "Hello from ACP", "A healthy session answers before it is closed")
+        closing.close()
+        check(await waitUntilDead(closing), "An explicitly closed session is reported dead")
+    }
+
+    /// `AgySession.close()` and process exit both reach the ACP session asynchronously, so poll briefly.
+    static func waitUntilDead(_ session: AgySession) async -> Bool {
+        for _ in 0..<30 {
+            if !session.isAlive { return true }
+            try? await Task.sleep(for: .milliseconds(100))
+        }
+        return !session.isAlive
     }
 
     /// FastLane's helper is off only when it would be the same provider on the same model.

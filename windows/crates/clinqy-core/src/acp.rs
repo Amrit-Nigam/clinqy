@@ -2,16 +2,16 @@
 //! permission requests are never granted. OpenCode gets a deny-all agent and Cursor runs its read-only Ask mode.
 
 use crate::provider::{CliCommand, Provider};
-use anyhow::{Context, Result, anyhow, bail};
+use anyhow::{anyhow, bail, Context, Result};
 use base64::Engine;
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::process::Stdio;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{mpsc, Mutex};
 
 /// What every ACP agent gets from the environment, besides its own provider keys. Clinqy's other settings stay private.
 const BASE_ENVIRONMENT_KEYS: &[&str] = &[
@@ -556,11 +556,9 @@ mod tests {
     #[test]
     fn agent_environment_is_an_allowlist_without_clinqy_secrets() {
         assert!(BASE_ENVIRONMENT_KEYS.contains(&"PATH"));
-        assert!(
-            BASE_ENVIRONMENT_KEYS.iter().all(|key| !key.contains("KEY")
-                && !key.contains("TOKEN")
-                && !key.contains("SECRET"))
-        );
+        assert!(BASE_ENVIRONMENT_KEYS
+            .iter()
+            .all(|key| !key.contains("KEY") && !key.contains("TOKEN") && !key.contains("SECRET")));
     }
 
     #[test]
@@ -656,11 +654,9 @@ mod tests {
             provider_environment_keys(Provider::CursorCli),
             &["CURSOR_API_KEY", "CURSOR_AUTH_TOKEN"]
         );
-        assert!(
-            provider_environment_keys(Provider::CursorCli)
-                .iter()
-                .all(|key| key.starts_with("CURSOR_"))
-        );
+        assert!(provider_environment_keys(Provider::CursorCli)
+            .iter()
+            .all(|key| key.starts_with("CURSOR_")));
         assert_eq!(
             provider_environment_keys(Provider::OpenCodeCli),
             &[
