@@ -58,7 +58,8 @@ actor ACPAgentSession {
         guard !closed, !sending else { throw Failure(message: "The \(provider.displayName) session is closed or busy") }
         // Give the agent a few seconds to answer the cancelled turn before refusing the next one. A close during that wait ends it early.
         for _ in 0..<50 where staleTurnID != nil && !closed { try await Task.sleep(for: .milliseconds(100)) }
-        guard !closed else { throw Failure(message: "The \(provider.displayName) session is closed or busy") }
+        // The actor can run other calls during that wait, so the busy check is repeated here, before anything awaits again.
+        guard !closed, !sending else { throw Failure(message: "The \(provider.displayName) session is closed or busy") }
         guard staleTurnID == nil else {
             throw Failure(message: "\(provider.displayName) is still finishing the timed-out turn. Try again shortly.", keepsSession: true)
         }

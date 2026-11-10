@@ -114,6 +114,22 @@ private final class CollectedText: @unchecked Sendable {
         check(recovered == "Hello from ACP", "ACP session survives a timed-out turn and answers the next one")
         check(!recovered.contains("LATE"), "Output from the cancelled turn never reaches the next answer")
         await stalled.close()
+        // Two calls that queue behind a stale turn must not both start a prompt once it clears.
+        let slowWrapper = root.appendingPathComponent("slow-fake")
+        let slowBody = "#!/bin/sh\nexec /usr/bin/python3 \"\(fake)\" \"cursor-cli\" \"\(root.appendingPathComponent("slow.jsonl").path)\" slowstall\n"
+        try slowBody.write(to: slowWrapper, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: slowWrapper.path)
+        let queued = ACPAgentSession(provider: .cursorCLI, executable: slowWrapper.path,
+                                     system: "Do not use tools. Return plain text.", model: "vendor/model-test",
+                                     promptTimeout: 1)
+        do { _ = try await queued.send("First", image: nil) } catch {}
+        let callA = Task { try await queued.send("A", image: nil) }
+        let callB = Task { try await queued.send("B", image: nil) }
+        let outcomeA = await callA.result, outcomeB = await callB.result
+        let successes = [outcomeA, outcomeB].filter { (try? $0.get()) != nil }.count
+        check(successes == 1, "Only one of two calls queued behind a stale turn starts a prompt")
+        await queued.close()
+
         // A provider that never acknowledges cancellation must not wedge the session: it is closed, and the next call fails fast.
         let deafWrapper = root.appendingPathComponent("deaf-fake")
         let deafBody = "#!/bin/sh\nexec /usr/bin/python3 \"\(fake)\" \"cursor-cli\" \"\(root.appendingPathComponent("deaf.jsonl").path)\" deaf\n"
