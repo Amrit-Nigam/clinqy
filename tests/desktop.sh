@@ -3,9 +3,9 @@
 # Needs: Clinqy.app running. Opens its own TextEdit documents and closes them without saving.
 # Usage: CLINQY_DESKTOP_TESTS=1 tests/desktop.sh [name-filter]
 #
-# This is a live test. Every task goes to the model Clinqy is configured with, it types into and closes TextEdit
-# documents, and the schedule test writes a real entry to schedules.json. It refuses to run unless
-# CLINQY_DESKTOP_TESTS=1 is set, and it is not part of CI. The schedule test also needs CLINQY_DESKTOP_SCHEDULE=1.
+# This is a live test. Every task goes to the model Clinqy is configured with, and it types into and closes TextEdit
+# documents. It refuses to run unless CLINQY_DESKTOP_TESTS=1 is set, and it is not part of CI.
+# It never touches schedules.json: the schedule scenario was removed until the app can use an isolated data folder.
 set -u
 cd "$(dirname "$0")"
 if [[ ${CLINQY_DESKTOP_TESTS:-} != 1 ]]; then
@@ -115,21 +115,8 @@ if want restore-front; then
   [[ ${text:l} == *"restore check"* && $front == Finder ]]; result restore-front $(( $? == 0 )) "front=$front text=$text · $answer"
 fi
 
-if want schedule; then
-  if [[ ${CLINQY_DESKTOP_SCHEDULE:-} != 1 ]]; then
-    printf "SKIP  %-16s needs CLINQY_DESKTOP_SCHEDULE=1 (it adds a real entry to schedules.json)\n" schedule
-  else
-    # Back up the user's real schedules.json to a private temp file, and restore it afterwards. If the file didn't
-    # exist before, the entry this test adds is removed again.
-    SCHED=~/Library/Application\ Support/Clinqy/schedules.json
-    BACKUP=$(mktemp); had=0
-    if [[ -e $SCHED ]]; then cp "$SCHED" "$BACKUP"; had=1; fi
-    run "remind me every weekday at 9:15 to check placement emails"; answer=$ANSWER
-    grep -q "placement" "$SCHED" 2>/dev/null; ok=$(( $? == 0 ))
-    if (( had )); then cp "$BACKUP" "$SCHED"; else rm -f "$SCHED"; fi
-    result schedule $ok "$answer"
-  fi
-fi
+# The schedule scenario ("remind me every weekday…") is intentionally absent: it writes a real entry to the user's
+# schedules.json, and this script can't isolate that file yet (the app has no data-directory override).
 
 if want mcp; then
   RUN_TURNS=0
