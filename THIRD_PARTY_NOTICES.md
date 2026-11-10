@@ -2,7 +2,7 @@
 
 ## open-computer-use macOS background input reference
 
-SkyLight key-window records and related background-input ABI definitions were adapted from iFurySt/open-computer-use (https://github.com/iFurySt/open-computer-use). The original Cua/yabai notices are retained below.
+SkyLight key-window records and related background-input ABI definitions were adapted from iFurySt/open-computer-use (https://github.com/iFurySt/open-computer-use), also published as iFurySt/open-codex-computer-use (https://github.com/iFurySt/open-codex-computer-use). From the latter, Clinqy also ports: the occlusion keep-alive (`SLSPackagesEnableWindowOcclusionNotifications` ABI, apply-only-while-unoccluded grid check, restore at exit), the `SLSHWCaptureWindowList` backing-store capture options used as the primary window capture, the double-click variant of the click recipe, and the measured input delay defaults and their environment knobs (focus record settle 10 ms, click delay scale 0.2, key settle/release 10 ms) from its background-input benchmarks. The original Cua/yabai notices are retained below.
 
 MIT License
 

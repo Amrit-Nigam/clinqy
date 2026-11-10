@@ -65,6 +65,36 @@ def score(expected, state, reported_success):
             'wrong_target_actions': wrong, 'duplicate_effects': duplicates}
 
 
+def receipt_counts(result):
+    """Per-task counts from an app receipt: model turns, UNVERIFIED action results and questions to the user.
+    None where the receipt doesn't carry them (older app builds); never inferred from the agent's prose."""
+    counts = result.get('counts') if isinstance(result, dict) else None
+    counts = counts if isinstance(counts, dict) else {}
+    def count(key):
+        value = counts.get(key)
+        return value if type(value) is int and value >= 0 else None
+    return {'model_turns': count('turns'), 'unverified_results': count('unverified_results'), 'user_prompts': count('asks')}
+
+
+def count_totals(rows):
+    """Sums and median of the receipt counts over rows that reported them."""
+    out = {}
+    for key in ('model_turns', 'unverified_results', 'user_prompts'):
+        values = [r[key] for r in rows if type(r.get(key)) is int]
+        out[key] = {'reported': len(values), 'total': sum(values) if values else None,
+                    'median': statistics.median(values) if values else None}
+    return out
+
+
+def phase_totals(rows):
+    """Median milliseconds per phase (from receipt phase_milliseconds) across rows that reported that phase."""
+    phases = {}
+    for row in rows:
+        for key, value in (row.get('phase_milliseconds') or {}).items():
+            if type(value) in (int, float) and math.isfinite(value) and value >= 0: phases.setdefault(key, []).append(value)
+    return {key: statistics.median(values) for key, values in sorted(phases.items())}
+
+
 def summary(rows):
     durations = sorted(row['seconds'] for row in rows)
     count = len(rows)
@@ -77,7 +107,8 @@ def summary(rows):
             'wrong_target_actions': sum(r['wrong_target_actions'] for r in rows),
             'duplicate_effects': sum(r['duplicate_effects'] for r in rows),
             'median_seconds': statistics.median(durations) if count else None,
-            'p95_seconds': durations[max(0, math.ceil(count * .95) - 1)] if count else None}
+            'p95_seconds': durations[max(0, math.ceil(count * .95) - 1)] if count else None,
+            'counts': count_totals(rows), 'median_phase_milliseconds': phase_totals(rows)}
 
 
 PROVIDERS = ['agy', 'claude', 'codex', 'anthropic', 'openai', 'gemini', 'openrouter', 'ollama', 'compatible']
@@ -343,6 +374,7 @@ def main():
                    'timed_out': timed_out, **score(expected, state, reported),
                    'fixture_state_received': state is not None, 'fixture_state': state, 'agent_output': output[-8000:],
                    'phase_milliseconds': metrics or None, 'phase_metrics_source': 'app receipt' if metrics else None,
+                   **receipt_counts(result or owned.result),
                    'desktop_observation': desktop, 'desktop_monitor_error': monitor.error,
                    'download_path': str(download) if name == 'download' else None,
                    'interventions': None, 'recovery_attempts': None, 'model_cost': None, 'foreground_interruptions': None})

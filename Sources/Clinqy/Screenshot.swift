@@ -119,23 +119,53 @@ enum Screenshot {
     /// Shared exact-window capture for model images, OCR and coordinate validation. Off-Space
     /// windows are enumerated without activation. The optional private fallback reads only this ID.
     static func rawImage(window snapshot: NativeWindowObservation, width: Int, height: Int) async -> CGImage? {
-        guard !Task.isCancelled, snapshot.staleness(includeContent: true) == nil, CGPreflightScreenCaptureAccess(),
-              width > 0, height > 0, width <= 8192, height <= 8192 else { return nil }
-        if let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false),
-           let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }),
-           ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame) {
-            let config = SCStreamConfiguration()
-            config.width = width; config.height = height; config.showsCursor = false
-            if let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window), configuration: config),
-               !Task.isCancelled, snapshot.staleness(includeContent: true) == nil { return image }
+        guard !Task.isCancelled, snapshot.staleness(includeContent: true) == nil else { return nil }
+        guard let image = await uncheckedImage(window: snapshot, width: width, height: height),
+              !Task.isCancelled, snapshot.staleness(includeContent: true) == nil else { return nil }
+        return image
+    }
+
+    /// Exact-window pixels without staleness checks; callers check provenance once before and once after.
+    /// Primary: WindowServer backing-store capture (15–45 ms, covered windows and other Spaces). Fallback:
+    /// ScreenCaptureKit (90–155 ms) with its shareable-content inventory reused for about a second.
+    private static func uncheckedImage(window snapshot: NativeWindowObservation, width: Int, height: Int) async -> CGImage? {
+        guard CGPreflightScreenCaptureAccess(), width > 0, height > 0, width <= 8192, height <= 8192 else { return nil }
+        if let image = SkyLight.capture(snapshot) {
+            // A background run pins the window's visible state while it is still uncovered (Chromium/Electron
+            // otherwise stop rendering once the user covers it). Restored at run end by Hand.endRun.
+            if await MainActor.run(body: { Background.active }) { SkyLight.keepVisible(snapshot) }
+            if image.width == width, image.height == height { return image }
+            guard let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                                          space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
+            context.interpolationQuality = .high
+            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
+            if let scaled = context.makeImage() { return scaled }
         }
-        guard !Task.isCancelled, let image = SkyLight.capture(snapshot),
-              let context = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
-                                      space: CGColorSpaceCreateDeviceRGB(), bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue) else { return nil }
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        guard snapshot.staleness(includeContent: true) == nil else { return nil }
-        return context.makeImage()
+        guard !Task.isCancelled, let window = await ShareableWindows.shared.window(pid: snapshot.pid, id: snapshot.windowID),
+              ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame) else { return nil }
+        let config = SCStreamConfiguration()
+        config.width = width; config.height = height; config.showsCursor = false
+        return try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window), configuration: config)
+    }
+
+    /// ScreenCaptureKit's window inventory, reused for about a second instead of being re-enumerated on every
+    /// capture. A miss (new window) re-enumerates once.
+    actor ShareableWindows {
+        static let shared = ShareableWindows()
+        private var content: SCShareableContent?
+        private var fetchedAt = Date.distantPast
+        static let lifetime: TimeInterval = 1
+
+        func window(pid: pid_t, id: CGWindowID) async -> SCWindow? {
+            func find(_ content: SCShareableContent?) -> SCWindow? {
+                content?.windows.first { $0.owningApplication?.processID == pid && $0.windowID == id }
+            }
+            if Date().timeIntervalSince(fetchedAt) < Self.lifetime, let hit = find(content) { return hit }
+            guard let fresh = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: false) else { return nil }
+            content = fresh
+            fetchedAt = Date()
+            return find(fresh)
+        }
     }
 
     private static func currentImage(window snapshot: NativeWindowObservation, width: Int, height: Int) async -> CGImage? {
@@ -186,9 +216,11 @@ enum Screenshot {
         // Long side, not width: a tall narrow window would otherwise blow past the budget.
         let ceiling = detail == .high ? backingScale(for: targetFrame) : 1
         let scale = min(ceiling, maxSide / max(targetFrame.width, targetFrame.height))
-        guard let image = await rawImage(window: snapshot, width: max(1, Int(targetFrame.width * scale)),
-                                        height: max(1, Int(targetFrame.height * scale))) else { return .failure(.captureFailed) }
-        guard snapshot.staleness(includeContent: true) == nil else { return .failure(.staleWindow) }
+        // Provenance (identity, frame, AX content) is checked once before (above) and once after encoding
+        // (below) instead of four times; an image of a window that changed meanwhile is still rejected.
+        guard let image = await uncheckedImage(window: snapshot, width: max(1, Int(targetFrame.width * scale)),
+                                               height: max(1, Int(targetFrame.height * scale))) else { return .failure(.captureFailed) }
+        guard !Task.isCancelled else { return .failure(.staleWindow) }
         // A flat image whose provenance is valid is still the window's real content (a blank page, a loading
         // screen), so it is kept with a notice. Only all-black, the signature of withheld frames, is refused.
         var notice: String?

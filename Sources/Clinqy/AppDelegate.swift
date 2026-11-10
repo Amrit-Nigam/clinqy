@@ -45,6 +45,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     func applicationWillTerminate(_ notification: Notification) {
         defer { TaskPowerAssertions.shared.shutdown() }
         // Nothing of Clinqy's hidden screen may land on the user's when it goes with the app.
+        ControlSocket.stop()
         Updater.shared.stop()
         Efficiency.stop()
         Clipboard.stop()
@@ -117,15 +118,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         Background.onBusyApp = { [weak self] text in self?.buddy.bubble(text, for: 4) }
         Background.watchSwitches()
         AgentScreenView.shared.agent = agent
-        Notifier.onAnswer = { [weak self] text in self?.agent.answer(text) }
-        // "Done": show the window it worked in. "Needs you": the bar, to answer.
-        Notifier.onOpen = { [weak self] question in
+        // A browser job's question is answered back to that job; nil is the main agent's own question.
+        Notifier.onAnswer = { [weak self] text, run in
+            if let run, let job = BrowserJobs.shared.jobs.first(where: { $0.id == run && !$0.finished }) { BrowserJobs.shared.answer(job.id, text: text) }
+            else { self?.agent.answer(text) }
+        }
+        // "Done": show the window it worked in. "Needs you": the bar (or the browser job's card), to answer.
+        Notifier.onOpen = { [weak self] question, run in
             guard let self else { return }
+            if question, let run, let job = BrowserJobs.shared.jobs.first(where: { $0.id == run }) { BrowserJobs.shared.details(job); return }
             if question || self.agent.question != nil { self.panel.showCentered(); self.island.show() }
             else { AgentScreenView.shared.show() }
         }
+        configureRunSupervisor()
         enableOpenAtLogin()
         _ = Self.cliToken   // written now, so the clinqy command can read it before its first link
+        startControlSocket()
         linkCommand()
         installEditMenu()
         dismissOnOutsideClick()
@@ -178,6 +186,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.onStart = { [weak self] in
             guard let self else { return }
+            self.superviseMainRun()
             self.setStatusIcon(running: true, background: self.agent.runBackground)
             StepUndo.shared.clear()
             // Keystrokes must reach the target app, and clicks must not land on our windows.
@@ -186,6 +195,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         agent.onFinish = { [weak self] answer, ok in
             guard let self else { return }
+            RunSupervisor.shared.finished(run: self.agent.taskRecordID)
             DispatchQueue.main.async { [weak self] in self?.startNextNativeRequest() }
             UI.cancelReview()
             self.setStatusIcon(running: false)
@@ -204,6 +214,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         // Paused for the user's input: bring the bar up with the question; hide it again once answered.
         agent.onQuestion = { [weak self] in
             guard let self else { return }
+            self.superviseMainQuestion()
             // A background run asks through a notification instead: the bar would take the user's focus.
             if self.agent.runBackground { self.island.show(); return }
             if self.panel.isVisible && self.agent.newTaskMode { return }
@@ -211,7 +222,12 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             self.panel.showCentered()
             self.island.show()
         }
-        agent.onAnswered = { [weak self] in self?.panel.orderOut(nil) }
+        agent.onAnswered = { [weak self] in
+            guard let self else { return }
+            self.panel.orderOut(nil)
+            RunSupervisor.shared.answered(run: self.agent.taskRecordID)
+            Telegram.shared.dismissQuestion(from: self.agent)
+        }
         voice.onLevel = { [weak self] level in self?.buddy.level = level }
         voice.onFinal = { [weak self] text in
             guard let self else { return }
@@ -428,6 +444,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
             agent.submit(dry ? "dry run: " + task : task, test: test, provider: runProvider)
         }
+    }
+
+    /// Local control socket (owner-only, peer uid checked): the MCP relay's fast path; the clinqy://control file relay remains the fallback.
+    private func startControlSocket() {
+        guard let agent = self.agent else { return }
+        let ok = ControlSocket.serve(handler: { box in
+            UncheckedBox(await agent.control(box.value))
+        }, cancel: { session in
+            Task { @MainActor in agent.cancelControl(session: session) }
+        })
+        if !ok { Agent.writeLog("control socket unavailable; MCP falls back to the file relay") }
     }
 
     /// The authenticated URL names only an app-owned request file; callers cannot choose an output path.
@@ -785,6 +812,48 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
             startScheduledTask(id)
             return
         }
+    }
+
+    // MARK: - Remote copilot (every run visible, pausable and answerable from the phone)
+
+    private func configureRunSupervisor() {
+        let supervisor = RunSupervisor.shared
+        supervisor.questionTimeout = QuestionPolicy.timeout(config: Config.value("QUESTION_TIMEOUT_MINUTES"))
+        supervisor.onChange = { [weak self] id in
+            guard let self, id == self.agent.taskRecordID, self.agent.isRunning, self.agent.runBackground else { return }
+            switch supervisor.state(id) {
+            case .paused: WorkingBadge.shared.update(status: "Paused — resume from Telegram or Tasks", waiting: true)
+            case .takenOver: WorkingBadge.shared.update(status: "You have control — hand back when done", waiting: true)
+            case .running where supervisor.pendingQuestion(id) == nil && self.agent.question == nil: WorkingBadge.shared.update(status: "Continuing")
+            default: break
+            }
+        }
+        supervisor.onReveal = { [weak self] id in
+            guard let self else { return }
+            if let job = BrowserJobs.shared.jobs.first(where: { $0.id == id && !$0.finished }) { BrowserJobs.shared.reveal(job) }
+            else if id == self.agent.taskRecordID { Task { await self.agent.revealTelegramTarget() } }
+        }
+    }
+
+    /// The main agent started (or auto-continued) a run: register it and mirror it to Telegram when paired.
+    private func superviseMainRun() {
+        guard !agent.isTest, let id = agent.taskRecordID, let item = TaskStore.shared.record(id) else { return }
+        let source: RunSource = item.source == .telegram ? .telegram : isScheduledTask(item) ? .scheduled : agent.runReceiptID != nil ? .mcp : .mac
+        RunSupervisor.shared.register(run: id, source: source, title: item.request, background: agent.runBackground)
+        if source != .telegram { Telegram.shared.mirror(agent, taskID: id, source: source) }
+    }
+
+    /// The main agent is waiting on the user: give the question a timeout with a safe default, and send it to the
+    /// phone for mirrored runs (Telegram-owned runs are asked by the agent; Telegram ignores the repeat).
+    private func superviseMainQuestion() {
+        guard let question = agent.question, let id = agent.taskRecordID, RunSupervisor.shared.entry(id) != nil else { return }
+        RunSupervisor.shared.question(run: id, text: question.text, options: question.options, sensitive: question.sensitive) { [weak self] fallback in
+            guard let self, self.agent.taskRecordID == id, self.agent.question == question else { return }
+            Agent.writeLog("question timed out; using the safe default: " + (fallback.map { String($0.prefix(60)) } ?? "(no answer)"))
+            // Marked as a timeout default even when it is a plain option ("No"): never filled in, remembered or read as a yes.
+            self.agent.answer(AskApproval.timeoutReply(fallback))
+        }
+        Telegram.shared.ask(question.text, options: question.options, sensitive: question.sensitive, from: agent)
     }
 
     private func isScheduledTask(_ item: TaskStore.Record) -> Bool {

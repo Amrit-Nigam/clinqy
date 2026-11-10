@@ -2,7 +2,8 @@
 import AppKit
 
 enum Config {
-    static func value(_ key: String) -> String? { key == "TELEGRAM_BOT_TOKEN" ? "test-token" : "42" }
+    static var overrides: [String: String] = [:]
+    static func value(_ key: String) -> String? { key == "TELEGRAM_BOT_TOKEN" ? "test-token" : key == "TELEGRAM_CHAT_ID" ? "42" : overrides[key] }
     static func write(_ values: [String: String]) throws {}
 }
 enum Secrets { static func mask(_ text: String) -> String { text } }
@@ -14,6 +15,8 @@ struct ResultCard: Equatable {
     var plain: String { ([title] + [text].compactMap { $0 } + items.map { [$0.title, $0.subtitle, $0.detail, $0.link].compactMap { $0 }.joined(separator: " — ") }).joined(separator: "\n") }
 }
 enum Background { static func choice(_ text: inout String) -> Bool? { ExecutionMode.choice(&text) } }
+struct Workflow { var name: String }
+@MainActor final class Workflows { static let shared = Workflows(); var all: [Workflow] = [] }
 @MainActor final class Agent {
     struct Question { var text: String; var sensitive = false }
     struct Step { enum State { case running, ok, failed, info }; var text: String; var state: State = .ok }
@@ -60,6 +63,29 @@ final class TelegramAPI: URLProtocol {
     static var rawRequests: [(String, Data)] = []
     static var nextMessage = 100
     static var failPhotos = false
+    static var rateLimited = 0
+    static var limitedHits = 0
+    /// Text fields of a multipart upload; JSON fields (reply_markup, media) decoded; files recorded as "_file_<name>".
+    static func multipart(_ data: Data, boundary: String) -> [String: Any] {
+        var fields: [String: Any] = [:]
+        let separator = Data(("--" + boundary).utf8)
+        var parts: [Data] = [], rest = data[...]
+        while let range = rest.range(of: separator) {
+            let part = rest[..<range.lowerBound]; if !part.isEmpty { parts.append(Data(part)) }
+            rest = rest[range.upperBound...]
+        }
+        for part in parts {
+            guard let split = part.range(of: Data("\r\n\r\n".utf8)), let header = String(data: part[..<split.lowerBound], encoding: .utf8),
+                  let name = header.firstMatch(of: /name="([^"]+)"/)?.1 else { continue }
+            var value = part[split.upperBound...]
+            if value.suffix(2) == Data("\r\n".utf8) { value = value.dropLast(2) }
+            if header.contains("filename=") { fields["_file_" + name] = Data(value); continue }
+            let text = String(data: Data(value), encoding: .utf8) ?? ""
+            if ["reply_markup", "media"].contains(String(name)), let json = try? JSONSerialization.jsonObject(with: Data(text.utf8)) { fields[String(name)] = json }
+            else { fields[String(name)] = text }
+        }
+        return fields
+    }
     override class func canInit(with request: URLRequest) -> Bool { true }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
     override func startLoading() {
@@ -71,7 +97,18 @@ final class TelegramAPI: URLProtocol {
             while stream.hasBytesAvailable { let n = stream.read(&bytes, maxLength: bytes.count); if n <= 0 { break }; result.append(contentsOf: bytes.prefix(n)) }
             data = result
         }
-        let body = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        var body = data.flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] } ?? [:]
+        if let type = request.value(forHTTPHeaderField: "Content-Type"), type.hasPrefix("multipart/form-data; boundary="), let data {
+            body = Self.multipart(data, boundary: String(type.dropFirst("multipart/form-data; boundary=".count)))
+        }
+        if Self.lock.withLock({ () -> Bool in
+            guard Self.rateLimited > 0, method == "sendMessage" else { return false }
+            Self.rateLimited -= 1; Self.limitedHits += 1; return true
+        }) {
+            let payload = try! JSONSerialization.data(withJSONObject: ["ok": false, "error_code": 429, "description": "Too Many Requests: retry after 1", "parameters": ["retry_after": 1]])
+            client?.urlProtocol(self, didReceive: HTTPURLResponse(url: request.url!, statusCode: 429, httpVersion: nil, headerFields: nil)!, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: payload); client?.urlProtocolDidFinishLoading(self); return
+        }
         let id = Self.lock.withLock { () -> Int in
             Self.nextMessage += 1
             var recorded = body; recorded["_responseMessageID"] = body["message_id"] as? Int ?? Self.nextMessage
@@ -91,11 +128,28 @@ final class TelegramAPI: URLProtocol {
     }
     override func stopLoading() {}
     static func bodies(_ method: String) -> [[String: Any]] { lock.withLock { requests.filter { $0.0 == method }.map { $0.1 } } }
-    static func texts(_ method: String = "sendMessage") -> [String] { bodies(method).compactMap { $0["text"] as? String } }
+    static func texts(_ method: String) -> [String] { bodies(method).compactMap { ($0["text"] ?? $0["caption"]) as? String } }
+    /// Messages that appear in the chat (texts and photo captions), in order.
+    static func texts() -> [String] {
+        lock.withLock { requests.filter { ["sendMessage", "sendPhoto"].contains($0.0) }.compactMap { ($0.1["text"] ?? $0.1["caption"]) as? String } }
+    }
+    /// Every version of every live card edit.
+    static func cards() -> [String] {
+        lock.withLock { requests.compactMap { method, body -> String? in
+            switch method {
+            case "editMessageText": return body["text"] as? String
+            case "editMessageCaption": return body["caption"] as? String
+            case "editMessageMedia": return (body["media"] as? [String: Any])?["caption"] as? String
+            default: return nil
+            }
+        } }
+    }
+    static func toasts() -> [String] { bodies("answerCallbackQuery").compactMap { $0["text"] as? String } }
+    /// Newest button whose label is `title` or ends with it ("⏸ Pause", "2. No").
     static func option(_ title: String) -> String? {
-        bodies("sendMessage").reversed().compactMap { body -> String? in
+        lock.withLock { requests.map(\.1) }.reversed().compactMap { body -> String? in
             guard let markup = body["reply_markup"] as? [String: Any], let rows = markup["inline_keyboard"] as? [[[String: String]]] else { return nil }
-            return rows.flatMap { $0 }.first { $0["text"] == title }?["callback_data"]
+            return rows.flatMap { $0 }.first { $0["text"] == title || $0["text"]?.hasSuffix(" " + title) == true }?["callback_data"]
         }.first
     }
 }
@@ -108,7 +162,7 @@ final class TelegramAPI: URLProtocol {
         let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
         func bridge() -> (Telegram, Agent, TaskStore) {
             let store = TaskStore(file: root.appendingPathComponent(UUID().uuidString + ".json"))
-            let bot = Telegram(session: session, downloadDirectory: root, store: store)
+            let bot = Telegram(session: session, downloadDirectory: root, store: store, cardInterval: 0.05, tickInterval: 3600)
             let worker = Agent(); worker.store = store; bot.agent = worker
             worker.onFinish = { [weak bot, weak worker] text, ok in if let worker { bot?.finished(answer: text, ok: ok, result: nil, from: worker) } }
             return (bot, worker, store)
@@ -133,12 +187,9 @@ final class TelegramAPI: URLProtocol {
         for text in ["change the background color", "blur the people in the background", "type \"use normal mode\"", "calculate the normal mode of a distribution"] { var value = text; check(ExecutionMode.choice(&value) == nil, "task content is not execution mode: \(text)") }
 
         let (mode, modeWorker, _) = bridge()
-        mode.handle(message("open Calculator")); try await wait { TelegramAPI.option("Background") != nil }
-        check(modeWorker.submitted.isEmpty, "no action before choosing execution mode")
-        let oldMode = TelegramAPI.option("Normal · use my Mac")!
-        tap(mode, oldMode); try await wait { modeWorker.submitted.count == 1 }
-        check(modeWorker.modes == [false], "Normal selection reaches the desktop controller")
-        tap(mode, oldMode); try await settle(); check(modeWorker.submitted.count == 1, "mode choice is single-use")
+        mode.handle(message("open Calculator")); try await wait { modeWorker.submitted.count == 1 }
+        check(modeWorker.modes == [true], "a Telegram task without a mode starts in the background")
+        check(!TelegramAPI.texts().contains { $0.contains("Where should I run this?") }, "no mode-choice gate before Telegram tasks")
         modeWorker.complete()
 
         let (explicit, explicitWorker, _) = bridge()
@@ -189,11 +240,11 @@ final class TelegramAPI: URLProtocol {
         try await wait { TelegramAPI.option("Delhi") != nil }
         let oldQuestion = TelegramAPI.option("Delhi")!
         let oldQuestionMessage = TelegramAPI.bodies("sendMessage").last { ($0["text"] as? String)?.contains("Which location?") == true }!["_responseMessageID"] as! Int
-        conversation.handle(message("how far along?")); try await wait { TelegramAPI.texts().contains { $0.contains("2 steps completed") && $0.contains("Waiting for your answer") } }
+        conversation.handle(message("how far along?")); try await wait { TelegramAPI.texts().contains { $0.contains("step 2") && $0.contains("Waiting for you") } }
         check(worker.answers.isEmpty && worker.notes.isEmpty, "status commands cannot answer a question")
-        conversation.handle(message("How can I do it?")); try await wait { TelegramAPI.texts().contains { $0.contains("Still paused") } }
+        conversation.handle(message("How can I do it?")); try await wait { TelegramAPI.texts().contains { $0.contains("is still waiting") } }
         check(worker.answers.isEmpty && worker.question != nil, "help request keeps handoff paused")
-        tap(conversation, TelegramAPI.option("Open task on Mac")!); try await wait { worker.reveals == 1 }
+        tap(conversation, TelegramAPI.option("Open on Mac")!); try await wait { worker.reveals == 1 }
         check(worker.answers.isEmpty, "Open task reveals only the task without answering")
         tap(conversation, oldQuestion); check(worker.answers == ["Delhi"], "question option answers exact worker")
         worker.question = .init(text: "Which role?")
@@ -203,13 +254,14 @@ final class TelegramAPI: URLProtocol {
         try await wait { TelegramAPI.texts().contains { $0.contains("That question has ended") } }
         check(worker.answers == ["Delhi"], "stale and unpaired callbacks cannot answer a later question")
         worker.screenshot = Data("test-image".utf8)
-        conversation.handle(message("/screenshot")); try await wait { TelegramAPI.bodies("sendPhoto").count == 1 }
-        check(worker.captures == 1 && worker.answers.count == 1, "screenshot targets requested worker and preserves pending question")
+        let capturesBefore = worker.captures, photosBeforeShot = TelegramAPI.bodies("sendPhoto").count
+        conversation.handle(message("/screenshot")); try await wait { TelegramAPI.bodies("sendPhoto").count == photosBeforeShot + 1 }
+        check(worker.captures == capturesBefore + 1 && worker.answers.count == 1, "screenshot targets requested worker and preserves pending question")
         worker.question = .init(text: "Secret internal password prompt", sensitive: true)
         conversation.ask(worker.question!.text, options: [], sensitive: true, from: worker)
         conversation.handle(message("/screenshot")); conversation.handle(message("/status")); conversation.handle(message("secret answer"))
         try await wait { TelegramAPI.texts().contains { $0.contains("screenshots are paused") } }
-        check(worker.captures == 1 && worker.answers.count == 1 && !TelegramAPI.texts().contains { $0.contains("Secret internal password prompt") }, "private questions block remote answers and screenshots")
+        check(worker.captures == capturesBefore + 1 && worker.answers.count == 1 && !TelegramAPI.texts().contains { $0.contains("Secret internal password prompt") }, "private questions block remote answers and screenshots")
         worker.question = nil
         let review = ResultCard(title: "Form review", text: "Check the actual answers", items: (0..<25).map { .init(title: "Field \($0)", subtitle: String(repeating: "value ", count: 60), detail: "detail \($0)", link: nil) })
         let beforePresent = TelegramAPI.texts().count
@@ -225,8 +277,11 @@ final class TelegramAPI: URLProtocol {
         let beforeFinish = TelegramAPI.texts().count, photosBefore = TelegramAPI.bodies("sendPhoto").count
         worker.complete("Filled, not submitted")
         conversation.finished(answer: "Filled, not submitted", ok: true, result: review, from: worker)
-        try await wait { TelegramAPI.texts("editMessageText").contains { $0.contains("✅ Done") && $0.contains("Filled, not submitted") } }
-        check(TelegramAPI.texts().count == beforeFinish && TelegramAPI.bodies("sendPhoto").count == photosBefore, "completion edits one status card without duplicate text or automatic photos")
+        try await wait { TelegramAPI.cards().contains { $0.contains("✅ <b>Done</b>") && $0.contains("Filled, not submitted") } }
+        try await wait { TelegramAPI.texts().count == beforeFinish + 1 }
+        try await settle()
+        check(TelegramAPI.texts().dropFirst(beforeFinish).filter { $0.contains("Filled, not submitted") }.count == 1 && TelegramAPI.texts().count == beforeFinish + 1, "completion: one silent card edit plus one notifying result message")
+        check(TelegramAPI.bodies("sendPhoto").count == photosBefore + 1 && (TelegramAPI.bodies("sendPhoto").last?["caption"] as? String)?.hasPrefix("✅ <b>Done</b>") == true, "a card with a thumbnail ends with the final view in the result")
         conversation.handle(message("/result")); try await wait { TelegramAPI.texts().dropFirst(beforeFinish).contains { $0.contains("Field 24") } }
         check(TelegramAPI.texts().dropFirst(beforeFinish).contains { $0.contains("Filled, not submitted") }, "on-demand full result includes status and all answers")
 
@@ -381,8 +436,8 @@ final class TelegramAPI: URLProtocol {
         }
         coordinator.complete("All child media returned")
         try await settle()
-        check(TelegramAPI.bodies("sendPhoto").count == photosStart + 3 && TelegramAPI.texts().count == beforeChildren, "three requested images, one parent completion, zero child completion spam")
-        check(TelegramAPI.texts("editMessageText").contains { $0.contains("3/3 requested images delivered") && $0.contains("✅ Done") }, "group completion reports acknowledged image counts")
+        check(TelegramAPI.bodies("sendPhoto").count == photosStart + 3 && TelegramAPI.texts().count == beforeChildren + 3 + 1, "three requested images, one parent completion, zero child completion spam")
+        check(TelegramAPI.cards().contains { $0.contains("3/3 requested images delivered") && $0.contains("✅ <b>Done</b>") }, "group completion reports acknowledged image counts")
         imageWorkers[0].screenshot = Data("group-task-view".utf8)
         imageWorkers[1].screenshot = Data("group-task-view".utf8)
         imageWorkers[2].screenshot = Data("group-task-view".utf8)
@@ -394,7 +449,7 @@ final class TelegramAPI: URLProtocol {
         media.handle(message("What is the progress ?")); try await settle()
         check(mediaStore.records.count == recordCount && TelegramAPI.texts().last!.contains("3/3 requested images delivered"), "natural progress reports parent group without starting another task")
         media.handle(message("/runs")); try await settle()
-        check(!imageWorkers.contains { TelegramAPI.texts().last!.contains("[" + String($0.taskRecordID!.uuidString.prefix(8)).lowercased() + "]") }, "runs lists parent tasks rather than internal child jobs")
+        check(!imageWorkers.contains { TelegramAPI.texts().last!.contains("#" + String($0.taskRecordID!.uuidString.prefix(8)).lowercased()) } && TelegramAPI.texts().last!.contains("#" + String(rootID.uuidString.prefix(8)).lowercased()), "runs lists parent tasks rather than internal child jobs")
 
         let (failedMedia, failedWorker, failedStore) = bridge()
         failedMedia.handle(message("foreground: send the first image")); try await wait { failedWorker.submitted.count == 1 }
@@ -408,7 +463,8 @@ final class TelegramAPI: URLProtocol {
         failedWorker.complete("I described the image but did not send it")
         try await settle()
         check(failedStore.record(failedWorker.taskRecordID)?.state == .failed, "description without photo delivery cannot become Succeeded")
-        check(TelegramAPI.texts("editMessageText").contains { $0.contains("Image delivery incomplete: 0/1") && $0.contains("⚠️ Couldn't finish") }, "partial media results are labelled honestly")
+        try await wait { TelegramAPI.cards().contains { $0.contains("Image delivery incomplete: 0/1") && $0.contains("❌ <b>Couldn't finish</b>") } }
+        check(true, "partial media results are labelled honestly")
         let (analysisOnly, analysisWorker, _) = bridge()
         analysisOnly.handle(message("foreground: describe this image")); try await wait { analysisWorker.submitted.count == 1 }
         let unsolicited = await analysisOnly.deliverImage(failedAsset, caption: "Not requested", from: analysisWorker)
@@ -425,11 +481,167 @@ final class TelegramAPI: URLProtocol {
         check(outputStore.record(outputWorker.taskRecordID)?.outputs == [ownFile.path], "created screenshot path is persisted with its exact task")
         let offerBefore = TelegramAPI.texts().count
         outputs.handle(message("send it on WhatsApp to my own chat"))
-        try await wait { TelegramAPI.texts().count > offerBefore }
-        tap(outputs, TelegramAPI.option("Normal · use my Mac")!)
         try await wait { outputWorker.submitted.count == 2 }
+        check(TelegramAPI.texts().count >= offerBefore && outputWorker.modes.last == true, "follow-up starts directly in the background")
         check(outputWorker.selectedFiles == [ownFile] && outputWorker.submitted.last!.contains(ownFile.path), "forwarding follow-up inherits the actual generated screenshot")
         outputWorker.complete("Forwarding test stopped", ok: false)
+
+        // Remote copilot: runs started on the Mac, by a schedule or over MCP get the same card, questions and controls.
+        let (mirror, macAgent, mirrorStore) = bridge()
+        let macID = mirrorStore.enqueue("Check the order status on example.com", source: .mac, background: true)!
+        check(mirrorStore.start(macID), "mirrored fixture starts")
+        macAgent.submit("Check the order status on example.com", background: true, taskID: macID)
+        RunSupervisor.shared.register(run: macID, source: .scheduled, title: "Check the order status", background: true)
+        mirror.mirror(macAgent, taskID: macID, source: .scheduled)
+        try await wait { TelegramAPI.texts().contains { $0.contains("from Scheduled") && $0.contains("Check the order status") } }
+        check(TelegramAPI.option("Pause") != nil && TelegramAPI.option("Stop") != nil && TelegramAPI.option("Screenshot") != nil, "working card: Pause · Screenshot · Stop")
+        let macShort = String(macID.uuidString.prefix(8)).lowercased()
+        mirror.handle(message("/runs")); try await wait { TelegramAPI.texts().last?.contains("#" + macShort) == true }
+        check(TelegramAPI.texts().last!.contains("from Scheduled"), "/runs lists runs started outside Telegram")
+        macAgent.screenshot = Data("mac-run-view".utf8)
+        macAgent.question = .init(text: "Cancel the order?")
+        let photosBeforeQuestion = TelegramAPI.bodies("sendPhoto").count
+        let pending = RunSupervisor.shared.question(run: macID, text: "Cancel the order?", options: ["Yes, go ahead", "No"], sensitive: false) { _ in }
+        check(pending.fallback == .option("No"), "timeout default never approves the risky option")
+        mirror.ask("Cancel the order?", options: ["Yes, go ahead", "No"], sensitive: false, from: macAgent)
+        mirror.ask("Cancel the order?", options: ["Yes, go ahead", "No"], sensitive: false, from: macAgent)
+        try await wait { TelegramAPI.texts().contains { $0.contains("Cancel the order?") && $0.contains("No answer in 10 min → I'll choose “No”") } }
+        check(TelegramAPI.bodies("sendPhoto").count == photosBeforeQuestion + 1, "question arrives once, with a screenshot of the task target")
+        check(TelegramAPI.texts().filter { $0.contains("Cancel the order?") }.count == 1, "duplicate question delivery is ignored")
+        tap(mirror, TelegramAPI.option("No")!)
+        check(macAgent.answers == ["No"], "option button answers the mirrored run")
+        RunSupervisor.shared.answered(run: macID); macAgent.question = nil
+        let pauseButton = TelegramAPI.option("Pause")!
+        let messagesBeforePause = TelegramAPI.texts().count
+        tap(mirror, pauseButton); tap(mirror, pauseButton)
+        check(RunSupervisor.shared.state(macID) == .paused, "Pause button pauses the run")
+        try await wait { Set(TelegramAPI.toasts().suffix(3)).isSuperset(of: ["Paused", "Already paused"]) }
+        check(TelegramAPI.texts().count == messagesBeforePause, "buttons answer with a toast and a silent card edit, not chat messages")
+        try await wait { TelegramAPI.cards().contains { $0.contains("⏸ <b>Paused</b>") && $0.contains("#" + macShort) } }
+        check(TelegramAPI.option("Resume") != nil && TelegramAPI.option("Take over") != nil, "paused card offers Resume and Take over")
+        mirror.handle(message("/resume")); check(RunSupervisor.shared.state(macID) == .running, "/resume continues the selected run")
+        mirror.handle(message("/takeover " + macShort)); try await wait { macAgent.reveals == 1 }
+        check(RunSupervisor.shared.state(macID) == .takenOver, "/takeover pauses the run and reveals its target")
+        let waiter = Task { await RunSupervisor.shared.waitIfPaused(macID, poll: .milliseconds(10)) }
+        try await settle()
+        mirror.handle(message("/handback"))
+        let handBack = await waiter.value
+        check(handBack == RunSupervisor.handBackNote && RunSupervisor.shared.state(macID) == .running, "hand back resumes with a note to observe again")
+        mirror.handle(message("/stop all")); try await settle()
+        check(macAgent.isRunning, "/stop all never stops runs started on the Mac")
+        macAgent.complete("Order status checked")
+        try await wait { TelegramAPI.cards().contains { $0.contains("✅ <b>Done</b>") && $0.contains("Order status checked") } }
+        try await wait { TelegramAPI.texts().contains { $0.contains("Order status checked") && $0.contains("✅") } }
+        tap(mirror, pauseButton)
+        try await wait { TelegramAPI.toasts().last == "This run has finished" }
+        check(RunSupervisor.shared.state(macID) == .running || RunSupervisor.shared.entry(macID) == nil, "stale buttons on a finished run change nothing")
+        RunSupervisor.shared.finished(run: macID)
+        check(RunSupervisor.shared.entry(macID) == nil, "finished runs leave the registry")
+
+        // Live card: thumbnail refreshes only on meaningful change; replies steer the replied-to run.
+        let (live, liveWorker, liveStore) = bridge()
+        live.handle(message("background: tidy my downloads folder")); try await wait { liveWorker.submitted.count == 1 }
+        let liveID = liveWorker.taskRecordID!, liveShort = String(liveID.uuidString.prefix(8)).lowercased()
+        try await wait { TelegramAPI.bodies("sendMessage").contains { ($0["text"] as? String)?.contains("#" + liveShort) == true } }
+        let liveCard = TelegramAPI.bodies("sendMessage").last { ($0["text"] as? String)?.contains("#" + liveShort) == true }!
+        check(liveCard["parse_mode"] as? String == "HTML" && liveCard["disable_notification"] as? Bool == true, "cards are HTML and silent")
+        let liveCardMessage = liveCard["_responseMessageID"] as! Int
+        liveWorker.screenshot = Data("live-view-1".utf8); liveWorker.narration = "Sorting <files> & folders"
+        liveStore.update(liveID, completedSteps: 3)
+        let mediaBefore = TelegramAPI.bodies("editMessageMedia").count
+        live.refreshCards()
+        try await wait { TelegramAPI.bodies("editMessageMedia").count == mediaBefore + 1 }
+        let cardEdit = TelegramAPI.bodies("editMessageMedia").last!
+        let mediaCaption = (cardEdit["media"] as? [String: Any])?["caption"] as? String ?? ""
+        check(cardEdit["_file_card"] != nil && mediaCaption.contains("step 3") && mediaCaption.contains("Sorting &lt;files&gt; &amp; folders"), "card gets the run's thumbnail with an escaped caption")
+        let capturesAfterFirst = liveWorker.captures
+        live.refreshCards(); try await settle()
+        check(liveWorker.captures == capturesAfterFirst && TelegramAPI.bodies("editMessageMedia").count == mediaBefore + 1, "unchanged state is not re-captured")
+        let noteMessage = message("also skip the PDFs", extra: ["message_id": 9001, "reply_to_message": ["message_id": liveCardMessage]])
+        live.handle(noteMessage); try await wait { liveWorker.notes.count == 1 }
+        try await wait { TelegramAPI.bodies("setMessageReaction").contains { $0["message_id"] as? Int == 9001 } }
+        check(liveWorker.notes[0].contains("skip the PDFs"), "a reply to the card adds context to that run, acknowledged with a reaction")
+        RunSupervisor.shared.register(run: liveID, source: .telegram, title: "tidy", background: true)
+        live.handle(message("pause", extra: ["message_id": 9002, "reply_to_message": ["message_id": liveCardMessage]]))
+        try await wait { RunSupervisor.shared.state(liveID) == .paused }
+        check(RunSupervisor.shared.state(liveID) == .paused && liveWorker.notes.count == 1, "“pause” replied to the card pauses that run")
+        live.handle(message("continue", extra: ["message_id": 9003, "reply_to_message": ["message_id": liveCardMessage]]))
+        try await wait { RunSupervisor.shared.state(liveID) == .running }
+        check(RunSupervisor.shared.state(liveID) == .running, "“continue” replied to the card resumes it")
+        // Skip answers with the safest option; a second tap is idempotent.
+        liveWorker.question = .init(text: "Pay for express shipping?")
+        live.ask("Pay for express shipping?", options: ["Pay now", "Skip shipping upgrade"], sensitive: false, from: liveWorker)
+        try await wait { TelegramAPI.option("Skip") != nil && TelegramAPI.texts().contains { $0.contains("Pay for express shipping?") } }
+        let skip = TelegramAPI.option("Skip")!
+        tap(live, skip); tap(live, skip)
+        check(liveWorker.answers == ["Skip shipping upgrade"], "Skip picks the declining option, once")
+        try await wait { Set(TelegramAPI.toasts().suffix(3)).isSuperset(of: ["Skipped", "Nothing to skip right now"]) }
+        // Stop twice: one stop, one "already" toast; then Run again exactly once.
+        let stopButton = CallbackData.control(liveShort, .stop)
+        liveWorker.isRunning = true
+        tap(live, stopButton)
+        check(!liveWorker.isRunning, "Stop button stops the run")
+        tap(live, stopButton)
+        try await wait { TelegramAPI.toasts().suffix(3).contains { $0 == "This run has finished" || $0 == "Already stopping" } && TelegramAPI.toasts().suffix(3).contains("Stopping…") }
+        try await wait { TelegramAPI.cards().contains { $0.contains("⏹ <b>Stopped</b>") } }
+        let again = CallbackData.control(liveShort, .again)
+        tap(live, again); tap(live, again)
+        try await wait { liveWorker.submitted.count == 2 }
+        check(liveWorker.submitted[1].contains("tidy my downloads folder") && liveWorker.modes.last == true, "Run again repeats the request in its mode")
+        try await wait { Set(TelegramAPI.toasts().suffix(3)).isSuperset(of: ["Starting again", "Already started again"]) }
+        liveWorker.complete("Tidied")
+
+        // Unconfirmed finish: ⚠️ with the screenshot Clinqy saved; produced files come back as documents.
+        let (unsure, unsureWorker, _) = bridge()
+        unsure.handle(message("foreground: submit the expense form")); try await wait { unsureWorker.submitted.count == 1 }
+        let shot = root.appendingPathComponent("unconfirmed.png"); try Data("saved-shot".utf8).write(to: shot)
+        let report = root.appendingPathComponent("expenses.csv"); try Data("a,b\n".utf8).write(to: report)
+        unsureWorker.outputFiles = [report]
+        let photosBeforeUnsure = TelegramAPI.bodies("sendPhoto").count
+        unsureWorker.complete("Done — one item I couldn't confirm: submission. The form looked sent. Screenshot: " + shot.path)
+        try await wait { TelegramAPI.bodies("sendPhoto").count == photosBeforeUnsure + 1 && !TelegramAPI.bodies("sendDocument").isEmpty }
+        let unsurePhoto = TelegramAPI.bodies("sendPhoto").last!
+        check((unsurePhoto["_file_photo"] as? Data) == Data("saved-shot".utf8) && (unsurePhoto["caption"] as? String)?.hasPrefix("⚠️ <b>Done — one item I couldn't confirm</b>") == true, "unconfirmed result is ⚠️ with its screenshot")
+        check((unsurePhoto["caption"] as? String)?.contains(shot.path) == false, "local screenshot path isn't sent as text")
+        check((TelegramAPI.bodies("sendDocument").last?["_file_document"] as? Data) == Data("a,b\n".utf8), "produced file is sent as a document")
+
+        // 429: waits retry_after and delivers once.
+        let (limited, limitedWorker, _) = bridge()
+        TelegramAPI.lock.withLock { TelegramAPI.rateLimited = 1; TelegramAPI.limitedHits = 0 }
+        let welcomes = TelegramAPI.texts().filter { $0 == "You're welcome." }.count
+        limited.handle(message("thanks"))
+        try await wait { TelegramAPI.texts().filter { $0 == "You're welcome." }.count == welcomes + 1 }
+        check(TelegramAPI.lock.withLock { TelegramAPI.limitedHits } == 1 && limitedWorker.submitted.isEmpty, "429 is retried after retry_after")
+
+        // /status overview with tap-to-open cards; /new offers quick replies.
+        let (overview, overviewWorker, _) = bridge()
+        overview.handle(message("foreground: check the weather")); try await wait { overviewWorker.submitted.count == 1 }
+        overviewWorker.isRunning = true
+        overview.handle(message("/status")); try await wait { TelegramAPI.texts().last?.contains("1 active run") == true }
+        check(TelegramAPI.option("Open card · check the weather") != nil, "overview links each active run's card")
+        let deletesBefore = TelegramAPI.bodies("deleteMessage").count
+        tap(overview, TelegramAPI.option("Open card · check the weather")!)
+        try await wait { TelegramAPI.bodies("deleteMessage").count == deletesBefore + 1 }
+        check(TelegramAPI.texts().last?.contains("check the weather") == true, "Open card reposts the card at the bottom")
+        Workflows.shared.all = [Workflow(name: "Morning report")]
+        overview.handle(message("/new")); try await wait { TelegramAPI.texts().last?.contains("What should I do?") == true }
+        let keyboard = (TelegramAPI.bodies("sendMessage").last?["reply_markup"] as? [String: Any])?["keyboard"] as? [[[String: String]]]
+        check(keyboard?.first?.first?["text"] == "Morning report" && keyboard?.contains { $0.first?["text"] == "check the weather" } == true, "quick replies offer workflows and recent tasks")
+        Workflows.shared.all = []
+        overviewWorker.complete()
+        try await wait { TelegramAPI.texts().contains { $0.hasPrefix("✅") && $0.contains("check the weather") } }
+        try await settle()
+
+        Config.overrides["TELEGRAM_RUNS"] = "telegram"
+        let (scoped, scopedAgent, scopedStore) = bridge()
+        let scopedID = scopedStore.enqueue("Mac-only work", source: .mac, background: false)!
+        _ = scopedStore.start(scopedID)
+        scopedAgent.submit("Mac-only work", background: false, taskID: scopedID)
+        let beforeScoped = TelegramAPI.texts().count
+        scoped.mirror(scopedAgent, taskID: scopedID, source: .mac); try await settle()
+        check(TelegramAPI.texts().count == beforeScoped, "TELEGRAM_RUNS=telegram keeps Mac runs out of the chat")
+        Config.overrides = [:]
+        scopedAgent.complete()
         print("All Telegram attachment, routing, concurrency and conversation tests passed.")
     }
 }

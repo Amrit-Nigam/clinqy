@@ -106,7 +106,9 @@ enum Stats {
             let done = rows.filter { $0["stopped"] as? Bool != true }
             let ok = done.filter { $0["ok"] as? Bool == true }.count
             let mean = { (k: String) in rows.map { num($0, k) }.reduce(0, +) / Double(rows.count) }
-            out.append("Last \(d) days: \(rows.count) runs · \(ok)/\(done.count) succeeded (\(done.isEmpty ? 0 : 100 * ok / done.count)%) · \(rows.count - done.count) stopped by you")
+            let unconfirmed = rows.filter { $0["status"] as? String == "unconfirmed" }.count
+            out.append("Last \(d) days: \(rows.count) runs · \(ok)/\(done.count) succeeded (\(done.isEmpty ? 0 : 100 * ok / done.count)%) · \(rows.count - done.count) stopped by you"
+                       + (unconfirmed > 0 ? " · \(unconfirmed) ended with a consequential item unconfirmed (needs a look)" : ""))
             out.append(String(format: "Per run: %.0f s · %.1f turns (%.1f by the fast helper) · %.1f screenshots · %.1f failed steps",
                               mean("seconds"), mean("turns"), mean("fast_turns"), mean("screenshots"), mean("failed_steps")))
             // Success rate per app: which apps Clinqy struggles in.

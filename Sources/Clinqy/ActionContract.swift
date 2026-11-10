@@ -16,14 +16,18 @@ enum ActionContract {
     static let opKinds: Set<String> = ["window", "tab", "pdf", "media", "application", "event", "reminder", "files"]
 
     static let specs: [String: Spec] = [
-        "click": Spec(keys: ["id", "x", "y", "text", "nth", "button", "count", "modifiers", "duration_ms"]),
+        "click": Spec(keys: ["id", "x", "y", "text", "nth", "button", "count", "modifiers", "duration_ms", "expect"]),
         "hover": Spec(keys: ["id", "x", "y"]),
         "right_click": Spec(keys: ["id", "x", "y"]),
         "double_click": Spec(keys: ["id", "x", "y"]),
         "drag": Spec(keys: ["id", "x", "y", "to_id", "to_x", "to_y"]),
-        "type": Spec(keys: ["id", "text", "submit", "mode"]),
+        "type": Spec(keys: ["id", "text", "submit", "mode", "expect"]),
         "set_state": Spec(keys: ["id", "state"]),
-        "key": Spec(keys: ["keys"]),
+        "set_value": Spec(keys: ["id", "value"]),
+        "secondary_action": Spec(keys: ["id", "action"]),
+        // plan:true marks the one ask that shows the plan at the plan autonomy level; only its yes approves the plan.
+        "ask": Spec(keys: ["question", "options", "sensitive", "plan"]),
+        "key": Spec(keys: ["keys", "expect"]),
         "scroll": Spec(keys: ["id", "dir", "direction", "unit", "amount"]),
         "open_app": Spec(keys: ["name"]),
         "open_url": Spec(keys: ["url"]),
@@ -52,6 +56,7 @@ enum ActionContract {
         "paste_snaps", "pdf", "media", "upload", "review", "application", "email", "extract", "table", "event", "reminder",
         "files", "look", "wait", "recall", "remember", "remember_answer", "autofill", "think", "schedule", "dictionary",
         "applescript", "shell", "parallel_browser", "calendar", "set_state", "delegate", "collect", "plan", "capabilities",
+        "set_value", "secondary_action",
     ]
 
     /// Operations that only read. Only these two actions have a read-only `info` operation; `op` on anything else
@@ -111,6 +116,7 @@ enum ActionContract {
                     + (allowed.isEmpty ? "none" : allowed.sorted().joined(separator: ", "))
             }
         }
+        if let why = ActionExpectation.problem(action["expect"]) { return why }
         if let ops = spec.ops, let raw = action["op"] {
             guard let op = raw as? String, ops.contains(op.lowercased()) else {
                 return "\(kind) op must be one of: " + ops.sorted().joined(separator: ", ")
@@ -133,6 +139,16 @@ enum ActionContract {
         case "look":
             for key in ["query", "role"] where action[key] != nil {
                 guard let text = action[key] as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.count <= 200 else { return "look \(key) must be a nonempty string of at most 200 characters" }
+            }
+        case "set_value":
+            guard let id = action["id"] as? String, id.hasPrefix("e") else { return "set_value needs a native element's e-id" }
+            guard (action["value"] as? String).map({ !$0.isEmpty && $0.count <= 1000 }) == true || isNumber(action["value"]) else {
+                return "set_value needs value: text or a finite number"
+            }
+        case "secondary_action":
+            guard let id = action["id"] as? String, id.hasPrefix("e") else { return "secondary_action needs a native element's e-id" }
+            guard let name = action["action"] as? String, name.hasPrefix("AX"), name.count <= 64 else {
+                return "secondary_action needs action: one of the element's AX action names (e.g. AXShowMenu, AXIncrement)"
             }
         case "set_state":
             guard action["id"] is String else { return "set_state needs the control's id" }
@@ -221,5 +237,34 @@ enum SubmitReadback {
     static func allows(expected: String, actual: String?, unreadable: Bool = false) -> Bool {
         if let actual { return actual == expected }
         return unreadable
+    }
+}
+
+/// An action's own postcondition, checked locally right after it ran (no model turn): {"expect":{"text":"Added"}},
+/// {"expect":{"url":"/cart"}}, {"expect":{"value":"Pune"}}, or {"expect":"Added"} for text.
+struct ActionExpectation: Equatable {
+    enum Kind: String { case text, url, value }
+    let kind: Kind
+    let value: String
+
+    /// nil for a well-formed (or absent) expectation; otherwise why it is refused.
+    static func problem(_ raw: Any?) -> String? {
+        guard let raw else { return nil }
+        if let text = raw as? String { return text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || text.count > 300 ? "expect text must be 1–300 characters" : nil }
+        guard let object = raw as? [String: Any], object.count == 1, let key = object.keys.first, Kind(rawValue: key) != nil else {
+            return "expect takes exactly one of text, url or value (e.g. {\"expect\":{\"text\":\"Added to cart\"}})"
+        }
+        guard let value = object[key] as? String, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, value.count <= 300 else {
+            return "expect \(key) must be 1–300 characters of text"
+        }
+        return nil
+    }
+
+    static func parse(_ raw: Any?) -> ActionExpectation? {
+        guard problem(raw) == nil else { return nil }
+        if let text = raw as? String { return .init(kind: .text, value: text) }
+        guard let object = raw as? [String: Any], let key = object.keys.first, let kind = Kind(rawValue: key),
+              let value = object[key] as? String else { return nil }
+        return .init(kind: kind, value: value)
     }
 }

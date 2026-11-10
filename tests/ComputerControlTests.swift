@@ -96,6 +96,101 @@ import CryptoKit
         if case .attention = BackgroundPolicy.route(conditionWait, hasWorkerPage: false) { checks += 1 }
         else { preconditionFailure("structured wait accepted absent owned page") }
         check(BackgroundPolicy.route(["do": "wait", "ms": 100], hasWorkerPage: false) == .api, "plain delay requires no browser")
+        // Delivered is not confirmed, but it is not a failure either.
+        check(ActionOutcome.unverified.delivered && ActionOutcome.confirmed.delivered, "delivered input is ok")
+        check(!ActionOutcome.uncertain.delivered && !ActionOutcome.failed.delivered && !ActionOutcome.refused.delivered, "unknown delivery, failure and refusal are not ok")
+        // Consequential classification.
+        check(ConsequentialInput.classify(kind: "click", riskyLabel: true) && !ConsequentialInput.classify(kind: "click"), "risky label decides a click")
+        check(ConsequentialInput.classify(kind: "type", submit: true) && !ConsequentialInput.classify(kind: "type"), "submit:true is consequential")
+        check(ConsequentialInput.classify(kind: "key", keys: "return") && ConsequentialInput.classify(kind: "key", keys: "cmd+s")
+              && !ConsequentialInput.classify(kind: "key", keys: "cmd+a") && !ConsequentialInput.classify(kind: "key", keys: "tab"), "risky keys")
+        check(ConsequentialInput.classify(kind: "shell") && ConsequentialInput.classify(kind: "applescript") && ConsequentialInput.classify(kind: "email"), "scripts and email")
+        // Receipt → outcome.
+        let modal = EffectReceipt(dialogOpened: true, mutationCount: 4)
+        let added = EffectReceipt(addedText: "Item added to your cart", mutationCount: 2)
+        let ripple = EffectReceipt(focusChanged: true, mutationCount: 3)
+        let clock = EffectReceipt(addedText: "10:42:01", removedText: "10:42:00", mutationCount: 2)
+        let rerender = EffectReceipt(addedText: "Cart | Checkout", removedText: "Checkout | Cart", mutationCount: 6)
+        check(EffectClassification.click(receipt: modal, consequential: false, expectation: nil) == .confirmed, "opened dialog confirms an ordinary click")
+        check(EffectClassification.click(receipt: added, consequential: false, expectation: nil) == .confirmed, "new text confirms an ordinary click")
+        check(EffectClassification.click(receipt: EffectReceipt(urlChanged: true), consequential: false, expectation: nil) == .confirmed, "navigation confirms")
+        check(EffectClassification.click(receipt: EffectReceipt(targetStateChanged: true), consequential: false, expectation: nil) == .confirmed, "target state confirms")
+        check(EffectClassification.click(receipt: ripple, consequential: false, expectation: nil) == .unverified, "focus or attribute churn is not an effect")
+        check(EffectClassification.click(receipt: clock, consequential: false, expectation: nil) == .unverified, "digit-only text churn is not attributable")
+        check(EffectClassification.click(receipt: rerender, consequential: false, expectation: nil) == .unverified, "re-rendered identical text is not new")
+        let ago = EffectReceipt(addedText: "4 seconds ago", removedText: "3 seconds ago", mutationCount: 2)
+        check(EffectClassification.click(receipt: ago, consequential: false, expectation: nil) == .unverified, "time-ago churn is not attributable")
+        check(EffectClassification.click(receipt: EffectReceipt(addedText: "Updated just now", mutationCount: 1), consequential: false, expectation: nil) == .unverified,
+              "a relative timestamp alone is not attributable")
+        check(EffectClassification.click(receipt: EffectReceipt(addedText: "Step 2 of 3", removedText: "Step 1 of 3", mutationCount: 2), consequential: false, expectation: nil) == .confirmed,
+              "a wizard step change in the target's container confirms")
+        check(EffectClassification.click(receipt: EffectReceipt(focusIntoNew: true, mutationCount: 2), consequential: false, expectation: nil) == .confirmed,
+              "focus moving into newly added content confirms")
+        check(EffectReceipt(["mutationCount": 2, "focusIntoNew": true])?.focusIntoNew == true, "focusIntoNew parsed from the extension")
+        check(EffectClassification.click(receipt: EffectReceipt(focusChanged: true, mutationCount: 5), consequential: false, expectation: nil) == .unverified,
+              "focus merely moving is still not an effect")
+        check(EffectClassification.click(receipt: nil, consequential: false, expectation: nil) == .unverified, "no receipt cannot confirm")
+        check(EffectClassification.click(receipt: added, consequential: true, expectation: nil) == .unverified, "a submit is never confirmed by any page change")
+        check(EffectClassification.click(receipt: nil, consequential: true, expectation: true) == .confirmed, "a met expectation confirms even a submit")
+        check(EffectClassification.click(receipt: added, consequential: false, expectation: false) == .unverified, "an unmet expectation overrides a page change")
+        check(EffectReceipt(["mutationCount": 0, "urlChanged": false, "structural": false]).map(\.keepsListing) == true, "quiet receipt keeps the listing")
+        check(EffectReceipt(["mutationCount": 3, "structural": true])?.keepsListing == false, "added elements force a relist")
+        check(EffectReceipt(["mutationCount": 1])?.keepsListing == false, "older receipts without structure info relist")
+        check(EffectReceipt(nil) == nil && EffectReceipt(["clicked": true]) == nil, "non-receipt replies are not receipts")
+        check(EffectReceipt(addedText: "Saved | Draft", removedText: "Draft").netAddedText == "Saved", "net added text excludes re-rendered text")
+        // Normalised readback.
+        check(FieldReadback.matches(expected: "Amrit Nigam", actual: " amrit  nigam "), "case and whitespace reformatting is a match")
+        check(FieldReadback.matches(expected: "9845012345", actual: "98450 12345"), "spaced phone is a match")
+        check(FieldReadback.matches(expected: "9845012345", actual: "+91 98450-12345"), "country-code prefixed phone is a match")
+        check(FieldReadback.matches(expected: "(555) 123-4567", actual: "5551234567"), "punctuation-free phone is a match")
+        check(!FieldReadback.matches(expected: "9845012345", actual: "9845012346"), "different digits are a mismatch")
+        check(!FieldReadback.matches(expected: "9845012345", actual: "19845012345"), "an extra digit without a country code is a mismatch")
+        check(!FieldReadback.matches(expected: "Pune", actual: "Mumbai") && !FieldReadback.matches(expected: "Pune", actual: nil), "real mismatch or unreadable")
+        check(!FieldReadback.matches(expected: "1,000", actual: "1000.00"), "amount reformatting with other digits is not assumed equal")
+        // verify text: new, more frequent, or in the receipt's added text.
+        check(VerificationEvidence.textEvidence("Item added", before: "Cart", after: "Cart Item added"), "newly present text")
+        check(VerificationEvidence.textEvidence("Item added", before: "Item added", after: "Item added Item added"), "count rose")
+        check(!VerificationEvidence.textEvidence("Item added", before: "Item added", after: "Item added"), "unchanged count is not evidence")
+        check(VerificationEvidence.textEvidence("Saved", before: "Saved", after: "Saved", added: "Saved just now"), "receipt saw it added")
+        check(!VerificationEvidence.textEvidence("Paid", before: "unpaid", after: "unpaid unpaid"), "fragments never count")
+        check(!VerificationEvidence.textEvidence("Receipt", before: nil, after: "Receipt 123"), "missing baseline without a receipt is not evidence")
+        check(VerificationEvidence.occurrences("ab", in: "ab ab abc ab") == 3, "whole-word occurrences")
+        // Inline expect.
+        check(ActionExpectation.problem(["text": "Added"]) == nil && ActionExpectation.problem("Added") == nil, "expect forms accepted")
+        check(ActionExpectation.problem(["text": "A", "url": "/b"]) != nil && ActionExpectation.problem(["title": "x"]) != nil && ActionExpectation.problem(["text": ""]) != nil, "malformed expect refused")
+        check(ActionContract.validate(["do": "click", "id": "w1", "expect": ["url": "/cart"]]) == nil, "click accepts expect")
+        check(ActionContract.validate(["do": "type", "id": "w1", "text": "x", "expect": ["value": "x"]]) == nil, "type accepts expect")
+        check(ActionContract.validate(["do": "key", "keys": "return", "expect": "Sent"]) == nil, "key accepts expect")
+        check(ActionContract.validate(["do": "click", "id": "w1", "expect": ["colour": "red"]]) != nil, "bad expect is refused before input")
+        check(ActionContract.validate(["do": "scroll", "dir": "down", "expect": "x"]) != nil, "expect only where it is read")
+        check(VerificationEvidence.expectationMet(kind: "url", value: "/cart", beforeURL: "https://s.test/p", afterURL: "https://s.test/cart",
+              beforeText: nil, afterText: nil, addedText: nil, fieldValue: nil), "changed URL meets url expectation")
+        check(!VerificationEvidence.expectationMet(kind: "url", value: "/cart", beforeURL: "https://s.test/cart", afterURL: "https://s.test/cart",
+              beforeText: nil, afterText: nil, addedText: nil, fieldValue: nil), "unchanged URL never meets it")
+        check(VerificationEvidence.expectationMet(kind: "value", value: "9845012345", beforeURL: nil, afterURL: nil,
+              beforeText: nil, afterText: nil, addedText: nil, fieldValue: "+91 98450 12345"), "value expectation uses normalised readback")
+        check(!VerificationEvidence.expectationMet(kind: "text", value: "Sent", beforeURL: nil, afterURL: nil,
+              beforeText: "Sent", afterText: "Sent", addedText: "", fieldValue: nil), "pre-existing text never meets a text expectation")
+        // Completion evidence: CONFIRMED and ordinary delivered input need no separate verify; consequential gaps do.
+        var ordinary = CompletionEvidence()
+        ordinary.record(kind: "click", outcome: .unverified)
+        ordinary.record(kind: "type", outcome: .confirmed)
+        check(!ordinary.needsVerification, "ordinary delivered input needs no separate verify")
+        ordinary.record(kind: "click", outcome: .unverified, consequential: true)
+        check(ordinary.needsVerification, "unconfirmed submit needs evidence")
+        ordinary.record(kind: "verify", outcome: .confirmed)
+        check(!ordinary.needsVerification, "verify clears it")
+        ordinary.record(kind: "click", outcome: .confirmed, consequential: true)
+        check(!ordinary.needsVerification, "a submit confirmed by its expect needs nothing more")
+        ordinary.record(kind: "key", outcome: .uncertain)
+        check(ordinary.needsVerification, "unknown delivery always needs evidence")
+        ordinary.acknowledgeUnconfirmed()
+        check(!ordinary.needsVerification, "reported unconfirmed item closes the gate")
+        check(CompletionEvidence.needsEvidence(kind: "set_value", outcome: .uncertain)
+              && CompletionEvidence.needsEvidence(kind: "secondary_action", outcome: .uncertain), "native set_value/secondary_action are mutations")
+        check(CompletionGate.decide(missingEvidence: false, reminders: 0) == .finish, "nothing missing finishes")
+        check(CompletionGate.decide(missingEvidence: true, reminders: 0) == .remind, "first done reminds once")
+        check(CompletionGate.decide(missingEvidence: true, reminders: 1) == .finishUnconfirmed, "then finishes as done with an unconfirmed item, never a failure")
         var goal = CompletionEvidence()
         check(!goal.needsVerification, "read-only goal needs no mutation proof")
         goal.record(kind: "files", outcome: .confirmed, op: "list")
@@ -149,10 +244,11 @@ import CryptoKit
         // --- Action contract: arguments the dispatcher would ignore must never change classification ---
         func classified(_ action: [String: Any]) -> Bool {
             var evidence = CompletionEvidence()
-            evidence.record(kind: action["do"] as! String, outcome: .confirmed, op: action["op"] as? String ?? "")
+            // Unknown delivery always needs evidence for a mutation, so only `op` can change the classification here.
+            evidence.record(kind: action["do"] as! String, outcome: .uncertain, op: action["op"] as? String ?? "")
             return evidence.needsVerification
         }
-        check(classified(["do": "type", "id": "w1", "text": "x"]), "ordinary type dirties completion evidence")
+        check(classified(["do": "type", "id": "w1", "text": "x"]), "uncertain type dirties completion evidence")
         check(classified(["do": "type", "id": "w1", "text": "x", "op": "list"]), "type with unrelated op still dirties evidence")
         check(classified(["do": "shell", "cmd": "touch a", "op": "info"]), "shell with op:info still dirties evidence")
         check(classified(["do": "click", "id": "w1", "op": "check"]), "click with op:check still dirties evidence")

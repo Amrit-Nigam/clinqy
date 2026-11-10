@@ -49,6 +49,8 @@ final class Hand {
     /// Never changes foreground focus during cancellation or completion.
     func endRun() {
         _ = SkyLight.retryPendingCleanup()
+        // Windows pinned visible for the run get their occlusion notifications back.
+        SkyLight.releaseKeepAlive()
         // A background run never touched the user's pointer, buttons or front app: nothing to put back.
         if Background.active {
             runCursor = nil
@@ -159,16 +161,26 @@ final class Hand {
 
     /// A click on `pid`'s window at `point` that leaves the pointer and the front app alone: SkyLight where this macOS
     /// has it (Chromium and Electron windows take nothing else), else posted to the app.
-    private func backgroundClick(at point: CGPoint, pid: pid_t, window: WindowSnapshot?) -> String? {
+    private func backgroundClick(at point: CGPoint, pid: pid_t, window: WindowSnapshot?, button: SkyLight.Button = .left, count: Int = 1) -> String? {
         guard SkyLight.isAvailable else { return refuse("background pointer input is unavailable on this macOS; use a semantic control or foreground handoff") }
         guard let window, window.pid == pid, window.frame.contains(point) else {
             return refuse("background input needs the exact observed window; observe again")
         }
-        if let why = window.staleness(includeContent: true) { return refuse(why) }
+        // Callers checked staleness immediately before; SkyLight.click re-captures the exact window and checks
+        // it again right before delivery, so no extra content fingerprint pass happens here.
         // Never substitute another window or a helper process merely because it occupies the same coordinates.
-        if let why = SkyLight.click(at: point, pid: pid, window: window.windowID, frame: window.frame) { return refuse(why) }
+        if let why = SkyLight.click(at: point, pid: pid, window: window.windowID, frame: window.frame, button: button, count: count) { return refuse(why) }
         return nil
     }
+
+    /// Click options a SkyLight background click can honour exactly: left or right, one or two clicks,
+    /// no modifiers and no hold. Anything else stays a foreground handoff rather than an approximation.
+    nonisolated static func skyCompatible(_ options: ClickOptions) -> Bool {
+        options.button != .middle && (1...2).contains(options.count) && options.modifiers.isEmpty && options.holdMilliseconds == 0
+    }
+
+    /// Whether a window number still exists anywhere (including other Spaces).
+    nonisolated static func windowExists(_ id: CGWindowID) -> Bool { NativeWindowObservation.serverInfo(id) != nil }
 
     /// The frontmost normal-level window at `point`, whoever owns it.
     nonisolated static func topWindow(at point: CGPoint) -> (pid: pid_t, id: CGWindowID, frame: CGRect)? {
@@ -223,7 +235,18 @@ final class Hand {
     /// Foreground gestures use the same window provenance and hit checks as clicks. Always release a
     /// possibly delivered down event, including cancellation and failure during a drag.
     func gesture(_ plan: PointerGesture, in app: NSRunningApplication, window: WindowSnapshot) async -> String? {
-        guard !Background.active else { return refuse("Native pointer gestures require foreground mode") }
+        if Background.active {
+            // Right and double clicks are window-targeted SkyLight clicks; hover and drag need the real pointer.
+            guard plan.kind == .right_click || plan.kind == .double_click else { return refuse("Native hover and drag require foreground mode") }
+            let point = CGPoint(x: plan.start.x, y: plan.start.y)
+            guard app.processIdentifier == window.pid, window.frame.contains(point) else { return refuse("gesture endpoints must belong to the observed window") }
+            if let why = window.staleness(includeContent: true) { return refuse(why) }
+            if let why = hitCheck(point, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+            buddy.click()
+            lastMethod = "background"
+            return backgroundClick(at: point, pid: app.processIdentifier, window: window,
+                                   button: plan.kind == .right_click ? .right : .left, count: plan.kind == .double_click ? 2 : 1)
+        }
         let start = CGPoint(x: plan.start.x, y: plan.start.y), end = CGPoint(x: plan.end.x, y: plan.end.y)
         guard app.processIdentifier == window.pid, window.frame.contains(start), window.frame.contains(end) else {
             return refuse("gesture endpoints must belong to the observed window")
@@ -444,7 +467,7 @@ final class Hand {
     @discardableResult
     func scroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint? = nil) async -> String? {
         refusal = nil
-        guard !Background.active else { return refuse("native scrolling needs foreground mode until its scroll container can be verified") }
+        if Background.active { return await backgroundScroll(plan, in: app, window: window, anchor: anchor) }
         if let window {
             guard window.pid == app.processIdentifier else { return refuse("the scroll target belongs to another application; look again") }
             if let why = window.staleness() { return refuse(why) }
@@ -467,16 +490,196 @@ final class Hand {
         return nil
     }
 
+    /// Background scrolling of the pinned window: AX scroll-by-page actions on the scroll area under the
+    /// anchor first (no events at all), otherwise wheel events posted to the app and tagged with the window.
+    /// The real pointer, frontmost app and window order never change.
+    private func backgroundScroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint?) async -> String? {
+        guard let window, window.pid == app.processIdentifier else { return refuse("background scrolling needs the exact observed window; observe again") }
+        if let why = window.staleness() { return refuse(why) }
+        if let anchor, !window.frame.contains(anchor) { return refuse("the scroll anchor is outside the observed window; look again") }
+        let target = anchor ?? CGPoint(x: window.frame.midX, y: window.frame.midY)
+        if let why = hitCheck(target, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        if plan.unit == .pages, let area = Self.scrollArea(at: target, pid: app.processIdentifier, window: window) {
+            let action = Self.pageScrollAction(plan.direction)
+            var names: CFArray?
+            if AXUIElementCopyActionNames(area, &names) == .success, (names as? [String] ?? []).contains(action) {
+                for _ in 0..<max(1, Int(plan.amount.rounded())) {
+                    if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+                    guard AXUIElementPerformAction(area, action as CFString) == .success else {
+                        return refuse("the scroll area stopped accepting page actions; inspect before repeating")
+                    }
+                }
+                lastMethod = "axscroll"
+                return nil
+            }
+        }
+        let (pixels, steps) = plan.chunks(viewport: window.frame.size)
+        for step in steps {
+            if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+            if let why = window.staleness() { return refuse(why) }
+            guard SkyLight.scroll(dy: step.dy, dx: step.dx, pixels: pixels, at: target, pid: app.processIdentifier, window: window.windowID) else {
+                return refuse("couldn't construct a scroll event")
+            }
+            try? await Task.sleep(for: .milliseconds(30))
+        }
+        lastMethod = "pidwheel"
+        return nil
+    }
+
+    nonisolated static func pageScrollAction(_ direction: ScrollPlan.Direction) -> String {
+        switch direction {
+        case .up: return "AXScrollUpByPage"
+        case .down: return "AXScrollDownByPage"
+        case .left: return "AXScrollLeftByPage"
+        case .right: return "AXScrollRightByPage"
+        }
+    }
+
+    /// The AXScrollArea of the observed window under `point` (walking up from the app-only hit test).
+    private static func scrollArea(at point: CGPoint, pid: pid_t, window: WindowSnapshot) -> AXUIElement? {
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &hit) == .success,
+              var node = hit, window.containsElement(node) else { return nil }
+        for _ in 0..<20 {
+            if (axAttr(node, kAXRoleAttribute) as String?) == "AXScrollArea" { return node }
+            guard let parent: AXUIElement = axAttr(node, kAXParentAttribute) else { return nil }
+            node = parent
+        }
+        return nil
+    }
+
+    // MARK: - Native choose and secondary actions (Accessibility only; work behind the user's window)
+
+    enum SemanticOutcome: Equatable { case done(String), uncertain(String), refused(String) }
+
+    /// Picks `option` from a native pop-up button, combo box or menu button through Accessibility: open the
+    /// control (AXPress / AXShowMenu), press the exactly matching AXMenuItem once, then read the value back.
+    func choose(_ option: String, on el: UIElementInfo, in app: NSRunningApplication, window: WindowSnapshot) async -> SemanticOutcome {
+        refusal = nil
+        guard window.pid == app.processIdentifier, el.observationID == window.id, el.windowID == window.windowID else {
+            return .refused(refuse("the control belongs to another observation; look again"))
+        }
+        if let why = window.staleness(includeContent: true) { return .refused(refuse(why)) }
+        let control = el.element
+        var names: CFArray?
+        _ = AXUIElementCopyActionNames(control, &names)
+        let actions = names as? [String] ?? []
+        let opener = actions.contains("AXShowMenu") && el.role != "AXPopUpButton" ? "AXShowMenu" : kAXPressAction as String
+        guard actions.contains(opener) else { return .refused(refuse("this control offers no Accessibility menu to choose from")) }
+        buddy.click()
+        guard AXUIElementPerformAction(control, opener as CFString) == .success else {
+            return .uncertain("the menu may have opened; inspect before choosing again")
+        }
+        var items: [AXUIElement] = []
+        for _ in 0..<15 where items.isEmpty {
+            try? await Task.sleep(for: .milliseconds(40))
+            items = Self.menuItems(under: control) ?? Self.menuItems(under: AXUIElementCreateApplication(app.processIdentifier)) ?? []
+        }
+        let titles = items.map { (Self.axAttr($0, kAXTitleAttribute) as String?) ?? "" }
+        let wanted = option.trimmingCharacters(in: .whitespaces).lowercased()
+        var hits = titles.indices.filter { titles[$0].lowercased() == wanted }
+        if hits.isEmpty { hits = titles.indices.filter { titles[$0].lowercased().hasPrefix(wanted) } }
+        guard hits.count == 1 else {
+            _ = AXUIElementPerformAction(control, kAXCancelAction as CFString)
+            let offered = titles.filter { !$0.isEmpty }.prefix(20).joined(separator: ", ")
+            return .refused(refuse(hits.isEmpty ? "no “\(option)” in that menu; it has: \(offered)" : "“\(option)” matches several items; name one exactly"))
+        }
+        let item = items[hits[0]]
+        guard (Self.axAttr(item, kAXEnabledAttribute) as Bool?) != false else {
+            _ = AXUIElementPerformAction(control, kAXCancelAction as CFString)
+            return .refused(refuse("“\(titles[hits[0]])” is disabled"))
+        }
+        switch AXUIElementPerformAction(item, kAXPressAction as CFString) {
+        case .success: break
+        default: return .uncertain("the choice may have been applied; inspect before choosing again")
+        }
+        for _ in 0..<10 {
+            try? await Task.sleep(for: .milliseconds(40))
+            let value = (Self.axAttr(control, kAXValueAttribute) as String?) ?? (Self.axAttr(control, kAXTitleAttribute) as String?) ?? ""
+            if value.lowercased() == titles[hits[0]].lowercased() { return .done(titles[hits[0]]) }
+        }
+        return .uncertain("chose “\(titles[hits[0]])” once, but the control did not read it back")
+    }
+
+    /// Sets an element's AXValue once and reads it back (sliders, steppers, text fields, date pickers).
+    func setValue(_ value: String, on el: UIElementInfo, window: WindowSnapshot) -> SemanticOutcome {
+        refusal = nil
+        guard el.observationID == window.id, el.windowID == window.windowID else { return .refused(refuse("the element belongs to another observation; look again")) }
+        if let why = window.staleness(includeContent: true) { return .refused(refuse(why)) }
+        guard !Safety.isSecureField(el.element), Safety.secureInputBlock() == nil else { return .refused(refuse("secure input is active; no value was set")) }
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(el.element, kAXValueAttribute as CFString, &settable) == .success, settable.boolValue else {
+            return .refused(refuse("this element's value is not settable through Accessibility"))
+        }
+        let current: CFTypeRef? = Self.axAttr(el.element, kAXValueAttribute)
+        let typed: CFTypeRef
+        if current is NSNumber, let number = Double(value.trimmingCharacters(in: .whitespaces)) { typed = NSNumber(value: number) }
+        else { typed = value as CFString }
+        buddy.click()
+        switch AXUIElementSetAttributeValue(el.element, kAXValueAttribute as CFString, typed) {
+        case .success: break
+        case .attributeUnsupported, .illegalArgument: return .refused(refuse("the element rejected that value"))
+        default: return .uncertain("the value may have been set; read it before trying again")
+        }
+        let now: CFTypeRef? = Self.axAttr(el.element, kAXValueAttribute)
+        if let now, CFEqual(now, typed) { return .done(value) }
+        if let n = now as? NSNumber, let want = typed as? NSNumber, abs(n.doubleValue - want.doubleValue) < 1e-6 { return .done(value) }
+        return .uncertain("the value was set once but did not read back exactly")
+    }
+
+    /// Open menu items below `root` (breadth-first, bounded). nil when no open AXMenu is found.
+    private static func menuItems(under root: AXUIElement) -> [AXUIElement]? {
+        var queue: [(AXUIElement, Int)] = [(root, 0)], head = 0
+        while head < queue.count, head < 400 {
+            let (node, depth) = queue[head]; head += 1
+            let role: String? = Self.axAttr(node, kAXRoleAttribute)
+            if role == "AXMenu" {
+                let items = ((Self.axAttr(node, kAXChildrenAttribute) as [AXUIElement]?) ?? [])
+                    .filter { (Self.axAttr($0, kAXRoleAttribute) as String?) == "AXMenuItem" }
+                if !items.isEmpty { return items }
+            }
+            // Never walk into the menu bar: its items are not this control's popup.
+            if depth < 4, role != "AXMenuBar" {
+                queue.append(contentsOf: ((axAttr(node, kAXChildrenAttribute) as [AXUIElement]?) ?? []).map { ($0, depth + 1) })
+            }
+        }
+        return nil
+    }
+
+    /// Performs one advertised non-press AX action (AXShowMenu, AXIncrement, AXPick, …) on an element of the
+    /// observed window. Delivered once; a timeout is uncertainty, never a reason to repeat it.
+    func performSecondaryAction(_ name: String, on el: UIElementInfo, window: WindowSnapshot) -> SemanticOutcome {
+        refusal = nil
+        guard el.observationID == window.id, el.windowID == window.windowID else { return .refused(refuse("the element belongs to another observation; look again")) }
+        if let why = window.staleness(includeContent: true) { return .refused(refuse(why)) }
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(el.element, &names) == .success, (names as? [String] ?? []).contains(name),
+              !BackgroundPolicy.secondaryActionDenylist.contains(name) else {
+            return .refused(refuse("\(name) is not one of this element's secondary actions"))
+        }
+        buddy.click()
+        switch AXUIElementPerformAction(el.element, name as CFString) {
+        case .success: return .done(name)
+        case .actionUnsupported: return .refused(refuse("the element rejected \(name)"))
+        default: return .uncertain("\(name) may have been applied; inspect before repeating it")
+        }
+    }
+
     // MARK: - Click options
 
     /// A pixel click with the requested button, count, modifiers and hold, after the same window and hit checks as
     /// every other click. AXPress cannot express any of these, so it is never used here.
     @discardableResult
     func click(at point: CGPoint, options: ClickOptions, pid: pid_t, window: WindowSnapshot) async -> String? {
-        guard !Background.active else { return refuse("button, count, modifier and hold options need foreground mode") }
         guard pid == window.pid, window.frame.contains(point) else { return refuse("the point is outside the observed target window; look again") }
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
+        if Background.active {
+            guard Self.skyCompatible(options) else { return refuse("modifier, hold, middle-button and triple-click options need foreground mode") }
+            buddy.click()
+            lastMethod = "background"
+            return backgroundClick(at: point, pid: pid, window: window, button: options.button == .right ? .right : .left, count: options.count)
+        }
         await buddy.travel(to: point)
         try? await Task.sleep(for: .milliseconds(80))
         if let why = window.staleness(includeContent: true) { return refuse(why) }

@@ -53,6 +53,8 @@ private struct TaskRecordView: View {
     @ObservedObject var store: TaskStore
     let item: TaskStore.Record
     @State private var showActions = false
+    /// Pause state lives in RunSupervisor (not TaskStore); bumping this redraws after a control tap.
+    @State private var controlRevision = 0
     private var recoverable: Bool { [.interrupted, .failed, .cancelled].contains(item.state) }
     private var canStart: Bool { (item.background || store.activeForeground == nil) && item.reviewReason?.contains("Private values") != true }
     var body: some View {
@@ -110,6 +112,22 @@ private struct TaskRecordView: View {
                     Text("Phases may overlap; total is elapsed task time.").font(.caption).foregroundStyle(.secondary)
                 }
             }
+            if [.running, .waiting, .needsAttention].contains(item.state), RunSupervisor.shared.entry(item.id) != nil {
+                let control = RunSupervisor.shared.state(item.id)
+                HStack {
+                    if control != .running { Label(control.label, systemImage: control == .paused ? "pause.circle" : "hand.raised").foregroundStyle(.orange) }
+                    switch control {
+                    case .running:
+                        Button("Pause") { command(.pause) }.help("The task waits before its next action; nothing is lost.")
+                        Button("Take over") { command(.takeOver) }.help("Pause the task and show its tab or window so you can work in it.")
+                    case .paused:
+                        Button("Resume") { command(.resume) }
+                        Button("Take over") { command(.takeOver) }
+                    case .takenOver:
+                        Button("Hand back") { command(.handBack) }.help("The task looks at its target again before continuing.")
+                    }
+                }.id(controlRevision)
+            }
             if item.state == .queued {
                 HStack {
                     Button(item.requiresReview ? "Reviewed — start task" : "Start task") { store.requestStart(item.id) }.disabled(!canStart)
@@ -121,5 +139,9 @@ private struct TaskRecordView: View {
             }
         }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+    }
+    private func command(_ command: RunControl.Command) {
+        if RunSupervisor.shared.apply(command, to: item.id)?.reveal == true { RunSupervisor.shared.onReveal(item.id) }
+        controlRevision += 1
     }
 }

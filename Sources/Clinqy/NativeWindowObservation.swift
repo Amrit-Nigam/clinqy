@@ -49,8 +49,7 @@ struct NativeWindowObservation: @unchecked Sendable {
         }
         let geometry = ObservationGeometry(frame: frame, imageSize: CGSize(width: 1, height: 1))
         guard geometry.matches(now) else { return "the target window moved or resized; look again" }
-        let list = CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? []
-        guard let info = list.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }),
+        guard let info = Self.serverInfo(windowID),
               (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
               let bounds = info[kCGWindowBounds as String] as? NSDictionary,
               let serverFrame = CGRect(dictionaryRepresentation: bounds), geometry.matches(serverFrame) else {
@@ -60,6 +59,16 @@ struct NativeWindowObservation: @unchecked Sendable {
             return "the target window contents changed since the image was captured; look again"
         }
         return nil
+    }
+
+    /// WindowServer's row for exactly one window. The single-window query is far cheaper than enumerating
+    /// every window; it omits off-screen windows (other Space, hidden), so those fall back to the full list.
+    static func serverInfo(_ windowID: CGWindowID) -> [String: Any]? {
+        func match(_ rows: [[String: Any]]) -> [String: Any]? {
+            rows.first { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }
+        }
+        if let row = match(CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]] ?? []) { return row }
+        return match(CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? [])
     }
 }
 

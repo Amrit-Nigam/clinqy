@@ -23,6 +23,32 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(summary(rows)['p95_seconds'], 3)
 
 
+class ReceiptCountTests(unittest.TestCase):
+    def test_counts_from_receipt(self):
+        from run import receipt_counts
+        receipt = {'ok': True, 'counts': {'turns': 4, 'unverified_results': 1, 'asks': 0, 'fast_turns': 2}}
+        self.assertEqual(receipt_counts(receipt), {'model_turns': 4, 'unverified_results': 1, 'user_prompts': 0})
+    def test_missing_or_invalid_counts_are_none(self):
+        from run import receipt_counts
+        empty = {'model_turns': None, 'unverified_results': None, 'user_prompts': None}
+        self.assertEqual(receipt_counts(None), empty)
+        self.assertEqual(receipt_counts({'ok': True}), empty)
+        self.assertEqual(receipt_counts({'counts': {'turns': -1, 'unverified_results': True, 'asks': '2'}}), empty)
+    def test_summary_totals_and_phases(self):
+        rows = [dict(seconds=1, model_turns=3, unverified_results=1, user_prompts=0, phase_milliseconds={'model': 100, 'observation': 20},
+                     **score({'ok': True}, {'ok': True}, True)),
+                dict(seconds=2, model_turns=5, unverified_results=0, user_prompts=2, phase_milliseconds={'model': 300},
+                     **score({'ok': True}, {'ok': True}, True)),
+                dict(seconds=3, model_turns=None, unverified_results=None, user_prompts=None, phase_milliseconds=None,
+                     **score({'ok': True}, {'ok': True}, True))]
+        result = summary(rows)
+        self.assertEqual(result['counts']['model_turns'], {'reported': 2, 'total': 8, 'median': 4})
+        self.assertEqual(result['counts']['unverified_results']['total'], 1)
+        self.assertEqual(result['counts']['user_prompts']['total'], 2)
+        self.assertEqual(result['median_phase_milliseconds'], {'model': 200, 'observation': 20})
+        self.assertIsNone(summary([])['counts']['model_turns']['total'])
+
+
 class OwnershipTests(unittest.TestCase):
     def test_cancel_exact_receipt_and_preserve_unrelated(self):
         import tempfile, json, subprocess, threading

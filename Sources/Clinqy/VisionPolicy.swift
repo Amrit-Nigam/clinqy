@@ -15,8 +15,10 @@ enum VisionPolicy {
     }
 }
 
-/// A successful input or subprocess is not a completed user goal. A postcondition must be checked
-/// after the latest potentially meaningful edit, including one which returned unverified delivery.
+/// A successful input or subprocess is not a completed user goal. Evidence is required after the latest mutation
+/// that lacks it: a consequential input (submit, send, save, delete, script) whose effect was not CONFIRMED, any
+/// input whose delivery is unknown, and scripts or generated artifacts (exit zero is not the goal). Ordinary UI input
+/// that was delivered needs no separate verify; CONFIRMED results (receipt, readback, inline expect) are evidence.
 struct CompletionEvidence {
     private(set) var revision = 0
     private(set) var verifiedRevision = 0
@@ -24,15 +26,35 @@ struct CompletionEvidence {
     // Typed filesystem/EventKit tools already return their direct operation result; this gate covers
     // UI delivery, arbitrary scripts and generated artifacts, where delivery alone is weaker evidence.
     static let mutations: Set<String> = ["click", "right_click", "double_click", "drag", "type", "choose", "fill",
-        "autofill", "upload", "key", "menu", "set_state", "window", "shell", "applescript", "paste_snaps",
+        "set_value", "secondary_action", "autofill", "upload", "key", "menu", "set_state", "window", "shell", "applescript", "paste_snaps",
         "pdf", "table", "media"]
+    /// Scripts and generated artifacts: a successful run is never evidence of the requested result.
+    static let alwaysVerify: Set<String> = ["shell", "applescript", "paste_snaps", "pdf", "table", "media"]
     /// An input from an earlier segment of the same task is still unresolved: the goal is not verified.
     mutating func markUnverifiedCarryover() { revision += 1 }
-    mutating func record(kind: String, outcome: ActionOutcome, op: String = "") {
+    /// The run finishes reporting the unconfirmed item to the user (with a screenshot) instead of claiming it.
+    mutating func acknowledgeUnconfirmed() { verifiedRevision = revision }
+    static func needsEvidence(kind: String, outcome: ActionOutcome, op: String = "", consequential: Bool = false) -> Bool {
         // `op` only lowers the classification for actions that define a read-only operation; on any other action it is
         // an ignored argument (ActionContract rejects it) and must never hide a mutation from the gate.
-        if Self.mutations.contains(kind), !ActionContract.readsOnly(kind: kind, op: op), outcome.delivery != .notAttempted { revision += 1 }
+        guard mutations.contains(kind), !ActionContract.readsOnly(kind: kind, op: op), outcome.delivery != .notAttempted else { return false }
+        if alwaysVerify.contains(kind) || outcome.delivery == .unknown { return true }
+        return consequential && !outcome.isConfirmed
+    }
+    mutating func record(kind: String, outcome: ActionOutcome, op: String = "", consequential: Bool = false) {
+        if Self.needsEvidence(kind: kind, outcome: outcome, op: op, consequential: consequential) { revision += 1 }
         if kind == "verify", outcome.isConfirmed { verifiedRevision = revision }
+    }
+}
+
+/// What `done:true` does while evidence is still missing. One reminder lets the model verify (it may send the verify
+/// and done in the same turn); after that the run finishes as done, naming the item it couldn't confirm, with a
+/// screenshot — never as a failure and never by asking the user whether it happened.
+enum CompletionGate {
+    enum Decision: Equatable { case finish, remind, finishUnconfirmed }
+    static func decide(missingEvidence: Bool, reminders: Int) -> Decision {
+        guard missingEvidence else { return .finish }
+        return reminders < 1 ? .remind : .finishUnconfirmed
     }
 }
 

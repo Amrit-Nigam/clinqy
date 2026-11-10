@@ -7,7 +7,7 @@ import Darwin
 struct UIElementInfo: @unchecked Sendable {
     let id: String
     let role: String
-    let label: String
+    var label: String
     /// Frame in global top-left-origin coordinates (the same space CGEvent uses).
     let frame: CGRect
     let element: AXUIElement
@@ -96,8 +96,11 @@ enum AXEngine {
         // Visible means on an actual display: the bounding box of several monitors also covers the gaps between them.
         let displays = NSScreen.screens.map { flipped($0.frame) }
         // Roots are walked one after another (not interleaved), so the sheet's controls come first.
-        var pending = ArraySlice(roots.map { (element: $0.0, depth: 0, inDialog: $0.1) })
-        var queue: [(element: AXUIElement, depth: Int, inDialog: Bool)] = []
+        var pending = ArraySlice(roots.map { (element: $0.0, depth: 0, inDialog: $0.1, parent: -1, inCollection: false) })
+        typealias Pending = (element: AXUIElement, depth: Int, inDialog: Bool, parent: Int, inCollection: Bool)
+        var queue: [Pending] = []
+        var metas: [AXTreeBudget.Node] = []
+        var visitCount = 0
         var head = 0
         var found: [UIElementInfo] = []
         var seen = Set<String>(), refCounts: [String: Int] = [:]
@@ -106,7 +109,7 @@ enum AXEngine {
         let limit = min(1200, max(1, limit))
         let candidateBudget = min(10000, max(256, limit * 12))
         let deadline = Date().addingTimeInterval(2)
-        var deferred: [(element: AXUIElement, depth: Int, inDialog: Bool)] = []
+        var deferred: [Pending] = []
         var visited: [CFHashCode: [AXUIElement]] = [:]
         var truncated = false
 
@@ -116,8 +119,10 @@ enum AXEngine {
                 else if !deferred.isEmpty { queue.append(contentsOf: deferred); deferred.removeAll(keepingCapacity: true) }
                 else { break }
             }
-            let (element, depth, inDialog) = queue[head]
+            let (element, depth, inDialog, parentVisit, inCollection) = queue[head]
             head += 1
+            let visit = visitCount
+            visitCount += 1
             let hash = CFHash(element)
             guard !(visited[hash]?.contains(where: { CFEqual($0, element) }) ?? false) else { continue }
             visited[hash, default: []].append(element)
@@ -145,6 +150,8 @@ enum AXEngine {
                                          fallback: input ? (v[7] as? String ?? v[6] as? String) : label)
                     let n = (refCounts[base] ?? 0) + 1
                     refCounts[base] = n
+                    metas.append(.init(visit: visit, parent: parentVisit, role: role, label: label, enabled: v[10] as? Bool,
+                                       visible: true, inCollection: inCollection, inDialog: inDialog, isInput: input))
                     found.append(UIElementInfo(
                         id: "", role: role,
                         label: label.isEmpty ? "(unlabeled \(role.dropFirst(2)))" : label,
@@ -159,9 +166,10 @@ enum AXEngine {
             // Don't descend into closed menus from the menu bar.
             if role == "AXMenuBarItem" { continue }
             if depth < 30, !(excludingWebContent && role == "AXWebArea") {
-                let next = children(of: element, role: role).map { ($0, depth + 1, inDialog) }
+                let isCollection = ["AXTable", "AXOutline", "AXList", "AXBrowser"].contains(role)
+                let next: [Pending] = children(of: element, role: role).map { ($0, depth + 1, inDialog, visit, inCollection || isCollection) }
                 // Finish ordinary controls before walking large tables, lists and outlines.
-                if ["AXTable", "AXOutline", "AXList", "AXBrowser"].contains(role) { deferred.append(contentsOf: next) }
+                if isCollection { deferred.append(contentsOf: next) }
                 else { queue.append(contentsOf: next) }
                 if next.count == childCap { truncated = true }
             } else if depth >= 30 {
@@ -169,7 +177,16 @@ enum AXEngine {
             }
         }
         truncated = truncated || head < queue.count || !pending.isEmpty || !deferred.isEmpty || found.count > limit
-        if found.count > limit { found = trimmed(found, to: limit) }
+        // Compact the candidates (merge loose text, drop redundant wrappers and empty disabled nodes), then spend the
+        // node budget on visible controls first. Ids are assigned after this, so each still maps to its own element.
+        let plan = AXTreeBudget.compact(metas, limit: limit)
+        if plan.droppedAny || found.count > limit {
+            found = plan.keep.map { i in
+                var e = found[i]
+                if let merged = plan.mergedLabels[i] { e.label = merged }
+                return e
+            }
+        }
         let notice = truncated ? "Accessibility observation is bounded; some controls are not shown. Scroll the relevant panel or observe again before assuming a control is absent." : nil
         snapshot?.diagnostics.setNotice(notice)
         return found.enumerated().map { i, e in
@@ -215,12 +232,6 @@ enum AXEngine {
         default: base = 3
         }
         return e.inDialog ? base + 10 : base
-    }
-
-    /// Keeps the `count` most useful elements, in their original order.
-    private static func trimmed(_ elements: [UIElementInfo], to count: Int) -> [UIElementInfo] {
-        let keep = Set(elements.indices.sorted { (priority(elements[$0]), -$0) > (priority(elements[$1]), -$1) }.prefix(count))
-        return elements.indices.filter(keep.contains).map { elements[$0] }
     }
 
     /// "e12 Button: Send" lines within `budget` characters. Over budget, whole low-value lines go (never a
@@ -1214,11 +1225,15 @@ extension AXEngine {
     }
 
     /// The window server's number for an Accessibility window (private, long-stable _AXUIElementGetWindow).
+    /// Resolved once; nil (fail closed: no window binding, no native observation) if a macOS drops it.
+    private typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    private static let getWindow: GetWindow? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow")
+        .map { unsafeBitCast($0, to: GetWindow.self) }
+
     static func windowID(of window: AXUIElement) -> CGWindowID? {
-        typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else { return nil }
+        guard let getWindow else { return nil }
         var id: CGWindowID = 0
-        return unsafeBitCast(sym, to: GetWindow.self)(window, &id) == .success && id != 0 ? id : nil
+        return getWindow(window, &id) == .success && id != 0 ? id : nil
     }
 
     /// Moves a window into `rect` (global top-left), shrinking it to fit.

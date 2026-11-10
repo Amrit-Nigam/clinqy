@@ -185,6 +185,11 @@ final class BrowserBridge: ObservableObject {
                     self.checkVersion(msg["version"] as? String ?? "", build: msg["build"] as? String, on: conn)
                     if msg["version"] as? String == Self.extensionVersion, msg["build"] as? String == Self.extensionBuild { self.tidyAfterRestart(conn) }
                 }
+                // The user took back a tab adopted for a run: tell that run (it pauses until they hand it back).
+                if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any], msg["type"] as? String == "adoptedReleased",
+                   let tab = msg["tabId"] as? Int, let run = msg["runID"] as? String {
+                    Self.adoptionReleaseRoutes[run]?(tab, msg["reason"] as? String ?? "user input")
+                }
                 // A response is honoured only on the connection its request went to, so a delayed answer from a
                 // retired connection can never complete a request that is waiting on another one.
                 if let data, let msg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -211,7 +216,7 @@ final class BrowserBridge: ObservableObject {
 
     private func request(_ conn: NWConnection, _ body: [String: Any], timeout: Double = 2.5) async throws -> [String: Any] {
         var scopedBody = body
-        if body["workOnly"] as? Bool == true || body["cmd"] as? String == "clinqyTab" { scopedBody["runID"] = taskRunID }
+        if body["workOnly"] as? Bool == true || ["clinqyTab", "adoptTab", "releaseAdopted"].contains(body["cmd"] as? String ?? ""), body["runID"] == nil { scopedBody["runID"] = taskRunID }
         if let transport { return try await transport.requestTransport(conn, scopedBody, timeout: timeout) }
         return try await requestTransport(conn, scopedBody, timeout: timeout)
     }
@@ -449,13 +454,110 @@ final class BrowserBridge: ObservableObject {
     private var taskBrowserOwner: String?
     private var retiredTaskConnections: Set<ObjectIdentifier> = []
     private var taskTabs: Set<Int> = []
+    /// The user's own tabs adopted by this run (a subset of taskTabs), and ones they took back during it.
+    private(set) var adoptedTabs: Set<Int> = []
+    private var releasedAdoptedTabs: Set<Int> = []
+    /// Called when the user takes an adopted tab back (their input in it, selecting it, or closing it).
+    var onAdoptedRelease: ((Int, String) -> Void)?
+    /// Release notices arrive on the shared transport; each run's bridge registers under its ownership token.
+    private static var adoptionReleaseRoutes: [String: (Int, String) -> Void] = [:]
 
     func beginBackgroundRun() {
+        Self.adoptionReleaseRoutes[taskRunID] = nil
         taskRunID = UUID().uuidString
         taskGeneration += 1
         taskConnection = nil
         taskProfileIdentity = nil; taskBrowserOwner = nil; retiredTaskConnections = []
         taskTabs = []
+        adoptedTabs = []; releasedAdoptedTabs = []; onAdoptedRelease = nil
+    }
+
+    private func adoptedTabReleased(_ id: Int, reason: String) {
+        guard adoptedTabs.remove(id) != nil else { return }
+        taskTabs.remove(id)
+        releasedAdoptedTabs.insert(id)
+        Agent.writeLog("you took tab \(id) back (\(reason)); Clinqy let go of it")
+        onAdoptedRelease?(id, reason)
+    }
+
+    /// Whether the run's browser (or `app`) has an extension able to adopt existing tabs.
+    func canAdoptTabs(in app: NSRunningApplication? = nil) -> Bool {
+        guard let browser = app ?? NSWorkspace.shared.runningApplications.first(where: { $0.cleanName == Background.browserName && isConnected($0) }),
+              let bundle = browser.bundleURL?.resolvingSymlinksInPath().path else { return false }
+        return owners.contains { connections[$0.key] != nil && $0.value == bundle && handshakes[$0.key]?.capabilities.contains("adopted-tabs") == true }
+    }
+
+    /// The run's browser connection: the pinned one, else the connected profile of the run's browser (never another browser).
+    private func selectTaskConnection(_ app: NSRunningApplication?) async throws -> (ObjectIdentifier, NWConnection) {
+        if let selected = taskConnection {
+            guard let existing = connections[selected] else { throw BridgeError.notConnected }
+            return (selected, existing)
+        }
+        let generation = taskGeneration
+        guard let preferred = app ?? NSWorkspace.shared.runningApplications.first(where: {
+            $0.cleanName == Background.browserName && isConnected($0)
+        }) else { throw BridgeError.failed("Connect the Clinqy extension in " + Background.browserName + "; another browser will not be used instead.") }
+        guard let selected = await frontConnection(for: preferred) else {
+            throw BridgeError.failed("Connect the Clinqy extension in the browser profile you want to use.")
+        }
+        guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
+        taskConnection = selected.0
+        taskProfileIdentity = handshakes[selected.0]?.profileIdentity
+        taskBrowserOwner = owners[selected.0]
+        return selected
+    }
+
+    /// The user's open tabs (all windows of the run's browser profile, minus Clinqy's own), to pick one to adopt.
+    /// Metadata only: nothing is attached, focused or changed.
+    func adoptionCandidates(in app: NSRunningApplication? = nil) async throws -> [TabAdoptionRouting.Candidate] {
+        guard Background.active, Background.usesExtension else { return [] }
+        let (_, conn) = try await selectTaskConnection(app)
+        let raw = try await request(conn, ["cmd": "adoptCandidates"], timeout: 3)
+        return (raw["tabs"] as? [[String: Any]] ?? []).compactMap { t in
+            guard let id = t["id"] as? Int else { return nil }
+            return .init(id: id, title: t["title"] as? String ?? "", url: t["url"] as? String ?? "",
+                         active: t["active"] as? Bool == true, lastFocusedWindow: t["lastFocusedWindow"] as? Bool == true)
+        }
+    }
+
+    /// Adopts the user's tab `tabID` (showing `url`) for this run: the extension attaches to it with emulated focus and
+    /// shows the activity marker, without activating it or its window. Blocked origins are refused before anything is
+    /// sent; the extension refuses if the tab moved to another site since it was chosen. It then counts as a task tab.
+    func adopt(tabID: Int, url: String, in app: NSRunningApplication? = nil) async throws -> TabInfo {
+        guard Background.active, Background.usesExtension else {
+            throw BridgeError.failed("Working in an open tab needs a background run with the Clinqy browser extension.")
+        }
+        if let why = AccessBlocklist.originRefusal(url: url, blocked: Config.value("BLOCKED_ORIGINS"), allowed: Config.value("ALLOWED_ORIGINS")) {
+            throw BridgeError.failed(why)
+        }
+        let generation = taskGeneration
+        // The run this adoption belongs to, captured before any await: a cancelled adoption's cleanup must release the
+        // tab as *this* run even if a new run started meanwhile (the extension rejects another run's release).
+        let runID = taskRunID
+        let (key, conn) = try await selectTaskConnection(app)
+        guard handshakes[key]?.capabilities.contains("adopted-tabs") == true else {
+            throw BridgeError.failed("This browser's Clinqy extension can't work in an existing tab yet. Reload the extension, or let Clinqy open a new tab.")
+        }
+        var body: [String: Any] = ["cmd": "adoptTab", "tabId": tabID, "runID": runID]
+        if let origin = Self.origin(of: url) { body["expectedOrigin"] = origin }
+        let result = try await request(conn, body, timeout: 10)
+        guard result["adopted"] as? Bool == true, result["id"] as? Int == tabID else { throw BridgeError.failed("The browser did not confirm the tab was adopted.") }
+        guard generation == taskGeneration, Background.active, !Task.isCancelled else {
+            _ = try? await request(conn, ["cmd": "releaseAdopted", "tabId": tabID, "runID": runID], timeout: 5)
+            throw CancellationError()
+        }
+        taskTabs.insert(tabID)
+        adoptedTabs.insert(tabID)
+        releasedAdoptedTabs.remove(tabID)
+        Self.adoptionReleaseRoutes[runID] = { [weak self] id, reason in self?.adoptedTabReleased(id, reason: reason) }
+        return TabInfo(id: tabID, url: result["url"] as? String ?? url, connection: key)
+    }
+
+    /// scheme://host[:port], as a page's origin reads; nil for file: and unparseable addresses.
+    static func origin(of url: String) -> String? {
+        guard let parts = URLComponents(string: url), let scheme = parts.scheme?.lowercased(), ["http", "https"].contains(scheme),
+              let host = parts.host?.lowercased() else { return nil }
+        return scheme + "://" + host + (parts.port.map { ":\($0)" } ?? "")
     }
 
     /// Capture this test's exact connection and tab IDs before Background.end clears run state.
@@ -472,9 +574,10 @@ final class BrowserBridge: ObservableObject {
     }
 
     func endBackgroundRun() {
-        // Explicit ids prevent late cleanup from detaching the next run's debugger.
+        // Explicit ids prevent late cleanup from detaching the next run's debugger. Adopted tabs go back to the user.
+        Self.adoptionReleaseRoutes[taskRunID] = nil
         guard let key = taskConnection, let conn = connections[key] else { return }
-        let ids = Array(taskTabs)
+        let ids = Array(taskTabs.union(releasedAdoptedTabs))
         Task { _ = try? await request(conn, ["cmd": "clinqyDone", "tabIds": ids], timeout: 5) }
     }
 
@@ -494,25 +597,8 @@ final class BrowserBridge: ObservableObject {
                 return (TabInfo(id: id, url: url, connection: worker.identity), worker.app, CGRect(x: 0, y: 0, width: 1440, height: 900))
             }
             let generation = taskGeneration
-            let key: ObjectIdentifier
-            let conn: NWConnection
-            if let selected = taskConnection {
-                guard let existing = connections[selected] else { throw BridgeError.notConnected }
-                key = selected; conn = existing
-            } else {
-                guard let preferred = app ?? NSWorkspace.shared.runningApplications.first(where: {
-                    $0.cleanName == Background.browserName && isConnected($0)
-                }) else { throw BridgeError.failed("Connect the Clinqy extension in " + Background.browserName + "; another browser will not be used instead.") }
-                guard let selected = await frontConnection(for: preferred) else {
-                    throw BridgeError.failed("Connect the Clinqy extension in the browser profile you want to use.")
-                }
-                guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
-                key = selected.0; conn = selected.1
-                taskConnection = key
-                taskProfileIdentity = handshakes[key]?.profileIdentity
-                taskBrowserOwner = owners[key]
-                // Each job cleans up only its own tabs; global cleanup would detach parallel jobs.
-            }
+            // Each job cleans up only its own tabs; global cleanup would detach parallel jobs.
+            let (key, conn) = try await selectTaskConnection(app)
             guard generation == taskGeneration, Background.active, !Task.isCancelled else { throw CancellationError() }
             let result = try await request(conn, ["cmd": "clinqyTab", "url": url, "width": 1280, "height": 900], timeout: 15)
             guard let id = result["id"] as? Int else { throw BridgeError.failed("The extension did not open a task tab") }
@@ -526,8 +612,12 @@ final class BrowserBridge: ObservableObject {
         } catch { Agent.writeLog("background browser: " + error.localizedDescription); return nil }
     }
 
+    /// A run's own tabs and the user's tabs it adopted are its task tabs; a tab the user took back is not.
     private func requireTaskTab(_ tab: TabInfo) throws {
         if Background.active && Background.usesExtension {
+            if releasedAdoptedTabs.contains(tab.id), !taskTabs.contains(tab.id) {
+                throw BridgeError.failed("You took this tab back, so Clinqy let go of it and sends nothing to it until you hand the task back")
+            }
             guard tab.connection == taskConnection, taskTabs.contains(tab.id) else {
                 throw BridgeError.failed("This tab does not belong to the current task")
             }

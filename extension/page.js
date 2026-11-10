@@ -1,7 +1,7 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  const HELPER_VERSION = 7;
+  const HELPER_VERSION = 8;
   const waits = new Set();
   function cancelWaits() { for (const cancel of [...waits]) cancel(); }
   if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
@@ -948,19 +948,141 @@ function readText() {
     // Preparation must not rewrite autocomplete on unrelated user fields.
     return { ok: !field.disabled && !field.readOnly };
   }
+  // The target's own state plus the URL: the only fields the app compares (no whole-page text hash or focus).
+  function targetState(el) {
+    const a = (n) => el && el.getAttribute(n);
+    return JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
+      el && el.value, location.href]);
+  }
   function state(i) {
     let el = null; try { el = target(i); } catch {}
-    const a = (n) => el && el.getAttribute(n);
-    return { sig: JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
-      el && el.value, location.href, textHash(), document.activeElement === el]) };
+    return { sig: targetState(el) };
   }
-  // Cheap hash of the visible text: its length alone misses same-length changes ("Step 2" → "Step 4"),
-  // and a click that did work would then be clicked again by the fallback.
-  function textHash() {
-    const t = document.body ? document.body.innerText : "";
-    let h = 0;
-    for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
-    return t.length + ":" + h;
+  // Effect receipt: a MutationObserver armed before an input records what the page did in response, so an ordinary
+  // click's effect is reported with its result instead of costing a separate verification turn.
+  const receipts = new Map();
+  const dialogSelector = "dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]";
+  function openDialogs() {
+    try { return [...document.querySelectorAll(dialogSelector)].filter((d) => d.getAttribute("aria-hidden") !== "true" && visible(d)).length; }
+    catch { return 0; }
+  }
+  function nodeText(node) {
+    if (!node) return "";
+    if (node.nodeType === 3) return node.data || "";
+    if (node.nodeType !== 1 || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|svg)$/i.test(node.tagName || "")) return "";
+    return node.innerText || node.textContent || "";
+  }
+  // Text only counts as the input's effect where the input could have caused it: inside the target's own container
+  // (its nearest form/section/list item/landmark/dialog, at most 3 levels up), inside a dialog/alert/menu that opened
+  // after arming, or in a node that is itself such a popup. Clocks, tickers, chats and live regions elsewhere don't.
+  const containerSelector = "form, dialog, section, article, li, fieldset, main, nav, aside, header, footer, tr, [role=dialog], [role=alertdialog], " +
+    "[role=form], [role=region], [role=listitem], [role=row], [role=main], [role=navigation], [role=complementary], [role=banner], " +
+    "[role=contentinfo], [role=search], [role=menu], [role=listbox], [role=tabpanel], [role=group], [role=toolbar], [role=article]";
+  const openedSelector = "dialog, [role=dialog], [role=alertdialog], [role=alert], [role=menu], [role=listbox], [aria-modal=true], [popover]";
+  const timeChurn = /^(?:[\d\s:.,/%+\-–—]*|(?:about |over |almost |updated |edited )?(?:\d+\s*|(?:a|an|one)\s+)(?:s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?|mo|months?|y|yrs?|years?)( ago)?|just now|now|(?:updated |edited )?(?:just now|moments? ago|yesterday|today))$/i;
+  function isChurn(text) { return timeChurn.test(squash(text)); }
+  function matchesSel(n, sel) { try { return !!(n && n.nodeType === 1 && n.matches && n.matches(sel)); } catch { return false; } }
+  function closestUp(n, sel) {
+    for (let x = n, k = 0; x && k < 200; x = x.parentNode || x.host, k++) if (matchesSel(x, sel)) return x;
+    return null;
+  }
+  function receiptScope(el) {
+    if (!el) return null;
+    let scope = el;
+    for (let n = el.parentNode || el.host, level = 1; n && n.nodeType === 1 && level <= 3; n = n.parentNode || n.host, level++) {
+      if (n === document.body || n === document.documentElement) break;
+      scope = n;
+      if (matchesSel(n, containerSelector)) break;
+    }
+    return scope;
+  }
+  function openedNow(rec, node) {
+    if (matchesSel(node, openedSelector)) return !rec.preOpened.has(node);
+    try { if (node && node.nodeType === 1 && node.querySelector && node.querySelector(openedSelector)) return true; } catch {}
+    return false;
+  }
+  // Is a change at `place` (the mutation's target) attributable to the input?
+  function attributable(rec, place) {
+    if (rec.scope && within(rec.scope, place)) return true;
+    const popup = closestUp(place, openedSelector);
+    return !!(popup && !rec.preOpened.has(popup));
+  }
+  // Armed right before delivery (after locate and the pointer's approach), so a hover tooltip is not the click's effect.
+  function receiptArm(token, index) {
+    if (typeof token !== "string" || !token || token.length > 80) throw new Error("receipt needs a token");
+    receiptDrop(token);
+    const el = Number.isInteger(index) ? target(index) : null;
+    let preOpened = new Set();
+    try { preOpened = new Set(document.querySelectorAll(openedSelector)); } catch {}
+    const rec = { el, scope: receiptScope(el), preOpened, addedEls: [], sig: el ? targetState(el) : null, url: location.href, active: deepActive(),
+      dialogs: openDialogs(), added: [], removed: [], size: 0, count: 0, structural: false, armedAt: performance.now(), last: performance.now() };
+    const keep = (list, text) => {
+      const t = squash(text);
+      if (!t || isChurn(t) || rec.size > 4000 || list.includes(t)) return;
+      list.push(t.slice(0, 400)); rec.size += Math.min(400, t.length);
+    };
+    rec.observer = new MutationObserver((records) => {
+      for (const m of records) {
+        rec.count++;
+        if (m.type === "childList") {
+          if ([...(m.addedNodes || []), ...(m.removedNodes || [])].some((n) => n.nodeType === 1)) rec.structural = true;
+          const here = attributable(rec, m.target);
+          for (const n of m.addedNodes || []) {
+            if (n.nodeType === 1 && rec.addedEls.length < 200) rec.addedEls.push(n);
+            if (here || openedNow(rec, n)) keep(rec.added, nodeText(n));
+          }
+          if (here) for (const n of m.removedNodes || []) keep(rec.removed, nodeText(n));
+        } else if (m.type === "characterData") {
+          const now = squash(m.target && m.target.data), was = squash(m.oldValue);
+          if (now !== was && !(isChurn(now) && isChurn(was)) && attributable(rec, m.target)) { keep(rec.added, now); keep(rec.removed, was); }
+        }
+      }
+      rec.last = performance.now();
+    });
+    rec.observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, characterDataOldValue: true,
+      attributes: true, attributeFilter: ["open", "hidden", "aria-hidden", "aria-expanded", "aria-checked", "aria-selected", "aria-pressed", "checked", "value", "disabled"] });
+    rec.expiry = setTimeout(() => receiptDrop(token), 15000);
+    receipts.set(token, rec);
+    return { armed: true, url: rec.url };
+  }
+  function receiptDrop(token) {
+    const rec = receipts.get(token);
+    if (!rec) return;
+    try { rec.observer.disconnect(); } catch {}
+    clearTimeout(rec.expiry);
+    receipts.delete(token);
+  }
+  // Waits until the DOM has been quiet for `quietMs` (or `capMs` passed), then reports what changed.
+  function receiptCollect(token, quietMs = 120, capMs = 800) {
+    const rec = receipts.get(token);
+    if (!rec) throw new Error("no armed receipt " + token);
+    const quiet = Math.max(30, Math.min(1000, Number(quietMs) || 120)), cap = Math.max(quiet, Math.min(3000, Number(capMs) || 800));
+    const started = performance.now();
+    return new Promise((resolve) => {
+      const tick = () => {
+        const now = performance.now();
+        if (now - Math.max(rec.last, started) < quiet && now - started < cap) { setTimeout(tick, 30); return; }
+        try { rec.observer.takeRecords && rec.observer.takeRecords(); } catch {}
+        const el = rec.el;
+        const connected = !!(el && el.isConnected);
+        const result = {
+          urlChanged: location.href !== rec.url,
+          targetStateChanged: !!(el && connected && targetState(el) !== rec.sig),
+          targetRemoved: !!(el && !connected),
+          dialogOpened: openDialogs() > rec.dialogs,
+          focusChanged: deepActive() !== rec.active,
+          focusIntoNew: (() => { const a = deepActive(); return !!(a && a !== rec.active && rec.addedEls.some((n) => within(n, a))); })(),
+          addedText: rec.added.join(" | ").slice(0, 600),
+          removedText: rec.removed.join(" | ").slice(0, 600),
+          mutationCount: rec.count,
+          structural: rec.structural,
+          waitedMs: Math.round(now - started),
+        };
+        receiptDrop(token);
+        resolve(result);
+      };
+      tick();
+    });
   }
   // Apps like the AWS console scroll an inner panel, not the window: scroll whichever actually moves.
   function scroller() {
@@ -1102,9 +1224,26 @@ function readText() {
     });
   }
   function pageTitle() { return window.__clinqyActivity?.pageTitle?.() || document.title; }
+  // In a tab the user handed over (adopted), their own click, key, scroll or touch means they want it back. Only
+  // trusted events are reported; the extension discards those arriving while it is sending its own CDP input.
+  const USER_EVENTS = ["pointerdown", "mousedown", "keydown", "wheel", "touchstart"];
+  let watchingUser = false, lastUserReport = 0;
+  function onUserEvent(event) {
+    if (!event.isTrusted) return;
+    const now = Date.now();
+    if (now - lastUserReport < 100) return;
+    lastUserReport = now;
+    try { chrome.runtime.sendMessage({ clinqy: "userInput", kind: event.type })?.catch?.(() => {}); } catch {}
+  }
+  function watchUser(on) {
+    if (on && !watchingUser) for (const type of USER_EVENTS) addEventListener(type, onUserEvent, { capture: true, passive: true });
+    if (!on && watchingUser) for (const type of USER_EVENTS) removeEventListener(type, onUserEvent, { capture: true });
+    watchingUser = !!on;
+    return { watching: watchingUser };
+  }
   function waitText(want,gone,ms) { return waitCondition({kind:"text",text:want,gone},ms); }
 
-  window.__clinqy = { version: HELPER_VERSION, dispose: () => { candidateObserver.disconnect(); cancelWaits(); }, protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { version: HELPER_VERSION, dispose: () => { candidateObserver.disconnect(); cancelWaits(); watchUser(false); }, protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, coordinateGuard, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, setRange, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText, waitCondition, cancelWaits };
+    frameBoxes, snapshot, coordinateGuard, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, setRange, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, receiptArm, receiptCollect, receiptDrop, scroll, selection, waitText, waitCondition, cancelWaits, watchUser };
 })();

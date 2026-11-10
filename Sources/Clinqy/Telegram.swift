@@ -1,7 +1,12 @@
 import AppKit
 
-/// Telegram conversations own their task, question, mode choice and status message. A new request never
-/// silently changes another task, and browser work uses the same isolated pool as the Mac UI.
+/// Telegram conversations own their task, question and status message. A new request never silently changes another
+/// task, and browser work uses the same isolated pool as the Mac UI. Runs started elsewhere (Mac, schedules, MCP) are
+/// mirrored here too, so every run can be watched, answered, paused, taken over and stopped from the phone.
+///
+/// Each run has one live card, edited in place silently (state, elapsed time, step, current action, checklist and a
+/// thumbnail of its own tab/window). Questions and final results are separate messages that notify. Rendering, button
+/// layouts, pacing and reply routing are pure and live in TelegramUI.swift.
 @MainActor
 final class Telegram {
     static let shared = Telegram()
@@ -11,6 +16,8 @@ final class Telegram {
     private let session: URLSession
     private let store: TaskStore
     private let downloadDirectory: URL
+    private let cardInterval: TimeInterval
+    private let tickInterval: TimeInterval
     private var sending: Task<Void, Never>?
     private var polling: Task<Void, Never>?
     private var reporting: Task<Void, Never>?
@@ -22,6 +29,9 @@ final class Telegram {
     private var pendingFiles: [URL] = []
     private var downloads: [String: URL] = [:]
     private static let downloadLimit = 20 * 1024 * 1024
+    /// Bot API upload limits: photos 10 MB, documents 50 MB.
+    private static let photoLimit = 10_000_000
+    private static let documentLimit = 50 * 1024 * 1024
 
     private struct Request {
         var text: String
@@ -51,35 +61,77 @@ final class Telegram {
         var completedAt: Date?
         var screenshot: Data?
         var takingScreenshot = false
-        var message: Int?
-        var cardAttempted = false
-        var rendered = ""
         var questionID: String?
         var questionText: String?
         var questionMessage: Int?
         var options: [String] = []
         var reviewedResult: ResultCard?
-        init(id: UUID, request: Request, background: Bool) { self.id = id; self.request = request; self.background = background }
-        var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
-    }
-    private struct ModeChoice {
-        let request: Request
+        /// Started on the Mac, by a schedule or over MCP: shown and controllable here, never implicitly answered.
+        var mirrored = false
+        var source: RunSource = .telegram
+        var stepShots = 0
+        var before: Data?
+        let startedAt = Date()
+        // Outcome
+        var ok = true
+        var stopped = false
+        var unconfirmed = false
+        var finalAnswer: String?
+        var cardOutcome: String?
+        var stopping = false
+        var reran = false
+        var link: String?
+        // The live card
         var message: Int?
+        var cardAttempted = false
+        var rendered = ""
+        var renderedAt: Date?
+        var coalescer: EditCoalescer
+        var cardPhoto = false
+        var cardImage: Data?
+        var photoDigest: Int?
+        var pendingPhoto: Data?
+        var photoKey: String?
+        var photoAt: Date?
+        var capturingCard = false
+        init(id: UUID, request: Request, background: Bool, interval: TimeInterval) {
+            self.id = id; self.request = request; self.background = background
+            coalescer = EditCoalescer(minInterval: interval)
+        }
+        var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
     }
     private var runs: [UUID: Run] = [:]
     private var selected: UUID?
-    private var modes: [String: ModeChoice] = [:]
     private var messageRuns: [Int: UUID] = [:]
     private var messageQuestions: [Int: String] = [:]
+    private var answeredQuestions: [String: String] = [:]
     private var seenMessages: [Int] = []
-    var ownsRun: Bool { runs.values.contains { !$0.ended && $0.worker === agent } }
+    var ownsRun: Bool { runs.values.contains { !$0.ended && !$0.mirrored && $0.worker === agent } }
 
+    /// `cardInterval`: minimum seconds between edits of one card. `tickInterval`: how often active cards refresh.
     init(session: URLSession = .shared, downloadDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
-         .appendingPathComponent("Library/Application Support/Clinqy/Telegram", isDirectory: true), store: TaskStore? = nil) {
+         .appendingPathComponent("Library/Application Support/Clinqy/Telegram", isDirectory: true), store: TaskStore? = nil,
+         cardInterval: TimeInterval = 3, tickInterval: TimeInterval = 5) {
         self.store = store ?? .shared; self.session = session; self.downloadDirectory = downloadDirectory
+        self.cardInterval = cardInterval; self.tickInterval = tickInterval
     }
     var token: String? { Config.value("TELEGRAM_BOT_TOKEN").flatMap { $0.isEmpty ? nil : $0 } }
     var chatID: Int64? { Config.value("TELEGRAM_CHAT_ID").flatMap { Int64($0) } }
+    /// TELEGRAM_RUNS=telegram limits the chat to Telegram-started tasks; the default mirrors every run.
+    static var mirrorsAllRuns: Bool { (Config.value("TELEGRAM_RUNS") ?? "all").trimmingCharacters(in: .whitespaces).lowercased() != "telegram" }
+    /// A screenshot of the task's own tab/window rides with each question (TELEGRAM_QUESTION_SCREENSHOT=0 turns it off).
+    static var questionScreenshots: Bool { flag("TELEGRAM_QUESTION_SCREENSHOT", default: true) }
+    /// Opt-in: a screenshot at each completed checklist step, and before/after images with the result.
+    static var stepScreenshots: Bool { flag("TELEGRAM_STEP_SCREENSHOTS", default: false) }
+    /// The card's thumbnail of a background run's own tab/window, refreshed on meaningful changes (TELEGRAM_CARD_PHOTOS=0
+    /// turns it off). Foreground runs are captured only on request, at questions and at the end.
+    static var cardPhotos: Bool { flag("TELEGRAM_CARD_PHOTOS", default: true) }
+    static func flag(_ key: String, default value: Bool) -> Bool {
+        guard let raw = Config.value(key)?.trimmingCharacters(in: .whitespaces).lowercased(), !raw.isEmpty else { return value }
+        if ["1", "on", "true", "yes"].contains(raw) { return true }
+        if ["0", "off", "false", "no"].contains(raw) { return false }
+        return value
+    }
     private var offset: Int {
         get { UserDefaults.standard.integer(forKey: "telegramOffset") }
         set { UserDefaults.standard.set(newValue, forKey: "telegramOffset") }
@@ -88,7 +140,10 @@ final class Telegram {
         polling?.cancel(); polling = nil
         guard token != nil else { return }
         // Recovery is available through /runs; launching the app never sends unsolicited chat messages.
-        polling = Task { [weak self] in await self?.poll() }
+        polling = Task { [weak self] in
+            _ = await self?.request("setMyCommands", ["commands": TelegramCommands.json])
+            await self?.poll()
+        }
     }
     func checkToken() async -> String? {
         let me = await call("getMe", [:]) as? [String: Any]
@@ -100,12 +155,16 @@ final class Telegram {
         return (code, username.flatMap { URL(string: "https://t.me/\($0)?start=\(code)") })
     }
     private func poll() async {
+        var failures = 0
         while !Task.isCancelled, token != nil {
             guard let updates = await call("getUpdates", ["offset": offset, "timeout": 50,
                                                           "allowed_updates": ["message", "callback_query"]], wait: 60) as? [[String: Any]] else {
-                try? await Task.sleep(for: .seconds(5))
+                // Network down or Telegram unavailable: back off (5 s → 60 s) and keep polling.
+                failures += 1
+                try? await Task.sleep(for: .seconds(min(60, 5 * failures)))
                 continue
             }
+            failures = 0
             for update in updates {
                 offset = max(offset, (update["update_id"] as? Int ?? 0) + 1)
                 if let message = update["message"] as? [String: Any] { handle(message) }
@@ -123,7 +182,7 @@ final class Telegram {
             do {
                 try Config.write(["TELEGRAM_CHAT_ID": String(id)])
                 send("Paired with Clinqy on your Mac. Send me a task, e.g. “apply to this job with my profile: <link>”.\n"
-                     + "Choose Normal or Background before each task, or include the mode in your request. /runs lists tasks.", to: id)
+                     + "Tasks run in the background; start with “foreground:” to use your Mac's screen. /help shows the rest.", to: id)
             } catch {
                 send("Couldn't save the pairing on the Mac: \(error.localizedDescription)", to: id)
             }
@@ -190,13 +249,16 @@ final class Telegram {
         guard current == generation, !Task.isCancelled else { return }
         if text.isEmpty {
             for file in files where !pendingFiles.contains(file) { pendingFiles.append(file) }
-            return send("\(pendingFiles.count) file(s) ready. What should I do with them? Send your instruction as a message.")
+            let voice = messages.contains { $0["voice"] != nil || $0["audio"] != nil }
+            return send("\(pendingFiles.count) file(s) ready. What should I do with them? Send your instruction as a message."
+                        + (voice ? " (Voice notes are attached as audio files; I don't transcribe them here.)" : ""))
         }
         var combined = pendingFiles
         for file in files where !combined.contains(file) { combined.append(file) }
         files = combined
         pendingFiles.removeAll()
-        route(Request(text: text, files: files), replyTo: (messages.first?["reply_to_message"] as? [String: Any])?["message_id"] as? Int)
+        route(Request(text: text, files: files), replyTo: (messages.first?["reply_to_message"] as? [String: Any])?["message_id"] as? Int,
+              source: messages.last?["message_id"] as? Int)
     }
 
     /// A photo contains several resolutions of the same image, not separate attachments.
@@ -243,7 +305,8 @@ final class Telegram {
         let directory = downloadDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true,
                                               attributes: [.posixPermissions: 0o700])
-        let name = (attachment["file_name"] as? String) ?? (path as NSString).lastPathComponent
+        let fallback = (path as NSString).lastPathComponent
+        let name = (attachment["file_name"] as? String) ?? fallback
         let destination = directory.appendingPathComponent(Self.safeFilename(name))
         FileManager.default.createFile(atPath: destination.path, contents: nil, attributes: [.posixPermissions: 0o600])
         let file = try FileHandle(forWritingTo: destination)
@@ -299,25 +362,28 @@ final class Telegram {
     }
 
 
-    // MARK: - Routing and mode selection
+    // MARK: - Commands
 
     private func handleCommand(_ text: String, message: [String: Any]) -> Bool {
         let parts = text.split(maxSplits: 1, whereSeparator: \.isWhitespace).map(String.init)
-        let command = parts.first?.lowercased() ?? ""
+        let command = (parts.first?.lowercased() ?? "").replacingOccurrences(of: #"@\w+$"#, with: "", options: .regularExpression)
         let argument = parts.count > 1 ? parts[1].trimmingCharacters(in: .whitespacesAndNewlines) : ""
         let reply = (message["reply_to_message"] as? [String: Any])?["message_id"] as? Int
-        let run = reply.flatMap { messageRuns[$0] }.flatMap { runs[$0] } ?? selected.flatMap { runs[$0] }
-        if ["/runs", "/tasks", "/recovery"].contains(command) {
-            let items = store.records.filter { $0.source == .telegram && $0.conversationID == chatID && $0.parentID == nil && !["/runs", "/tasks", "/status", "/result"].contains($0.request.trimmingCharacters(in: .whitespacesAndNewlines)) }.suffix(12)
-            send(items.isEmpty ? "No Telegram tasks yet." : items.map {
-                "[" + $0.shortID + "] " + $0.state.label + " · " + ($0.background ? "Background" : "Normal") + "\n" + Self.title($0.request)
-            }.joined(separator: "\n\n") + "\n\n/task <id> selects a task. /run <id> resumes a reviewed queued request; interrupted work is never replayed.")
+        let replied = reply.flatMap { messageRuns[$0] }.flatMap { runs[$0] }
+        let run = replied ?? selected.flatMap { runs[$0] }
+        if ["/runs", "/tasks", "/recovery"].contains(command) { sendHistory(); return true }
+        if command == "/status", argument.isEmpty, replied == nil { sendOverview(); return true }
+        if let control = Self.controlCommand(command) {
+            let target = argument.isEmpty ? run : chatRecord(argument).flatMap { runs[$0.id] }
+            guard let target else { send(argument.isEmpty ? "Select a task with /status or /task <id> first, or use \(command) <id>." : "That task isn't running in this chat. Use /runs."); return true }
+            selected = rootRun(target).id
+            applyControl(target, command: control, fromButton: false)
             return true
         }
         if command == "/task" {
             guard let item = chatRecord(argument) else { send("Use /runs, then /task <id>."); return true }
             selected = item.id
-            if let run = runs[item.id] { send(statusText(run), extra: controls(run)) }
+            if let run = runs[item.id] { repostCard(run) }
             else { send(savedStatus(item)) }
             return true
         }
@@ -334,106 +400,246 @@ final class Telegram {
             return true
         }
         if command == "/stop", argument == "all" { stop(all: true); return true }
-        if command == "/open" { if let run { reveal(run) } else { send("Select a task with /task <id> first.") }; return true }
+        if command == "/open" { if let run { reveal(run) } else { send("Select a task with /status first.") }; return true }
         if command == "/new" {
-            if argument.isEmpty { send("Use /new followed by the new task."); return true }
+            if argument.isEmpty { offerQuickReplies("What should I do? Type a task, or pick a recent one."); return true }
             return false
         }
         guard let intent = Self.intent(text) else { return false }
         switch intent {
         case .help:
-            send("Send a task or files with a caption. I'll ask Normal (uses your Mac) or Background (isolated browser tabs and supported file tools), unless you specify the mode.\n\nNew messages start new tasks. Reply to a task's message to add instructions, or reply to its question to answer it. /new <task> always starts a separate task.\n\n/runs — all tasks\n/task <id> — select one\n/status · /result · /screenshot — selected task\n/open — show its tab on your Mac\n/stop — stop selected task\n/stop all — stop only Telegram tasks\n\nFor a CAPTCHA, use Open task and solve it yourself on the Mac. Asking how to do it keeps the task paused.")
+            send(TelegramCommands.help, extra: quickReplyMarkup().map { ["reply_markup": $0] } ?? [:])
         case .status:
-            if let run { send(statusText(run), extra: controls(run)) }
+            if let run { repostCard(run) }
             else if let item = selected.flatMap({ store.record($0) }) { send(savedStatus(item)) }
-            else { send("Idle. Send a task, or use /runs for saved work.") }
+            else { sendOverview() }
         case .result:
             if run == nil, let item = selected.flatMap({ store.record($0) }) { send(savedStatus(item)) }
             else { sendResult(run) }
-        case .screenshot: if let run { requestScreenshot(run) } else { send("No task selected. Use /runs.") }
-        case .stop: stop(run)
-        case .greeting: send("I'm here. Send a task, or /runs to check existing work.")
+        case .screenshot: if let run { requestScreenshot(run) } else { send("No task selected. Use /status.") }
+        case .stop:
+            // A typed "stop" never reaches a run started on the Mac unless it replies to that run.
+            if let run, run.mirrored, replied == nil, !command.hasPrefix("/") {
+                send("To stop a run started on your Mac, reply “stop” to its card or tap Stop.")
+            } else { stop(run) }
+        case .greeting: send("I'm here. Send a task, or /status to check running work.")
         case .thanks: send("You're welcome.")
         }
         return true
     }
 
     private func dispatch(_ command: String, run: Run) {
-        if ["/status", "/progress"].contains(command) { send(statusText(run), extra: controls(run)) }
+        if ["/status", "/progress"].contains(command) { repostCard(run) }
         else if ["/result", "/results", "/review"].contains(command) { sendResult(run) }
         else if ["/screenshot", "/screen"].contains(command) { requestScreenshot(run) }
         else if command == "/open" { reveal(run) }
         else if command == "/stop" { stop(run) }
+        else if let control = Self.controlCommand(command) { applyControl(run, command: control, fromButton: false) }
+    }
+    static func controlCommand(_ command: String) -> RunControl.Command? {
+        switch command {
+        case "/pause": return .pause
+        case "/resume", "/continue": return .resume
+        case "/takeover", "/take_over": return .takeOver
+        case "/handback", "/hand_back": return .handBack
+        default: return nil
+        }
+    }
+
+    /// Recent parent runs from this chat (and mirrored runs), newest first, with a one-line result each.
+    private func sendHistory() {
+        let items = store.records.filter { ($0.source == .telegram && $0.conversationID == chatID || runs[$0.id]?.mirrored == true) && $0.parentID == nil && !["/runs", "/tasks", "/status", "/result"].contains($0.request.trimmingCharacters(in: .whitespacesAndNewlines)) }
+            .sorted { $0.createdAt > $1.createdAt }.prefix(10)
+        guard !items.isEmpty else { return send("No tasks yet. Send one in plain words.") }
+        let lines = items.map { item -> String in
+            let run = runs[item.id]
+            let phase = run.map(cardModel)?.phase
+            let emoji = phase?.emoji ?? Self.emoji(item.state)
+            let label = phase?.label ?? listState(item)
+            var line = emoji + " " + TelegramHTML.bold(TelegramText.title(item.request, limit: 50)) + "\n"
+            line += TelegramHTML.escape(label)
+            let detail = ResultText.oneLiner(run?.finalAnswer ?? item.result)
+            if !detail.isEmpty, item.state.terminal { line += " — " + TelegramHTML.escape(detail) }
+            line += "\n" + TelegramHTML.code("#" + item.shortID) + (run?.mirrored == true ? TelegramHTML.escape(" · from " + run!.source.label) : "")
+                + (item.background ? "" : TelegramHTML.escape(" · Normal"))
+            return line
+        }
+        sendHTML(TelegramHTML.bold("Recent runs") + "\n\n" + lines.joined(separator: "\n\n")
+                 + "\n\n" + TelegramHTML.italic("/task <id> shows one. /run <id> starts a reviewed queued request; interrupted work is never replayed."))
+    }
+    private static func emoji(_ state: TaskStore.State) -> String {
+        switch state {
+        case .queued: return "🕓"
+        case .running: return "⚙️"
+        case .waiting, .needsAttention: return "🙋"
+        case .succeeded: return "✅"
+        case .failed, .interrupted: return "❌"
+        case .cancelled: return "⏹"
+        }
+    }
+    /// One message listing active runs, each with a button that brings its card to the bottom of the chat.
+    private func sendOverview() {
+        let active = runs.values.filter { !$0.ended && $0.parentID == nil }.sorted { $0.startedAt < $1.startedAt }
+        guard !active.isEmpty else { return send("Nothing running. Send a task, or /runs for recent results.") }
+        let now = Date()
+        let lines = active.map { run -> String in
+            let model = cardModel(run)
+            return model.phase.emoji + " " + TelegramHTML.bold(model.title) + "\n" + TelegramHTML.escape(model.phase.label + " · " + TelegramText.elapsed(now.timeIntervalSince(run.startedAt))
+                + (model.step > 0 ? " · step \(model.step)" : "") + (run.mirrored ? " · from " + run.source.label : "")) + " " + TelegramHTML.code("#" + run.shortID)
+        }
+        let rows = active.prefix(8).map { run in [TGButton.callback("Open card · " + TelegramText.title(run.request.text, limit: 40), CallbackData.control(run.shortID, .card))] }
+        sendHTML(TelegramHTML.bold("\(active.count) active run" + (active.count == 1 ? "" : "s")) + "\n\n" + lines.joined(separator: "\n\n"),
+                 extra: ["reply_markup": TGButton.markup(Array(rows))])
+    }
+    private func listState(_ item: TaskStore.Record) -> String {
+        let control = RunSupervisor.shared.state(item.id)
+        return control.isPaused && runs[item.id]?.ended == false ? control.label : item.state.label
+    }
+    private func quickReplyMarkup() -> [String: Any]? {
+        let recent = store.records.filter { $0.source == .telegram && $0.conversationID == chatID && $0.parentID == nil }
+            .sorted { $0.createdAt < $1.createdAt }.suffix(30).map { TelegramText.title($0.request, limit: 120) }
+        let items = QuickReplies.build(recent: Array(recent), workflows: Workflows.shared.all.map(\.name))
+        return items.isEmpty ? nil : QuickReplies.markup(items)
+    }
+    private func offerQuickReplies(_ text: String) {
+        send(text, extra: quickReplyMarkup().map { ["reply_markup": $0] } ?? [:])
+    }
+
+    // MARK: - Pause, resume, take over, hand back
+
+    /// Pause, resume, take over or hand back a task and every unfinished parallel job under it. Buttons answer with a
+    /// toast (returned) and a silent card edit; typed commands also get a one-line reply. Repeats change nothing.
+    @discardableResult
+    private func applyControl(_ target: Run, command: RunControl.Command, fromButton: Bool) -> String {
+        let run = rootRun(target)
+        guard !run.ended else {
+            if !fromButton { send("#\(run.shortID) has already finished.") }
+            return TapToast.finished
+        }
+        let family = [run] + children(run).filter { !$0.ended }
+        let wasTakenOver = family.contains { RunSupervisor.shared.state($0.id) == .takenOver }
+        var changed = false
+        for member in family {
+            if RunSupervisor.shared.entry(member.id) == nil {
+                RunSupervisor.shared.register(run: member.id, source: member.source, title: Self.title(member.request.text),
+                                              background: store.record(member.id)?.background ?? member.background, parent: member.parentID)
+            }
+            if RunSupervisor.shared.apply(command, to: member.id) != nil { changed = true }
+        }
+        let state = RunSupervisor.shared.state(run.id)
+        if command == .takeOver, changed { reveal(run) }
+        updateCard(run)
+        let action: CardAction = command == .pause ? .pause : command == .resume ? .resume : command == .takeOver ? .takeover : .handback
+        if !fromButton {
+            let text: String
+            switch (command, changed) {
+            case (_, false): text = "#\(run.shortID) is \(state.label.lowercased()); nothing changed."
+            case (.pause, _): text = "⏸ Paused #\(run.shortID). It will wait before its next action; nothing is lost. /resume to continue."
+            case (.takeOver, _): text = "🖐 #\(run.shortID) is yours. I've paused it and brought its tab or window forward on your Mac. /handback when you're done; I'll look at it again before doing anything."
+            case (.resume, _), (.handBack, _): text = "▶️ #\(run.shortID) continues." + (wasTakenOver ? " I'll look at the screen again before the next action." : "")
+            }
+            send(text)
+        }
+        return TapToast.control(action, changed: changed, state: state.label)
     }
     private func chatRecord(_ id: String) -> TaskStore.Record? {
-        guard !id.isEmpty, let item = store.find(id), item.source == .telegram, item.conversationID == chatID else { return nil }
+        let id = id.hasPrefix("#") ? String(id.dropFirst()) : id
+        guard !id.isEmpty, let item = store.find(id) else { return nil }
+        guard item.source == .telegram && item.conversationID == chatID || runs[item.id]?.mirrored == true else { return nil }
         return item
     }
     private func savedStatus(_ item: TaskStore.Record) -> String {
-        "[\(item.shortID)] \(item.state.label) · " + (item.background ? "Background" : "Normal") + "\n"
+        "\(Self.emoji(item.state)) \(item.state.label) · " + (item.background ? "Background" : "Normal") + " · #\(item.shortID)\n"
             + Self.title(item.request) + "\n\n" + (item.result ?? item.stage)
             + (item.requiresReview ? "\n\nNot running. Review with /run " + item.shortID + " before restarting." : "")
     }
     private func run(for worker: Agent) -> Run? {
         runs.values.first { !$0.ended && $0.worker === worker && $0.id == worker.taskRecordID }
     }
-    private func route(_ input: Request, replyTo: Int?) {
+
+    // MARK: - Routing messages
+
+    private func route(_ input: Request, replyTo: Int?, source: Int? = nil) {
         var request = input
         let forceNew = request.text.lowercased().hasPrefix("/new ")
         if forceNew { request.text = String(request.text.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines) }
         guard !request.text.isEmpty else { return send("Use /new followed by the new task.") }
-        if let replyTo, let key = modes.first(where: { $0.value.message == replyTo })?.key, !forceNew {
-            if let mode = Self.modeAnswer(request.text) { chooseMode(key, background: mode); return }
-            if request.text.lowercased() == "cancel" { cancelMode(key); return }
-            return send("Tap Normal or Background on that task. Nothing has started yet.")
-        }
-        if !forceNew, replyTo == nil, modes.count == 1, let mode = Self.modeAnswer(request.text), let key = modes.keys.first {
-            chooseMode(key, background: mode); return
-        }
-        let explicitRun = replyTo.flatMap { messageRuns[$0] }.flatMap { runs[$0] }
-        if let replyTo, let questionID = messageQuestions[replyTo], explicitRun?.questionID != questionID, !forceNew {
-            return send("That question has ended. Reply to the current question or use /new for another task.")
-        }
-        let waiting = runs.values.filter { !$0.ended && $0.worker?.question != nil }
         var modeText = request.text
         let explicitMode = Background.choice(&modeText)
         // An explicit new task/mode or new URL never becomes a pending form answer.
         let newModeRequest = explicitMode != nil && !modeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let newBrowserRequest = BrowserTaskRouting.isBrowserTask(request.text) && request.text.range(of: #"https?://"#, options: .regularExpression) != nil
-        let target = explicitRun ?? (!forceNew && !newModeRequest && !newBrowserRequest && waiting.count == 1 ? waiting.first : nil)
-        if !forceNew, let target, !target.ended, let worker = target.worker {
+        let replyFacts: MessageRoute.ReplyFacts? = replyTo.flatMap { message in
+            messageRuns[message].flatMap { runs[$0] }.map { run in
+                let key = messageQuestions[message]
+                return .init(run: run.id, ended: rootRun(run).ended, toQuestion: key != nil, current: key != nil && key == run.questionID,
+                             waiting: run.worker?.question != nil && !run.ended, mirrored: run.mirrored)
+            }
+        }
+        if replyFacts == nil, let replyTo, messageQuestions[replyTo] != nil, !forceNew {
+            return send("That question has ended. Reply to the current question or use /new for another task.")
+        }
+        // Mirrored runs (started on the Mac) are answered by replying to their question or tapping an option, never by
+        // a stray message that might be meant as a new task.
+        let waiting = runs.values.filter { !$0.ended && !$0.mirrored && $0.worker?.question != nil }.map(\.id)
+        let previous = selected.flatMap { runs[$0] }
+        let selectedFacts = previous.map { (id: $0.id, ended: $0.ended, mirrored: $0.mirrored,
+                                            recent: $0.completedAt.map { Date().timeIntervalSince($0) < 1800 } == true && $0.summary != nil) }
+        let decision = MessageRoute.decide(text: request.text, forceNew: forceNew, explicitNew: newModeRequest || newBrowserRequest,
+                                           reply: replyFacts, waitingOwned: waiting, selected: selectedFacts,
+                                           followUpPhrase: Self.isFollowUp(request.text))
+        switch decision {
+        case .questionEnded:
+            return send("That question has ended. Reply to the current question or use /new for another task.")
+        case .ambiguous:
+            return send("More than one task needs an answer. Reply to the specific question, or use /new <task> for a new request.")
+        case .answer(let id):
+            guard let target = runs[id], let worker = target.worker, let question = worker.question else { return }
             selected = rootRun(target).id
-            if let question = worker.question {
-                if question.sensitive { return send("That one's private — answer it on your Mac.") }
-                if Self.questionHelp(request.text) {
-                    return send("[\(target.shortID)] Still paused. Tap Open task to show its page on your Mac. If it's a CAPTCHA, complete it yourself there, then reply Done to this question. I haven't treated your help request as an answer.", extra: controls(target))
-                }
-                dismissQuestion(target)
-                worker.answer(request.prompt)
-                updateCard(target)
-                return
+            if question.sensitive { return send("That one's private — answer it on your Mac.") }
+            if Self.questionHelp(request.text) {
+                return send("#\(target.shortID) is still waiting. Tap Open on Mac to show its page there. If it's a CAPTCHA, complete it yourself, then reply Done to the question. I haven't treated your help request as an answer.")
+            }
+            if let key = target.questionID { answeredQuestions[key] = request.text }
+            dismissQuestion(target)
+            worker.answer(request.prompt)
+            react(source, "👍")
+            updateCard(target)
+            return
+        case .control(let id, let command):
+            guard let target = runs[id] else { return }
+            selected = rootRun(target).id
+            switch command {
+            case .stop: stop(target)
+            case .pause: applyControl(target, command: .pause, fromButton: false)
+            case .resume: applyControl(target, command: RunSupervisor.shared.state(rootRun(target).id) == .takenOver ? .handBack : .resume, fromButton: false)
+            case .takeOver: applyControl(target, command: .takeOver, fromButton: false)
+            case .handBack: applyControl(target, command: .handBack, fromButton: false)
+            case .status: repostCard(target)
+            case .screenshot: requestScreenshot(target)
+            }
+            return
+        case .context(let id):
+            guard let target = runs[id] else { return }
+            selected = rootRun(target).id
+            guard let worker = target.worker, !target.ended else {
+                return send("#\(target.shortID) hasn't started yet. I'll keep it as is; use /new for a separate task.")
             }
             worker.addContext(request.prompt)
-            return // The existing status card shows progress; no acknowledgement spam.
-        }
-        if !forceNew, explicitRun == nil, !newModeRequest, !newBrowserRequest, waiting.count > 1 {
-            return send("More than one task needs an answer. Reply to the specific question, or use /new <task> for a new request.")
-        }
-        if !forceNew, explicitRun == nil, !newModeRequest, !newBrowserRequest,
-           Self.isFollowUp(request.text), let previous = selected.flatMap({ runs[$0] }) {
-            if !previous.ended, let worker = previous.worker {
-                worker.addContext(request.prompt); return
-            }
-            if let completed = previous.completedAt, Date().timeIntervalSince(completed) < 1800, let summary = previous.summary {
-                request.context = "Task: " + previous.request.text + "\n" + summary
-                for file in previous.outputFiles where !request.files.contains(file) { request.files.append(file) }
+            react(source, "👀") // Acknowledged without another message; the card shows progress.
+            return
+        case .newTask(let followUp):
+            if let earlier = followUp.flatMap({ runs[$0] }), let summary = earlier.summary {
+                request.context = "Task: " + earlier.request.text + "\n" + summary
+                for file in earlier.outputFiles where !request.files.contains(file) { request.files.append(file) }
             }
         }
         if let background = explicitMode {
             guard !modeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return send("Include the task too, for example: foreground: open Calculator.") }
             request.text = modeText; begin(request, background: background)
         }
-        else { offerMode(request) }
+        // Telegram tasks without a stated mode run in the background: the user isn't at the screen.
+        else { begin(request, background: true) }
     }
 
     static func modeAnswer(_ text: String) -> Bool? {
@@ -451,43 +657,12 @@ final class Telegram {
         let value = instruction.isEmpty ? (URL(string: lines.first ?? "")?.host ?? text) : instruction
         return String(value.replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression).prefix(140))
     }
-    private func offerMode(_ request: Request) {
-        guard modes.count < 16 else { return send("Choose a mode for the pending tasks first.") }
-        let key = String(UUID().uuidString.prefix(8))
-        modes[key] = ModeChoice(request: request)
-        let markup = ["inline_keyboard": [[
-            ["text": "Normal · use my Mac", "callback_data": "m:\(key):fg"],
-            ["text": "Background", "callback_data": "m:\(key):bg"]],
-            [["text": "Cancel", "callback_data": "m:\(key):cancel"]]]]
-        guard let chatID else { return }
-        enqueue { [weak self] in
-            guard let self, self.modes[key] != nil else { return }
-            let result = await self.call("sendMessage", ["chat_id": chatID,
-                "text": "Where should I run this?\n" + Secrets.mask(Self.title(request.text)) + "\n\nNormal uses your Mac's screen and input. Background uses isolated browser tabs and supported file tools. Nothing starts until you choose.", "reply_markup": markup]) as? [String: Any]
-            let message = result?["message_id"] as? Int
-            if self.modes[key] != nil { self.modes[key]?.message = message }
-            else if let message { await self.clearMarkup(message) }
-        }
-    }
-    private func chooseMode(_ key: String, background: Bool) {
-        guard let choice = modes.removeValue(forKey: key) else { return }
-        if let message = choice.message { enqueue { [weak self] in await self?.clearMarkup(message) } }
-        begin(choice.request, background: background, statusMessage: choice.message)
-    }
-    private func cancelMode(_ key: String) {
-        guard let choice = modes.removeValue(forKey: key) else { return }
-        if let message = choice.message { enqueue { [weak self] in await self?.clearMarkup(message) } }
-        send("Cancelled before starting.")
-    }
-
-    private func begin(_ request: Request, background: Bool, savedID: UUID? = nil, reviewed: Bool = false, statusMessage: Int? = nil) {
+    private func begin(_ request: Request, background: Bool, savedID: UUID? = nil, reviewed: Bool = false) {
         guard let id = savedID ?? store.enqueue(request.prompt, files: request.files, source: .telegram, background: background, conversationID: chatID) else {
             return send(store.storageError ?? "Couldn't save this task. Nothing started.")
         }
         if let item = store.record(id), item.requiresReview && !reviewed { return send("Private values were removed. Review this task in /runs before starting.") }
-        let run = Run(id: id, request: request, background: background)
-        run.message = statusMessage
-        if let statusMessage { messageRuns[statusMessage] = id }
+        let run = newRun(id, request: request, background: background)
         runs[id] = run; selected = id
         updateCard(run)
         if background, BrowserTaskRouting.isBrowserTask(request.text), let submitBrowserTask {
@@ -499,11 +674,32 @@ final class Telegram {
         startReporting()
         prune()
     }
+    private func newRun(_ id: UUID, request: Request, background: Bool) -> Run {
+        Run(id: id, request: request, background: background, interval: cardInterval)
+    }
     func registerBrowserTask(_ taskID: UUID) {
         guard runs[taskID] == nil, let item = store.record(taskID), item.source == .telegram, item.conversationID == chatID else { return }
-        let run = Run(id: taskID, request: Request(text: item.request, files: item.files.map { URL(fileURLWithPath: $0) }), background: item.background)
+        let run = newRun(taskID, request: Request(text: item.request, files: item.files.map { URL(fileURLWithPath: $0) }), background: item.background)
         run.parentID = item.parentID; runs[taskID] = run
         updateCard(run)
+    }
+    /// Shows a run that didn't start in Telegram (Mac, schedule, MCP) with the same status card and controls.
+    /// No-op unless a chat is paired and TELEGRAM_RUNS isn't "telegram".
+    func mirror(_ worker: Agent, taskID: UUID, source: RunSource) {
+        guard source != .telegram, token != nil, chatID != nil, Self.mirrorsAllRuns else { return }
+        if let run = runs[taskID] {
+            if !run.ended, run.mirrored { run.worker = worker; updateCard(run) }
+            return
+        }
+        guard let item = store.record(taskID), item.source != .telegram, !item.state.terminal else { return }
+        // A parallel child belongs to its parent's card; never start a card for an orphan child.
+        if let parent = item.parentID, runs[parent] == nil { return }
+        let run = newRun(taskID, request: Request(text: item.request, files: []), background: item.background)
+        run.mirrored = true; run.source = source; run.parentID = item.parentID; run.worker = worker
+        runs[taskID] = run
+        updateCard(run)
+        startReporting()
+        prune()
     }
     func attach(_ worker: Agent, taskID: UUID) {
         registerBrowserTask(taskID)
@@ -516,10 +712,18 @@ final class Telegram {
     }
     func startQueued(_ id: UUID, reviewed: Bool = false) {
         guard let item = store.record(id), item.source == .telegram, item.conversationID == chatID, item.state == .queued else { return send("This task couldn't start. Check /runs.") }
-        if let run = runs[id], !run.ended { selected = id; return send(statusText(run), extra: controls(run)) }
+        if let run = runs[id], !run.ended { selected = id; return repostCard(run) }
         // Admission is performed by the pool or desktop controller, never ahead of a free slot.
         if reviewed, item.requiresReview { guard store.reviewQueued(id) else { return send("This task couldn't be reviewed. Check /runs.") } }
         begin(Request(text: item.request, files: item.files.map { URL(fileURLWithPath: $0) }), background: item.background, savedID: id, reviewed: reviewed)
+    }
+    /// "Run again" from a finished card: the same request as a new Telegram task, with the attachments still on disk.
+    private func runAgain(_ run: Run) {
+        run.reran = true
+        let files = run.request.files.filter { FileManager.default.fileExists(atPath: $0.path) }
+        let background = store.record(run.id)?.background ?? run.background
+        begin(Request(text: run.request.text, files: files), background: background)
+        updateCard(run)
     }
     private func drain(reviewedID: UUID? = nil) {
         guard let agent, !agent.isRunning else { return }
@@ -557,6 +761,7 @@ final class Telegram {
                 for message in messages { messageRuns.removeValue(forKey: message); messageQuestions.removeValue(forKey: message) }
             }
         }
+        if answeredQuestions.count > 200 { answeredQuestions.removeAll() }
     }
 
     private func rootRun(_ run: Run) -> Run {
@@ -577,82 +782,202 @@ final class Telegram {
     private func imageCount(_ run: Run) -> Int {
         run.deliveredImages.count + children(run).reduce(0) { $0 + $1.deliveredImages.count }
     }
-
-    // MARK: - One status card per task
-
-    private func button(_ text: String, _ action: String, _ run: Run) -> [String: String] {
-        ["text": text, "callback_data": "c:\(run.shortID):\(action)"]
+    private func expectedImages(_ run: Run) -> Int {
+        ImageRequest.count(rootRun(run).request.text) > 0 ? (run.parentID == nil ? ImageRequest.count(run.request.text) : 1) : 0
     }
-    private func controls(_ run: Run) -> [String: Any] {
-        var rows = [[button("Progress", "status", run), button("Screenshot", "screenshot", run), button("Result", "result", run)]]
-        if !run.ended { rows.append([button("Open task on Mac", "open", run), button("Stop task", "stop", run)]) }
-        return ["reply_markup": ["inline_keyboard": rows]]
-    }
-    private func statusText(_ run: Run) -> String {
-        if let summary = run.summary { return summary }
-        let childJobs = children(run)
-        if !childJobs.isEmpty {
-            let complete = childJobs.filter(\.ended).count
-            let rows = childJobs.map { child in
-                let state = child.ended ? (child.deliveredImages.isEmpty && ImageRequest.count(run.request.text) > 0 ? "Image not delivered" : store.record(child.id)?.state.label ?? "Finished") : child.worker?.question != nil ? "Needs input" : child.worker?.narration.isEmpty == false ? String(child.worker!.narration.prefix(100)) : "Working"
-                return "• " + Self.title(child.request.text).prefix(70) + " — " + state
-            }.joined(separator: "\n")
-            let output = ImageRequest.count(run.request.text) > 0 ? " · \(imageCount(run)) images delivered" : ""
-            return "[\(run.shortID)] Working · Background\n" + Self.title(run.request.text) + "\n\n\(complete)/\(childJobs.count) tasks finished" + output + "\n" + rows
-        }
+
+    // MARK: - The live run card
+
+    /// The card's facts, masked for secrets. Child jobs show as parts of their parent's card.
+    private func cardModel(_ run: Run) -> RunCardModel {
         let record = store.record(run.id)
-        let worker = run.worker
-        let mode = (record?.background ?? run.background) ? "Background" : "Normal"
-        let state = record?.state.label ?? "Queued"
-        let title = Self.title(run.request.text)
-        let stage: String
-        if let question = worker?.question { stage = question.sensitive ? "Waiting for private input on your Mac" : "Waiting for your answer" }
-        else if worker?.isRunning == true { stage = String((worker?.narration.isEmpty == false ? worker!.narration : "Getting started").prefix(180)) }
-        else { stage = "Waiting for a free task slot" }
-        return "[\(run.shortID)] \(state) · \(mode)\n\(title)\n\n\(stage)\n\(record?.completedSteps ?? 0) steps completed"
+        let control = RunSupervisor.shared.state(run.id)
+        let jobs = children(run)
+        let asking = run.worker?.question ?? jobs.first { !$0.ended && $0.worker?.question != nil }?.worker?.question
+        let running = run.worker?.isRunning == true || jobs.contains { !$0.ended && $0.worker != nil }
+        let phase = CardPhase.from(ended: run.ended, ok: run.ok, stopped: run.stopped, unconfirmed: run.unconfirmed,
+                                   paused: control == .paused, takenOver: control == .takenOver,
+                                   question: asking != nil, sensitive: asking?.sensitive == true, running: running)
+        var model = RunCardModel(shortID: run.shortID, title: Secrets.mask(TelegramText.title(run.request.text)), phase: phase)
+        model.source = run.mirrored ? run.source.label : nil
+        model.background = record?.background ?? run.background
+        model.elapsed = (run.completedAt ?? Date()).timeIntervalSince(run.startedAt)
+        model.step = record?.completedSteps ?? 0
+        if phase == .waiting { model.action = asking.map { Secrets.mask($0.text) } }
+        else if phase == .working, let narration = run.worker?.narration, !narration.isEmpty { model.action = Secrets.mask(narration) }
+        model.checklist = (record?.checklist ?? []).filter { $0.supersededAt == nil }.map { CardItem(title: Secrets.mask($0.title), complete: $0.complete) }
+        if phase == .waiting, run.worker?.question != nil {
+            model.options = run.options; model.questionKey = run.questionID
+            model.note = RunSupervisor.shared.pendingQuestion(run.id)?.note
+        }
+        let expected = expectedImages(run)
+        if !jobs.isEmpty {
+            model.parts = jobs.map { child in
+                let state = child.ended ? (child.deliveredImages.isEmpty && expected > 0 ? "image not delivered" : store.record(child.id)?.state.label ?? "Finished")
+                    : child.worker?.question != nil ? "Needs input" : child.worker?.narration.isEmpty == false ? child.worker!.narration : "Working"
+                return Secrets.mask(TelegramText.title(child.request.text, limit: 50) + " — " + state)
+            }
+            model.partsSummary = expected > 0 ? "\(imageCount(run))/\(expected) requested images delivered"
+                : "\(jobs.filter(\.ended).count)/\(jobs.count) tasks finished"
+        }
+        if run.ended { model.outcome = Secrets.mask(ResultText.withoutScreenshotPath(run.cardOutcome ?? run.finalAnswer ?? "")) }
+        model.link = run.link
+        model.hasResult = run.result != nil || run.summary != nil
+        model.canRunAgain = run.parentID == nil && !run.reran
+        return model
     }
+
+    /// Asks for a card edit. Edits are coalesced per card (one per `cardInterval`) and run on the serial send queue.
     private func updateCard(_ run: Run) {
         if run.parentID != nil { updateCard(rootRun(run)); return }
-        guard let chatID else { return }
-        enqueue { [weak self, weak run] in
-            guard let self, let run, self.runs[run.id] === run else { return }
-            var text = Self.chunks(Secrets.mask(self.statusText(run))).first ?? "Task"
-            if self.statusText(run).utf16.count > 3800 { text = String(text.prefix(3400)) + "\n\nFull result: /result " + run.shortID }
-            guard text != run.rendered else { return }
-            var body: [String: Any] = ["chat_id": chatID, "text": text, "link_preview_options": ["is_disabled": true]]
-            body.merge(self.controls(run)) { _, new in new }
-            let method: String
-            if let message = run.message { method = "editMessageText"; body["message_id"] = message }
-            else {
-                // An unknown send outcome must not produce another unsolicited message on the next tick.
-                guard !run.cardAttempted else { return }
-                run.cardAttempted = true; method = "sendMessage"
-            }
-            if let result = await self.call(method, body) as? [String: Any] {
-                run.rendered = text
-                if let message = result["message_id"] as? Int { run.message = message; self.messageRuns[message] = run.id }
+        guard chatID != nil else { return }
+        switch run.coalescer.request(at: Date()) {
+        case .merged: return
+        case .now: enqueue { [weak self, weak run] in await self?.flushCard(run) }
+        case .after(let delay):
+            Task { [weak self, weak run] in
+                try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
+                self?.enqueue { [weak self, weak run] in await self?.flushCard(run) }
             }
         }
     }
+
+    private func flushCard(_ run: Run?) async {
+        guard let run, runs[run.id] === run, let chatID else {
+            run?.coalescer.flushed(at: Date(), sent: false); return
+        }
+        let photo = run.pendingPhoto
+        let model = cardModel(run)
+        let html = RunCard.render(model, limit: run.cardPhoto || photo != nil ? RunCard.captionLimit : RunCard.textLimit)
+        let markup = TGButton.markup(RunCard.keyboard(model))
+        let signature = html + "\u{1}" + (String(data: (try? JSONSerialization.data(withJSONObject: markup, options: .sortedKeys)) ?? Data(), encoding: .utf8) ?? "")
+        guard photo != nil || signature != run.rendered else { run.coalescer.flushed(at: Date(), sent: false); return }
+        var reply: APIReply
+        if let message = run.message {
+            if let photo {
+                let media: [String: Any] = ["type": "photo", "media": "attach://card", "caption": html, "parse_mode": "HTML"]
+                reply = await upload("editMessageMedia", fields: ["chat_id": String(chatID), "message_id": String(message),
+                                                                   "media": Self.json(media), "reply_markup": Self.json(markup)],
+                                     file: ("card", photo))
+            } else if run.cardPhoto {
+                reply = await request("editMessageCaption", ["chat_id": chatID, "message_id": message, "caption": html,
+                                                             "parse_mode": "HTML", "reply_markup": markup])
+            } else {
+                reply = await request("editMessageText", ["chat_id": chatID, "message_id": message, "text": html, "parse_mode": "HTML",
+                                                          "link_preview_options": ["is_disabled": true], "reply_markup": markup])
+            }
+            if !reply.ok, TelegramRetry.isGone(reply.description) {
+                // The card was deleted in the chat: the next update sends a fresh one.
+                run.message = nil; run.cardAttempted = false; run.rendered = ""
+            }
+        } else {
+            // An unknown send outcome must not produce another unsolicited message on the next tick.
+            guard !run.cardAttempted else { run.coalescer.flushed(at: Date(), sent: false); return }
+            run.cardAttempted = true
+            if let image = photo ?? (run.cardPhoto ? run.cardImage : nil) {
+                reply = await upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": html, "parse_mode": "HTML",
+                                                           "disable_notification": "true", "reply_markup": Self.json(markup)],
+                                     file: ("photo", image))
+            } else {
+                reply = await request("sendMessage", ["chat_id": chatID, "text": html, "parse_mode": "HTML", "disable_notification": true,
+                                                      "link_preview_options": ["is_disabled": true], "reply_markup": markup])
+            }
+        }
+        if reply.ok {
+            run.rendered = signature; run.renderedAt = Date()
+            if let image = photo {
+                run.cardPhoto = true; run.cardImage = image; run.photoDigest = CardPhotoPolicy.digest(image)
+            }
+            if run.pendingPhoto == photo { run.pendingPhoto = nil }
+            if let message = (reply.result as? [String: Any])?["message_id"] as? Int { run.message = message; messageRuns[message] = run.id }
+        } else if photo != nil {
+            run.pendingPhoto = nil // Don't retry an image the API refused; the next meaningful change brings a new one.
+        }
+        run.coalescer.flushed(at: Date(), sent: reply.ok)
+    }
+
+    /// Sends the card again at the bottom of the chat (from /status, a reply or "Open card") and removes the old copy.
+    private func repostCard(_ run: Run) {
+        let root = rootRun(run)
+        selected = root.id
+        let old = root.message
+        root.message = nil; root.cardAttempted = false; root.rendered = ""
+        enqueue { [weak self, weak root] in
+            guard let self, let root else { return }
+            await self.flushCard(root)
+            if let old, root.message != nil, root.message != old, let chatID = self.chatID {
+                _ = await self.request("deleteMessage", ["chat_id": chatID, "message_id": old])
+            }
+        }
+    }
+
     private func startReporting() {
         guard reporting == nil else { return }
         reporting = Task { [weak self] in
             while !Task.isCancelled {
-                try? await Task.sleep(for: .seconds(15))
+                try? await Task.sleep(for: .milliseconds(Int((self?.tickInterval ?? 5) * 1000)))
                 guard !Task.isCancelled, let self else { return }
-                let active = self.runs.values.filter { !$0.ended && $0.parentID == nil }
-                if active.isEmpty { self.reporting = nil; return }
-                for run in active { self.updateCard(run) }
+                if !self.refreshCards() { self.reporting = nil; return }
+            }
+        }
+    }
+    /// One reporting tick: refresh each active card (unchanged cards aren't edited) and its thumbnail when due.
+    /// Returns false when nothing is active.
+    @discardableResult
+    func refreshCards() -> Bool {
+        let active = runs.values.filter { !$0.ended && $0.parentID == nil }
+        for run in active { updateCard(run); refreshPhoto(run); reportSteps(run) }
+        return !active.isEmpty
+    }
+    /// A new thumbnail of a background run's own tab/window when its phase, step or checklist moved (at most every 20 s);
+    /// an identical image isn't uploaded again. Never during a private question.
+    private func refreshPhoto(_ run: Run) {
+        let target = visualChild(run) ?? run
+        guard Self.cardPhotos, !run.capturingCard, (store.record(run.id)?.background ?? run.background),
+              let worker = target.worker, worker.taskRecordID == target.id, worker.question?.sensitive != true else { return }
+        let model = cardModel(run)
+        let key = CardPhotoPolicy.key(phase: model.phase, step: model.step, checked: model.checklist.filter(\.complete).count)
+        guard model.phase == .working || model.phase == .waiting,
+              CardPhotoPolicy.shouldCapture(now: Date(), last: run.photoAt, lastKey: run.photoKey, key: key) else { return }
+        run.photoKey = key; run.photoAt = Date(); run.capturingCard = true
+        Task { [weak self, weak run] in
+            let image = await worker.telegramScreenshot()
+            guard let self, let run else { return }
+            run.capturingCard = false
+            guard let image, !run.ended, worker.question?.sensitive != true else { return }
+            self.setCardPhoto(run, image)
+        }
+    }
+    private func setCardPhoto(_ run: Run, _ image: Data) {
+        let root = rootRun(run)
+        guard Self.cardPhotos, image.count < Self.photoLimit, CardPhotoPolicy.shouldUpload(image, lastDigest: root.photoDigest) else { return }
+        root.pendingPhoto = image
+        updateCard(root)
+    }
+    /// Opt-in (TELEGRAM_STEP_SCREENSHOTS=1): a screenshot at each verified checklist outcome. The first capture is kept
+    /// as the "before" image for the result.
+    private func reportSteps(_ run: Run) {
+        guard Self.stepScreenshots, !run.ended, !run.takingScreenshot, let worker = run.worker, worker.taskRecordID == run.id,
+              worker.question?.sensitive != true else { return }
+        let done = store.record(run.id)?.checklist?.filter(\.complete) ?? []
+        guard done.count > run.stepShots || run.before == nil else { return }
+        run.takingScreenshot = true
+        Task { [weak self, weak run] in
+            guard let self, let run else { return }
+            defer { run.takingScreenshot = false }
+            guard let image = await worker.telegramScreenshot(), !run.ended, worker.question?.sensitive != true else { return }
+            if run.before == nil { run.before = image }
+            if done.count > run.stepShots, let step = done.last {
+                run.stepShots = done.count
+                self.sendPhoto(image, caption: "✓ " + step.title + " · #" + run.shortID, silent: true)
             }
         }
     }
     private func stop(_ target: Run? = nil, all: Bool = false) {
         generation += 1; inbox.removeAll(); receiving?.cancel(); receiving = nil; pendingFiles.removeAll()
-        if all || target == nil && selected == nil {
-            for key in Array(modes.keys) { if let message = modes.removeValue(forKey: key)?.message { enqueue { [weak self] in await self?.clearMarkup(message) } } }
-        }
-        let targets = all ? Array(runs.values.filter { !$0.ended }) : [target ?? selected.flatMap { runs[$0] }].compactMap { $0 }.filter { !$0.ended }
+        let targets = all ? Array(runs.values.filter { !$0.ended && !$0.mirrored }) : [target ?? selected.flatMap { runs[$0] }].compactMap { $0 }.filter { !$0.ended }
         for run in targets {
+            run.stopping = true
             dismissQuestion(run)
             if let worker = run.worker, worker.isRunning, worker.taskRecordID == run.id { worker.cancel() }
             else { cancelBrowserTask?(run.id); store.cancelQueued(run.id); finish(run, answer: "Stopped", ok: false, result: run.result) }
@@ -666,42 +991,80 @@ final class Telegram {
     }
     private func clearMarkup(_ message: Int) async {
         guard let chatID else { return }
-        _ = await call("editMessageReplyMarkup", ["chat_id": chatID, "message_id": message, "reply_markup": ["inline_keyboard": []]])
+        _ = await request("editMessageReplyMarkup", ["chat_id": chatID, "message_id": message, "reply_markup": ["inline_keyboard": []]])
     }
     private func dismissQuestion(_ run: Run) {
         run.questionID = nil; run.questionText = nil; run.options = []
         if let message = run.questionMessage { enqueue { [weak self] in await self?.clearMarkup(message) } }
         run.questionMessage = nil
     }
-    func dismissQuestion(from worker: Agent) { if let run = run(for: worker) { dismissQuestion(run) } }
+    func dismissQuestion(from worker: Agent) {
+        if let run = run(for: worker) { dismissQuestion(run); updateCard(run) }
+    }
+
+    // MARK: - Buttons
 
     func handleTap(_ tap: [String: Any]) {
         guard let message = tap["message"] as? [String: Any], let chat = message["chat"] as? [String: Any],
               chat["type"] as? String == "private", (chat["id"] as? NSNumber)?.int64Value == chatID,
               let data = tap["data"] as? String else { return }
-        let parts = data.split(separator: ":").map(String.init)
-        var valid = false
-        if parts.count == 3, parts[0] == "m", modes[parts[1]] != nil {
-            if parts[2] == "bg" || parts[2] == "fg" { valid = true; chooseMode(parts[1], background: parts[2] == "bg") }
-            else if parts[2] == "cancel" { valid = true; cancelMode(parts[1]) }
-        } else if parts.count == 3, parts[0] == "c", let run = runs.values.first(where: { $0.shortID == parts[1] }) {
-            selected = rootRun(run).id; valid = true
-            switch parts[2] {
-            case "status": send(statusText(run), extra: controls(run))
-            case "result": sendResult(run)
-            case "screenshot": requestScreenshot(run)
-            case "open" where !run.ended: reveal(run)
-            case "stop" where !run.ended: stop(run)
-            default: valid = false
-            }
-        } else if parts.count == 3, parts[0] == "a", let run = runs.values.first(where: { $0.questionID == parts[1] && !$0.ended }),
-                  let worker = run.worker, worker.question?.sensitive == false, worker.taskRecordID == run.id,
-                  let index = Int(parts[2]), run.options.indices.contains(index) {
-            valid = true; selected = rootRun(run).id
-            let answer = run.options[index]
-            dismissQuestion(run); worker.answer(answer); updateCard(run)
+        let toast: String
+        switch CallbackData.parse(data) {
+        case .control(let short, let action)?:
+            if let run = runs.values.first(where: { $0.shortID == short }) { toast = perform(action, on: run) }
+            else if let item = chatRecord(short), item.state.terminal { toast = action == .result ? { send(savedStatus(item)); return "" }() : TapToast.finished }
+            else { toast = TapToast.expired }
+        case .answer(let key, let index)?:
+            if let run = runs.values.first(where: { $0.questionID == key && !$0.ended }), let worker = run.worker,
+               worker.question?.sensitive == false, worker.taskRecordID == run.id, run.options.indices.contains(index) {
+                selected = rootRun(run).id
+                let answer = run.options[index]
+                answeredQuestions[key] = answer
+                dismissQuestion(run); worker.answer(answer); updateCard(run)
+                toast = "Answered: " + TelegramText.clip(answer, 60)
+            } else if let previous = answeredQuestions[key] {
+                toast = "Already answered: " + TelegramText.clip(previous, 60)
+            } else if let tapped = (message["message_id"] as? Int).flatMap({ messageRuns[$0] }).flatMap({ runs[$0] }), rootRun(tapped).ended {
+                toast = TapToast.finished
+            } else { toast = "This question has ended. /status shows current runs." }
+        case nil: toast = TapToast.expired
         }
-        Task { _ = await call("answerCallbackQuery", ["callback_query_id": tap["id"] ?? "", "text": valid ? "" : "This choice has expired. Use /runs for current tasks."]) }
+        let id = tap["id"] ?? ""
+        Task { _ = await request("answerCallbackQuery", ["callback_query_id": id, "text": String(toast.prefix(200))]) }
+    }
+
+    /// A card button. Every action is idempotent: a second tap answers with what already happened.
+    private func perform(_ action: CardAction, on run: Run) -> String {
+        let root = rootRun(run)
+        selected = root.id
+        if action.needsLiveRun, root.ended || run.ended { return TapToast.finished }
+        switch action {
+        case .status, .card: repostCard(run); return ""
+        case .screenshot:
+            if run.takingScreenshot || (visualChild(run)?.takingScreenshot ?? false) { return "Already taking a screenshot" }
+            requestScreenshot(run); return "Taking a screenshot…"
+        case .result: sendResult(run); return ""
+        case .open: reveal(run); return "Showing it on your Mac"
+        case .stop:
+            if run.stopping || root.stopping { return "Already stopping" }
+            stop(run); return "Stopping…"
+        case .pause: return applyControl(run, command: .pause, fromButton: true)
+        case .resume: return applyControl(run, command: .resume, fromButton: true)
+        case .takeover: return applyControl(run, command: .takeOver, fromButton: true)
+        case .handback: return applyControl(run, command: .handBack, fromButton: true)
+        case .skip:
+            let asking = run.worker?.question != nil ? run : children(root).first { !$0.ended && $0.worker?.question != nil } ?? root
+            guard let worker = asking.worker, let question = worker.question, worker.taskRecordID == asking.id else { return "Nothing to skip right now" }
+            if question.sensitive { return "This one is private — answer it on your Mac" }
+            let answer = QuestionPolicy.skipAnswer(options: asking.options)
+            if let key = asking.questionID { answeredQuestions[key] = "Skip" }
+            dismissQuestion(asking); worker.answer(answer); updateCard(asking)
+            return "Skipped"
+        case .again:
+            guard root.ended else { return "Still running" }
+            if root.reran { return "Already started again" }
+            runAgain(root); return "Starting again"
+        }
     }
 
     // MARK: - Questions and results
@@ -711,41 +1074,73 @@ final class Telegram {
         guard run.questionText != text || run.questionID == nil else { return }
         dismissQuestion(run)
         let key = String(UUID().uuidString.prefix(8)); run.questionID = key; run.questionText = text; run.options = sensitive ? [] : options
-        var rows = (sensitive ? [] : options).prefix(8).enumerated().map { [["text": String($1.prefix(60)), "callback_data": "a:\(key):\($0)"]] }
-        rows.append([button("Open task on Mac", "open", run), button("Screenshot", "screenshot", run)])
-        rows.append([button("Stop task", "stop", run)])
-        var body = "[\(run.shortID)] Input needed\n\n" + (sensitive ? "Answer this private question on your Mac. Don't send passwords or codes here." : text + "\n\nReply to this message or tap an option.")
-        if !sensitive, let result = run.result, !result.items.isEmpty, result != run.reviewedResult,
-           text.lowercased().contains("review") {
-            body = "[\(run.shortID)] Review before submitting\n\n" + result.plain + "\n\n" + text
+        answeredQuestions[key] = nil
+        let pending = RunSupervisor.shared.pendingQuestion(run.id)
+        let note = pending?.text == text ? pending?.note : nil
+        let paused = RunSupervisor.shared.isPaused(run.id)
+        let rows = QuestionMessage.keyboard(shortID: run.shortID, key: key, options: run.options, sensitive: sensitive)
+        let title = Secrets.mask(TelegramText.title(rootRun(run).request.text))
+        // A form review sends every reviewed answer (possibly several messages) before the question itself.
+        var review: String?
+        if !sensitive, let result = run.result, !result.items.isEmpty, result != run.reviewedResult, text.lowercased().contains("review") {
+            review = "Review before submitting · #\(run.shortID)\n\n" + result.plain
             run.reviewedResult = result
         }
+        let caption = QuestionMessage.render(shortID: run.shortID, title: title, text: Secrets.mask(text), sensitive: sensitive,
+                                             note: note, paused: paused, options: run.options, limit: RunCard.captionLimit)
+        let full = QuestionMessage.render(shortID: run.shortID, title: title, text: Secrets.mask(text), sensitive: sensitive,
+                                          note: note, paused: paused, options: run.options)
+        let fitsCaption = caption == full
         guard let chatID else { return }
-        let chunks = Self.chunks(Secrets.mask(body))
-        enqueue { [weak self, weak run] in
+        let withScreenshot = !sensitive && Self.questionScreenshots
+        updateCard(run)
+        enqueue { [weak self, weak run, weak worker] in
             guard let self, let run, run.questionID == key else { return }
-            for (index, chunk) in chunks.enumerated() {
-                guard run.questionID == key else { return }
-                var args: [String: Any] = ["chat_id": chatID, "text": chunk, "link_preview_options": ["is_disabled": true]]
-                if index == chunks.count - 1 { args["reply_markup"] = ["inline_keyboard": rows] }
-                let sent = await self.call("sendMessage", args) as? [String: Any]
-                if let message = sent?["message_id"] as? Int {
-                    self.messageRuns[message] = run.id
-                    self.messageQuestions[message] = key
-                    if run.questionID == key { run.questionMessage = message }
-                    else { await self.clearMarkup(message) }
+            // What the task looks like right now: its own tab or window, never the user's desktop.
+            var image: Data?
+            if withScreenshot, let worker, worker.taskRecordID == run.id {
+                _ = await self.request("sendChatAction", ["chat_id": chatID, "action": "upload_photo"])
+                image = await worker.telegramScreenshot()
+                if worker.question?.sensitive == true || run.questionID != key { image = nil }
+            }
+            if let image { run.screenshot = image }
+            if let review {
+                for chunk in TelegramHTML.chunks(Secrets.mask(review)) {
+                    guard run.questionID == key else { return }
+                    _ = await self.request("sendMessage", ["chat_id": chatID, "text": chunk, "parse_mode": "HTML",
+                                                            "link_preview_options": ["is_disabled": true]])
                 }
             }
+            guard run.questionID == key else { return }
+            let markup = TGButton.markup(rows)
+            var sent: APIReply
+            if let image, image.count < Self.photoLimit, fitsCaption, review == nil {
+                sent = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": caption, "parse_mode": "HTML",
+                                                                "reply_markup": Self.json(markup)], file: ("photo", image))
+            } else {
+                if let image, image.count < Self.photoLimit {
+                    _ = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": "What I see now · #" + run.shortID,
+                                                                 "disable_notification": "true"], file: ("photo", image))
+                }
+                sent = await self.request("sendMessage", ["chat_id": chatID, "text": full, "parse_mode": "HTML",
+                                                           "link_preview_options": ["is_disabled": true], "reply_markup": markup])
+            }
+            if let message = (sent.result as? [String: Any])?["message_id"] as? Int {
+                self.messageRuns[message] = run.id
+                self.messageQuestions[message] = key
+                if run.questionID == key { run.questionMessage = message }
+                else { await self.clearMarkup(message) }
+            }
+            if let image { self.setCardPhoto(run, image) }
         }
-        updateCard(run)
     }
     func present(_ result: ResultCard, from worker: Agent) {
         guard let run = run(for: worker) else { return }
         run.result = result // Intermediate output is available through /result; a review is sent with its question.
     }
     private func sendResult(_ run: Run?) {
-        guard let run else { return send("No task selected. Use /runs.") }
-        var text = run.fullSummary ?? run.summary ?? statusText(run)
+        guard let run else { return send("No task selected. Use /status.") }
+        var text = run.fullSummary ?? run.summary ?? plainStatus(run)
         if let result = run.result {
             let plain = result.plain
             if !text.contains(plain) {
@@ -753,26 +1148,34 @@ final class Telegram {
                 else if let detail = result.text, !detail.isEmpty, !text.contains(detail) { text += "\n\n" + detail }
             }
         }
-        send(text, extra: controls(run))
+        send(text)
+    }
+    /// Plain status for /result before a run has finished.
+    private func plainStatus(_ run: Run) -> String {
+        let model = cardModel(run)
+        return "\(model.phase.emoji) \(model.phase.label) · #\(run.shortID)\n" + model.title
+            + (model.action.map { "\n\n" + $0 } ?? "") + "\nStep \(model.step)"
     }
     private func requestScreenshot(_ run: Run) {
         if let child = visualChild(run) { requestScreenshot(child); return }
         guard !run.takingScreenshot else { return }
         guard run.worker?.question?.sensitive != true else { return send("I'm waiting for private input; screenshots are paused until that's answered on the Mac.") }
         guard let worker = run.worker, worker.taskRecordID == run.id else {
-            if let image = run.screenshot { sendPhoto(image, caption: "[\(run.shortID)] Saved task view") }
+            if let image = run.screenshot ?? run.cardImage { sendPhoto(image, caption: "Saved task view · #" + run.shortID) }
             else { send("No saved image for this task. /result " + run.shortID + " shows its text result.") }
             return
         }
         run.takingScreenshot = true
+        if let chatID { Task { _ = await request("sendChatAction", ["chat_id": chatID, "action": "upload_photo"]) } }
         Task { [weak self, weak run] in
             guard let self, let run else { return }
             defer { run.takingScreenshot = false }
             let image = await worker.telegramScreenshot()
             guard worker.taskRecordID == run.id, worker.question?.sensitive != true else { return }
-            guard let image else { return self.send("Couldn't capture this task's page or window. Use Open task on Mac to inspect it, or /result " + run.shortID + " for text. Your unrelated desktop wasn't captured.") }
+            guard let image else { return self.send("Couldn't capture this task's page or window. Use Open on Mac to inspect it, or /result " + run.shortID + " for text. Your unrelated desktop wasn't captured.") }
             run.screenshot = image
-            self.sendPhoto(image, caption: "[\(run.shortID)] " + Self.title(run.request.text))
+            self.sendPhoto(image, caption: TelegramText.title(rootRun(run).request.text) + " · #" + run.shortID)
+            if !run.ended { self.setCardPhoto(run, image) }
         }
     }
     func failedToStart(taskID: UUID, reason: String) {
@@ -788,33 +1191,103 @@ final class Telegram {
         run.ended = true; run.completedAt = Date(); run.result = result ?? run.result
         run.outputFiles = Array(Set((run.worker?.outputFiles ?? []) + run.request.files))
         dismissQuestion(run)
-        let expected = ImageRequest.count(rootRun(run).request.text) > 0 ? (run.parentID == nil ? ImageRequest.count(run.request.text) : 1) : 0
+        let expected = expectedImages(run)
         let delivered = imageCount(run)
         let ok = ok && delivered >= expected
         if delivered < expected && answer != "Stopped" {
             store.finish(run.id, ok: false, answer: "Image delivery incomplete: \(delivered)/\(expected). " + answer)
         }
-        let head = ok ? "✅ Done" : answer == "Stopped" ? "⏹ Stopped" : "⚠️ Couldn't finish"
+        run.ok = ok; run.stopped = answer == "Stopped"; run.unconfirmed = ok && ResultText.isUnconfirmed(answer)
+        run.finalAnswer = answer
+        let phase: CardPhase = run.stopped ? .stopped : !ok ? .failed : run.unconfirmed ? .doneUnconfirmed : .done
+        let head = phase.emoji + " " + phase.label
         let mode = (store.record(run.id)?.background ?? run.background) ? "Background" : "Normal"
-        run.summary = "\(head) [\(run.shortID)] · \(mode)\n" + Self.title(run.request.text) + "\n\n" + answer
+        var summary = "\(head) · #\(run.shortID) · \(mode)\n" + Self.title(run.request.text) + "\n\n" + answer
         if let result = run.result {
-            if !result.items.isEmpty { run.summary! += "\n\n" + result.plain }
-            else if let detail = result.text, !detail.isEmpty, !answer.contains(detail) { run.summary! += "\n\n" + detail }
+            if !result.items.isEmpty { summary += "\n\n" + result.plain }
+            else if let detail = result.text, !detail.isEmpty, !answer.contains(detail) { summary += "\n\n" + detail }
         }
-        if let url = run.worker?.telegramPageURL, !answer.contains(url) { run.summary! += "\n\nPage: " + url }
-        run.fullSummary = run.summary
-        if !children(run).isEmpty {
-            let rows = children(run).map { child in
-                "• " + Self.title(child.request.text).prefix(80) + " — " + (child.deliveredImages.isEmpty && expected > 0 ? "image not delivered" : store.record(child.id)?.state.label ?? "Finished")
-            }.joined(separator: "\n")
-            let output = expected > 0 ? "\(delivered)/\(expected) requested images delivered" : "\(children(run).filter(\.ended).count)/\(children(run).count) tasks finished"
-            run.summary = "\(head) [\(run.shortID)]\n" + Self.title(run.request.text) + "\n\n" + output + "\n" + rows + "\n\nFull details: /result " + run.shortID
-        } else if expected > 0 && delivered < expected {
-            run.summary = "\(head) [\(run.shortID)]\n" + Self.title(run.request.text) + "\n\nImage delivery incomplete: \(delivered)/\(expected).\n" + answer
+        let pageURL = run.worker?.telegramPageURL
+        if let url = pageURL, !answer.contains(url) { summary += "\n\nPage: " + url }
+        run.summary = summary; run.fullSummary = summary
+        run.cardOutcome = answer
+        if expected > 0 && delivered < expected && children(run).isEmpty {
+            run.cardOutcome = "Image delivery incomplete: \(delivered)/\(expected). " + answer
+            run.summary = "\(head) · #\(run.shortID)\n" + Self.title(run.request.text) + "\n\n" + run.cardOutcome!
             run.fullSummary = run.summary
+        } else if !children(run).isEmpty {
+            run.summary = "\(head) · #\(run.shortID)\n" + Self.title(run.request.text) + "\n\n"
+                + (expected > 0 ? "\(delivered)/\(expected) requested images delivered" : "\(children(run).filter(\.ended).count)/\(children(run).count) tasks finished")
+                + "\n\nFull details: /result " + run.shortID
         }
-        updateCard(run) // One terminal edit. No second review message, automatic photo, or image-error message.
+        let links = TelegramLinks.extract([answer, run.result?.text] + (run.result?.items.map(\.link) ?? []) + [pageURL])
+        run.link = links.first
+        updateCard(run) // Silent terminal edit of the card.
+        guard run.parentID == nil else { return }
+        sendCompletion(run, phase: phase, links: links)
     }
+
+    /// The notifying completion message: outcome, concise summary, links, the final view when there is one, and the
+    /// files the task produced (Telegram-started runs only; Mac runs keep their files on the Mac).
+    private func sendCompletion(_ run: Run, phase: CardPhase, links: [String]) {
+        guard let chatID else { return }
+        let worker = run.worker
+        let title = Secrets.mask(TelegramText.title(run.request.text))
+        let expected = expectedImages(run)
+        let extra = !children(run).isEmpty ? (expected > 0 ? "\(imageCount(run))/\(expected) requested images delivered" : "\(children(run).filter(\.ended).count)/\(children(run).count) tasks finished")
+            : nil
+        let body = Secrets.mask(run.cardOutcome ?? run.finalAnswer ?? "")
+        let keyboard = TGButton.markup(RunCard.keyboard(cardModel(run)))
+        let documents = run.mirrored ? [] : Self.deliverable(run.worker?.outputFiles ?? [], excluding: run.request.files)
+        // The final view: the screenshot Clinqy saved for an unconfirmed item, else (background cards, or opt-in step
+        // screenshots) a fresh capture of the task's own target.
+        let savedShot = run.unconfirmed ? ResultText.screenshotPath(run.finalAnswer ?? "").flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) } : nil
+        let wantsAfter = savedShot == nil && !run.stopped && (run.unconfirmed || run.cardPhoto || Self.stepScreenshots)
+        let before = Self.stepScreenshots ? run.before : nil
+        Task { [weak self, weak run] in
+            var image = savedShot
+            if wantsAfter, let worker, let run, worker.taskRecordID == run.id { image = await worker.telegramScreenshot() }
+            guard let self, let run else { return }
+            if let image { run.screenshot = image }
+            self.enqueue { [weak self] in
+                guard let self else { return }
+                if let before, image != nil, before.count < Self.photoLimit {
+                    _ = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": "Before · #" + run.shortID,
+                                                                 "disable_notification": "true"], file: ("photo", before))
+                }
+                var sent = APIReply(ok: false)
+                if let image, image.count < Self.photoLimit {
+                    let caption = ResultText.render(phase: phase, title: title, shortID: run.shortID, summary: body, links: links, extra: extra, limit: RunCard.captionLimit)
+                    sent = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": caption, "parse_mode": "HTML",
+                                                                    "reply_markup": Self.json(keyboard)], file: ("photo", image))
+                }
+                if !sent.ok {
+                    let html = ResultText.render(phase: phase, title: title, shortID: run.shortID, summary: body, links: links, extra: extra, limit: RunCard.textLimit)
+                    sent = await self.request("sendMessage", ["chat_id": chatID, "text": html, "parse_mode": "HTML",
+                                                               "link_preview_options": ["is_disabled": true], "reply_markup": keyboard])
+                }
+                if let message = (sent.result as? [String: Any])?["message_id"] as? Int { self.messageRuns[message] = run.id }
+                for file in documents {
+                    guard let data = try? Data(contentsOf: file) else { continue }
+                    _ = await self.upload("sendDocument", fields: ["chat_id": String(chatID), "caption": file.lastPathComponent,
+                                                                    "disable_notification": "true"],
+                                          file: ("document", data), filename: Self.safeFilename(file.lastPathComponent))
+                }
+            }
+        }
+    }
+    /// Produced files worth sending back: existing regular files under Telegram's 50 MB limit, not the user's own
+    /// attachments, at most five.
+    static func deliverable(_ files: [URL], excluding attachments: [URL]) -> [URL] {
+        var seen: Set<String> = []
+        return files.filter { file in
+            guard !attachments.contains(file), seen.insert(file.standardizedFileURL.path).inserted,
+                  let values = try? file.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey]), values.isRegularFile == true,
+                  (values.fileSize ?? 0) > 0, (values.fileSize ?? 0) <= documentLimit else { return false }
+            return true
+        }.prefix(5).map { $0 }
+    }
+
     // MARK: - Bot API
 
     /// Telegram counts UTF-16 units. Split on character boundaries and keep long reviews intact across messages.
@@ -834,16 +1307,34 @@ final class Telegram {
         sending = Task { await previous?.value; await work() }
     }
 
-    private func send(_ text: String, to chat: Int64? = nil, extra: [String: Any] = [:]) {
+    /// Plain text, escaped for HTML and split to fit. `extra` (buttons) rides on the last part.
+    private func send(_ text: String, to chat: Int64? = nil, extra: [String: Any] = [:], silent: Bool = false) {
         guard let chat = chat ?? chatID else { return }
-        let chunks = Self.chunks(Secrets.mask(text))
+        let chunks = TelegramHTML.chunks(Secrets.mask(text))
         enqueue { [weak self] in
             for (index, chunk) in chunks.enumerated() {
-                var body: [String: Any] = ["chat_id": chat, "text": chunk, "link_preview_options": ["is_disabled": true]]
+                var body: [String: Any] = ["chat_id": chat, "text": chunk, "parse_mode": "HTML", "link_preview_options": ["is_disabled": true]]
+                if silent { body["disable_notification"] = true }
                 if index == chunks.count - 1 { body.merge(extra) { _, new in new } }
-                _ = await self?.call("sendMessage", body)
+                _ = await self?.request("sendMessage", body)
             }
         }
+    }
+    /// Pre-built HTML that already fits one message.
+    private func sendHTML(_ html: String, extra: [String: Any] = [:]) {
+        guard let chat = chatID else { return }
+        let text = html.utf16.count <= RunCard.textLimit ? html : TelegramHTML.escape(TelegramText.clip(html, 3000))
+        enqueue { [weak self] in
+            var body: [String: Any] = ["chat_id": chat, "text": text, "parse_mode": "HTML", "link_preview_options": ["is_disabled": true]]
+            body.merge(extra) { _, new in new }
+            _ = await self?.request("sendMessage", body)
+        }
+    }
+    /// A light acknowledgement on the user's own message (no extra chat message).
+    private func react(_ message: Int?, _ emoji: String) {
+        guard let message, let chatID else { return }
+        Task { _ = await request("setMessageReaction", ["chat_id": chatID, "message_id": message,
+                                                        "reaction": [["type": "emoji", "emoji": emoji]]]) }
     }
 
     /// Only an explicit image-output request can authorize media output. An uncertain upload is never replayed.
@@ -859,48 +1350,95 @@ final class Telegram {
         let upload = Task { @MainActor [weak self] in
             await previous?.value
             guard let self, !run.ended, worker.taskRecordID == run.id else { return false }
-            return await self.uploadPhoto(asset.jpeg, caption: "[" + root.shortID + "] " + caption)
+            return await self.uploadPhoto(asset.jpeg, caption: caption + " · #" + root.shortID)
         }
         sending = Task { _ = await upload.value }
         let delivered = await upload.value
         if delivered { run.deliveredImages.insert(asset.key); updateCard(root) }
         return delivered
     }
-    private func sendPhoto(_ image: Data, caption: String) {
+    private func sendPhoto(_ image: Data, caption: String, silent: Bool = false) {
         enqueue { [weak self] in
             guard let self else { return }
-            if await self.uploadPhoto(image, caption: caption) == false { self.send("Couldn't deliver that task image. Use /result for text, or request a fresh screenshot.") }
+            if await self.uploadPhoto(image, caption: caption, silent: silent) == false { self.send("Couldn't deliver that task image. Use /result for text, or request a fresh screenshot.") }
         }
     }
-    private func uploadPhoto(_ image: Data, caption: String) async -> Bool {
-        guard let chatID, !image.isEmpty, image.count < 10_000_000, let token,
-              let url = URL(string: "https://api.telegram.org/bot\(token)/sendPhoto") else { return false }
-        let boundary = "Clinqy-" + UUID().uuidString
-        var body = Data()
-        for (name, value) in [("chat_id", String(chatID)), ("caption", Self.chunks(Secrets.mask(caption), limit: 1000).first ?? "Task image")] {
-            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
-        }
-        let png = image.starts(with: [137, 80, 78, 71, 13, 10, 26, 10])
-        let filename = png ? "image.png" : "image.jpg", mime = png ? "image/png" : "image/jpeg"
-        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"photo\"; filename=\"\(filename)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
-        body.append(image)
-        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
-        var request = URLRequest(url: url, timeoutInterval: 30)
-        request.httpMethod = "POST"; request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type"); request.httpBody = body
-        guard let (data, response) = try? await session.data(for: request), (response as? HTTPURLResponse)?.statusCode == 200,
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any], json["ok"] as? Bool == true else { return false }
-        return true
+    private func uploadPhoto(_ image: Data, caption: String, silent: Bool = false) async -> Bool {
+        guard let chatID, !image.isEmpty, image.count < Self.photoLimit else { return false }
+        var fields = ["chat_id": String(chatID), "caption": Self.chunks(Secrets.mask(caption), limit: 1000).first ?? "Task image"]
+        if silent { fields["disable_notification"] = "true" }
+        return await upload("sendPhoto", fields: fields, file: ("photo", image)).ok
+    }
+
+    private struct APIReply {
+        var result: Any? = nil
+        var ok: Bool
+        var description: String? = nil
+    }
+    private static func json(_ value: Any) -> String {
+        (try? JSONSerialization.data(withJSONObject: value)).flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
     }
 
     private func call(_ method: String, _ body: [String: Any], wait: TimeInterval = 20) async -> Any? {
+        let reply = await request(method, body, wait: wait)
+        return reply.ok ? reply.result : nil
+    }
+
+    /// JSON Bot API call with retry: 429 waits `retry_after`; network errors and 5xx retry only idempotent methods.
+    /// "Message is not modified" counts as success. Never throws; failures are logged and returned.
+    private func request(_ method: String, _ body: [String: Any], wait: TimeInterval = 20) async -> APIReply {
         guard let token, let url = URL(string: "https://api.telegram.org/bot\(token)/\(method)"),
-              let data = try? JSONSerialization.data(withJSONObject: body) else { return nil }
+              let data = try? JSONSerialization.data(withJSONObject: body) else { return APIReply(ok: false) }
         var request = URLRequest(url: url, timeoutInterval: wait)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
-        guard let (reply, _) = try? await session.data(for: request),
-              let json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any], json["ok"] as? Bool == true else { return nil }
-        return json["result"]
+        return await perform(method, request)
+    }
+
+    /// Multipart upload (sendPhoto, sendDocument, editMessageMedia). `file.0` is the form field (or attach:// name).
+    private func upload(_ method: String, fields: [String: String], file: (String, Data), filename: String? = nil) async -> APIReply {
+        guard let token, let url = URL(string: "https://api.telegram.org/bot\(token)/\(method)"), !file.1.isEmpty else { return APIReply(ok: false) }
+        let boundary = "Clinqy-" + UUID().uuidString
+        var body = Data()
+        for (name, value) in fields.sorted(by: { $0.key < $1.key }) {
+            body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(name)\"\r\n\r\n\(value)\r\n".utf8))
+        }
+        let png = file.1.starts(with: [137, 80, 78, 71, 13, 10, 26, 10])
+        let isPhoto = filename == nil
+        let name = (filename ?? (png ? "image.png" : "image.jpg")).replacingOccurrences(of: "\"", with: "_")
+        let mime = isPhoto ? (png ? "image/png" : "image/jpeg") : "application/octet-stream"
+        body.append(Data("--\(boundary)\r\nContent-Disposition: form-data; name=\"\(file.0)\"; filename=\"\(name)\"\r\nContent-Type: \(mime)\r\n\r\n".utf8))
+        body.append(file.1)
+        body.append(Data("\r\n--\(boundary)--\r\n".utf8))
+        var request = URLRequest(url: url, timeoutInterval: isPhoto ? 30 : 120)
+        request.httpMethod = "POST"; request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type"); request.httpBody = body
+        return await perform(method, request)
+    }
+
+    private func perform(_ method: String, _ request: URLRequest) async -> APIReply {
+        var attempt = 1
+        while true {
+            var status: Int?
+            var json: [String: Any]?
+            if let (reply, response) = try? await session.data(for: request) {
+                status = (response as? HTTPURLResponse)?.statusCode
+                json = try? JSONSerialization.jsonObject(with: reply) as? [String: Any]
+            }
+            if json?["ok"] as? Bool == true { return APIReply(result: json?["result"], ok: true) }
+            let description = json?["description"] as? String
+            if TelegramRetry.isNotModified(description) { return APIReply(ok: true, description: description) }
+            let retryAfter = (json?["parameters"] as? [String: Any])?["retry_after"] as? Int
+            let code = json?["error_code"] as? Int ?? status
+            guard method != "getUpdates", !Task.isCancelled,
+                  let delay = TelegramRetry.delay(method: method, status: code, retryAfter: retryAfter, attempt: attempt) else {
+                if method != "getUpdates" || status != nil {
+                    Agent.writeLog("telegram: \(method) failed (\(code.map(String.init) ?? "network"))" + (description.map { ": " + $0 } ?? ""))
+                }
+                return APIReply(ok: false, description: description)
+            }
+            try? await Task.sleep(for: .milliseconds(Int(delay * 1000)))
+            attempt += 1
+        }
     }
 }

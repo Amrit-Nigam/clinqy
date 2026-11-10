@@ -1,31 +1,42 @@
-# Native Mac implementation — testing deferred
+# Native Mac background lane (Phase 0.2/0.3 + Phase 4)
 
-No builds, test execution, app installation, live desktop input, commits, or pushes were performed for this work. This is source implementation, not a claim of runtime compatibility or Codex parity.
+## Default and kill switch
 
-## Implemented
+The native background lane is **on by default**. `BACKGROUND_NATIVE=0` (also `false`/`off`/`no`) turns it off; private SkyLight paths then fail closed to the existing foreground handoff. Every private symbol is resolved with `dlsym`; a missing symbol disables only its own capability (input, capture, occlusion keep-alive).
 
-- **21–22:** Scoped target-only SkyLight keyboard sessions, including internal key-window record pair; exact process/window validation; unique enabled menu-equivalent lookup for background Command shortcuts; no physical-pointer fallback. Private mechanisms require symbol availability. Native Agent routing is opt-in through `BACKGROUND_NATIVE=1` and `NativeBackgroundCapability`; runtime integration is owned by the runtime implementation work.
-- **23:** Exact-window ScreenCaptureKit enumeration includes other Spaces. Screenshot, OCR and visual coordinate revalidation share `Screenshot.rawImage`. An independently capability-gated backing-store capture fallback is available under `BACKGROUND_NATIVE=1`, respects Screen Recording permission, validates aspect/identity, and never activates a window. This does not force a suspended renderer to produce new content.
-- **24:** Focused/attached sheets retain their own CGWindowID. New blocking sheets invalidate parent actions. Explicit `followAttachedSheet` follows only the pinned owner's child; it does not adopt an unrelated same-app window. Native window enumeration includes focused and attached sheets.
-- **25–26:** Existing exact geometry, process lifetime, negative-coordinate and Retina mapping are preserved. Staleness also rejects hidden/minimized targets. Scroll chunks recheck target geometry. Multi-display/scaling execution is deferred to the test phase.
-- **27:** Native text replacement first uses AX value semantics and exact readback. Unsupported setters permit one process-targeted delivery, with verified full selection before replacing nonempty content. Cancellation/focus/security checks run between Unicode character chunks. UTF-16 selection insertion rejects overflow and invalid Unicode ranges; insertion/appending verifies text and caret. Unknown write replies never become permission for a second mutation.
-- **28:** Native text fallback no longer retries with a clipboard paste, clears uncertain text, or uses global keyboard delivery. Existing clipboard snapshot ownership restoration remains in foreground paste/copy routes. Native background pointer delivery no longer guesses helper-process windows or silently changes delivery method.
-- **29–30:** Capability-specific refusal messages explain why foreground handoff is needed. Keyboard and SkyLight click operations share input ownership. Deactivation failures retain a retryable cleanup record and block new synthetic input until cleanup succeeds; identity is checked against process restart. End-of-run cleanup retries pending restoration. No synthetic active state is left by the legacy app-selection `focus` call.
-- **41–44:** AX scans have candidate/time/depth limits, defer collections until ordinary controls have been visited, prefer visible rows even in short scrolled lists, include AXContents, and expose bounded-scan diagnostics with the observation. Batch attribute reads already existed and remain in use. Empty scans can report their notice through `AXEngine.listing(..., window:)`. Existing screenshot acquisition stays explicit; this native change does not add automatic screenshot deduplication.
+## Live probe (tests/focus-intrusion-probe.sh, macOS 27.0 build 26A428)
 
-## Interfaces for Agent integration
+A disposable AppKit fixture is put in front (counts resign-active, resign-key, stray mouse-downs and keys in its first-responder field); Clinqy's production `SkyLight.click` and keyboard session drive TextEdit behind it, then both quit. Not in CI (needs Accessibility and a GUI session).
 
-- `NativeBackgroundCapability.enabled`
-- `NativeBackgroundCapability.canObserve(_:window:) -> String?`
-- `NativeBackgroundCapability.canPerform(_:window:elements:) -> String?`
-- `Background.nativeWindowID` is task-scoped and reset at run boundaries.
-- `NativeWindowObservation.capture(_:windowID:followAttachedSheet:)`
-- `Hand.press(_:in:window:) -> Bool`
-- `Hand.type(_:in:window:) async -> Bool` should receive the original observed window.
-- `AXEngine.listing(_:budget:refs:window:)`
+| | before | after |
+| --- | --- | --- |
+| front lost active / key | 0 / 0 | 0 / 0 |
+| pointer moved / frontmost changed | no / no | no / no |
+| click delivered (caret moved) / keys arrived | yes / yes | yes / yes |
+| click fixed sleeps | ~257 ms (40 ms focus settle, 117 ms recipe, 100 ms renderer settle) | ~63 ms (10 ms focus settle in and out, scale 0.2) |
 
-## Deliberate compatibility limits
+Runs where physical HID input happened during the probe are reported as inconclusive (the user clicking elsewhere is counted as lost-active). Under load (load avg ~12) the same-binary A/B gave click return 645 ms (old gaps) vs 131–195 ms (tuned).
 
-Native opt-in supports bounded observation, current-element plain clicks/text, and scoped shortcuts. Native drag/right-click/count/modifier gestures, native scrolling without a verified container, unknown popup ownership, hidden/minimized apps, and arbitrary application launch remain foreground handoffs. No private symbol availability check proves behavior across macOS releases. No universal background-native claim is made. Covered-window capture does not imply arbitrary occluded Chromium renderers remain live; an occlusion-notification mutator is not silently enabled.
+Phase 0.3 go/no-go on this Mac: `SLEventPostToPid`, `SLEventSetIntegerValueField`, `CGEventSetWindowLocation`, `SLPSPostEventRecordTo`, `GetProcessForPID`, `SLSMainConnectionID`, `SLSHWCaptureWindowList`, `SLSPackagesEnableWindowOcclusionNotifications`, `_AXUIElementGetWindow`: present (go). `_AXObserverAddNotificationAndCheckRemote`: **absent** (no-go); Electron trees are instead requested once per process with `AXManualAccessibility`. HW capture of a covered window 10–45 ms idle vs ScreenCaptureKit enumerate+capture 56–96 ms.
 
-The SkyLight record/ABI references were adapted from MIT-licensed open-computer-use, Cua Driver and yabai. Full notices are retained in `THIRD_PARTY_NOTICES.md`.
+## What the lane does
+
+- **Focus:** synthetic activation and key-window records go to the target PSN only; nothing is posted to the real frontmost app.
+- **Timing knobs** (`NativeInputTiming`, env or `~/.config/clinqy/env`): `SKY_FOCUS_SETTLE_MS` (10), `SKY_CLICK_DELAY_SCALE` (0.2, floor 0.05 — scale 0 failed every click in the OCU sweep), `SKY_KEY_SETTLE_MS` (10), `SKY_KEY_RELEASE_MS` (10).
+- **Pointer:** left/right, single/double SkyLight clicks at elements or in-window coordinates (`Hand.click(at:options:)`, `Hand.gesture` for `right_click`/`double_click`). Modifiers, hold, middle button, triple click, hover and drag stay foreground.
+- **Scroll:** AX `AXScroll*ByPage` on the scroll area under the anchor for page units, otherwise wheel events posted to the pid and tagged with the window id.
+- **Semantic:** `Hand.choose` (AX popup/menu, exact single match, readback), `Hand.setValue` (AXValue with readback), `Hand.performSecondaryAction` (advertised non-press AX action, once).
+- **Launch:** `Launcher.launchInBackground(named:)` opens with `activates=false, hides=false`, polls for a window, never uses the virtual screen. `focusBehind` no longer unhides apps.
+- **Capture:** `SLSHWCaptureWindowList` is primary for native windows, ScreenCaptureKit is the fallback with its inventory cached ~1 s. Capture-path staleness checks collapsed from five to two per screenshot; `staleness()` queries one window instead of enumerating all.
+- **Occlusion keep-alive:** in background runs a captured window that is still unoccluded has its occlusion notifications disabled (keeps Chromium/Electron rendering once covered). `Hand.endRun` and an `atexit` hook restore the previous state (`SKY_OCCLUSION_KEEPALIVE=0` disables).
+- **Refused:** hidden (⌘H) apps, terminals, system security/authorization agents, Clinqy itself (`BackgroundPolicy.nativeAppRefusal`).
+
+## Tests
+
+`tests/native-lane.sh` (CI): routing table, kill switch, refused app classes, knob parsing/clamping, click recipe and sleep budget, keep-alive geometry.
+
+## Limits
+
+No symbol check proves behaviour on a future macOS; re-run the probe per release. Keep-alive cannot revive a window that was already covered when first seen. Canvas/GL surfaces that ignore both AX and window-targeted events still need foreground HID.
+
+SkyLight record/ABI references were adapted from MIT-licensed open-codex-computer-use, Cua Driver and yabai; notices in `THIRD_PARTY_NOTICES.md`.

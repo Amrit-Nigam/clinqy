@@ -55,6 +55,38 @@ enum Launcher {
         return await launch(url)
     }
 
+    /// Native background lane: launch (or reopen) an app WITHOUT activating it. No Space switch, no raise, no
+    /// virtual screen; its new window simply appears behind the user's front app. Terminals, security agents and
+    /// Clinqy itself are refused. Returns the app and its first readable window id, or why not.
+    static func launchInBackground(named name: String) async -> Result<(NSRunningApplication, CGWindowID), LaunchRefusal> {
+        let wanted = name.lowercased().replacingOccurrences(of: ".app", with: "")
+        let existing = running(named: wanted)
+        guard let url = existing?.bundleURL ?? find(named: wanted) else { return .failure(.init(reason: "Couldn't find an app called \(name)")) }
+        let bundleID = Bundle(url: url)?.bundleIdentifier
+        if let why = NativeBackgroundCapability.canLaunch(bundleID: bundleID, name: url.deletingPathExtension().lastPathComponent) {
+            return .failure(.init(reason: why))
+        }
+        if let existing, existing.isHidden { return .failure(.init(reason: BackgroundPolicy.nativeAppRefusal(bundleID: bundleID, name: name, hidden: true, isSelf: false) ?? "hidden")) }
+        let had = existing.map { Hand.windowIDs(pid: $0.processIdentifier) } ?? []
+        let config = NSWorkspace.OpenConfiguration()
+        config.activates = false
+        config.hides = false
+        config.addsToRecentItems = false
+        guard let app = try? await NSWorkspace.shared.openApplication(at: url, configuration: config) else {
+            return .failure(.init(reason: "\(name) could not be launched in the background"))
+        }
+        // Poll (no fixed sleep) for a readable window; prefer one the launch created.
+        for _ in 0..<60 {
+            if Task.isCancelled { break }
+            let ids = AXEngine.windows(of: app).compactMap { AXEngine.windowID(of: $0) }
+            if let id = ids.first(where: { !had.contains($0) }) ?? ids.first { return .success((app, id)) }
+            try? await Task.sleep(for: .milliseconds(80))
+        }
+        return .failure(.init(reason: "\(app.cleanName ?? name) is running but showed no window; it was not activated"))
+    }
+
+    struct LaunchRefusal: Error { let reason: String }
+
     static func launch(_ url: URL) async -> NSRunningApplication? {
         // The windows the user already has: a background run moves only the ones it opens to Clinqy's hidden screen.
         let had = NSWorkspace.shared.runningApplications.first { $0.bundleURL == url }.map { Hand.windowIDs(pid: $0.processIdentifier) } ?? []
@@ -129,7 +161,8 @@ enum Launcher {
     private static func focusBehind(_ app: NSRunningApplication) {
         Background.app = app
         Background.track(app)
-        if app.isHidden { app.unhide() }
+        // A hidden (⌘H) app stays hidden: unhiding would change the user's desktop. Its input is refused instead.
+        guard !app.isHidden else { return }
         guard !(isBrowser(app) && Background.tab != nil), app.processIdentifier != getpid() else { return }
         let list = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         if let info = list.first(where: { ($0[kCGWindowOwnerPID as String] as? Int).map(pid_t.init) == app.processIdentifier

@@ -5,7 +5,7 @@ const URL_ = "ws://127.0.0.1:47823";
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
 const SCRIPT_VERSION = "1.9.16";
 const SCRIPT_BUILD = "2026-11-browser-reliability-2";
-const CAPABILITIES = ["document-tokens", "task-ownership", "condition-waits", "activity-phases", "cooperative-cancellation", "upload-readback", "html-range-state"];
+const CAPABILITIES = ["document-tokens", "task-ownership", "condition-waits", "activity-phases", "cooperative-cancellation", "upload-readback", "html-range-state", "effect-receipts", "adopted-tabs"];
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
@@ -348,6 +348,8 @@ async function snapshot(tab) {
   const snapshotID = crypto.randomUUID();
   await saveMap(tab.id, { ...assignIds(previous.documentID === top.documentID ? previous : null, top.url, list),
     documentID: top.documentID, snapshotID, frameTokens, frameBoxes, offsets, coverage });
+  // A new document in an adopted tab needs the user-input watcher again before Clinqy acts in it.
+  if (await isAdopted(tab.id)) await armUserWatch(tab.id, true);
   if (coverage.length) extraText.push("[frames not read: " + coverage.map((c) => `${c.frame} (${c.reason})`).join("; ") + "]");
   if (extraText.length) top.text = [top.text, ...extraText].filter(Boolean).join(" · ").slice(0, 2400);
   return { ...top, snapshotID, elements, tabId: tab.id, active: !!tab.active, frameCoverage: coverage };
@@ -594,6 +596,12 @@ async function finishClinqyTabs(tabIds, closeInactive = false) {
   // Let key/button release cleanup run before detaching. A wedged renderer cannot hold cleanup indefinitely.
   if(finishing.length)await Promise.race([Promise.all(finishing),new Promise(resolve=>setTimeout(resolve,1500))]);
   await finishActivity(tabIds);
+  // Adopted tabs go back to the user exactly as they were: detached, no emulation, never closed.
+  const adoptedNow = await adoptedRecords();
+  for (const id of Object.keys(adoptedNow).map(Number).filter(id => !tabIds || tabIds.includes(id))) {
+    await dropAdoption(id);
+    await restoreAdopted(id);
+  }
   const owned = await workTabs();
   for (const tabId of tabIds ? owned.filter(id => tabIds.includes(id)) : owned) {
     try { await chrome.debugger.detach({ tabId }); } catch {}
@@ -619,6 +627,7 @@ async function finishClinqyTabs(tabIds, closeInactive = false) {
     await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => !closed.includes(id)) });
   }
   for (const id of affected) endingTaskTabs.delete(id);
+  for (const id of tabIds || [...userReleased.keys()]) userReleased.delete(id);
   return { done: true, closed, kept };
 }
 
@@ -712,9 +721,11 @@ if (chrome.debugger) {
 
 async function cdp(tabId, method, params = {}) {
   assertRequestLive(tabId);
+  if (userReleased.has(tabId)) throw new Error(releasedMessage(tabId));
   if (!attached.has(tabId)) {
     const mine = await openedTabs();
-    if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
+    // Only Clinqy's own tabs, or a tab the user's request handed over for this run (adoptTab), are ever attached.
+    if (!mine.has(tabId) && !(await isAdopted(tabId))) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
     if (!chrome.debugger) throw new Error("reload the Clinqy extension to allow this action");
     try { await chrome.debugger.attach({ tabId }, "1.3"); }
     catch (e) { if (!/already attached/i.test(String(e && e.message || e))) throw e; }
@@ -775,6 +786,32 @@ async function cdpClick(tabId, x, y, count = 1) {
     }
   }
   return { clicked: at };
+}
+
+// Effect receipts armed before an input (token → tab, URL and frames). Collecting merges every frame's report;
+// a frame that no longer answers was replaced or navigated, which is itself an observed effect.
+const receiptsArmed = new Map();
+async function receiptCollect(tab, msg) {
+  const armed = receiptsArmed.get(msg.token);
+  if (!armed || armed.tabId !== tab.id) throw Error("no armed receipt for this tab");
+  receiptsArmed.delete(msg.token);
+  const out = { urlChanged: false, unreadable: false, targetStateChanged: false, targetRemoved: false, dialogOpened: false,
+    focusChanged: false, focusIntoNew: false, structural: false, addedText: "", removedText: "", mutationCount: 0 };
+  const quiet = Number(msg.quietMs) || 120, cap = Number(msg.capMs) || 800;
+  await Promise.all(armed.frames.map(async (frameId) => {
+    let r;
+    try { r = await call(tab.id, frameId, "receiptCollect", [msg.token, quiet, cap]); }
+    catch { out.unreadable = true; return; }
+    for (const key of ["urlChanged", "targetStateChanged", "targetRemoved", "dialogOpened", "focusChanged", "focusIntoNew", "structural"]) out[key] = out[key] || !!r[key];
+    for (const key of ["addedText", "removedText"]) if (r[key]) out[key] = (out[key] ? out[key] + " | " : "") + r[key];
+    out.mutationCount += Number(r.mutationCount) || 0;
+  }));
+  try {
+    const now = await chrome.tabs.get(tab.id);
+    if ((now.pendingUrl || now.url || "") !== armed.url) out.urlChanged = true;
+  } catch {}
+  out.addedText = out.addedText.slice(0, 800); out.removedText = out.removedText.slice(0, 800);
+  return out;
 }
 
 // Endpoint identity is checked before any pointer input. A lost acknowledgement never triggers a retry.
@@ -864,6 +901,10 @@ chrome.tabs.onRemoved.addListener((tabId) => queueActivity(async () => {
   tabEvents.delete(tabId);
   dialogPolicy.delete(tabId);
   for (const [guid,download] of downloads) if (download.tabId === tabId) downloads.delete(guid);
+  clinqyInput.delete(tabId);
+  const adoption = await withOwnership(() => dropAdoption(tabId));
+  if (adoption) send({ type: "adoptedReleased", tabId, runID: adoption.runID, reason: "closed" });
+  userReleased.delete(tabId);
   await withOwnership(async () => {
     try { await chrome.storage.session.remove(["map" + tabId,"owner"+tabId,"popup"+tabId]); } catch {}
     const mine = await openedTabs();
@@ -871,6 +912,160 @@ chrome.tabs.onRemoved.addListener((tabId) => queueActivity(async () => {
     await chrome.storage.session.set({workTabs:(await workTabs()).filter(id => id !== tabId)});
   });
 }));
+
+// ---- the user's own tab, adopted for one run ----
+// "Work in the tab I have open": the user's request hands one existing tab to one run. It gets the same ownership
+// token as a task tab (owner<id>, workTabs) plus an adoption record, the debugger with emulated focus, and the
+// activity marker. It is never activated, nor its window focused, and never closed. The moment the user acts in it
+// (a real click, key or scroll that Clinqy did not send) or selects it, Clinqy lets go: the debugger detaches,
+// focus emulation and the marker go, and the app is told so the run pauses until the user hands it back.
+async function adoptedRecords() {
+  try { return (await chrome.storage.session.get("adoptedTabs")).adoptedTabs || {}; } catch { return {}; }
+}
+async function setAdoptedRecords(records) {
+  try { await chrome.storage.session.set({ adoptedTabs: records }); } catch {}
+}
+async function isAdopted(tabId) { return !!(await adoptedRecords())[tabId]; }
+// Tabs the user took back during a run: actions on them stop with this reason instead of a generic ownership error.
+const userReleased = new Map();   // tabId → { runID, reason }
+function releasedMessage(tabId) {
+  return "the user took tab " + tabId + " back (" + (userReleased.get(tabId)?.reason || "user input") + "); Clinqy let go of it and sends nothing more to it";
+}
+// Input Clinqy itself is sending to a tab: CDP input is trusted, so a page cannot tell it from the user's. Real
+// input is whatever arrives while Clinqy is not sending any, plus a short grace for events still in flight.
+const clinqyInput = new Map();   // tabId → { depth, until }
+const CLINQY_INPUT_GRACE_MS = 400;
+const INPUT_COMMANDS = new Set(["cdpClick", "cdpKey", "cdpType", "cdpScroll", "cdpGesture", "click", "clickOption", "fill", "fillActive",
+  "setRange", "focus", "prepare", "upload", "uploadVia", "scroll"]);
+function beginClinqyInput(tabId) {
+  const state = clinqyInput.get(tabId) || { depth: 0, until: 0 };
+  state.depth++; clinqyInput.set(tabId, state);
+}
+function endClinqyInput(tabId) {
+  const state = clinqyInput.get(tabId);
+  if (!state) return;
+  state.depth = Math.max(0, state.depth - 1); state.until = Date.now() + CLINQY_INPUT_GRACE_MS;
+}
+function clinqyInputActive(tabId) {
+  const state = clinqyInput.get(tabId);
+  return !!state && (state.depth > 0 || Date.now() < state.until);
+}
+function hostOf(raw) {
+  try { return new URL(raw).hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
+}
+function originOf(raw) { try { return new URL(raw).origin; } catch { return ""; } }
+// Same rule as the app's AccessBlocklist: a host or its subdomains, "*" matching any run of characters.
+function blockedHost(url, patterns) {
+  const host = hostOf(url);
+  if (!host) return false;
+  return patterns.some(raw => {
+    const pattern = String(raw || "").trim().toLowerCase();
+    if (!pattern) return false;
+    if (pattern.includes("*")) return new RegExp("^" + pattern.split("*").map(p => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(host);
+    const bare = hostOf(pattern.includes("://") ? pattern : "https://" + pattern) || pattern;
+    return host === bare || host.endsWith("." + bare);
+  });
+}
+async function armUserWatch(tabId, on) {
+  try {
+    if (on) await inject({ tabId, allFrames: true });
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: on => window.__clinqy?.watchUser?.(on), args: [on] });
+  } catch {} // a navigating or restricted document; the next observation re-arms it
+}
+async function adoptTab(msg) {
+  const tabId = Number(msg.tabId), runID = msg.runID;
+  if (!Number.isInteger(tabId)) throw Error("adoptTab needs a tab id");
+  if (typeof runID !== "string" || !runID.length || runID.length > 128) throw Error("invalid task ownership token");
+  const adopted = await withOwnership(async () => {
+    const tab = await chrome.tabs.get(tabId);
+    const url = tab.url || tab.pendingUrl || "";
+    if (!/^(https?|file):/.test(url)) throw Error("this tab is a browser page (new tab, settings, extensions) that extensions can't drive");
+    if (msg.expectedOrigin && originOf(url) !== msg.expectedOrigin) throw Error("the tab changed site since it was chosen; choose it again");
+    if (Array.isArray(msg.blockedHosts) && blockedHost(url, msg.blockedHosts)) throw Error("this site is on Clinqy's blocked list and is never operated");
+    const owner = (await chrome.storage.session.get("owner" + tabId))["owner" + tabId];
+    if (owner && owner !== runID) throw Error("this tab is already in use by another Clinqy task");
+    const records = await adoptedRecords();
+    records[tabId] = { runID, url, windowId: tab.windowId, at: Date.now() };
+    await setAdoptedRecords(records);
+    await chrome.storage.session.set({ ["owner" + tabId]: runID, workTabs: [...new Set([...await workTabs(), tabId])] });
+    userReleased.delete(tabId);
+    return tab;
+  });
+  try {
+    await cdp(tabId, "Page.enable");   // attaches and prepares it like a task tab: emulated focus, no native pickers
+  } catch (error) {
+    await withOwnership(() => dropAdoption(tabId));
+    await restoreAdopted(tabId);
+    throw error;
+  }
+  await armUserWatch(tabId, true);
+  await showActivity(tabId);
+  // No tabs.update(active) or windows.update(focused): the user keeps the tab and window they are in.
+  return { id: tabId, adopted: true, url: adopted.url || adopted.pendingUrl || "", title: adopted.title || "", active: !!adopted.active, windowId: adopted.windowId };
+}
+// Ownership records only; callers hold the ownership lane.
+async function dropAdoption(tabId) {
+  const records = await adoptedRecords();
+  if (!records[tabId]) return null;
+  const record = records[tabId];
+  delete records[tabId];
+  await setAdoptedRecords(records);
+  try { await chrome.storage.session.remove(["owner" + tabId]); } catch {}
+  try { await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => id !== tabId) }); } catch {}
+  return record;
+}
+// The tab behaves as it did before: no focus emulation, native pickers allowed, no debugger bar, no watcher.
+async function restoreAdopted(tabId) {
+  await armUserWatch(tabId, false);
+  if (attached.has(tabId)) {
+    for (const [method, params] of [["Emulation.setFocusEmulationEnabled", { enabled: false }], ["Page.setInterceptFileChooserDialog", { enabled: false }]]) {
+      try { await chrome.debugger.sendCommand({ tabId }, method, params); } catch {}
+    }
+  }
+  try { await chrome.debugger.detach({ tabId }); } catch {}
+  attached.delete(tabId);
+  clinqyInput.delete(tabId);
+  dialogPolicy.delete(tabId);
+}
+// The user acted in an adopted tab (or the run ended): let go at once and say why.
+async function releaseAdopted(tabId, reason) {
+  const record = (await adoptedRecords())[tabId];
+  if (!record) return { released: false };
+  if (reason !== "done") userReleased.set(tabId, { runID: record.runID, reason });
+  for (const [id, request] of runningRequests) if (request.tabId === tabId) markCancelled(id);
+  await restoreAdopted(tabId);
+  await finishActivity([tabId]);
+  await withOwnership(() => dropAdoption(tabId));
+  if (reason !== "done") {
+    recordEvent(tabId, { kind: "adoption", state: "released", reason });
+    send({ type: "adoptedReleased", tabId, runID: record.runID, reason });
+  }
+  return { released: true, reason };
+}
+async function userTookTab(tabId, reason) {
+  if (reason.startsWith("input") && clinqyInputActive(tabId)) return;
+  if (!(await isAdopted(tabId))) return;
+  if (reason.startsWith("input") && clinqyInputActive(tabId)) return;
+  await releaseAdopted(tabId, reason);
+}
+chrome.runtime.onMessage?.addListener((message, sender) => {
+  if (message?.clinqy !== "userInput" || sender?.tab?.id == null) return;
+  void userTookTab(sender.tab.id, "input:" + String(message.kind || "event").slice(0, 20));
+});
+// Clinqy never activates an adopted tab, so its activation is the user's.
+chrome.tabs.onActivated?.addListener(({ tabId }) => { void userTookTab(tabId, "selected"); });
+// The user's tabs to choose from (metadata only: nothing is attached, focused or changed).
+async function adoptCandidates() {
+  const [front] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const own = new Set(await workTabs());
+  const agent = await agentWindow();
+  const all = await chrome.tabs.query({});
+  return { lastFocusedWindow: front ? front.windowId : null, tabs: all
+    .filter(t => !own.has(t.id) && (!agent || t.windowId !== agent.id) && !t.incognito)
+    .slice(0, 300)
+    .map(t => ({ id: t.id, windowId: t.windowId, title: (t.title || "").slice(0, 200), url: (t.url || t.pendingUrl || "").slice(0, 2048),
+      active: !!t.active, lastFocusedWindow: !!front && t.windowId === front.windowId })) };
+}
 
 async function tabCommand(msg) {
   const tabId = Number(msg.tabId);
@@ -915,21 +1110,25 @@ function activityKind(msg) {
 async function handle(msg) {
   msg._startedAt=Date.now();
   let out;
+  const inputTab = INPUT_COMMANDS.has(msg.cmd) && msg.tabId != null ? Number(msg.tabId) : null;
+  if (inputTab != null) beginClinqyInput(inputTab);
   try {
     out = await handleCommand(msg);
-    if (msg._activity && msg.tabId != null && msg._activityState && !["observing","waiting"].includes(msg._activityState.kind))
+    if (msg._activity && msg.tabId != null && msg._activityState && !userReleased.has(Number(msg.tabId)) && !["observing","waiting"].includes(msg._activityState.kind))
       await showActivity(Number(msg.tabId), {...msg._activityState,stage:out?.ok===false || out?.skipped || out?.cancelled ? "failed" : "delivered",
         ...(out?.ok===false || out?.skipped || out?.cancelled ? {kind:"error"} : {})});
   } catch(error) {
-    if (msg._activity && msg.tabId != null) await showActivity(Number(msg.tabId),{kind:"error"});
+    if (msg._activity && msg.tabId != null && !userReleased.has(Number(msg.tabId))) await showActivity(Number(msg.tabId),{kind:"error"});
     throw error;
+  } finally {
+    if (inputTab != null) endClinqyInput(inputTab);
   }
   const id = msg.tabId != null && msg.tabId !== "" ? Number(msg.tabId) : null;
   if (id == null || !Number.isInteger(id) || !out || typeof out !== "object" || Array.isArray(out)) return out;
   const events = drainEvents(id);
   if (events.length && out.events === undefined) out.events = events;
   out.elapsedMs = Math.max(0, Date.now() - (msg._startedAt || Date.now()));
-  if (!["snapshot", "tabs", "tabInfo", "newTab", "clinqyTab", "switchTab", "closeTab", "clinqyDone"].includes(msg.cmd) && out.observation === undefined) {
+  if (!["snapshot", "tabs", "tabInfo", "newTab", "clinqyTab", "switchTab", "closeTab", "clinqyDone", "adoptTab", "releaseAdopted"].includes(msg.cmd) && out.observation === undefined) {
     const map = maps.get(id);
     if (map && map.documentID) out.observation = { documentID: map.documentID, snapshotID: map.snapshotID };
   }
@@ -939,6 +1138,13 @@ async function handle(msg) {
 async function handleCommand(msg) {
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
   if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version, build:SCRIPT_BUILD, capabilities:CAPABILITIES, protocolVersion:7 };
+  if (msg.cmd === "adoptTab") return await adoptTab(msg);
+  if (msg.cmd === "adoptCandidates") return await adoptCandidates();
+  if (msg.cmd === "releaseAdopted") {
+    const record = (await adoptedRecords())[Number(msg.tabId)];
+    if (record && record.runID !== msg.runID) throw new Error("This tab does not belong to Clinqy's task");
+    return await releaseAdopted(Number(msg.tabId), "done");
+  }
   // Task commands are explicitly scoped: they cannot fall through to the user's active tab.
   if (msg.workOnly) {
     let owned = await workTabs();
@@ -953,18 +1159,21 @@ async function handleCommand(msg) {
         const all=await workTabs(), ownership=await chrome.storage.session.get(all.map(id=>"owner"+id));
         owned=all.filter(id=>ownership["owner"+id]===msg.runID);
       }
-      const tabs = [];
+      const tabs = [], adoptedNow = await adoptedRecords();
       for (const id of owned) {
         try {
           const t = await chrome.tabs.get(id);
           const popup=(await chrome.storage.session.get("popup"+id))["popup"+id];
-          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true,
+          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true, adopted: !!adoptedNow[id],
             inherited:!!popup && popup.runID===msg.runID, openerTabId:popup?.opener });
         } catch {}
       }
       return { tabs };
     }
     if (msg.cmd === "newTab") throw new Error("Use clinqyTab to create an inactive task tab");
+    const released = msg.tabId != null ? userReleased.get(Number(msg.tabId)) : null;
+    if (released && (!msg.runID || released.runID === msg.runID) && !owned.includes(Number(msg.tabId)))
+      throw new Error(releasedMessage(Number(msg.tabId)));
     if (msg.tabId == null || !owned.includes(Number(msg.tabId)))
       throw new Error("This tab does not belong to Clinqy's task");
     if (msg.cmd === "switchTab") return { id: Number(msg.tabId) };
@@ -1001,7 +1210,7 @@ async function handleCommand(msg) {
     if (!(await activityTabs()).includes(tab.id)) return {updated:false};
     await showActivity(tab.id,{kind:msg.phase}); return {updated:true};
   }
-  msg._activity = msg.activity || (await activityTabs()).includes(tab.id);
+  msg._activity = !userReleased.has(tab.id) && (msg.activity || (await activityTabs()).includes(tab.id));
   if (msg._activity) {
     const kind = activityKind(msg);
     const state = {kind,stage:"prepare"};
@@ -1073,6 +1282,8 @@ async function handleCommand(msg) {
   if (msg.cmd === "downloadStatus") {
     return { downloads: [...downloads.entries()].filter(([, d]) => d.tabId === tab.id).map(([guid, d]) => ({ guid, ...d })) };
   }
+  // A receipt is collected after the input it watched, which may have navigated or replaced the observed document.
+  if (msg.cmd === "receiptCollect") return await receiptCollect(tab, msg);
   const unguarded = new Set(["snapshot", "goBack", "navigate"]);
   if (!unguarded.has(msg.cmd)) {
     const map = await mapFor(tab.id);
@@ -1169,6 +1380,20 @@ async function handleCommand(msg) {
       return await call(tab.id, frame, "clickOption", [msg.pointToken]);
     }
     case "activeOption": return await indexed("activeOption", [msg.want || ""]);
+    case "receiptArm": {
+      // Armed in the target's own frame (its state and local changes) and in the top page (dialogs, navigation).
+      const token = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const frames = [];
+      if (Number.isInteger(msg.index)) {
+        const { frameId, local } = await route(tab.id, msg.index);
+        await call(tab.id, frameId, "receiptArm", [token, local]);
+        frames.push(frameId);
+      }
+      if (!frames.includes(0)) { await call(tab.id, 0, "receiptArm", [token, null]); frames.push(0); }
+      receiptsArmed.set(token, { tabId: tab.id, url: tab.url || "", frames, at: Date.now() });
+      for (const [old, r] of receiptsArmed) if (Date.now() - r.at > 60000) receiptsArmed.delete(old);
+      return { token };
+    }
     case "locate": {
       // In top-page coordinates, so a frame's element (LinkedIn's Easy Apply form) is placed right too.
       const { frameId, local } = await route(tab.id, msg.index);

@@ -42,6 +42,22 @@ import AppKit
         let probe = WorkerObservations()
         let clipboard = NSPasteboard.general.changeCount
         var checks = 0
+        do {
+            let frameA: [String: Any] = ["urlChanged": false, "targetStateChanged": true, "mutationCount": 2, "addedText": "Saved", "removedText": "", "structural": false]
+            let frameB: [String: Any] = ["dialogOpened": true, "mutationCount": 3, "addedText": "Done", "removedText": "Old", "structural": true]
+            let merged = WorkerReceipt.merge([frameA, frameB], urlChanged: false)
+            guard merged["targetStateChanged"] as? Bool == true, merged["dialogOpened"] as? Bool == true, merged["structural"] as? Bool == true,
+                  merged["urlChanged"] as? Bool == false, merged["unreadable"] as? Bool == false, merged["mutationCount"] as? Int == 5,
+                  merged["addedText"] as? String == "Saved | Done", merged["removedText"] as? String == "Old" else { throw WorkerCDP.error("receipt merge") }
+            let dead = WorkerReceipt.merge([frameA, nil], urlChanged: true)
+            guard dead["unreadable"] as? Bool == true, dead["urlChanged"] as? Bool == true, dead["mutationCount"] as? Int == 2 else { throw WorkerCDP.error("receipt unreadable") }
+            let long = WorkerReceipt.merge([["addedText": String(repeating: "a", count: 700)], ["addedText": String(repeating: "b", count: 700)]], urlChanged: false)
+            guard (long["addedText"] as? String)?.count == 800 else { throw WorkerCDP.error("receipt cap") }
+            guard EffectReceipt(merged)?.dialogOpened == true, EffectReceipt(dead)?.unreadable == true else { throw WorkerCDP.error("receipt shape") }
+            guard WorkerReceipt.frames(target: "f1", top: "t") == ["f1", "t"], WorkerReceipt.frames(target: "t", top: "t") == ["t"],
+                  WorkerReceipt.frames(target: nil, top: "t") == ["t"] else { throw WorkerCDP.error("receipt frames") }
+            checks += 9
+        }
         func check(_ value: Bool, _ label: String) throws { guard value else { throw WorkerCDP.error(label) }; checks += 1 }
         func page(_ label: String) -> String {
             let html = "<button onclick=\"const field=document.createElement('input');field.setAttribute('aria-label','Dynamic field');document.body.append(field)\">Add field</button><title>\(label)</title><nav><img src='http://127.0.0.1:1/nav.png' width='90' height='70'></nav><img src='http://127.0.0.1:1/article.png' alt='Article image' width='90' height='70'><img src='http://127.0.0.1:1/icon.png' width='16' height='16'><label>Name<input id='name'></label><label>Resume<input id='upload' type='file' onchange=\"setTimeout(async()=>{document.querySelector('#uploadStatus').textContent=await this.files[0].text()},100)\"></label><button onclick=\"document.querySelector('#upload').click()\">Attach sample</button><p id='uploadStatus'></p><button onclick=\"document.body.dataset.sent='yes';this.textContent='Confirmed'\">Submit sample</button>"

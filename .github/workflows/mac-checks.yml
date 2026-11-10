@@ -18,6 +18,7 @@ jobs:
           bash tests/desktop-input.sh
           bash tests/observations.sh
           bash tests/background-tasks.sh
+          bash tests/native-lane.sh
           bash tests/task-context.sh
           bash tests/task-memory.sh
           bash tests/route-memory.sh
@@ -29,7 +30,13 @@ jobs:
           bash tests/browser-correlation.sh
           bash tests/image-assets.sh
           bash tests/telegram.sh
+          bash tests/telegram-ui.sh
           bash tests/notifier.sh
+          bash tests/run-supervisor.sh
+          bash tests/asking-policy.sh
+          bash tests/ax-tree-budget.sh
+          bash tests/control-socket.sh
+          bash tests/settle-wait.sh
           bash tests/codex-session.sh
           bash tests/http-provider.sh
           python3 tests/benchmarks/test_scoring.py
@@ -47,6 +54,8 @@ jobs:
           node tests/extension-images.mjs
           node tests/extension-frames.mjs
           node tests/extension-transport.mjs
+          node tests/extension-receipt.mjs
+          node tests/extension-adopt.mjs
           node tests/telegram-screenshot.mjs
           node tests/mac-download.mjs
       - name: Website build

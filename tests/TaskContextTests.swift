@@ -52,6 +52,42 @@ enum Secrets { static func mask(_ text: String) -> String { text } }
         check(TaskCapacity.canStart(background: false, foregroundRunning: false, backgroundRunning: 3, limit: 3), "native task can start alongside browser workers")
         check(!TaskCapacity.canStart(background: true, foregroundRunning: false, backgroundRunning: 3, limit: 3), "excess browser jobs queue")
         check(TaskCapacity.canStart(background: true, foregroundRunning: true, backgroundRunning: 2, limit: 3), "new browser task can start during native work")
+        // Phase 5: requests about a tab the user already has open adopt it instead of re-opening the site.
+        for phrase in ["Summarize this tab", "Fill the form on the current page", "In my open github tab, star the repo",
+                       "Use the tab I have open to reply", "Reply in the gmail tab I have open", "Check the page I'm on",
+                       "In the already open gmail, archive the newsletter", "Work in my existing jira tab"] {
+            check(TabAdoptionRouting.requestsAdoption(phrase), "adoption phrase: \(phrase)")
+        }
+        for phrase in ["Open github and star the repo", "Open three new tabs about Pokemon", "Read the three already open Chrome tabs",
+                       "Summarize the tabs I already have open", "Open a new tab and search flights"] {
+            check(!TabAdoptionRouting.requestsAdoption(phrase), "not adoption: \(phrase)")
+        }
+        check(TabAdoptionRouting.siteHint("In my open github tab, star it") == "github", "site named before 'tab'")
+        check(TabAdoptionRouting.siteHint("In the already open gmail, archive it") == "gmail", "site after 'already open'")
+        check(TabAdoptionRouting.siteHint("Summarize this tab") == nil, "'this tab' names no site")
+        check(TabAdoptionRouting.siteHint("Use my open tab for https://www.example.com/x") == "example.com", "explicit URL names the site")
+        let open: [TabAdoptionRouting.Candidate] = [
+            .init(id: 1, title: "repo · GitHub", url: "https://github.com/me/repo", active: true, lastFocusedWindow: true),
+            .init(id: 2, title: "Inbox - me@gmail.com - Gmail", url: "https://mail.google.com/mail/u/0", active: false, lastFocusedWindow: true),
+            .init(id: 3, title: "Issues · GitHub", url: "https://github.com/me/repo/issues", active: true, lastFocusedWindow: false),
+            .init(id: 4, title: "New Tab", url: "chrome://newtab/", active: true, lastFocusedWindow: false),
+            .init(id: 5, title: "Docs", url: "https://docs.test", active: false, lastFocusedWindow: false),
+            .init(id: 6, title: "Docs two", url: "https://docs.test/2", active: false, lastFocusedWindow: true),
+        ]
+        check(TabAdoptionRouting.choose("Summarize this tab", candidates: open) == .adopt(1), "'this tab' = active tab of last-focused window")
+        check(TabAdoptionRouting.choose("archive it in the already open gmail", candidates: open) == .adopt(2), "title match finds Gmail")
+        check(TabAdoptionRouting.choose("In my open github tab, star it", candidates: open) == .adopt(1), "several matches: active tab of last-focused window wins")
+        check(TabAdoptionRouting.choose("Edit my open docs.test tab", candidates: open) == .ask([5, 6]), "several matches and none in front: ask once")
+        check(TabAdoptionRouting.choose("In my open jira tab, file it", candidates: open) == .none, "no match: open a task tab as usual")
+        check(TabAdoptionRouting.choose("Summarize this tab", candidates: [open[3]]) == .none, "browser pages are never adopted")
+        check(TabAdoptionRouting.consent("Yes") == .adopt && TabAdoptionRouting.consent("Yes, always on github.com") == .adoptAlways,
+              "consent yes / always")
+        check(TabAdoptionRouting.consent("Open a new tab instead") == .newTab && TabAdoptionRouting.consent(nil) == .newTab
+              && TabAdoptionRouting.consent("[No reply after 10 min] Skip this step") == .newTab, "anything else (incl. timeout) opens a new tab")
+        check(TabAdoptionRouting.consentOptions(site: "github.com") == ["Yes", "Yes, always on github.com", "Open a new tab instead"], "consent options")
+        check(TabAdoptionRouting.lane(extensionConnected: true, nativeLaneEnabled: true) == .extensionAdopt, "extension adopts")
+        check(TabAdoptionRouting.lane(extensionConnected: false, nativeLaneEnabled: true) == .nativeWindow, "no extension: native window lane")
+        check(TabAdoptionRouting.lane(extensionConnected: false, nativeLaneEnabled: false) == .unavailable, "neither: unavailable")
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: folder) }
         let store = TaskStore(file: folder.appendingPathComponent("tasks.json"))

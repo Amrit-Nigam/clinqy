@@ -123,6 +123,7 @@ enum Background {
             }
         }
         _ = SkyLight.retryPendingCleanup()
+        SkyLight.releaseKeepAlive()   // a pinned native window kept "visible" for input goes back to normal
         active = false
         nativeWindowID = nil
         userWindows = [:]
