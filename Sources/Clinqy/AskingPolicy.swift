@@ -778,9 +778,19 @@ enum PlanGate {
 
     /// The question Clinqy asks itself: the model's plan (its checklist) or else the request.
     static func question(request: String, steps: [String]) -> String {
-        let plan = steps.isEmpty ? "Do what you asked: “" + String(request.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200)) + "”"
-            : steps.prefix(12).enumerated().map { "\($0.offset + 1). " + String($0.element.prefix(120)) }.joined(separator: "\n")
-        return "Here's my plan before I change anything:\n" + plan + "\nI'll still ask before paying. Go ahead?"
+        let plan: String
+        if steps.isEmpty {
+            let trimmed: String = String(request.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))
+            plan = "Do what you asked: “\(trimmed)”"
+        } else {
+            var lines: [String] = []
+            for (index, step) in steps.prefix(12).enumerated() {
+                let text: String = String(step.prefix(120))
+                lines.append("\(index + 1). \(text)")
+            }
+            plan = lines.joined(separator: "\n")
+        }
+        return "Here's my plan before I change anything:\n\(plan)\nI'll still ask before paying. Go ahead?"
     }
 
     enum Reply: Equatable { case approve, change(String?), stop }
