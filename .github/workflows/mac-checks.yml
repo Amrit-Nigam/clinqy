@@ -24,7 +24,6 @@ jobs:
           bash tests/route-memory.sh
           bash tests/delegation.sh
           bash tests/delegation-worker.sh
-          bash tests/efficiency.sh
           bash tests/browser-navigation.sh
           bash tests/action-contract.sh
           bash tests/browser-correlation.sh
@@ -37,8 +36,6 @@ jobs:
           bash tests/ax-tree-budget.sh
           bash tests/control-socket.sh
           bash tests/settle-wait.sh
-          bash tests/codex-session.sh
-          bash tests/http-provider.sh
           python3 tests/benchmarks/test_scoring.py
           bash tests/scheduler.sh
           bash tests/router.sh

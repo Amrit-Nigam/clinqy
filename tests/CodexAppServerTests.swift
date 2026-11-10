@@ -67,6 +67,12 @@ import Foundation
         let blocked = session("stop-reading", timeout: 10)
         let huge = Data(repeating: 42, count: 2 * 1024 * 1024).base64EncodedString()
         let blockedTask = Task { try await blocked.send("Large image", image: huge) }
+        // Wait until the fixture process is really running (it logs its pid at startup) and has had time to block.
+        // Slow CI runners can take well over 300 ms to start python; cancelling earlier tests nothing.
+        let startDeadline = Date().addingTimeInterval(15)
+        while Date() < startDeadline, ((try? records("stop-reading"))?.contains { $0["pid"] != nil } ?? false) == false {
+            try await Task.sleep(for: .milliseconds(50))
+        }
         try await Task.sleep(for: .milliseconds(300))
         let beforeCancel = Date()
         blockedTask.cancel()
