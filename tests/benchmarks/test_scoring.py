@@ -23,6 +23,33 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(summary(rows)['p95_seconds'], 3)
 
 
+class RecorderMergeTests(unittest.TestCase):
+    def test_duplicate_zero_state_page_does_not_reset_progress(self):
+        from run import merged_state
+        base = {'project': '', 'submitted': 0, 'popup_opened': 0, 'popup_confirmed': 0, 'wrong': 0}
+        original = dict(base, popup_opened=1, popup_confirmed=1)
+        duplicate = dict(base)  # the start URL reopened later: a fresh page reports zero state
+        merged = merged_state({'a': original, 'b': duplicate})
+        self.assertEqual((merged['popup_opened'], merged['popup_confirmed'], merged['submitted']), (1, 1, 0))
+        self.assertTrue(score({'popup_opened': 1, 'popup_confirmed': 1, 'submitted': 0}, merged, True)['verified_completion'])
+    def test_same_page_latest_report_wins(self):
+        from run import merged_state
+        self.assertEqual(merged_state({'': {'project': 'Release draft', 'saved': 1, 'wrong': 0}})['project'], 'Release draft')
+        self.assertEqual(merged_state({'a': {'project': 'x', 'wrong': 0}})['project'], 'x')
+        self.assertIsNone(merged_state({}))
+    def test_repeat_on_a_second_page_still_counts_as_duplicate(self):
+        from run import merged_state
+        merged = merged_state({'a': {'submitted': 1, 'wrong': 0}, 'b': {'submitted': 1, 'wrong': 0}})
+        result = score({'submitted': 1}, merged, True)
+        self.assertEqual(result['duplicate_effects'], 1)
+        self.assertTrue(result['false_success'])
+    def test_wrong_actions_on_any_page_count(self):
+        from run import merged_state
+        merged = merged_state({'a': {'saved': 1, 'wrong': 0}, 'b': {'saved': 0, 'wrong': 1}})
+        self.assertEqual(merged['wrong'], 1)
+        self.assertFalse(score({'saved': 1}, merged, True)['verified_completion'])
+
+
 class ReceiptCountTests(unittest.TestCase):
     def test_counts_from_receipt(self):
         from run import receipt_counts

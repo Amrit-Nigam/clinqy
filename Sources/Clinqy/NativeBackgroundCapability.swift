@@ -43,7 +43,7 @@ enum NativeBackgroundCapability {
         if let keys = action["keys"] as? String { facts.chordValid = AXEngine.chordProblem(keys) == nil }
         if let id = action["id"] as? String, let element = AXEngine.lookup(id, in: elements),
            element.observationID == window.id, element.windowID == window.windowID,
-           window.frame.contains(element.center), window.containsElement(element.element) {
+           NativeAim.point(element: element.frame, window: window.frame) != nil, window.containsElement(element.element) {
             facts.elementInWindow = true
             facts.elementEnabled = element.enabled != false
             facts.elementSecure = Safety.isSecureField(element.element)

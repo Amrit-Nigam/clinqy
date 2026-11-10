@@ -367,6 +367,7 @@ struct DashboardContentView: View {
 
     private let pages = ["Overview", "Usage", "AI & Model", "Background", "Shortcuts"]
     @AppStorage("backgroundMode") private var backgroundMode = false
+    @AppStorage("notificationsEnabled") private var notificationsEnabled = true
     @AppStorage("backgroundWebMode") private var backgroundWebMode = "extension"
     private let surface = Brand.text.opacity(0.035)
     private let text = Brand.text
@@ -427,6 +428,16 @@ struct DashboardContentView: View {
                         Text("Work in the background").font(.system(size: 15, weight: .semibold))
                         Text("Web tasks run in Clinqy’s own browser tabs while you keep browsing. File and supported service tasks run directly; native app work asks before switching to foreground. "
                              + "Either way, a request can choose: say or type “in the background” or “not in the background”.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
+                    }
+                }
+                .toggleStyle(.switch)
+            }
+            card {
+                Toggle(isOn: $notificationsEnabled) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Notifications").font(.system(size: 15, weight: .semibold))
+                        Text("Banners when a background task finishes or needs you. Off: questions stay answerable in Clinqy and Telegram.")
                             .font(.system(size: 11)).foregroundStyle(muted)
                     }
                 }

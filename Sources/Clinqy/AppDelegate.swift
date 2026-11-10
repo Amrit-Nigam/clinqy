@@ -10,6 +10,7 @@ import ServiceManagement
 final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     private var statusItem: NSStatusItem!
     private var backgroundMenuItem: NSMenuItem?
+    private var notificationsMenuItem: NSMenuItem?
     private var onboarding: OnboardingWindow?
     private var buddy: Buddy!
     private var agent: Agent!
@@ -19,7 +20,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var app: NSRunningApplication?
         var files: [URL] = []
         var selection: String?
+        /// A queued background app request (CLI/MCP/agent submit): its own receipt and provider, and work out of sight.
+        var background = false
+        var receipt: String?
+        var provider: Provider?
     }
+    /// Test-mode background app requests waiting for the main agent (kept out of the task store, like test runs).
+    private var queuedTestRequests: [(request: String, provider: Provider?, receipt: String?)] = []
     private var newRequestTarget = RequestTarget()
     private var queuedNativeTargets: [UUID: RequestTarget] = [:]
     private var panel: CommandPanel!
@@ -65,14 +72,27 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         buddy = Buddy()
         agent = Agent(buddy: buddy)
         agent.enqueueNewRequest = { [weak self] text in self?.enqueueNewRequest(text) ?? false }
-        agent.dispatchBrowserTask = { [weak self] request, test, model, provider, taskID in
+        // Native app names on this Mac decide whether a background request may become an isolated browser job.
+        BackgroundRouting.installedApp = { name in
+            Memory.installedApps.contains { $0.name.lowercased() == name || $0.spaced.lowercased() == name }
+                || NSWorkspace.shared.runningApplications.contains { $0.activationPolicy == .regular && $0.cleanName?.lowercased() == name }
+        }
+        agent.enqueueBackgroundRequest = { [weak self] request, test, provider, receipt in
+            guard let self else { return false }
+            if test { self.queuedTestRequests.append((request, provider, receipt)); return true }
+            var stripped = request
+            _ = Background.choice(&stripped)
+            guard let id = TaskStore.shared.enqueue(stripped, source: .mac, background: true) else { return false }
+            self.queuedNativeTargets[id] = RequestTarget(background: true, receipt: receipt, provider: provider)
+            return true
+        }
+        agent.dispatchBrowserTask = { [weak self] request, test, model, provider, taskID, receipt in
             guard let self else { return false }
             // Telegram dispatches its own requests to the pool and binds questions to their originating task.
             if let taskID, TaskStore.shared.record(taskID)?.source == .telegram { return false }
-            let receipt = self.agent.runReceiptID
+            // The job's receipt is its own submission's; the foreground run's receipt is never read or cleared here.
             let id = BrowserJobs.shared.submit(request, test: test, model: model, provider: provider, files: self.agent.selectedFiles,
-                taskID: taskID, browser: BrowserTaskRouting.browser(in: request) ?? self.agent.targetApp.flatMap { Launcher.isBrowser($0) ? $0.cleanName : nil }, receipt: receipt)
-            self.agent.runReceiptID = nil
+                taskID: taskID, browser: BrowserTaskRouting.browser(in: request) ?? self.agent.followUpBrowser ?? self.agent.targetApp.flatMap { Launcher.isBrowser($0) ? $0.cleanName : nil }, receipt: receipt)
             if id == nil {
                 let message = "Couldn't queue this browser task. Check Tasks & Recovery or wait for a free queue slot."
                 if let receipt { RunReceipt.write(id: receipt, ok: false, answer: message, steps: []) }
@@ -172,7 +192,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
         TaskStore.shared.onReady = { [weak self] id in
             guard let self, let item = TaskStore.shared.record(id) else { return }
-            if item.background, item.source != .telegram, BrowserTaskRouting.isBrowserTask(item.request) {
+            if item.background, item.source != .telegram, BackgroundRouting.lane(for: item.request) == .browserJob {
                 _ = BrowserJobs.shared.submit(item.request, files: item.files.map { URL(fileURLWithPath: $0) }, taskID: id, reviewed: true)
                 return
             }
@@ -294,9 +314,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         backgroundMenuItem = background
         // The Dashboard has the same switch.
         NotificationCenter.default.addObserver(forName: UserDefaults.didChangeNotification, object: nil, queue: .main) { [weak self] _ in
-            MainActor.assumeIsolated { self?.backgroundMenuItem?.state = Background.always ? .on : .off }
+            MainActor.assumeIsolated {
+                self?.backgroundMenuItem?.state = Background.always ? .on : .off
+                self?.notificationsMenuItem?.state = NotificationPolicy.enabled ? .on : .off
+            }
         }
         background.toolTip = "Web tasks use Clinqy’s own signed-in browser tabs (or optional headless Chrome). File and supported service tasks run directly; native app tasks ask for foreground access."
+        let notes = menu.addItem(withTitle: "Notifications", action: #selector(toggleNotifications(_:)), keyEquivalent: "")
+        notes.state = NotificationPolicy.enabled ? .on : .off
+        notes.toolTip = "Banners when a background task finishes or needs you. Off: questions stay answerable in Clinqy and Telegram."
+        notificationsMenuItem = notes
         menu.addItem(withTitle: "Show Background Work", action: #selector(showBackgroundWork), keyEquivalent: "")
         menu.addItem(withTitle: "Telegram…", action: #selector(setUpTelegram), keyEquivalent: "")
         let follow = menu.addItem(withTitle: "Follow My Cursor", action: #selector(toggleFollowCursor(_:)), keyEquivalent: "")
@@ -385,7 +412,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         }
         for url in urls where url.scheme == "clinqy" && url.host == "cancel" {
             if let receipt = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems?.first(where: { $0.name == "receipt" })?.value {
-                if !BrowserJobs.shared.cancelReceipt(receipt), agent.runReceiptID == receipt { agent.cancel() }
+                // Exactly the run owning this receipt: a queued/isolated job, else the foreground run if it is that run's.
+                let owned = BrowserJobs.shared.cancelReceipt(receipt)
+                if RunReceiptRouting.cancelTarget(receipt: receipt, jobOwnsReceipt: owned, foregroundReceipt: agent.runReceiptID) == .foreground { agent.cancel() }
             } else { agent.cancel() }
         }
         // Same as the Undo button on the latest reversible step (voice, scripts, tests/run.sh).
@@ -438,11 +467,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
                 if let receipt { RunReceipt.write(id: receipt, ok: false, answer: "The foreground controller is busy. Browser tasks can run independently; wait or stop the foreground task before another native task.", steps: []) }
                 continue
             }
-            agent.runReceiptID = receipt
+            // The receipt travels with this submission only (a queued job or a new foreground run); it never replaces
+            // the receipt of a foreground run that is already in progress.
             // Tests skip the review card unless they ask for it (tests/run.sh answers it through clinqy://answer).
-            agent.reviewInTests = items.first { $0.name == "review" }?.value == "1"
-            agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
-            agent.submit(dry ? "dry run: " + task : task, test: test, provider: runProvider)
+            if !agent.isRunning {
+                agent.reviewInTests = items.first { $0.name == "review" }?.value == "1"
+                agent.saveInTests = items.first { $0.name == "save" }?.value == "1"
+            }
+            agent.submit(dry ? "dry run: " + task : task, test: test, provider: runProvider, receipt: receipt)
         }
     }
 
@@ -530,6 +562,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
         var request = raw
         let explicit = Background.choice(&request)
         let background = explicit != false && (explicit == true || BrowserTaskRouting.isBrowserTask(request))
+        // A background request that is an app task ("in the background: in TextEdit, …") runs on this agent's
+        // native lane, queued behind the current run if needed; only browser tasks become isolated jobs.
+        if background, BackgroundRouting.lane(for: request) == .mainAgent {
+            if agent.isRunning {
+                guard let id = TaskStore.shared.enqueue(request, files: newRequestTarget.files, source: .mac, background: true) else { return false }
+                var target = newRequestTarget; target.background = true
+                queuedNativeTargets[id] = target
+                return true
+            }
+            agent.targetApp = nil
+            agent.selectedFiles = newRequestTarget.files
+            agent.selectedText = newRequestTarget.selection
+            agent.continuation = nil
+            agent.submit(raw, background: true)
+            return true
+        }
         if background {
             return BrowserJobs.shared.submit(raw, files: newRequestTarget.files,
                 browser: BrowserTaskRouting.browser(in: request) ?? newRequestTarget.app.flatMap { Launcher.isBrowser($0) ? $0.cleanName : nil }
@@ -550,12 +598,17 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
     private func startNextNativeRequest() {
         guard !agent.isRunning, !Recorder.shared.isRecording else { return }
+        if !queuedTestRequests.isEmpty {
+            let next = queuedTestRequests.removeFirst()
+            agent.submit(next.request, test: true, provider: next.provider, background: true, receipt: next.receipt)
+            return
+        }
         for item in TaskStore.shared.queued where !item.requiresReview && queuedNativeTargets[item.id] != nil {
             guard TaskStore.shared.start(item.id) else { continue }
             guard let target = queuedNativeTargets.removeValue(forKey: item.id) else { continue }
             agent.targetApp = target.app; agent.selectedFiles = target.files; agent.selectedText = target.selection
             agent.copied = nil; agent.annotation = nil; agent.continuation = nil
-            agent.submit(item.request, background: false, taskID: item.id)
+            agent.submit(item.request, provider: target.provider, background: target.background, taskID: item.id, receipt: target.receipt)
             return
         }
     }
@@ -1359,6 +1412,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     @objc func toggleBackground(_ item: NSMenuItem) {
         Background.always.toggle()
         item.state = Background.always ? .on : .off
+    }
+
+    @objc func toggleNotifications(_ item: NSMenuItem) {
+        NotificationPolicy.enabled.toggle()
+        item.state = NotificationPolicy.enabled ? .on : .off
     }
 
     @objc func toggleFollowCursor(_ item: NSMenuItem) {

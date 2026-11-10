@@ -148,7 +148,6 @@ private func ms(since start: Date) -> Int { Int(Date().timeIntervalSince(start) 
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         let file = dir.appendingPathComponent("probe.txt"), statePath = dir.appendingPathComponent("front.json").path
         try "hello world\n".write(to: file, atomically: true, encoding: .utf8)
-        let userFront = NSWorkspace.shared.frontmostApplication
         var fixtureProcess: Process?
         var textEdit: NSRunningApplication?
         defer {
@@ -195,7 +194,7 @@ private func ms(since start: Date) -> Int { Int(Date().timeIntervalSince(start) 
         spin(0.3)
         state = FixtureState(path: statePath)
         let fixtureFront = NSWorkspace.shared.frontmostApplication?.processIdentifier == fixture.processIdentifier
-        print("SETUP: fixture active=\(state.active) key=\(state.key) frontmost=\(fixtureFront) (user front before: \(userFront?.localizedName ?? "?"))")
+        print("SETUP: fixture active=\(state.active) key=\(state.key) frontmost=\(fixtureFront)")
         guard state.active, state.key else { print("SKIP: fixture could not become the active key window; intrusion counts would be meaningless."); return }
 
         let inputTypes: [CGEventType] = [.mouseMoved, .leftMouseDown, .keyDown, .scrollWheel]

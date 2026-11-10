@@ -208,6 +208,51 @@ enum AXEngine {
         textRange(attr(element, kAXSelectedTextRangeAttribute) as CFTypeRef?)
     }
 
+    /// Selects `range` in a text element and reads the selection back (nil = refused or didn't stick).
+    static func select(_ range: NSRange, in element: AXUIElement) -> String? {
+        var cf = CFRange(location: range.location, length: range.length)
+        guard let value = AXValueCreate(.cfRange, &cf) else { return nil }
+        let err = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value)
+        guard err == .success || err == .cannotComplete, selection(of: element) == range else { return nil }
+        return selectedText(of: element)
+    }
+
+    static func selectedText(of element: AXUIElement) -> String? { attr(element, kAXSelectedTextAttribute) }
+    static func textValue(of element: AXUIElement) -> String? { attr(element, kAXValueAttribute) }
+
+    /// The character formatting of `range` as Accessibility reports it (AXAttributedStringForRange): one span per
+    /// attribute run, with the font's real traits when the font resolves. nil = the app doesn't expose it.
+    static func formattingSpans(of element: AXUIElement, range: NSRange) -> [TextFormatting.Span]? {
+        guard range.length > 0 else { return nil }
+        var cf = CFRange(location: range.location, length: range.length)
+        guard let param = AXValueCreate(.cfRange, &cf) else { return nil }
+        var raw: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, kAXAttributedStringForRangeParameterizedAttribute as CFString, param, &raw) == .success,
+              let attributed = raw as? NSAttributedString, attributed.length > 0 else { return nil }
+        var spans: [TextFormatting.Span] = []
+        attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attrs, _, _ in
+            var span = TextFormatting.Span()
+            if let font = attrs[NSAttributedString.Key("AXFont")] as? [String: Any] {
+                span.fontName = font["AXFontName"] as? String
+                let size = (font["AXFontSize"] as? NSNumber)?.doubleValue ?? 12
+                if let name = span.fontName, let resolved = NSFont(name: name, size: size) {
+                    let traits = NSFontManager.shared.traits(of: resolved)
+                    span.boldTrait = traits.contains(.boldFontMask)
+                    span.italicTrait = traits.contains(.italicFontMask)
+                }
+            }
+            func flag(_ key: String) -> Bool {
+                let v = attrs[NSAttributedString.Key(key)]
+                if let n = v as? NSNumber { return n.intValue != 0 }
+                return v != nil
+            }
+            span.underline = flag("AXUnderline")
+            span.strikethrough = flag("AXStrikethrough")
+            spans.append(span)
+        }
+        return spans
+    }
+
     /// Short state flags worth showing the model: only what differs from the unremarkable default.
     static func stateFlags(_ e: UIElementInfo) -> String {
         var flags: [String] = []
@@ -393,10 +438,9 @@ enum AXEngine {
         }
         let joined = parts.joined(separator: " — ")
             .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\u{200E}", with: "")
-            .replacingOccurrences(of: "\u{200F}", with: "")
+        let cleaned = stripFormatControls(joined)
         // Apps call the user's own chat "You"; name it so models can match "message amrit nigam".
-        let named = joined.replacingOccurrences(of: #"with You\b"#, with: "with \(userName) (You)", options: .regularExpression)
+        let named = cleaned.replacingOccurrences(of: #"with You\b"#, with: "with \(userName) (You)", options: .regularExpression)
         return String(named.prefix(140))
     }
 
@@ -766,7 +810,7 @@ enum AXEngine {
         for list in (attr(root, kAXChildrenAttribute) as [AXUIElement]?) ?? [] {
             for item in (attr(list, kAXChildrenAttribute) as [AXUIElement]?) ?? [] {
                 guard let title: String = attr(item, kAXTitleAttribute),
-                      title.replacingOccurrences(of: "\u{200E}", with: "").lowercased() == wanted,
+                      stripFormatControls(title).lowercased() == stripFormatControls(wanted),
                       let f = frame(of: item) else { continue }
                 return (item, f)
             }
@@ -1104,12 +1148,53 @@ extension AXEngine {
         return (false, enabled() ? "“\(title)” wouldn't press" : "“\(title)” is greyed out", false)
     }
 
+    /// The app's own menu item that applies `style` (Format ▸ Font ▸ Bold), found without opening any menu.
+    /// Nil when absent or ambiguous: nothing is pressed on a guess.
+    static func formattingMenuItem(_ style: TextFormatting.Style, in app: NSRunningApplication) -> AXUIElement? {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.5)
+        guard let bar: AXUIElement = attr(root, kAXMenuBarAttribute) else { return nil }
+        var queue: [(AXUIElement, [String], Int)] = [(bar, [], 0)], head = 0
+        var items: [AXUIElement] = [], candidates: [TextFormatting.MenuCandidate] = []
+        let deadline = Date().addingTimeInterval(1.0)
+        while head < queue.count, head < 800, Date() < deadline, !Task.isCancelled {
+            let (element, ancestors, depth) = queue[head]; head += 1
+            let values = attrs(element, [kAXRoleAttribute, kAXTitleAttribute, kAXEnabledAttribute])
+            let role = values[0] as? String ?? "", title = values[1] as? String ?? ""
+            if role == "AXMenuItem", !title.isEmpty {
+                items.append(element)
+                candidates.append(.init(title: title, ancestors: ancestors, enabled: values[2] as? Bool != false))
+            }
+            let path = ["AXMenuBarItem", "AXMenuItem"].contains(role) && !title.isEmpty ? ancestors + [title] : ancestors
+            if depth < 8 { queue.append(contentsOf: children(of: element, role: "", cap: 100).map { ($0, path, depth + 1) }) }
+        }
+        guard head == queue.count, let index = TextFormatting.menuChoice(candidates, for: style) else { return nil }
+        return items[index]
+    }
+
+    /// The document text area of `window` (the AXTextArea in its AXScrollArea), whatever covers the window and
+    /// however far the document is scrolled: Accessibility doesn't depend on visibility.
+    static func documentTextArea(in window: AXUIElement) -> AXUIElement? {
+        AXUIElementSetMessagingTimeout(window, 0.5)
+        return TextFormatting.documentTextArea(in: window, role: { (attr($0, kAXRoleAttribute) as String?) ?? "" },
+                                               children: { (attr($0, kAXChildrenAttribute) as [AXUIElement]?) ?? [] })
+    }
+
     /// Menu title reduced for matching: no case, accents, ellipsis or stray spaces.
     private static func menuKey(_ s: String) -> String {
-        s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        stripFormatControls(s).folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
             .replacingOccurrences(of: "…", with: "").replacingOccurrences(of: "...", with: "")
-            .replacingOccurrences(of: "\u{200E}", with: "")
             .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// Bidi / format controls apps wrap names in (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069, U+FEFF), removed.
+    /// Same set as `AXText` (kept here so AXEngine compiles on its own in the unit scripts).
+    static func stripFormatControls(_ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        out.append(contentsOf: s.unicodeScalars.lazy.filter {
+            switch $0.value { case 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069, 0xFEFF: return false; default: return true }
+        })
+        return String(out)
     }
 }
 
@@ -1212,6 +1297,9 @@ extension AXEngine {
     nonisolated(unsafe) private static var minimizedWindows: [pid_t: AXUIElement] = [:]
 
     static func attribute<T>(_ element: AXUIElement, _ name: String) -> T? { attr(element, name) }
+
+    /// The element's on-screen frame (AX coordinates: top-left origin).
+    static func elementFrame(_ element: AXUIElement) -> CGRect? { frame(of: element) }
 
     /// The app's windows, as Accessibility lists them.
     static func windows(of app: NSRunningApplication) -> [AXUIElement] {

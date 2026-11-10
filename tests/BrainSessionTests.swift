@@ -74,6 +74,18 @@ import Foundation
             blocked.close()
             try? FileManager.default.removeItem(at: pidFile)
         }
+        // Reply parsing: stray tool-call markup around the JSON is ignored; a self-correction after a bare finish wins.
+        checks += await MainActor.run { () -> Int in
+            let junk = Brain.json(from: "\n<invoke name=\"x\">\n</invoke>\n{\"say\":\"Filling\",\"actions\":[{\"do\":\"type\",\"id\":\"w8\",\"text\":\"A\"}],\"done\":false}")
+            precondition((junk?["actions"] as? [[String: Any]])?.first?["do"] as? String == "type", "junk invoke before JSON")
+            let twice = Brain.json(from: "<invoke name=\"x\">\n</invoke>\n{\"do\":\"key\",\"keys\":\"tab\"}\n\n<invoke name=\"x\">\n</invoke>\n{\"say\":\"Tab\",\"actions\":[{\"do\":\"key\",\"keys\":\"tab\"}],\"done\":false}")
+            precondition((twice?["actions"] as? [[String: Any]])?.count == 1, "first acting object kept once")
+            let corrected = Brain.json(from: "{\"say\":\"Short\",\"actions\":[],\"done\":true}\n\nWait — I must report precisely.\n\n{\"say\":\"Precise answer\",\"actions\":[],\"done\":true}")
+            precondition(corrected?["say"] as? String == "Precise answer", "self-correction after a bare finish")
+            precondition(Brain.json(from: "<invoke name=\"x\">\n</invoke>") == nil, "placeholder invoke is not an action")
+            precondition((Brain.json(from: "<invoke name=\"look\">\n</invoke>")?["actions"] as? [[String: Any]])?.first?["do"] as? String == "look", "real tool-call tag still read")
+            return 5
+        }
         print("Brain stream protocol: \(checks) checks passed")
     }
 }

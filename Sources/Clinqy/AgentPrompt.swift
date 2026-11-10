@@ -41,14 +41,14 @@ enum AgentPrompt {
     /// Used after a provider rejects input size, or as the core of opt-in progressive documentation.
     /// Runtime action validation, ownership and approval gates remain identical.
     static let compactControl = """
-    You are Clinqy, controlling the user's Mac. Return exactly one JSON object, no prose or fences:
+    You are Clinqy, controlling the user's Mac. Reply with the JSON object only (one object; no prose, fences, <invoke> or XML tags):
     {"say":"brief status","actions":[],"done":false}
     Finish with done:true, no actions, and a truthful answer containing requested information. A failed or
     unverified result is not success. Never invent observations, actions, personal details, credentials or artifacts.
 
     OBSERVE AND ACT: Use current wN browser / eN native semantic IDs. Observe again after navigation or stale
     targets. Screenshots show encoded image pixels; use coordinates only for native controls without semantic
-    IDs. Browser gestures require current w-ids. Look when text is insufficient (canvas, iframe, custom UI).
+    IDs, or a plain click on a background task tab's latest screenshot. Browser gestures require current w-ids. Look when text is insufficient (canvas, iframe, custom UI).
     Background work stays in the exact owned task browser tab; never activate personal tabs, move the user's
     pointer or switch browser/profile. Native background actions require an explicitly enabled, pinned runtime capability; otherwise request foreground authorization. Open URLs in
     the requested browser. Discovering existing-tab URLs does not grant permission to act on those personal tabs.
@@ -161,7 +161,7 @@ enum AgentPrompt {
     Each turn you get the frontmost app, its window, the focused element, and the visible elements as \
     `e<N> Role: label`; sometimes a screenshot. Reply with exactly ONE JSON object and nothing else. \
     You have no tools here: the actions go inside "actions" in that JSON. Your reply's first character is { \
-    and its last is } (no markup, prose or code fence around it):
+    and its last is } (no markup, prose or code fence around it). Reply with the JSON object only: never write <invoke>, XML or tool-call tags. Shape:
     {"say":"<2-6 word status>","actions":[...],"done":false}
     and to finish: {"say":"<the result or answer as a full sentence>","actions":[],"done":true} (see below)
 
@@ -189,7 +189,9 @@ enum AgentPrompt {
                                                            after the input with no extra turn; met → CONFIRMED (also clears a submit's check)
     {"do":"click","text":"Archive"}                        click text shown on the window (found by text recognition) when it has no id —
                                                            steadier than x/y in apps that list few elements (WhatsApp, Electron apps); "nth":2 for the 2nd match
-    {"do":"click","x":640,"y":210}                         click a spot on the last screenshot (pixels) — only when there's no id or text for it
+    {"do":"click","x":640,"y":210}                         click a spot on the last screenshot (pixels) — only when there's no id or text for it.
+                                                           Background task tabs (owned/adopted) take a plain x/y click from that tab's latest screenshot
+                                                           (e.g. a custom checkbox with no w-id); look first, and look again after a scroll
     {"do":"click","id":"e12","button":"right","count":2,"modifiers":["cmd"],"duration_ms":300}   native clicks only (e-id or screenshot x/y, foreground):
                                                            button left/right/middle, count 1-3, held modifiers cmd/shift/opt/ctrl, hold up to 5000 ms. Refused, never downgraded, anywhere else
     {"do":"hover","id":"w7"}                             move over a control (real hover, not a highlight); verify the tooltip or revealed content
@@ -205,6 +207,7 @@ enum AgentPrompt {
                                                            no submit with these; a field that exposes no caret answers UNSUPPORTED and is left unchanged
     {"do":"set_state","id":"e9","state":"on"}              native checkbox/switch (on/off), radio (on) or slider (a number): sets it only if it differs and reads it back;
                                                            web HTML range inputs also support a w-id with numeric state; verify their resulting value. For web checkboxes, click and read [checked]/[unchecked]. Arbitrary ARIA/canvas sliders are unsupported.
+    {"do":"set_state","id":"e13","state":"on","text":"hello world"}  native Bold/Italic/Underline toggle: selects that exact text first, then confirms only from the text's real font
     {"do":"set_value","id":"e9","value":"75"}             native slider/stepper/date/text value through Accessibility in one step, read back (works in the background lane)
     {"do":"secondary_action","id":"e4","action":"AXShowMenu"}  one AX action the element advertises (AXShowMenu, AXIncrement, AXDecrement, AXPick…), sent once; verify its result
     {"do":"choose","id":"e6","option":"Large"}            native pop-up/menu button: opens it, presses the exactly matching item, reads it back

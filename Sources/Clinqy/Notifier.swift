@@ -25,6 +25,7 @@ enum Notifier {
     /// notification can show the work, bring its window over, or open the first link. Several stack as one group.
     /// `needsLook`: a consequential item finished unconfirmed (not ok, but not a failure either).
     static func finished(request: String, answer: String, ok: Bool, result: ResultCard? = nil, needsLook: Bool = false) {
+        guard NotificationPolicy.enabled else { return }
         let content = UNMutableNotificationContent()
         content.title = finishedTitle(ok: ok, answer: answer, needsLook: needsLook)
         content.subtitle = String(request.prefix(80))
@@ -64,6 +65,8 @@ enum Notifier {
     /// that one only opens Clinqy. `run` is nil for the main agent; a browser job passes its task ID so the answer goes
     /// back to it. `note` says what happens with no answer ("No answer in 10 min → I'll skip this step").
     static func ask(_ text: String, options: [String], sensitive: Bool, run: UUID? = nil, note: String? = nil, title: String? = nil) {
+        // Notifications off: no banner. The question stays answerable in Clinqy's panel/bar/badge and Telegram.
+        guard NotificationPolicy.enabled else { return }
         let content = UNMutableNotificationContent()
         content.title = "Clinqy needs you"
         if let title, !title.isEmpty { content.subtitle = String(title.prefix(80)) }

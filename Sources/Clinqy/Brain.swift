@@ -654,20 +654,28 @@ enum Brain {
         func envelope(_ obj: [String: Any]) -> [String: Any] {
             obj["do"] != nil && obj["actions"] == nil ? ["say": "", "actions": [obj], "done": false] : obj
         }
-        if let start = reply.firstIndex(of: "{"), let end = reply.lastIndex(of: "}"), start < end,
-           let obj = try? JSONSerialization.jsonObject(with: Data(reply[start...end].utf8)) as? [String: Any] {
+        // Stray tool-call markup around the JSON (`<invoke name="x">\n</invoke>` before the object) is noise, never an action.
+        let text = withoutToolTags(reply)
+        if let start = text.firstIndex(of: "{"), let end = text.lastIndex(of: "}"), start < end,
+           let obj = try? JSONSerialization.jsonObject(with: Data(text[start...end].utf8)) as? [String: Any] {
             return envelope(obj)
         }
-        // Two objects (a reply, then another go at it), or braces in the prose around one: the first whole object
-        // that reads as a reply, the one early start already took its first step from.
-        var i = reply.startIndex
-        while let open = reply[i...].firstIndex(of: "{") {
-            guard let end = objectEnd(in: reply, from: open) else { i = reply.index(after: open); continue }
-            if let obj = try? JSONSerialization.jsonObject(with: Data(reply[open...end].utf8)) as? [String: Any],
+        // Two objects (a reply, then another go at it), or braces in the prose around one. The first whole object that
+        // reads as a reply when it carries actions (early start may already have taken its first step); when the first
+        // only finishes or narrates ("…done:true} Wait — I must report precisely. {…}"), the model's last word on it.
+        var replies: [[String: Any]] = []
+        var i = text.startIndex
+        while let open = text[i...].firstIndex(of: "{") {
+            guard let end = objectEnd(in: text, from: open) else { i = text.index(after: open); continue }
+            if let obj = try? JSONSerialization.jsonObject(with: Data(text[open...end].utf8)) as? [String: Any],
                obj["say"] != nil || obj["actions"] != nil || obj["do"] != nil {
-                return envelope(obj)
+                replies.append(obj)
             }
-            i = reply.index(after: end)
+            i = text.index(after: end)
+        }
+        if let first = replies.first {
+            let acts = first["do"] != nil || !((first["actions"] as? [Any]) ?? []).isEmpty
+            return envelope(acts ? first : replies.last!)
         }
         // Sometimes the model writes tool-call tags instead (`<invoke name="scroll"><parameter name="dir">up</parameter>…`):
         // read every one, with its parameters, as an action.
@@ -734,6 +742,14 @@ enum Brain {
         return found
     }
 
+    /// The reply with tool-call/XML tags removed (and any empty `<invoke …></invoke>` blocks), for finding its JSON.
+    static func withoutToolTags(_ reply: String) -> String {
+        guard reply.contains("<") else { return reply }
+        return reply
+            .replacingOccurrences(of: #"<invoke\b[^>]*>\s*</invoke>"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"</?(?:invoke|parameter|function_calls|tool_call|tool_use|antml:[a-z_]+)\b[^>]*>"#, with: "", options: .regularExpression)
+    }
+
     static func invokes(in reply: String) -> [String: Any]? {
         guard let block = try? NSRegularExpression(pattern: #"<invoke name="([A-Za-z_]+)"\s*/?>(.*?)(?:</invoke>|(?=<invoke )|$)"#,
                                                    options: [.dotMatchesLineSeparators]),
@@ -745,6 +761,8 @@ enum Brain {
         for m in block.matches(in: reply, range: NSRange(location: 0, length: ns.length)) {
             let name = ns.substring(with: m.range(at: 1))
             let body = m.range(at: 2).location == NSNotFound ? "" : ns.substring(with: m.range(at: 2))
+            // `<invoke name="x">` placeholders are junk, not an action to spend a turn on.
+            if name.count < 2 { continue }
             var action: [String: Any] = ["do": name]
             let bns = body as NSString
             for p in param.matches(in: body, range: NSRange(location: 0, length: bns.length)) {

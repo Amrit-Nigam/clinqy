@@ -19,9 +19,11 @@ const token = new URLSearchParams(location.search).get('token');
 const state = {name:'',message:'',checked:false,city:'Choose',range_value:25,range_changes:0,hint:false,context:0,details:0,dragged:false,report:false,saved:0,submitted:0,wrong:0,embedded:'',shadow:'',visual:'',attachment:'',navigated:false};
 const $ = id => document.getElementById(id);
 let reporting=Promise.resolve();
+// Each page load reports as its own instance, so a reopened duplicate page never resets an earlier page's state.
+const pageInstance=Math.random().toString(36).slice(2,12);
 function record() {
   $('status').textContent = 'Current result: ' + JSON.stringify(state);
-  const body=JSON.stringify(state);
+  const body=JSON.stringify({...state,page_instance:pageInstance});
   reporting=reporting.then(()=>fetch('/record/' + token, {method:'POST',headers:{'Content-Type':'application/json'},body})).catch(()=>{});
 }
 for (const id of ['name','message','visual']) $(id).oninput = () => { state[id] = $(id).value; record(); };

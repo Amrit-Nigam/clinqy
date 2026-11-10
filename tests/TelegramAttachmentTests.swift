@@ -54,6 +54,11 @@ struct Workflow { var name: String }
     }
     func cancel() { complete("Stopped", ok: false) }
     func telegramScreenshot() async -> Data? { captures += 1; return screenshot }
+    /// The view captured as the run finished (before its task tab was released); nil = none taken.
+    var finalShot: Data?
+    var finalReads = 0
+    var hangFinal = false
+    func finalScreenshot(for taskID: UUID?) async -> Data? { finalReads += 1; if hangFinal { try? await Task.sleep(nanoseconds: 60_000_000_000) }; return taskID == taskRecordID ? finalShot : nil }
     func revealTelegramTarget() async { reveals += 1 }
     static func writeLog(_ text: String) {}
 }
@@ -160,9 +165,9 @@ final class TelegramAPI: URLProtocol {
         defer { try? FileManager.default.removeItem(at: root) }
         let config = URLSessionConfiguration.ephemeral; config.protocolClasses = [TelegramAPI.self]
         let session = URLSession(configuration: config); defer { session.invalidateAndCancel() }
-        func bridge() -> (Telegram, Agent, TaskStore) {
+        func bridge(captureTimeout: Double = 8) -> (Telegram, Agent, TaskStore) {
             let store = TaskStore(file: root.appendingPathComponent(UUID().uuidString + ".json"))
-            let bot = Telegram(session: session, downloadDirectory: root, store: store, cardInterval: 0.05, tickInterval: 3600)
+            let bot = Telegram(session: session, downloadDirectory: root, store: store, cardInterval: 0.05, tickInterval: 3600, captureTimeout: captureTimeout)
             let worker = Agent(); worker.store = store; bot.agent = worker
             worker.onFinish = { [weak bot, weak worker] text, ok in if let worker { bot?.finished(answer: text, ok: ok, result: nil, from: worker) } }
             return (bot, worker, store)
@@ -173,10 +178,12 @@ final class TelegramAPI: URLProtocol {
         func doc(_ id: String, name: String = "report.pdf", size: Int = 4) -> [String: Any] { ["document": ["file_id": id, "file_name": name, "file_size": size]] }
         func tap(_ bot: Telegram, _ data: String, chat: Int = 42) { bot.handleTap(["id": UUID().uuidString, "message": message(extra: ["message_id": 1], chat: chat), "data": data]) }
         func wait(_ check: () -> Bool) async throws {
-            for _ in 0..<600 { if check() { return }; try await Task.sleep(for: .milliseconds(10)) }
+            let deadline = ContinuousClock.now + .seconds(20)
+            while ContinuousClock.now < deadline { if check() { return }; try await Task.sleep(for: .milliseconds(10)) }
+            if check() { return }
             fatalError("Timed out waiting for Telegram")
         }
-        func settle() async throws { try await Task.sleep(for: .milliseconds(100)) }
+        func settle() async throws { try await Task.sleep(for: .milliseconds(250)) }
         func check(_ test: @autoclosure () -> Bool, _ label: String) { precondition(test(), label); print("PASS \(label)") }
 
         // The user's exact failure: trailing normal mode must override every global background setting.
@@ -185,6 +192,26 @@ final class TelegramAPI: URLProtocol {
         }
         for text in ["in the background: open https://example.com", "read the file in background mode"] { var value = text; check(ExecutionMode.choice(&value) == true, "explicit Background routing") }
         for text in ["change the background color", "blur the people in the background", "type \"use normal mode\"", "calculate the normal mode of a distribution"] { var value = text; check(ExecutionMode.choice(&value) == nil, "task content is not execution mode: \(text)") }
+        check(!Telegram.isBrowserJob("msg mom hi on whatsapp"), "Telegram msg on whatsapp takes the native path")
+        check(!Telegram.isBrowserJob("in WhatsApp, send mom the youtube link"), "Telegram WhatsApp target is never a browser job")
+        check(Telegram.isBrowserJob("in the background: open https://example.com in chrome"), "Telegram browser task is a browser job")
+        // Live report C2: a negative foreground constraint must not select foreground, and the leading prefix wins.
+        do {
+            var value = "in the background: In TextEdit, type hello world and make it bold. Never switch to foreground mode."
+            check(ExecutionMode.choice(&value) == true, "negative foreground keeps explicit background")
+            check(value == "In TextEdit, type hello world and make it bold.", "constraint removed whole, request readable: \(value)")
+        }
+        for text in ["open Notes, never switch to foreground mode", "don't use foreground, open Notes", "open Notes without foreground", "open Notes and do not run it in the foreground"] {
+            var value = text; check(ExecutionMode.choice(&value) == true, "negative foreground is not foreground: \(text)")
+            check(value == "open Notes", "negative foreground removed cleanly: \(text) -> \(value)")
+        }
+        for text in ["in the background: open Notes and keep it in the foreground", "in the background: open Notes, not in the background"] {
+            var value = text; check(ExecutionMode.choice(&value) == true, "leading background prefix wins: \(text)")
+        }
+        for text in ["open Notes, don't run in the background", "don't run it in the background: open Notes"] {
+            var value = text; check(ExecutionMode.choice(&value) == false, "negative background still selects foreground: \(text)")
+        }
+        do { var value = "type \"never use foreground\" into Notes"; check(ExecutionMode.choice(&value) == nil, "quoted negative foreground is text") }
 
         let (mode, modeWorker, _) = bridge()
         mode.handle(message("open Calculator")); try await wait { modeWorker.submitted.count == 1 }
@@ -483,6 +510,26 @@ final class TelegramAPI: URLProtocol {
         outputs.handle(message("send it on WhatsApp to my own chat"))
         try await wait { outputWorker.submitted.count == 2 }
         check(TelegramAPI.texts().count >= offerBefore && outputWorker.modes.last == true, "follow-up starts directly in the background")
+        // Short back-references continue the task the chat just finished: "Submit it", "Apply it in arc", "foreground".
+        let (followBot, followWorker, _) = bridge()
+        followBot.handle(message("foreground: fill the job form at https://jobs.example/apply/1"))
+        try await wait { followWorker.submitted.count == 1 }
+        followWorker.complete("Form filled but not submitted: the consent box is still unticked.")
+        try await settle()
+        followBot.handle(message("Submit it"))
+        try await wait { followWorker.submitted.count == 2 }
+        check(followWorker.submitted[1].hasPrefix("Submit it") && followWorker.submitted[1].contains("https://jobs.example/apply/1")
+              && followWorker.submitted[1].contains("consent box is still unticked"), "“Submit it” carries the earlier request, URL and result")
+        followWorker.complete("Stopped", ok: false)
+        try await settle()
+        followBot.handle(message("Apply it in arc"))
+        try await wait { followWorker.submitted.count == 3 }
+        check(followWorker.submitted[2].contains("https://jobs.example/apply/1") && followWorker.modes[2] == false, "“Apply it in arc” continues the job in front")
+        followWorker.complete("Done")
+        try await settle()
+        followBot.handle(message("foreground"))
+        try await wait { followWorker.submitted.count == 4 }
+        check(followWorker.submitted[3].hasPrefix("Apply it in arc") && followWorker.modes[3] == false, "a bare “foreground” re-runs the previous request in front")
         check(outputWorker.selectedFiles == [ownFile] && outputWorker.submitted.last!.contains(ownFile.path), "forwarding follow-up inherits the actual generated screenshot")
         outputWorker.complete("Forwarding test stopped", ok: false)
 
@@ -642,6 +689,91 @@ final class TelegramAPI: URLProtocol {
         check(TelegramAPI.texts().count == beforeScoped, "TELEGRAM_RUNS=telegram keeps Mac runs out of the chat")
         Config.overrides = [:]
         scopedAgent.complete()
+        // Round 5 E6: a short "submit it" after a background Chrome browser job is itself a Chrome browser job.
+        check(Telegram.isBrowserJob("submit it", continuing: "In Google Chrome, open http://127.0.0.1:5000/form and fill Name but don't submit."), "follow-up inherits the browser-job lane")
+        check(!Telegram.isBrowserJob("submit it", continuing: "In TextEdit, type hello world"), "follow-up of a native task stays on the main agent")
+        check(!Telegram.isBrowserJob("submit it"), "without a prior task a bare follow-up is not a browser job")
+        do {
+            let (laneBot, laneDesktop, laneStore) = bridge()
+            var jobs: [(String, Agent)] = []
+            laneBot.submitBrowserTask = { [weak laneBot] request, files, id in
+                guard let laneBot else { return false }
+                let browser = Agent(); browser.store = laneStore
+                guard laneStore.start(id) else { return false }
+                jobs.append((request, browser)); laneBot.attach(browser, taskID: id)
+                browser.onFinish = { [weak laneBot, weak browser] text, ok in if let browser { laneBot?.finished(answer: text, ok: ok, result: nil, from: browser) } }
+                browser.submit(request, background: true, taskID: id); return true
+            }
+            laneBot.handle(message("In Google Chrome, open http://127.0.0.1:5000/form and fill Name with Telegram Retest but don't submit."))
+            try await wait { jobs.count == 1 }
+            jobs[0].1.complete("Filled Name; not submitted.")
+            try await settle()
+            laneBot.handle(message("submit it"))
+            try await wait { jobs.count == 2 || laneDesktop.submitted.count == 1 }
+            check(jobs.count == 2 && laneDesktop.submitted.isEmpty, "Telegram “submit it” continues in an isolated Chrome browser job, not the main agent")
+            check(jobs[1].0.hasPrefix("submit it") && jobs[1].0.contains("http://127.0.0.1:5000/form"), "the browser job carries the earlier request and page")
+            jobs[1].1.complete("Submitted.")
+            try await settle()
+        }
+
+        // Round 5 E1: the completion message carries the final view. Order: capture taken as the run finished
+        // (before tab cleanup), then a live capture, then the last card thumbnail; photo first, caption = result.
+        do {
+            let (shotBot, shotWorker, _) = bridge()
+            shotBot.handle(message("background: read https://example.com/final")); try await wait { shotWorker.submitted.count == 1 }
+            shotWorker.finalShot = Data("final-view".utf8); shotWorker.screenshot = Data("late-live".utf8)
+            let capturesBefore = shotWorker.captures, photosBefore = TelegramAPI.bodies("sendPhoto").count
+            shotWorker.complete("Read the page.")
+            try await wait { TelegramAPI.bodies("sendPhoto").count == photosBefore + 1 }
+            let photo = TelegramAPI.bodies("sendPhoto").last!
+            check(photo["_file_photo"] as? Data == Data("final-view".utf8) && (photo["caption"] as? String)?.contains("Read the page.") == true, "completion photo is the capture taken before cleanup, with the result as caption")
+            check(shotWorker.captures == capturesBefore, "no late capture of a released tab when the final view exists")
+            try await settle()
+        }
+        do {
+            let (thumbBot, thumbWorker, _) = bridge()
+            thumbBot.handle(message("background: read https://example.com/thumb")); try await wait { thumbWorker.submitted.count == 1 }
+            thumbWorker.screenshot = Data("card-thumb".utf8); thumbWorker.narration = "Reading"
+            let mediaBefore = TelegramAPI.bodies("editMessageMedia").count
+            // The card's first message may still be in flight, so the thumbnail lands as editMessageMedia or as the first sendPhoto.
+            let cardPhotosBefore = TelegramAPI.bodies("sendPhoto").count
+            _ = thumbBot.refreshCards()
+            try await wait { TelegramAPI.bodies("editMessageMedia").count == mediaBefore + 1 || TelegramAPI.bodies("sendPhoto").count == cardPhotosBefore + 1 }
+            thumbWorker.screenshot = nil   // the task tab is gone: both the final and the live capture fail
+            let photosBefore = TelegramAPI.bodies("sendPhoto").count
+            thumbWorker.complete("Read it.")
+            try await wait { TelegramAPI.bodies("sendPhoto").count == photosBefore + 1 }
+            check(TelegramAPI.bodies("sendPhoto").last?["_file_photo"] as? Data == Data("card-thumb".utf8), "failed final capture falls back to the last card thumbnail")
+            try await settle()
+        }
+        do {
+            // A hung final capture is abandoned after the (injected) timeout and the card thumbnail is used.
+            let (hangBot, hangWorker, _) = bridge(captureTimeout: 1)
+            hangBot.handle(message("background: read https://example.com/hang")); try await wait { hangWorker.submitted.count == 1 }
+            hangWorker.screenshot = Data("hang-thumb".utf8); hangWorker.narration = "Reading"
+            let mediaBefore = TelegramAPI.bodies("editMessageMedia").count, cardPhotosBefore = TelegramAPI.bodies("sendPhoto").count
+            _ = hangBot.refreshCards()
+            try await wait { TelegramAPI.bodies("editMessageMedia").count == mediaBefore + 1 || TelegramAPI.bodies("sendPhoto").count == cardPhotosBefore + 1 }
+            hangWorker.hangFinal = true; hangWorker.finalShot = Data("never".utf8); hangWorker.screenshot = nil
+            let photosBefore = TelegramAPI.bodies("sendPhoto").count
+            hangWorker.complete("Read it.")
+            try await wait { TelegramAPI.bodies("sendPhoto").count == photosBefore + 1 }
+            check(TelegramAPI.bodies("sendPhoto").last?["_file_photo"] as? Data == Data("hang-thumb".utf8), "a hung final capture times out to the card thumbnail")
+            try await settle()
+        }
+        do {
+            let (longBot, longWorker, _) = bridge()
+            longBot.handle(message("background: read https://example.com/long")); try await wait { longWorker.submitted.count == 1 }
+            longWorker.finalShot = Data("long-view".utf8)
+            let photosBefore = TelegramAPI.bodies("sendPhoto").count, textsBefore = TelegramAPI.bodies("sendMessage").count
+            let long = "Summary: " + String(repeating: "a long line of findings ", count: 90)
+            longWorker.complete(long)
+            try await wait { TelegramAPI.bodies("sendPhoto").count == photosBefore + 1 && TelegramAPI.bodies("sendMessage").count > textsBefore }
+            let photo = TelegramAPI.bodies("sendPhoto").last!, text = TelegramAPI.bodies("sendMessage").last!
+            check(photo["_file_photo"] as? Data == Data("long-view".utf8) && (photo["caption"] as? String)?.contains("a long line") == false, "a long result sends the photo first with a short caption")
+            check((text["text"] as? String)?.contains("a long line of findings") == true && text["reply_markup"] != nil, "then the full result text with the buttons")
+            try await settle()
+        }
         print("All Telegram attachment, routing, concurrency and conversation tests passed.")
     }
 }

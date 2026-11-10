@@ -22,6 +22,18 @@ enum TelegramHTML {
         }
         return out
     }
+    /// Plain-text fallback for a rendered HTML string: drops tags, decodes the entities `escape` produces.
+    static func plain(_ html: String) -> String {
+        var out = ""
+        var inTag = false
+        for character in html {
+            if inTag { if character == ">" { inTag = false }; continue }
+            if character == "<" { inTag = true; continue }
+            out.append(character)
+        }
+        return out.replacingOccurrences(of: "&lt;", with: "<").replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"").replacingOccurrences(of: "&amp;", with: "&")
+    }
     static func bold(_ text: String) -> String { "<b>" + escape(text) + "</b>" }
     static func italic(_ text: String) -> String { "<i>" + escape(text) + "</i>" }
     static func code(_ text: String) -> String { "<code>" + escape(text) + "</code>" }
@@ -94,6 +106,43 @@ enum TelegramLinks {
         guard value.count <= 2048, let url = URL(string: value), let scheme = url.scheme?.lowercased(),
               ["http", "https"].contains(scheme), url.host?.isEmpty == false else { return nil }
         return value
+    }
+    /// A URL Telegram accepts on an inline-keyboard button: http(s) with a public host (see `isPublicHost`).
+    static func button(_ text: String) -> String? {
+        guard let value = web(text), let host = URL(string: value)?.host, isPublicHost(host) else { return nil }
+        return value
+    }
+    /// Public DNS hosts only: no localhost, *.localhost, *.local, dotless names, or loopback/private/link-local IPs.
+    static func isPublicHost(_ rawHost: String) -> Bool {
+        var host = rawHost.lowercased().trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+        while host.hasSuffix(".") { host.removeLast() }
+        guard !host.isEmpty else { return false }
+        if host.contains(":") { return isPublicIPv6(host) }
+        let parts = host.split(separator: ".", omittingEmptySubsequences: false)
+        if parts.count == 4, parts.allSatisfy({ !$0.isEmpty && $0.allSatisfy(\.isNumber) }) {
+            let n = parts.compactMap { Int($0) }
+            guard n.count == 4, n.allSatisfy({ $0 <= 255 }) else { return false }
+            if n[0] == 0 || n[0] == 10 || n[0] == 127 || n[0] >= 224 { return false }
+            if n[0] == 169 && n[1] == 254 { return false }
+            if n[0] == 172 && (16...31).contains(n[1]) { return false }
+            if n[0] == 192 && n[1] == 168 { return false }
+            if n[0] == 100 && (64...127).contains(n[1]) { return false }
+            return true
+        }
+        guard host.contains("."), host != "localhost" else { return false }
+        for suffix in [".localhost", ".local", ".internal", ".lan", ".home.arpa", ".localdomain"] where host.hasSuffix(suffix) { return false }
+        return true
+    }
+    private static func isPublicIPv6(_ host: String) -> Bool {
+        let h = host.split(separator: "%").first.map(String.init) ?? host
+        if h == "::" || h == "::1" { return false }
+        if h.hasPrefix("::ffff:") { return isPublicHost(String(h.dropFirst(7))) }   // IPv4-mapped
+        guard let first = h.split(separator: ":", omittingEmptySubsequences: false).first, let word = Int(first.isEmpty ? "0" : first, radix: 16) else { return false }
+        if word & 0xfe00 == 0xfc00 { return false }   // fc00::/7 unique local
+        if word & 0xffc0 == 0xfe80 { return false }   // fe80::/10 link-local
+        if word & 0xffc0 == 0xfec0 { return false }   // site-local
+        if word & 0xff00 == 0xff00 { return false }   // multicast
+        return true
     }
     /// Distinct web links in order of appearance.
     static func extract(_ texts: [String?]) -> [String] {
@@ -203,7 +252,7 @@ enum RunCard {
 
     private static func compose(_ m: RunCardModel, maxItems: Int, actionLength: Int, outcomeLength: Int, maxParts: Int) -> String {
         var head = m.phase.emoji + " " + TelegramHTML.bold(m.phase.label)
-        if !m.phase.finished || m.elapsed > 0 { head += " · " + TelegramText.elapsed(m.elapsed) }
+        if !m.phase.finished || m.elapsed > 0 { head += " · " + TelegramHTML.escape(TelegramText.elapsed(m.elapsed)) }
         if m.step > 0 { head += " · step \(m.step)" }
         var lines = [head, TelegramHTML.bold(m.title)]
         switch m.phase {
@@ -271,7 +320,7 @@ enum RunCard {
             var first = [c("📄 Result", .result), c("📸 Screenshot", .screenshot)]
             if m.canRunAgain { first.append(c("🔁 Run again", .again)) }
             var rows = [first]
-            if let link = m.link.flatMap(TelegramLinks.web) { rows.append([.url("🔗 Open link", link)]) }
+            if let link = m.link.flatMap(TelegramLinks.button) { rows.append([.url("🔗 Open link", link)]) }
             return rows
         }
     }
@@ -331,6 +380,32 @@ struct TGButton: Equatable {
         return ["text": text, "callback_data": data ?? ""]
     }
     static func markup(_ rows: [[TGButton]]) -> [String: Any] { ["inline_keyboard": rows.map { $0.map(\.json) }] }
+}
+
+/// Keyboard repair: if Telegram rejects a send because of a button URL, resend without the URL buttons.
+enum TelegramKeyboardFallback {
+    static func shouldRetryWithoutURLButtons(status: Int?, description: String?) -> Bool {
+        guard status == nil || status == 400, let d = description?.lowercased() else { return false }
+        return d.contains("wrong http url") || d.contains("button url") || d.contains("inline keyboard") || d.contains("reply markup")
+            || d.contains("url host is empty") || d.contains("wrong url") || d.contains("button_url_invalid")
+    }
+    /// The markup without URL buttons (callback buttons kept; empty rows dropped), or nil when it has none.
+    static func strippingURLButtons(_ markup: [String: Any]) -> [String: Any]? {
+        guard let rows = markup["inline_keyboard"] as? [[[String: String]]],
+              rows.contains(where: { $0.contains { $0["url"] != nil } }) else { return nil }
+        return ["inline_keyboard": rows.map { $0.filter { $0["url"] == nil } }.filter { !$0.isEmpty }]
+    }
+}
+
+/// Card facts that must survive a missing or mismatched worker reference: the durable task record is the fallback.
+enum RunCardFacts {
+    /// The live narration when there is one, else the record's last stage line (updated every turn).
+    static func action(narration: String?, stage: String?) -> String? {
+        for text in [narration, stage] { if let t = text?.trimmingCharacters(in: .whitespacesAndNewlines), !t.isEmpty { return t } }
+        return nil
+    }
+    static func waitingOnRecord(state: String?, ended: Bool) -> Bool { !ended && state == "waiting" }
+    static func runningOnRecord(state: String?) -> Bool { state == "running" }
 }
 
 enum CardAction: String, CaseIterable {
@@ -487,6 +562,12 @@ enum TelegramRetry {
         guard unknown, idempotent.contains(method) else { return nil }
         return pow(2, Double(attempt - 1)) // 1 s, 2 s
     }
+    /// Telegram refused the markup itself (400 "can't parse entities" / "Unsupported start tag").
+    static func isParseError(_ description: String?) -> Bool {
+        guard let text = description?.lowercased() else { return false }
+        return text.contains("can't parse entities") || text.contains("unsupported start tag") || text.contains("can't find end tag")
+            || text.contains("unmatched end tag") || text.contains("unclosed")
+    }
     /// An edit that changes nothing is a success, not an error.
     static func isNotModified(_ description: String?) -> Bool { description?.lowercased().contains("message is not modified") == true }
     /// The card was deleted in the chat: the next update sends a fresh one.
@@ -531,6 +612,53 @@ enum ResultText {
         lines.append(TelegramHTML.italic("#" + shortID))
         let html = lines.joined(separator: "\n\n")
         return html.utf16.count <= limit ? html : TelegramHTML.escape(TelegramText.clip(phase.emoji + " " + phase.label + " · " + title, limit / 2))
+    }
+}
+
+/// The final view on a completion message. Order: the screenshot saved for an unconfirmed item, the capture taken
+/// as the run finished (before its task tab/window was released), a fresh capture, then the last card thumbnail.
+/// A stopped run gets no final view. Delivery: one photo with the result as its caption when it fits, else the
+/// photo followed by the full result text (which carries the buttons); text only when there is no usable image.
+enum CompletionPhoto {
+    enum Layout: Equatable { case photoWithCaption, photoThenText, textOnly }
+
+    static func usable(_ image: Data?, limit: Int) -> Data? {
+        guard let image, !image.isEmpty, image.count < limit else { return nil }
+        return image
+    }
+    /// The image to send, without any capture: nil means "try a live capture, then the card thumbnail".
+    static func preferred(saved: Data?, final: Data?, limit: Int) -> Data? {
+        usable(saved, limit: limit) ?? usable(final, limit: limit)
+    }
+    static func pick(saved: Data?, final: Data?, live: Data?, card: Data?, stopped: Bool, limit: Int) -> Data? {
+        guard !stopped else { return usable(saved, limit: limit) }
+        return preferred(saved: saved, final: final, limit: limit) ?? usable(live, limit: limit) ?? usable(card, limit: limit)
+    }
+    /// The first usable thumbnail the run ever had: the card's last uploaded image, else one still queued for upload,
+    /// else an earlier saved view. Read at send time (after the captures), not before them: a card photo can finish
+    /// uploading while the final capture is in flight.
+    static func fallback(_ candidates: [Data?], limit: Int) -> Data? {
+        for candidate in candidates { if let image = usable(candidate, limit: limit) { return image } }
+        return nil
+    }
+    /// A capture that gives up after `seconds` (nil) so a slow or hung screenshot can't hold the final result back
+    /// or starve the thumbnail fallback.
+    static func capture(timeout seconds: Double, _ operation: @escaping @Sendable () async -> Data?) async -> Data? {
+        await withCheckedContinuation { (continuation: CheckedContinuation<Data?, Never>) in
+            let gate = NSLock()
+            nonisolated(unsafe) var finished = false
+            let finish: @Sendable (Data?) -> Void = { value in
+                gate.lock(); let first = !finished; finished = true; gate.unlock()
+                if first { continuation.resume(returning: value) }
+            }
+            Task { finish(await operation()) }
+            Task { try? await Task.sleep(nanoseconds: UInt64(max(0, seconds) * 1_000_000_000)); finish(nil) }
+        }
+    }
+    /// `fullText`: the result rendered with the message limit; it fits as a caption when within the caption limit.
+    static func layout(photo: Data?, fullText: String, captionLimit: Int = RunCard.captionLimit) -> Layout {
+        guard photo != nil else { return .textOnly }
+        return fullText.utf16.count <= captionLimit ? .photoWithCaption : .photoThenText
     }
 }
 
@@ -598,5 +726,113 @@ enum MessageRoute {
             if selected.recent { return .newTask(followUp: selected.id) }
         }
         return .newTask(followUp: nil)
+    }
+}
+
+// MARK: - Back-references to the previous task
+
+/// A short message that only makes sense as a follow-up of the task the same chat just finished ("Submit it", "yes do
+/// it", "Apply it in arc", "foreground"). Such a message carries that task's request, URL and outcome as context, so a
+/// fresh run knows what "it" is; a bare mode/browser reply re-runs the previous request in that mode or browser.
+enum FollowUpRouting {
+    enum Mode: Equatable { case foreground, background, browser(String) }
+    struct Reference: Equatable {
+        /// The message is only a mode/browser switch ("foreground", "in arc", "do it in chrome"): run the earlier request again.
+        var rerun: Bool
+        var mode: Mode?
+    }
+    struct Prior: Equatable {
+        var request: String
+        var outcome: String
+        var finishedAt: Date
+        var stopped: Bool
+    }
+    static let window: TimeInterval = 30 * 60
+
+    private static let browsers: [(pattern: String, name: String)] = [
+        ("arc", "Arc"), ("google chrome", "Google Chrome"), ("chrome", "Google Chrome"), ("brave", "Brave Browser"),
+        ("safari", "Safari"), ("edge", "Microsoft Edge"), ("firefox", "Firefox"),
+    ]
+
+    static func normalized(_ text: String) -> String {
+        text.lowercased()
+            .replacingOccurrences(of: #"[’`]"#, with: "'", options: .regularExpression)
+            .replacingOccurrences(of: #"[^\p{L}\p{N}\s']"#, with: " ", options: .regularExpression)
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespaces)
+    }
+
+    /// nil = not a back-reference (a self-contained task, a URL, a long message).
+    static func reference(_ text: String) -> Reference? {
+        guard text.range(of: #"https?://|www\."#, options: [.regularExpression, .caseInsensitive]) == nil else { return nil }
+        let t = normalized(text)
+        let words = t.split(separator: " ")
+        guard !t.isEmpty, words.count <= 8, t.count <= 70 else { return nil }
+        var mode: Mode?
+        let browserAlternation = browsers.map(\.pattern).joined(separator: "|")
+        if let r = t.range(of: #"\b(?:in|on|with|using|use|via|open|through)\s+(?:the\s+)?(?:my\s+)?("# + browserAlternation + #")\b"#, options: .regularExpression),
+           let name = browsers.first(where: { t[r].hasSuffix(" " + $0.pattern) || t[r].hasSuffix($0.pattern) }) {
+            mode = .browser(name.name)
+        } else if t.range(of: #"\b(foreground|normal mode|in front|visibly)\b"#, options: .regularExpression) != nil {
+            mode = .foreground
+        } else if t.range(of: #"\b(?:in|as)\s+(?:the\s+)?background\b|^background(?: mode)?$"#, options: .regularExpression) != nil {
+            mode = .background
+        }
+        // Only a mode/browser, with at most a generic verb and a pronoun around it: "foreground", "in arc",
+        // "do it in chrome", "try again in the foreground", "use arc instead".
+        let filler = #"^(?:(?:please|ok|okay|yes|yeah|yep|sure|then|now|just|do|did|redo|run|rerun|try|retry|again|it|this|that|same|one|thing|instead|mode|browser|in|on|the|with|using|use|via|open|through|my|a|front|of|me|visibly|foreground|normal|background|as|"#
+            + browserAlternation.replacingOccurrences(of: "google chrome", with: "google") + #")\b\s*)+$"#
+        if mode != nil, t.range(of: filler, options: .regularExpression) != nil {
+            return Reference(rerun: true, mode: mode)
+        }
+        // A pronoun or a bare go-ahead with nothing else to say what it is.
+        let pronoun = t.range(of: #"\b(it|this|that|these|those|them|same|again|the form|the application|the job)\b"#, options: .regularExpression) != nil
+        let goAhead = t.range(of: #"^(?:(?:ok|okay|yes|yeah|yep|sure|please|now|then)\s+)*(?:go ahead|do it|proceed|continue|finish|submit|apply|send|retry|try again|carry on|complete|confirm)\b"#,
+                              options: .regularExpression) != nil
+        guard pronoun || goAhead || mode != nil, words.count <= 6 || pronoun else { return nil }
+        // Long noun phrases ("submit the expense report for March") name their own target.
+        if !pronoun, words.count > 3 { return nil }
+        return Reference(rerun: false, mode: mode)
+    }
+
+    /// The prior task a reference continues: the newest one finished/stopped within the window, else nil.
+    static func pick(_ candidates: [Prior], now: Date = Date()) -> Prior? {
+        candidates.filter { now.timeIntervalSince($0.finishedAt) >= 0 && now.timeIntervalSince($0.finishedAt) <= window }
+            .max { $0.finishedAt < $1.finishedAt }
+    }
+
+    static func firstURL(_ text: String) -> String? {
+        guard let r = text.range(of: #"https?://[^\s<>"')]+"#, options: .regularExpression) else { return nil }
+        return String(text[r]).trimmingCharacters(in: CharacterSet(charactersIn: ".,;:!?"))
+    }
+
+    /// Context for the new run: what "it" refers to.
+    static func context(for prior: Prior, now: Date = Date()) -> String {
+        let minutes = max(0, Int(now.timeIntervalSince(prior.finishedAt) / 60))
+        var lines = ["This message continues the task this chat \(prior.stopped ? "stopped" : "finished") \(minutes) min ago; \"it\"/\"this\" refers to that task.",
+                     "Earlier request: " + String(prior.request.prefix(1200))]
+        if let url = firstURL(prior.request) ?? firstURL(prior.outcome) { lines.append("Page: " + url) }
+        let outcome = prior.outcome.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !outcome.isEmpty { lines.append("Where it ended: " + String(outcome.prefix(1200))) }
+        lines.append("Pick up from that state (reopen the page if needed and check what is already filled) instead of asking what \"it\" is.")
+        return lines.joined(separator: "\n")
+    }
+
+    /// The new run's request text: a bare mode/browser switch repeats the earlier request in that browser.
+    static func request(_ text: String, reference: Reference, prior: Prior) -> String {
+        guard reference.rerun else { return text }
+        if case .browser(let name) = reference.mode { return prior.request + "\n\nDo this in " + name + "." }
+        return prior.request
+    }
+
+    /// Background flag for the new run: explicit foreground/background wins; a non-Chrome browser runs in front
+    /// (background tabs live in Clinqy's Chrome); otherwise keep the default.
+    static func background(_ reference: Reference, default value: Bool) -> Bool {
+        switch reference.mode {
+        case .foreground?: return false
+        case .background?: return true
+        case .browser(let name)?: return name == "Google Chrome" ? value : false
+        case nil: return value
+        }
     }
 }

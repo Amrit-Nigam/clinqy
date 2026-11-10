@@ -8,8 +8,39 @@ struct TelegramUITests {
     static func check(_ ok: Bool, _ what: String) {
         if ok { print("PASS \(what)") } else { failures += 1; print("FAIL: \(what)") }
     }
+    static func blocking(_ work: @escaping @Sendable () async -> Data?) -> Data? {
+        let done = DispatchSemaphore(value: 0)
+        nonisolated(unsafe) var out: Data?
+        Task { out = await work(); done.signal() }
+        done.wait()
+        return out
+    }
     static func texts(_ rows: [[TGButton]]) -> [[String]] { rows.map { $0.map(\.text) } }
     static func flat(_ rows: [[TGButton]]) -> [TGButton] { rows.flatMap { $0 } }
+
+    /// Telegram's allowed HTML: any `<` not starting one of these tags is rejected by the Bot API.
+    static func invalidHTML(_ html: String) -> String? {
+        let allowed = ["b", "strong", "i", "em", "u", "ins", "s", "strike", "del", "a", "code", "pre", "span", "tg-spoiler", "blockquote"]
+        let chars = Array(html)
+        var i = 0
+        while i < chars.count {
+            if chars[i] == "<" {
+                guard let end = chars[i...].firstIndex(of: ">") else { return "unterminated tag at \(i)" }
+                var inner = String(chars[(i + 1)..<end])
+                let closing = inner.hasPrefix("/")
+                if closing { inner.removeFirst() }
+                let name = inner.prefix { $0.isLetter || $0.isNumber || $0 == "-" }.lowercased()
+                guard allowed.contains(name) else { return "disallowed tag <\(inner)>" }
+                if name == "span", !closing, !inner.contains("class=\"tg-spoiler\"") { return "span without tg-spoiler" }
+                if name == "a", !closing, !inner.hasPrefix("a href=\"") { return "a without href" }
+                i = end + 1
+            } else { i += 1 }
+        }
+        return nil
+    }
+    static func checkHTML(_ html: String, _ what: String) {
+        if let problem = invalidHTML(html) { failures += 1; print("FAIL: \(what) — \(problem): \(html.prefix(200))") }
+    }
 
     static func main() {
         setbuf(stdout, nil)
@@ -216,6 +247,116 @@ struct TelegramUITests {
         check(decide("also send it to Bob", selected: (a, true, false, true)) == .newTask(followUp: a), "follow-up of a recent finished run carries context")
         check(decide("also send it to Bob", selected: (a, true, false, false)) == .newTask(followUp: nil), "stale runs don't leak context")
         check(decide("book a table") == .newTask(followUp: nil), "plain message starts a task")
+
+        // Every rendered HTML string must use only Telegram-allowed tags, whatever the dynamic text contains.
+        check(invalidHTML("<1m") != nil && invalidHTML("<b>x</b> &lt;1m") == nil && invalidHTML("<script>") != nil, "validator rejects stray < and accepts allowed tags")
+        check(TelegramHTML.plain(RunCard.render(RunCardModel(shortID: "x", title: "a<b & \"c\"", phase: .working))).contains("a<b & \"c\""), "plain fallback decodes entities and drops tags")
+        check(TelegramRetry.isParseError("Bad Request: can't parse entities: Unsupported start tag \"1m\" at byte offset 12"), "parse errors are recognised")
+        let nasty = ["Plain", "a < b > c & d", "\"quoted\" <b>bold</b>", "<1m", "x</i><a href=\"javascript:1\">y", "&amp; &lt;"]
+        for phase in CardPhase.allCases {
+            for elapsedSeconds in [0.0, 30, 60, 3600] {
+                for text in nasty {
+                    var card = RunCardModel(shortID: "ab12cd34", title: text, phase: phase)
+                    card.elapsed = elapsedSeconds; card.step = 3; card.action = text; card.note = text; card.outcome = text
+                    card.source = text; card.options = [text, "B"]; card.questionKey = "q1"; card.link = "https://example.com/?a=1&b=2"
+                    card.parts = [text]; card.partsSummary = text
+                    card.checklist = [.init(title: text, complete: true), .init(title: text, complete: false)]
+                    for limit in [RunCard.textLimit, RunCard.captionLimit, 120] {
+                        checkHTML(RunCard.render(card, limit: limit), "card \(phase) @\(elapsedSeconds)s limit \(limit) text \(text)")
+                    }
+                }
+            }
+        }
+        for text in nasty {
+            for sensitive in [false, true] {
+                for limit in [RunCard.textLimit, RunCard.captionLimit, 100] {
+                    checkHTML(QuestionMessage.render(shortID: "ab12cd34", title: text, text: text, sensitive: sensitive, note: text, paused: false, options: [text, "<x>"], limit: limit), "question \(text)")
+                    checkHTML(QuestionMessage.render(shortID: "ab12cd34", title: text, text: text, sensitive: sensitive, note: nil, paused: true, options: [], limit: limit), "question paused \(text)")
+                }
+            }
+            for phase in CardPhase.allCases {
+                for limit in [RunCard.textLimit, RunCard.captionLimit, 80] {
+                    checkHTML(ResultText.render(phase: phase, title: text, shortID: "ab12cd34", summary: text, links: ["https://example.com/?a=1&b=<2>", text], extra: text, limit: limit), "result \(phase) \(text)")
+                }
+            }
+        }
+
+        for host in ["localhost", "app.localhost", "mac.local", "127.0.0.1", "10.1.2.3", "172.20.0.1", "192.168.1.5", "169.254.1.1", "0.0.0.0",
+                     "[::1]", "::1", "fe80::1", "fd00::1", "intranet", "::ffff:127.0.0.1", "localhost."] {
+            check(!TelegramLinks.isPublicHost(host), "host \(host) is not public")
+        }
+        for host in ["example.com", "sub.example.co.uk", "8.8.8.8", "172.32.0.1", "[2606:4700::1111]"] {
+            check(TelegramLinks.isPublicHost(host), "host \(host) is public")
+        }
+        check(TelegramLinks.button("http://localhost:3000/x") == nil, "localhost URL gets no button")
+        check(TelegramLinks.button("https://example.com/a") == "https://example.com/a", "public URL gets a button")
+        var local = RunCardModel(shortID: "ab12cd34", title: "t", phase: .done); local.link = "http://localhost:3000/"
+        check(!flat(RunCard.keyboard(local)).contains { $0.url != nil }, "done keyboard has no URL button for localhost")
+        check(RunCard.render(local, limit: RunCard.textLimit).contains("localhost:3000"), "localhost link still shown as text")
+        local.link = "https://example.com/"
+        check(flat(RunCard.keyboard(local)).contains { $0.url != nil }, "done keyboard keeps URL button for public link")
+        check(TelegramKeyboardFallback.shouldRetryWithoutURLButtons(status: 400, description: "Bad Request: wrong HTTP URL specified"), "400 wrong URL retries")
+        check(TelegramKeyboardFallback.shouldRetryWithoutURLButtons(status: 400, description: "Bad Request: inline keyboard button URL 'x' is invalid"), "400 button URL retries")
+        check(!TelegramKeyboardFallback.shouldRetryWithoutURLButtons(status: 429, description: "wrong HTTP URL"), "429 does not retry")
+        check(!TelegramKeyboardFallback.shouldRetryWithoutURLButtons(status: 400, description: "chat not found"), "unrelated 400 does not retry")
+        let kb = TGButton.markup([[.callback("A", "a"), .url("L", "http://x.y")], [.url("L2", "http://x.y")]])
+        let stripped = TelegramKeyboardFallback.strippingURLButtons(kb)
+        check((stripped?["inline_keyboard"] as? [[[String: String]]])?.map { $0.map { $0["text"] ?? "" } } == [["A"]], "stripping keeps callbacks, drops URL buttons and empty rows")
+        check(TelegramKeyboardFallback.strippingURLButtons(TGButton.markup([[.callback("A", "a")]])) == nil, "no URL buttons means no retry markup")
+
+        check(RunCardFacts.action(narration: "", stage: "Clicking chat") == "Clicking chat", "card action falls back to the record stage")
+        check(RunCardFacts.action(narration: "Typing", stage: "old") == "Typing", "card action prefers live narration")
+        check(RunCardFacts.action(narration: nil, stage: "  ") == nil, "blank action is nil")
+        check(RunCardFacts.waitingOnRecord(state: "waiting", ended: false) && !RunCardFacts.waitingOnRecord(state: "waiting", ended: true), "record waiting flips the card to waiting")
+        check(CardPhase.from(ended: false, ok: true, stopped: false, unconfirmed: false, paused: false, takenOver: false, question: RunCardFacts.waitingOnRecord(state: "waiting", ended: false), sensitive: false, running: RunCardFacts.runningOnRecord(state: "running")) == .waiting, "waiting beats working with no worker reference")
+        check(CardPhase.from(ended: false, ok: true, stopped: false, unconfirmed: false, paused: false, takenOver: false, question: false, sensitive: false, running: RunCardFacts.runningOnRecord(state: "running")) == .working, "running record shows working without a worker")
+
+        // Back-references to the task the chat just finished.
+        check(FollowUpRouting.reference("Submit it") == .init(rerun: false, mode: nil), "“Submit it” refers back")
+        check(FollowUpRouting.reference("yes do it") == .init(rerun: false, mode: nil), "“yes do it” refers back")
+        check(FollowUpRouting.reference("do it") != nil && FollowUpRouting.reference("go ahead") != nil, "go-aheads refer back")
+        check(FollowUpRouting.reference("Apply it in arc") == .init(rerun: false, mode: .browser("Arc")), "“Apply it in arc” continues in Arc")
+        check(FollowUpRouting.reference("foreground") == .init(rerun: true, mode: .foreground), "a bare “foreground” re-runs in front")
+        check(FollowUpRouting.reference("in arc") == .init(rerun: true, mode: .browser("Arc")), "“in arc” re-runs in Arc")
+        check(FollowUpRouting.reference("do it in chrome") == .init(rerun: true, mode: .browser("Google Chrome")), "“do it in chrome” re-runs in Chrome")
+        check(FollowUpRouting.reference("Try again in the foreground") == .init(rerun: true, mode: .foreground), "retry in foreground re-runs")
+        check(FollowUpRouting.reference("book a table for two at 8") == nil, "a self-contained task is not a back-reference")
+        check(FollowUpRouting.reference("submit the expense report for March") == nil, "a named target is not a back-reference")
+        check(FollowUpRouting.reference("https://x.com/job apply it") == nil, "a new URL is a new task")
+        check(FollowUpRouting.reference("search for flights to Delhi") == nil, "words containing “arc” don't pick Arc")
+        let now = Date()
+        let older = FollowUpRouting.Prior(request: "https://saarthi.example/job/1 apply", outcome: "Form filled, not submitted", finishedAt: now.addingTimeInterval(-20 * 60), stopped: false)
+        let newer = FollowUpRouting.Prior(request: "https://jobs.example/2", outcome: "Stopped", finishedAt: now.addingTimeInterval(-5 * 60), stopped: true)
+        let stale = FollowUpRouting.Prior(request: "old", outcome: "", finishedAt: now.addingTimeInterval(-31 * 60), stopped: false)
+        check(FollowUpRouting.pick([older, newer, stale], now: now) == newer, "the newest recent task is continued")
+        check(FollowUpRouting.pick([stale], now: now) == nil, "tasks older than 30 minutes are not continued")
+        let context = FollowUpRouting.context(for: older, now: now)
+        check(context.contains("Page: https://saarthi.example/job/1") && context.contains("Form filled, not submitted") && context.contains("20 min ago"), "context carries request, URL and outcome")
+        check(FollowUpRouting.request("in arc", reference: .init(rerun: true, mode: .browser("Arc")), prior: older).hasPrefix(older.request), "a bare browser reply repeats the request")
+        check(FollowUpRouting.request("Submit it", reference: .init(rerun: false, mode: nil), prior: older) == "Submit it", "a continuation keeps the user's words")
+        check(!FollowUpRouting.background(.init(rerun: true, mode: .browser("Arc")), default: true), "Arc runs in front")
+        check(!FollowUpRouting.background(.init(rerun: true, mode: .foreground), default: true) && FollowUpRouting.background(.init(rerun: false, mode: nil), default: true), "mode follows the reply")
+
+        // Completion photo: saved → final (pre-cleanup) → live → card thumbnail; a stopped run gets none.
+        let saved = Data("saved".utf8), final = Data("final".utf8), live = Data("live".utf8), card = Data("card".utf8)
+        check(CompletionPhoto.pick(saved: saved, final: final, live: live, card: card, stopped: false, limit: 100) == saved, "saved unconfirmed screenshot first")
+        check(CompletionPhoto.pick(saved: nil, final: final, live: live, card: card, stopped: false, limit: 100) == final, "pre-cleanup capture before a late live capture")
+        check(CompletionPhoto.pick(saved: nil, final: nil, live: live, card: card, stopped: false, limit: 100) == live, "live capture next")
+        check(CompletionPhoto.pick(saved: nil, final: Data(), live: nil, card: card, stopped: false, limit: 100) == card, "failed captures fall back to the card thumbnail")
+        check(CompletionPhoto.pick(saved: nil, final: Data(repeating: 1, count: 200), live: nil, card: card, stopped: false, limit: 100) == card, "oversized capture is skipped")
+        check(CompletionPhoto.pick(saved: nil, final: final, live: live, card: card, stopped: true, limit: 100) == nil, "stopped runs get no final view")
+        check(CompletionPhoto.fallback([nil, Data(), card, live], limit: 100) == card, "fallback skips empty candidates, keeps order")
+        check(CompletionPhoto.fallback([Data(repeating: 1, count: 200), nil], limit: 100) == nil, "no usable thumbnail: none")
+        check(CompletionPhoto.pick(saved: nil, final: nil, live: nil, card: CompletionPhoto.fallback([nil, live], limit: 100), stopped: false, limit: 100) == live, "queued thumbnail used when the card has none")
+        let fast = blocking { await CompletionPhoto.capture(timeout: 1) { final } }
+        check(fast == final, "capture returns a prompt result")
+        let started = Date()
+        let slow = blocking { await CompletionPhoto.capture(timeout: 0.2) { try? await Task.sleep(nanoseconds: 3_000_000_000); return final } }
+        check(slow == nil && Date().timeIntervalSince(started) < 1.5, "a hung capture times out to nil")
+        check(CompletionPhoto.pick(saved: nil, final: slow, live: nil, card: card, stopped: false, limit: 100) == card, "timed-out capture falls back to the card thumbnail")
+        check(CompletionPhoto.layout(photo: final, fullText: "Done") == .photoWithCaption, "short result is the photo's caption")
+        check(CompletionPhoto.layout(photo: final, fullText: String(repeating: "x", count: 1100)) == .photoThenText, "long result: photo, then text")
+        check(CompletionPhoto.layout(photo: nil, fullText: "Done") == .textOnly, "no image: text only")
 
         print(failures == 0 ? "All Telegram UI tests passed." : "\(failures) Telegram UI test(s) failed.")
         if failures > 0 { exit(1) }

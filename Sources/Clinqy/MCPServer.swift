@@ -16,7 +16,9 @@ enum MCPServer {
     single-use observation and screenshot. Call clinqy_act, clinqy_wait or clinqy_verify with both tokens;
     observe again after every action. Never repeat input after a timeout; inspect and verify instead.
     Finish with clinqy_release complete=true only after verifying the final goal. complete=false stops.
-    Direct control is one controller bound to the tab or window it first observed (background input when possible, foreground otherwise); delegated browser jobs run in independent background tabs. clinqy_stats: how recent runs went.
+    Direct control is one controller bound to the tab or window it first observed (background input when possible, foreground otherwise); \
+    pass app (exact name or bundle id) and/or tab (tab id or URL substring) on the initial clinqy_observe to bind an explicit target \
+    instead of whatever is frontmost. Delegated browser jobs run in independent background tabs. clinqy_stats: how recent runs went.
     """
 
     private static func tool(_ name: String, _ title: String, _ description: String, _ props: [String: Any], required: [String] = [],
@@ -58,8 +60,12 @@ enum MCPServer {
              ["mode": ["type": "string", "enum": ["page", "read", "url"], "description": "page (default), read (full text) or url."]],
              readOnly: true),
         tool("clinqy_observe", "Observe for direct control",
-             "Start with task (the user's goal), then use session for subsequent observations. Returns semantic ids, a single-use observation token and a JPEG image when available. Binds the session to the observed browser tab or app window (acted on in the background when possible, else it must stay in front) and reserves the controller for 120 seconds. No inner model.",
-             ["task": ["type": "string"], "session": ["type": "string"], "image": ["type": "boolean", "default": true]], readOnly: true),
+             "Start with task (the user's goal), then use session for subsequent observations. Returns semantic ids, a single-use observation token and a JPEG image when available. Binds the session to the observed browser tab or app window (acted on in the background when possible, else it must stay in front) and reserves the controller for 120 seconds. No inner model. "
+             + "On the initial observe, app and/or tab name the target explicitly instead of whatever is frontmost: app is an exact app name or bundle id; tab is a browser tab id or a URL substring matching exactly one tab (without app, the user's background-browser setting is used). Exactly what is named is used; nothing else is substituted.",
+             ["task": ["type": "string"], "session": ["type": "string"], "image": ["type": "boolean", "default": true],
+              "app": ["type": "string", "description": "Initial observe only: exact app name (e.g. Google Chrome) or bundle id to bind, read without bringing it forward."],
+              "tab": ["type": ["string", "integer"], "description": "Initial observe only: browser tab id, or a URL substring matching exactly one open tab, to bind (adopted in the background through the extension)."]],
+             readOnly: true),
         tool("clinqy_act", "Perform one precise action",
              "One action through Clinqy's existing target validation and approval path. Requires a fresh single-use observation. Returns delivery/status separately; unverified input must be checked before further mutation. Observe after each call, including errors; never automatically replay a timeout.",
              ["session": ["type": "string"], "observation": ["type": "string"], "action": directActionSchema],

@@ -22,7 +22,7 @@ enum ActionContract {
         "double_click": Spec(keys: ["id", "x", "y"]),
         "drag": Spec(keys: ["id", "x", "y", "to_id", "to_x", "to_y"]),
         "type": Spec(keys: ["id", "text", "submit", "mode", "expect"]),
-        "set_state": Spec(keys: ["id", "state"]),
+        "set_state": Spec(keys: ["id", "state", "text", "target"]),
         "set_value": Spec(keys: ["id", "value"]),
         "secondary_action": Spec(keys: ["id", "action"]),
         // plan:true marks the one ask that shows the plan at the plan autonomy level; only its yes approves the plan.
@@ -234,9 +234,26 @@ enum ActionContract {
 enum SubmitReadback {
     /// `actual` nil with `unreadable` set means the field cannot be read back (a secure field): the typing itself
     /// was already refused unless the field accepted it, so the submit is not blocked for lack of a value.
-    static func allows(expected: String, actual: String?, unreadable: Bool = false) -> Bool {
-        if let actual { return actual == expected }
+    /// `tolerant`: the text went in as the field's own AX value (set_value, or type's background value-write fallback);
+    /// then a read-back differing only in whitespace (a trailing newline the app appends) still counts (TextReadback).
+    static func allows(expected: String, actual: String?, unreadable: Bool = false, tolerant: Bool = false) -> Bool {
+        if let actual { return tolerant ? TextReadback.matches(expected: expected, actual: actual) : actual == expected }
         return unreadable
+    }
+}
+
+/// Reading back a value written through Accessibility: exactly the written text, or the same text differing only in
+/// whitespace (runs collapsed, ends trimmed: a trailing newline, a non-breaking space). Shared by set_value and type's
+/// background value-write fallback, so both accept exactly the same read-backs. Empty text never matches non-empty.
+enum TextReadback {
+    static func matches(expected: String, actual: String) -> Bool {
+        if actual == expected { return true }
+        let want = normalized(expected)
+        return !want.isEmpty && normalized(actual) == want
+    }
+
+    static func normalized(_ text: String) -> String {
+        text.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).joined(separator: " ")
     }
 }
 

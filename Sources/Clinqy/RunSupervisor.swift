@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// Where a run came from. TaskStore only knows Mac vs Telegram; schedules and MCP/CLI runs are told apart here so
@@ -171,6 +172,10 @@ final class RunSupervisor {
 
     /// Called after any registry change (registration, pause state, question, finish) for that run.
     var onChange: (UUID) -> Void = { _ in }
+    /// Every registry change, from anywhere (Telegram, the Mac panel, a notification, a hand-back from the task card):
+    /// UI that shows a run's controls observes this rather than refreshing only after its own buttons.
+    let changes = PassthroughSubject<UUID, Never>()
+    static let didChange = Notification.Name("RunSupervisorDidChange")
     /// Releases a taken-over run's target to the user on the Mac (shows its tab or window). Wired by the app.
     var onReveal: (UUID) -> Void = { _ in }
     /// nil = questions never time out (QUESTION_TIMEOUT_MINUTES=0).
@@ -184,6 +189,12 @@ final class RunSupervisor {
 
     init(defaults: UserDefaults = .standard, key: String = "runSupervisor.paused") {
         self.defaults = defaults; self.key = key
+    }
+
+    private func changed(_ id: UUID) {
+        onChange(id)
+        changes.send(id)
+        NotificationCenter.default.post(name: Self.didChange, object: self, userInfo: ["run": id])
     }
 
     var active: [Entry] { entries.values.sorted { $0.startedAt < $1.startedAt } }
@@ -205,7 +216,7 @@ final class RunSupervisor {
             if let saved = persisted[id.uuidString].flatMap(RunControl.init(rawValue:)), saved.isPaused { entry.control = saved }
             entries[id] = entry
         }
-        onChange(id)
+        changed(id)
     }
 
     /// The run ended (any outcome): its pause state and any open question go with it.
@@ -216,7 +227,7 @@ final class RunSupervisor {
         let known = entries.removeValue(forKey: id) != nil
         var saved = persisted
         if saved.removeValue(forKey: id.uuidString) != nil { persisted = saved }
-        if known { onChange(id) }
+        if known { changed(id) }
     }
 
     // MARK: Pause, resume, take over, hand back
@@ -233,7 +244,7 @@ final class RunSupervisor {
         persisted = saved
         // A paused run's question keeps waiting without a default; resuming restarts its full timeout.
         if transition.state.isPaused { cancelTimer(id) } else if entry.question != nil { armTimer(id) }
-        onChange(id)
+        changed(id)
         return transition
     }
 
@@ -268,7 +279,7 @@ final class RunSupervisor {
         entries[id] = entry
         timeoutHandlers[id] = onTimeout
         if entry.control.isPaused { cancelTimer(id) } else { armTimer(id) }
-        onChange(id)
+        changed(id)
         return question
     }
 
@@ -281,7 +292,7 @@ final class RunSupervisor {
         timeoutHandlers[id] = nil
         entry.question = nil
         entries[id] = entry
-        onChange(id)
+        changed(id)
     }
 
     private func armTimer(_ id: UUID) {
@@ -295,7 +306,7 @@ final class RunSupervisor {
             self.timers[id] = nil
             let handler = self.timeoutHandlers.removeValue(forKey: id)
             handler?(question.fallback.reply)
-            self.onChange(id)
+            self.changed(id)
         }
     }
 

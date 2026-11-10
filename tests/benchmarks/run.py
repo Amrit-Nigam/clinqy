@@ -65,6 +65,29 @@ def score(expected, state, reported_success):
             'wrong_target_actions': wrong, 'duplicate_effects': duplicates}
 
 
+def merged_state(pages):
+    """One token's recorded state across every page instance that reported it.
+
+    A fixture page reports its whole state on each change, tagged with a per-load `page_instance`. A newer page for
+    the same token (a reopened duplicate of the workspace) starts at zero and must not reset what an earlier page
+    already did: counters are summed across instances (so a real repeat on a second page still counts as a duplicate
+    effect) and the other fields come from the most advanced instance (the later one on a tie). Reports without an
+    instance id behave as one page whose latest report wins.
+    """
+    if not pages: return None
+    def advancement(state):
+        counters = sum(state.get(key, 0) for key in COUNTERS + ('wrong',) if type(state.get(key)) is int)
+        fields = sum(1 for key, value in state.items() if key not in COUNTERS + ('wrong',) and value not in ('', None, False, 0))
+        return (counters, fields)
+    ordered = list(pages.values())
+    best = max(range(len(ordered)), key=lambda i: (advancement(ordered[i]), i))
+    merged = dict(ordered[best])
+    for key in COUNTERS + ('wrong',):
+        values = [state[key] for state in ordered if type(state.get(key)) is int]
+        if values: merged[key] = sum(values)
+    return merged
+
+
 def receipt_counts(result):
     """Per-task counts from an app receipt: model turns, UNVERIFIED action results and questions to the user.
     None where the receipt doesn't carry them (older app builds); never inferred from the agent's prose."""
@@ -271,7 +294,7 @@ def main():
     if args.dry_run:
         print(json.dumps([{'name': name, 'task': task_text(args.browser, '<fixture-url>', task, '<attachment>', args.foreground), 'provider': args.provider, 'expected': expected} for name, task, expected in selected], indent=2)); return 0
     if args.timeout <= 0 or not math.isfinite(args.timeout): parser.error('timeout must be positive and finite')
-    states, lock = {}, threading.Lock()
+    states, pages, lock = {}, {}, threading.Lock()
     visual_codes = {}
     fixtures = {name: Path(__file__).with_name(name).read_bytes() for name in ('site.html', 'workflow.html', 'popup.html')}
     fixture_hash = hashlib.sha256(b''.join(fixtures.values())).hexdigest()
@@ -308,7 +331,11 @@ def main():
                     if key in state and (type(state[key]) is not int or state[key] < 0): raise ValueError('counter')
                 if type(state.get('wrong')) is not int or type(state.get('submitted')) is not int: raise ValueError('required counters')
             except (ValueError, TypeError): self.send_error(400); return
-            with lock: states[token] = state
+            instance = state.pop('page_instance', '')
+            if not isinstance(instance, str) or len(instance) > 64: self.send_error(400); return
+            with lock:
+                pages.setdefault(token, {})[instance] = state
+                states[token] = merged_state(pages[token])
             self.send_response(204); self.end_headers()
 
     server = ThreadingHTTPServer(('127.0.0.1', 0), Handler)
@@ -330,6 +357,7 @@ def main():
             token = secrets.token_hex(16)
             with lock:
                 states[token] = None
+                pages[token] = {}
                 visual_codes[token] = 'TEST-' + secrets.token_hex(3).upper()
             if name == 'vision': expected = {'visual': visual_codes[token]}
             route = 'workflow' if name in {case[0] for case in WORKFLOW_CASES} else 'case'

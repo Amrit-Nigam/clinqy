@@ -1,7 +1,7 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  const HELPER_VERSION = 8;
+  const HELPER_VERSION = 10;
   const waits = new Set();
   function cancelWaits() { for (const cancel of [...waits]) cancel(); }
   if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
@@ -245,8 +245,61 @@ const SEL = [
   "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
   "[role=button]", "[role=link]", "[role=tab]", "[role=menuitem]", "[role=checkbox]", "[role=radio]",
   "[role=option]", "[role=switch]", "[role=textbox]", "[role=combobox]", "[role=searchbox]", "[role=treeitem]", "[role=listbox]",
-  "[contenteditable=''], [contenteditable=true]", "[onclick]", "[tabindex]:not([tabindex='-1'])",
+  "[contenteditable=''], [contenteditable=true]", "[onclick]", "[tabindex]:not([tabindex='-1'])", "[aria-checked]",
 ].join(",");
+
+// Styled tick boxes: the real <input type=checkbox|radio> is invisible (opacity 0, 1px, clipped, display:none) and a
+// label or wrapper draws the box. That visible proxy is listed and clicked; its state is read from the input.
+const proxyControls = new WeakMap();   // visible proxy → the hidden input it stands for
+function controlOf(el) { return (el && proxyControls.get(el)) || el; }
+function visuallyHidden(el) {
+  const cs = getComputedStyle(el), r = el.getBoundingClientRect();
+  if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) < 0.05) return true;
+  if (r.width < 3 || r.height < 3) return true;
+  if (/rect\(\s*0(px)?[\s,]+0(px)?[\s,]+0(px)?[\s,]+0(px)?\s*\)/.test(cs.clip || "") || /inset\(\s*50%\s*\)/.test(cs.clipPath || "")) return true;
+  return cs.position === "absolute" && (r.right < -500 || r.bottom < -500);
+}
+function boxShown(el) {
+  const r = el.getBoundingClientRect();
+  if (r.width < 6 || r.height < 6) return false;
+  const cs = getComputedStyle(el);
+  return cs.display !== "none" && cs.visibility !== "hidden" && Number(cs.opacity) >= 0.05;
+}
+// The visible thing a person clicks for a hidden tick box: its label (wrapping or for=), else a small wrapper.
+function tickProxy(input) {
+  for (const l of input.labels || []) if (boxShown(l)) return l;
+  for (let p = input.parentElement, k = 0; p && k < 3 && p !== document.body && p !== document.documentElement; p = p.parentElement, k++) {
+    if (!boxShown(p)) continue;
+    const r = p.getBoundingClientRect();
+    if (r.width > 900 || r.height > 160) break;           // a whole form row/section is not the control
+    if (p.querySelectorAll("input[type=checkbox], input[type=radio]").length > 1) break;
+    return p;
+  }
+  return null;
+}
+// Proxies for every hidden checkbox/radio among the candidates (refreshed each snapshot; geometry can change
+// without any DOM mutation). Returns the proxies to list and the hidden inputs they replace.
+function tickProxies(nodes) {
+  const proxies = [], replaced = new Set();
+  for (const el of nodes) {
+    if (el.tagName !== "INPUT" || !/^(checkbox|radio)$/.test(el.type) || !visuallyHidden(el)) continue;
+    const proxy = tickProxy(el);
+    if (!proxy || proxyControls.get(proxy) && proxyControls.get(proxy) !== el && proxyControls.get(proxy).isConnected) continue;
+    proxyControls.set(proxy, el);
+    proxies.push(proxy);
+    replaced.add(el);
+  }
+  return { proxies, replaced };
+}
+// Text for a tick box that has none of its own (an empty <div role=checkbox> beside its caption).
+function tickCaption(el) {
+  for (let p = el.parentElement, k = 0; p && k < 2; p = p.parentElement, k++) {
+    const t = squash(p.innerText);
+    if (t && t.length <= 160) return t;
+  }
+  const next = el.nextElementSibling;
+  return next ? squash(next.innerText).slice(0, 160) : "";
+}
 
 // Cache only the candidate set. Geometry, labels, values and checked states are read fresh on every snapshot.
 let candidateCache = null, shadowHosts = [];
@@ -276,6 +329,13 @@ function candidates() {
 // What an element is, as listed to the model (null = not worth listing). Shared by snapshot and re-finding.
 function describe(el) {
   const tag = el.tagName.toLowerCase();
+  const ctl = proxyControls.get(el);
+  if (ctl) {
+    const role = ctl.getAttribute("role") === "switch" ? "switch" : ctl.type === "radio" ? "radio" : "checkbox";
+    const text = squash(ctl.getAttribute("aria-label") || labelledBy(ctl) || el.innerText || ctl.title || tickCaption(el) || ctl.value || ctl.name || role).slice(0, 100);
+    const q = questionOf(ctl);
+    return { tag, role, text, editable: false, listbox: false, q: q && norm(q) !== norm(text) && !norm(text).includes(norm(q)) ? q : "" };
+  }
   const role = el.getAttribute("role") || (tag === "a" ? "link" : tag === "input" ? (el.type || "text") : tag);
   // Fields are named by their label, never by what's typed in them (so a name stays stable run to run).
   const isField = tag === "input" || tag === "textarea" || tag === "select";
@@ -285,6 +345,11 @@ function describe(el) {
     el.getAttribute("placeholder") || el.title || el.getAttribute("alt") || el.name || (tag === "button" || tag === "a" ? el.innerText : "") ||
     (tag === "input" && el.type === "submit" ? el.value : "") || "").slice(0, 100);
   const editable = tag === "input" || tag === "textarea" || el.isContentEditable || /textbox|combobox|searchbox/.test(role);
+  const tickable = /^(checkbox|radio|switch)$/.test(role) || el.getAttribute("aria-checked") !== null;
+  if (!text && tickable && !editable) {
+    const caption = tickCaption(el).slice(0, 100);
+    return caption ? { tag, role: /^(checkbox|radio|switch)$/.test(role) ? role : "checkbox", text: caption, editable: false, listbox: false, q: "" } : null;
+  }
   if (!text && !editable && !listbox) return null;
   // Expanded state normally belongs to the controlling combobox, not its listbox. A visible
   // listbox without that attribute (including a persistent list) still exposes selectable options.
@@ -391,7 +456,11 @@ function snapshot() {
   // Controls come before long link/list collections so a large navigation list cannot hide Cancel or Submit.
   // Bounds limit sorting work; the explicit truncation flag is carried to the agent.
   const priority = [], ordinary = [];
+  let ticks = { proxies: [], replaced: new Set() };
+  try { ticks = tickProxies(allCandidates.slice(0, 10000)); } catch {}
+  priority.push(...ticks.proxies);
   for (const el of allCandidates.slice(0, 10000)) {
+    if (ticks.replaced.has(el)) continue;
     if (/^(BUTTON|INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || /^(button|textbox|combobox|checkbox|radio|switch)$/.test(el.getAttribute("role") || "")) priority.push(el);
     else ordinary.push(el);
   }
@@ -463,14 +532,16 @@ function snapshot() {
         item.value = (chosen ? optionText(chosen) : "") || (shown && shown !== text ? shown.slice(0, 80) : "") || "(nothing chosen)";
       }
       if (d.q) item.q = d.q;
-      if (el.required || el.getAttribute("aria-required") === "true" || /\*\s*$/.test(d.q || text)) item.required = true;
+      const ctl = controlOf(el);
+      if (ctl !== el) item.proxy = true;   // a label/wrapper standing in for a hidden checkbox/radio
+      if (el.required || ctl.required || el.getAttribute("aria-required") === "true" || /\*\s*$/.test(d.q || text)) item.required = true;
       if (el.getAttribute("aria-invalid") === "true") item.invalid = true;
       if (covered) item.covered = true;
       if (tag === "a" && el.href) item.href = el.href.slice(0, 120);
-      if (el.disabled || el.getAttribute("aria-disabled") === "true") item.disabled = true;
+      if (el.disabled || ctl.disabled || el.getAttribute("aria-disabled") === "true") item.disabled = true;
       // Tick boxes, radios and switches always say which way they are, so nothing gets clicked twice "to make sure".
       const tickable = /^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(role) || el.hasAttribute("aria-checked");
-      if (el.getAttribute("aria-checked") === "true" || el.checked) item.checked = true;
+      if (el.getAttribute("aria-checked") === "true" || el.checked || (ctl !== el && (ctl.checked || ctl.getAttribute("aria-checked") === "true"))) item.checked = true;
       else if (tickable) item.unchecked = true;
       if (el.getAttribute("aria-selected") === "true") item.selected = true;
       if (act && (act === el || (d.editable && act !== document.body && within(el, act)))) item.focused = true;
@@ -739,14 +810,30 @@ function activeOption(index, want) {
 
 // Uploads require an explicit input/label/unique container, or the document's sole file input.
 function fileInputCount() { return { count: document.querySelectorAll("input[type=file]").length }; }
+// The (usually hidden) file input behind an upload button, label or drop zone: itself, its label's control, the
+// input it names (for/aria-controls), the one inside it, or the only one in its nearby wrapper.
+function fileInputNear(el) {
+  if (el.matches("input[type=file]")) return el;
+  if (el.tagName === "LABEL" && el.control && el.control.type === "file") return el.control;
+  for (const attr of ["for", "aria-controls"]) {
+    const id = el.getAttribute(attr);
+    const named = id && document.getElementById(id);
+    if (named && named.matches && named.matches("input[type=file]")) return named;
+  }
+  const inner = [...el.querySelectorAll("input[type=file]")];
+  if (inner.length === 1) return inner[0];
+  if (inner.length > 1) throw new Error("ambiguous file upload fields; choose the exact input");
+  for (let p = el.parentElement, k = 0; p && k < 4 && p !== document.body && p !== document.documentElement; p = p.parentElement, k++) {
+    const near = [...p.querySelectorAll("input[type=file]")];
+    if (near.length === 1) return near[0];
+    if (near.length > 1) break;
+  }
+  return null;
+}
 function fileInputFor(index) {
   if (index >= 0) {
-    const el = target(index);
-    if (el.matches("input[type=file]")) return el;
-    if (el.tagName === "LABEL" && el.control && el.control.type === "file") return el.control;
-    const inner = [...el.querySelectorAll("input[type=file]")];
-    if (inner.length === 1) return inner[0];
-    if (inner.length > 1) throw new Error("ambiguous file upload fields; choose the exact input");
+    const near = fileInputNear(target(index));
+    if (near) return near;
   }
   const all = [...document.querySelectorAll("input[type=file]")];
   if (!all.length) throw new Error("this page has no file upload field (it may use its own picker, e.g. Google Drive)");
@@ -764,21 +851,56 @@ function markUpload(index) {
   return { ok: true };
 }
 
+// Tags the file input an upload goes into, so the bridge can hand it to the browser (CDP DOM.setFileInputFiles).
+function markFileInput(index, name) {
+  const input = fileInputFor(index);
+  document.querySelectorAll("[data-clinqy-file]").forEach((n) => n.removeAttribute("data-clinqy-file"));
+  const token = "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  input.setAttribute("data-clinqy-file", token);
+  return { token, multiple: !!input.multiple, accept: input.accept || "", shownBefore: fileNameShown(name) };
+}
+// Is the file name visible on the page now (many sites show "resume.pdf ✓" and reset their input after reading it)?
+function fileNameShown(name) {
+  const text = (document.body && document.body.innerText) || "";
+  return !!name && text.includes(name);
+}
+// After the bridge set the files: what the input holds, and whether the page shows the name.
+async function fileReadback(token, name, size, shownBefore = false) {
+  const input = document.querySelector('[data-clinqy-file="' + token + '"]');
+  if (input) input.removeAttribute("data-clinqy-file");
+  const has = (files) => files.some((f) => f.name === name && (!(size >= 0) || f.size === size));
+  let files = input ? [...(input.files || [])] : [];
+  // A name already on the page before the upload (an earlier attempt, the user's own text) proves nothing.
+  const showing = () => !shownBefore && fileNameShown(name);
+  let held = has(files), shown = showing();
+  for (let waited = 0; name && !held && !shown && waited < 1200; waited += 150) {   // its change handler may render the name a moment later
+    await new Promise((res) => setTimeout(res, 150));
+    files = input ? [...(input.files || [])] : [];
+    held = has(files); shown = showing();
+  }
+  return { ok: held || shown, held, shown, files: files.map((f) => f.name), attached: files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+           verified: held ? "file-input-readback" : shown ? "page-shows-file-name" : "none", serverAccepted: false, accept: input ? input.accept || "" : "" };
+}
+
 // Puts a file into an upload field without the Mac file picker (bytes come from the app, base64).
-function upload(index, name, type, b64) {
+async function upload(index, name, type, b64) {
   const input = fileInputFor(index);
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const shownBefore = fileNameShown(name);
   const dt = new DataTransfer();
   if (input.multiple) for (const f of input.files || []) dt.items.add(f);
   dt.items.add(new File([bytes], name, { type: type || "application/octet-stream", lastModified: Date.now() }));
   input.files = dt.files;
+  // Read back before the page's handlers run: many read the file and then clear their input.
+  const assigned = [...(input.files || [])].some((f) => f.name === name && f.size === bytes.length);
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  const files = [...(input.files || [])];
-  return { ok: files.some(f => f.name === name && f.size === bytes.length), files:files.map(f => f.name),
-    attached:files.map(f=>({name:f.name,size:f.size,type:f.type})), verified:"file-input-readback", serverAccepted:false, accept:input.accept || "" };
+  const token = "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  input.setAttribute("data-clinqy-file", token);
+  const r = await fileReadback(token, name, bytes.length, shownBefore);
+  return { ...r, assigned, cleared: assigned && !r.held, via: "datatransfer" };
 }
 
 // Every question on the page (not just the visible part) with its current answer, for a check before submitting.
@@ -898,9 +1020,22 @@ function readText() {
     const inner = editableOf(el), a = deepActive();
     return { active: !!a && a !== document.body && (within(inner, a) || within(el, a)) && document.hasFocus() };
   }
+  // A tick control's value is its checked state ("checked"/"unchecked"), read from the hidden input for a styled
+  // label/wrapper proxy, so "verify w0 checked" has something real to compare.
+  function tickState(el) {
+    const ctl = controlOf(el);
+    const role = (ctl.getAttribute && ctl.getAttribute("role")) || (el.getAttribute && el.getAttribute("role")) || "";
+    const native = ctl.tagName === "INPUT" && /^(checkbox|radio)$/.test(ctl.type);
+    const aria = ctl.getAttribute && ctl.getAttribute("aria-checked") !== null ? ctl : el.getAttribute && el.getAttribute("aria-checked") !== null ? el : null;
+    if (!native && !aria && !/^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(role)) return null;
+    const on = native ? !!ctl.checked : aria ? aria.getAttribute("aria-checked") === "true" : false;
+    return on ? "checked" : "unchecked";
+  }
   function value(i) {
     let el = null; try { el = target(i); } catch {}
     if (!el) return { value: null };
+    const tick = tickState(el);
+    if (tick) return { value: tick };
     const f = editableOf(el);
     return { value: f.tagName === "SELECT" ? (f.options[f.selectedIndex] ? f.options[f.selectedIndex].text.trim() : "")
                                            : String(f.isContentEditable ? f.innerText : f.value || "").slice(0, 400) };
@@ -951,7 +1086,8 @@ function readText() {
   // The target's own state plus the URL: the only fields the app compares (no whole-page text hash or focus).
   function targetState(el) {
     const a = (n) => el && el.getAttribute(n);
-    return JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
+    const ctl = controlOf(el);
+    return JSON.stringify([el && el.checked, ctl !== el ? [ctl.checked, ctl.getAttribute("aria-checked")] : null, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
       el && el.value, location.href]);
   }
   function state(i) {
@@ -1245,5 +1381,5 @@ function readText() {
 
   window.__clinqy = { version: HELPER_VERSION, dispose: () => { candidateObserver.disconnect(); cancelWaits(); watchUser(false); }, protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, coordinateGuard, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, setRange, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, receiptArm, receiptCollect, receiptDrop, scroll, selection, waitText, waitCondition, cancelWaits, watchUser };
+    frameBoxes, snapshot, coordinateGuard, locate, alive, activityPoint, focusFor, activeOption, markUpload, markFileInput, fileReadback, click, clickOption, focus, fill, setRange, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, receiptArm, receiptCollect, receiptDrop, scroll, selection, waitText, waitCondition, cancelWaits, watchUser };
 })();

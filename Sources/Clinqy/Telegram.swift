@@ -31,12 +31,18 @@ final class Telegram {
     private static let downloadLimit = 20 * 1024 * 1024
     /// Bot API upload limits: photos 10 MB, documents 50 MB.
     private static let photoLimit = 10_000_000
+    /// Longest a completion waits for each final-view capture before using the card thumbnail.
+    nonisolated static let defaultCaptureTimeout = 8.0
+    private let captureTimeout: Double
     private static let documentLimit = 50 * 1024 * 1024
 
     private struct Request {
         var text: String
         var files: [URL]
         var context: String? = nil
+        /// The earlier request a short follow-up ("submit it") continues: it is routed (browser job or main agent)
+        /// as that task was, not on its own two words.
+        var continues: String? = nil
         var prompt: String {
             let text = text + (context.map { "\n\nPrevious Telegram task (context for this follow-up):\n" + $0 } ?? "")
             guard !files.isEmpty else { return text }
@@ -101,6 +107,8 @@ final class Telegram {
         var shortID: String { String(id.uuidString.prefix(8)).lowercased() }
     }
     private var runs: [UUID: Run] = [:]
+    /// The task has a status card here (Telegram-started or mirrored), so its completion carries a final view.
+    func hasCard(for taskID: UUID?) -> Bool { taskID.map { runs[$0] != nil } ?? false }
     private var selected: UUID?
     private var messageRuns: [Int: UUID] = [:]
     private var messageQuestions: [Int: String] = [:]
@@ -111,7 +119,8 @@ final class Telegram {
     /// `cardInterval`: minimum seconds between edits of one card. `tickInterval`: how often active cards refresh.
     init(session: URLSession = .shared, downloadDirectory: URL = FileManager.default.homeDirectoryForCurrentUser
          .appendingPathComponent("Library/Application Support/Clinqy/Telegram", isDirectory: true), store: TaskStore? = nil,
-         cardInterval: TimeInterval = 3, tickInterval: TimeInterval = 5) {
+         cardInterval: TimeInterval = 3, tickInterval: TimeInterval = 5, captureTimeout: Double = Telegram.defaultCaptureTimeout) {
+        self.captureTimeout = captureTimeout
         self.store = store ?? .shared; self.session = session; self.downloadDirectory = downloadDirectory
         self.cardInterval = cardInterval; self.tickInterval = tickInterval
     }
@@ -554,7 +563,13 @@ final class Telegram {
             + (item.requiresReview ? "\n\nNot running. Review with /run " + item.shortID + " before restarting." : "")
     }
     private func run(for worker: Agent) -> Run? {
-        runs.values.first { !$0.ended && $0.worker === worker && $0.id == worker.taskRecordID }
+        if let exact = runs.values.first(where: { !$0.ended && $0.worker === worker && $0.id == worker.taskRecordID }) { return exact }
+        // The agent that executes a native-lane / background run can be a different instance than the one the run
+        // was started with; the task id is the real identity, so adopt the executing agent instead of dropping its
+        // questions and progress.
+        guard let id = worker.taskRecordID, let run = runs[id], !run.ended else { return nil }
+        run.worker = worker
+        return run
     }
 
     // MARK: - Routing messages
@@ -633,6 +648,26 @@ final class Telegram {
                 request.context = "Task: " + earlier.request.text + "\n" + summary
                 for file in earlier.outputFiles where !request.files.contains(file) { request.files.append(file) }
             }
+            // "Submit it", "Apply it in arc", "foreground": a short back-reference continues the task this chat just
+            // finished or stopped (from the persisted store, so a restart or another selected card doesn't lose it).
+            if !forceNew, let reference = FollowUpRouting.reference(request.text) {
+                let earlierID = followUp ?? recentChatTask()?.id
+                if let earlierID, let record = store.record(earlierID), let prior = Self.prior(record, run: runs[earlierID]) {
+                    if reference.rerun {
+                        // The earlier request already carries its own context; add only where that attempt ended.
+                        request.text = FollowUpRouting.request(request.text, reference: reference, prior: prior)
+                        if request.context == nil { request.context = "The previous attempt ended: " + String(prior.outcome.prefix(1200)) }
+                    } else if request.context == nil {
+                        request.context = FollowUpRouting.context(for: prior)
+                    }
+                    request.continues = prior.request
+                    for file in runs[earlierID]?.outputFiles ?? [] where !request.files.contains(file) { request.files.append(file) }
+                    // Telegram tasks without a stated mode run in the background (the user isn't at the screen).
+                    let background = FollowUpRouting.background(reference, default: explicitMode ?? true)
+                    Agent.writeLog("telegram follow-up: continues #\(record.shortID)\(reference.rerun ? " (re-run)" : "") · \(background ? "background" : "foreground")")
+                    return begin(request, background: background)
+                }
+            }
         }
         if let background = explicitMode {
             guard !modeText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return send("Include the task too, for example: foreground: open Calculator.") }
@@ -640,6 +675,23 @@ final class Telegram {
         }
         // Telegram tasks without a stated mode run in the background: the user isn't at the screen.
         else { begin(request, background: true) }
+    }
+
+    /// The newest top-level task of this chat that finished or stopped within the follow-up window.
+    private func recentChatTask() -> TaskStore.Record? {
+        let candidates = store.records.filter { $0.source == .telegram && $0.conversationID == chatID && $0.parentID == nil && $0.state.terminal }
+        let priors = candidates.compactMap { record in Self.prior(record, run: runs[record.id]).map { (record, $0) } }
+        guard let chosen = FollowUpRouting.pick(priors.map(\.1)) else { return nil }
+        return priors.first { $0.1 == chosen }?.0
+    }
+    private static func prior(_ record: TaskStore.Record, run: Run?) -> FollowUpRouting.Prior? {
+        guard record.state.terminal else { return nil }
+        // The stored request is the full prompt. Keep its own follow-up context (a chain "job link" → "Submit it" →
+        // "Apply it in arc" still knows the link); drop only the attachment list, which is re-attached as files.
+        var request = record.request
+        if let r = request.range(of: "\n\nFiles attached by the user in Telegram") { request = String(request[..<r.lowerBound]) }
+        let outcome = run?.summary ?? record.result ?? record.stage
+        return .init(request: request, outcome: outcome, finishedAt: run?.completedAt ?? record.updatedAt, stopped: record.state == .cancelled)
     }
 
     static func modeAnswer(_ text: String) -> Bool? {
@@ -665,7 +717,8 @@ final class Telegram {
         let run = newRun(id, request: request, background: background)
         runs[id] = run; selected = id
         updateCard(run)
-        if background, BrowserTaskRouting.isBrowserTask(request.text), let submitBrowserTask {
+        // "msg X on whatsapp": an app task takes the native path on the main agent, never an isolated browser job.
+        if background, Self.isBrowserJob(request.text, continuing: request.continues), let submitBrowserTask {
             if !submitBrowserTask(request.prompt, request.files, id) {
                 store.finish(id, ok: false, answer: "Couldn't queue this browser task.")
                 finish(run, answer: "Couldn't queue this browser task. Nothing started.", ok: false, result: nil)
@@ -673,6 +726,16 @@ final class Telegram {
         } else { drain(reviewedID: reviewed ? id : nil) }
         startReporting()
         prune()
+    }
+    /// A background Telegram request becomes an isolated browser job only when it is a browser task naming no app.
+    static func isBrowserJob(_ text: String, continuing prior: String? = nil) -> Bool {
+        var request = text
+        _ = Background.choice(&request)
+        guard let prior else { return BackgroundRouting.lane(for: request) == .browserJob }
+        // A follow-up keeps the lane of the task it continues (a Chrome fill → its "submit it" is a Chrome job too),
+        // unless it names its own app.
+        return FollowUpInheritance.route(followUp: request, prior: .init(request: prior, task: nil, background: true),
+                                         explicitBackground: true).lane == .browserJob
     }
     private func newRun(_ id: UUID, request: Request, background: Bool) -> Run {
         Run(id: id, request: request, background: background, interval: cardInterval)
@@ -729,7 +792,7 @@ final class Telegram {
         guard let agent, !agent.isRunning else { return }
         let next = store.queued.first { item in
             item.source == .telegram && item.conversationID == chatID && (!item.requiresReview || item.id == reviewedID)
-                && runs[item.id]?.ended == false && !(item.background && BrowserTaskRouting.isBrowserTask(runs[item.id]!.request.text) && submitBrowserTask != nil)
+                && runs[item.id]?.ended == false && !(item.background && Self.isBrowserJob(runs[item.id]!.request.text, continuing: runs[item.id]!.request.continues) && submitBrowserTask != nil)
         }
         guard let item = next, let run = runs[item.id] else { return }
         guard store.start(item.id, explicitlyReviewed: item.id == reviewedID) else {
@@ -797,14 +860,18 @@ final class Telegram {
         let running = run.worker?.isRunning == true || jobs.contains { !$0.ended && $0.worker != nil }
         let phase = CardPhase.from(ended: run.ended, ok: run.ok, stopped: run.stopped, unconfirmed: run.unconfirmed,
                                    paused: control == .paused, takenOver: control == .takenOver,
-                                   question: asking != nil, sensitive: asking?.sensitive == true, running: running)
+                                   question: asking != nil || RunCardFacts.waitingOnRecord(state: record?.state.rawValue, ended: run.ended),
+                                   sensitive: asking?.sensitive == true,
+                                   running: running || RunCardFacts.runningOnRecord(state: record?.state.rawValue))
         var model = RunCardModel(shortID: run.shortID, title: Secrets.mask(TelegramText.title(run.request.text)), phase: phase)
         model.source = run.mirrored ? run.source.label : nil
         model.background = record?.background ?? run.background
         model.elapsed = (run.completedAt ?? Date()).timeIntervalSince(run.startedAt)
         model.step = record?.completedSteps ?? 0
-        if phase == .waiting { model.action = asking.map { Secrets.mask($0.text) } }
-        else if phase == .working, let narration = run.worker?.narration, !narration.isEmpty { model.action = Secrets.mask(narration) }
+        if phase == .waiting { model.action = (asking?.text ?? record?.stage).map { Secrets.mask($0) } }
+        else if phase == .working {
+            model.action = RunCardFacts.action(narration: run.worker?.narration, stage: record?.stage).map { Secrets.mask($0) }
+        }
         model.checklist = (record?.checklist ?? []).filter { $0.supersededAt == nil }.map { CardItem(title: Secrets.mask($0.title), complete: $0.complete) }
         if phase == .waiting, run.worker?.question != nil {
             model.options = run.options; model.questionKey = run.questionID
@@ -882,6 +949,21 @@ final class Telegram {
                 reply = await request("sendMessage", ["chat_id": chatID, "text": html, "parse_mode": "HTML", "disable_notification": true,
                                                       "link_preview_options": ["is_disabled": true], "reply_markup": markup])
             }
+            if !reply.ok, TelegramRetry.isParseError(reply.description) {
+                // Markup rejected: nothing was sent, so show the card once as plain text rather than lose it for the run.
+                let plain = TelegramHTML.plain(html)
+                if let image = photo ?? (run.cardPhoto ? run.cardImage : nil) {
+                    reply = await upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": plain,
+                                                               "disable_notification": "true", "reply_markup": Self.json(markup)],
+                                         file: ("photo", image))
+                } else {
+                    reply = await request("sendMessage", ["chat_id": chatID, "text": plain, "disable_notification": true,
+                                                          "link_preview_options": ["is_disabled": true], "reply_markup": markup])
+                }
+            }
+            // Telegram answered with a refusal (nothing was sent): the next update may try again. Network errors stay
+            // suppressed because the send may have landed.
+            if !reply.ok, reply.description != nil { run.cardAttempted = false }
         }
         if reply.ok {
             run.rendered = signature; run.renderedAt = Date()
@@ -1239,14 +1321,28 @@ final class Telegram {
         let body = Secrets.mask(run.cardOutcome ?? run.finalAnswer ?? "")
         let keyboard = TGButton.markup(RunCard.keyboard(cardModel(run)))
         let documents = run.mirrored ? [] : Self.deliverable(run.worker?.outputFiles ?? [], excluding: run.request.files)
-        // The final view: the screenshot Clinqy saved for an unconfirmed item, else (background cards, or opt-in step
-        // screenshots) a fresh capture of the task's own target.
+        // The final view: the screenshot Clinqy saved for an unconfirmed item, else the capture the worker took as it
+        // finished (before its task tab/window was released), else a fresh capture, else the card's last thumbnail.
         let savedShot = run.unconfirmed ? ResultText.screenshotPath(run.finalAnswer ?? "").flatMap { try? Data(contentsOf: URL(fileURLWithPath: $0)) } : nil
-        let wantsAfter = savedShot == nil && !run.stopped && (run.unconfirmed || run.cardPhoto || Self.stepScreenshots)
+        let stopped = run.stopped
+        // A coordinator of parallel children has no tab of its own: its children's views were already delivered.
+        let ownView = children(run).isEmpty
         let before = Self.stepScreenshots ? run.before : nil
+        let captureTimeout = self.captureTimeout
         Task { [weak self, weak run] in
-            var image = savedShot
-            if wantsAfter, let worker, let run, worker.taskRecordID == run.id { image = await worker.telegramScreenshot() }
+            var final: Data?
+            if !stopped, ownView, savedShot == nil, let worker, let id = run?.id {
+                final = await CompletionPhoto.capture(timeout: captureTimeout) { await worker.finalScreenshot(for: id) }
+            }
+            var live: Data?
+            if !stopped, ownView, CompletionPhoto.preferred(saved: savedShot, final: final, limit: Self.photoLimit) == nil,
+               let worker, let run, worker.taskRecordID == run.id {
+                live = await CompletionPhoto.capture(timeout: captureTimeout) { await worker.telegramScreenshot() }
+            }
+            // The thumbnail fallback is read now, after the captures: the card's photo may have landed meanwhile.
+            let card = CompletionPhoto.fallback([run?.cardImage, run?.pendingPhoto, run?.screenshot], limit: Self.photoLimit)
+            let image = CompletionPhoto.pick(saved: savedShot, final: final, live: live, card: card, stopped: stopped, limit: Self.photoLimit)
+            if image == nil, !stopped { Agent.writeLog("telegram completion: no final screenshot or card thumbnail; sending text only") }
             guard let self, let run else { return }
             if let image { run.screenshot = image }
             self.enqueue { [weak self] in
@@ -1255,14 +1351,21 @@ final class Telegram {
                     _ = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": "Before · #" + run.shortID,
                                                                  "disable_notification": "true"], file: ("photo", before))
                 }
+                let html = ResultText.render(phase: phase, title: title, shortID: run.shortID, summary: body, links: links, extra: extra, limit: RunCard.textLimit)
                 var sent = APIReply(ok: false)
-                if let image, image.count < Self.photoLimit {
-                    let caption = ResultText.render(phase: phase, title: title, shortID: run.shortID, summary: body, links: links, extra: extra, limit: RunCard.captionLimit)
-                    sent = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": caption, "parse_mode": "HTML",
-                                                                    "reply_markup": Self.json(keyboard)], file: ("photo", image))
+                switch CompletionPhoto.layout(photo: image, fullText: html) {
+                case .photoWithCaption:
+                    sent = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": html, "parse_mode": "HTML",
+                                                                    "reply_markup": Self.json(keyboard)], file: ("photo", image!))
+                case .photoThenText:
+                    // Too long for a caption: the photo (quietly, with the title), then the full result with the buttons.
+                    let head = TelegramHTML.escape(TelegramText.clip(phase.emoji + " " + phase.label + " · " + title, 300)) + "\n\n" + TelegramHTML.italic("#" + run.shortID)
+                    let photo = await self.upload("sendPhoto", fields: ["chat_id": String(chatID), "caption": head, "parse_mode": "HTML",
+                                                                         "disable_notification": "true"], file: ("photo", image!))
+                    if let message = (photo.result as? [String: Any])?["message_id"] as? Int { self.messageRuns[message] = run.id }
+                case .textOnly: break
                 }
                 if !sent.ok {
-                    let html = ResultText.render(phase: phase, title: title, shortID: run.shortID, summary: body, links: links, extra: extra, limit: RunCard.textLimit)
                     sent = await self.request("sendMessage", ["chat_id": chatID, "text": html, "parse_mode": "HTML",
                                                                "link_preview_options": ["is_disabled": true], "reply_markup": keyboard])
                 }
@@ -1393,7 +1496,17 @@ final class Telegram {
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
-        return await perform(method, request)
+        let reply = await perform(method, request)
+        if !reply.ok, TelegramKeyboardFallback.shouldRetryWithoutURLButtons(status: nil, description: reply.description),
+           let markup = body["reply_markup"] as? [String: Any], let stripped = TelegramKeyboardFallback.strippingURLButtons(markup) {
+            Agent.writeLog("telegram: \(method) retried without URL buttons")
+            var retry = body; retry["reply_markup"] = stripped
+            if let data = try? JSONSerialization.data(withJSONObject: retry) {
+                var again = request; again.httpBody = data
+                return await perform(method, again)
+            }
+        }
+        return reply
     }
 
     /// Multipart upload (sendPhoto, sendDocument, editMessageMedia). `file.0` is the form field (or attach:// name).
@@ -1413,7 +1526,15 @@ final class Telegram {
         body.append(Data("\r\n--\(boundary)--\r\n".utf8))
         var request = URLRequest(url: url, timeoutInterval: isPhoto ? 30 : 120)
         request.httpMethod = "POST"; request.setValue("multipart/form-data; boundary=\(boundary)", forHTTPHeaderField: "Content-Type"); request.httpBody = body
-        return await perform(method, request)
+        let reply = await perform(method, request)
+        if !reply.ok, TelegramKeyboardFallback.shouldRetryWithoutURLButtons(status: nil, description: reply.description),
+           let raw = fields["reply_markup"], let markup = (try? JSONSerialization.jsonObject(with: Data(raw.utf8))) as? [String: Any],
+           let stripped = TelegramKeyboardFallback.strippingURLButtons(markup) {
+            Agent.writeLog("telegram: \(method) retried without URL buttons")
+            var retryFields = fields; retryFields["reply_markup"] = Self.json(stripped)
+            return await upload(method, fields: retryFields, file: file, filename: filename)
+        }
+        return reply
     }
 
     private func perform(_ method: String, _ request: URLRequest) async -> APIReply {

@@ -55,7 +55,11 @@ jobs:
           node tests/extension-frames.mjs
           node tests/extension-transport.mjs
           node tests/extension-receipt.mjs
+          node tests/extension-checkbox.mjs
+          node tests/extension-checkbox-label.mjs
+          node tests/extension-upload.mjs
           node tests/extension-adopt.mjs
+          node tests/extension-popup.mjs
           node tests/telegram-screenshot.mjs
           node tests/mac-download.mjs
       - name: Website build

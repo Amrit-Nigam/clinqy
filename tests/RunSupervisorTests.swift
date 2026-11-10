@@ -1,3 +1,4 @@
+import Combine
 import Foundation
 
 /// Pure run-registry logic: pause state machine, persistence across relaunch, question timeouts and safe defaults.
@@ -134,6 +135,31 @@ struct RunSupervisorTests {
         check(gate.pendingQuestion(run)?.note == nil, "disabled timeout shows no note")
         gate.finished(run: run)
         check(gate.active.isEmpty, "registry empty after finish")
+
+        // Live report D: Tasks & Recovery refreshes Hand back after a takeover made anywhere, via the change publisher.
+        do {
+            let watched = RunSupervisor(defaults: defaults)
+            let run = UUID()
+            var published: [UUID] = []
+            var posted: [UUID] = []
+            let subscription = watched.changes.sink { published.append($0) }
+            let observer = NotificationCenter.default.addObserver(forName: RunSupervisor.didChange, object: watched, queue: nil) { note in
+                if let id = note.userInfo?["run"] as? UUID { posted.append(id) }
+            }
+            watched.register(run: run, source: .telegram, title: "Remote", background: true)
+            check(published == [run] && posted == [run], "publisher and notification fire on registration")
+            watched.apply(.pause, to: run)
+            check(published.count == 2 && watched.state(run) == .paused, "publisher fires on pause")
+            watched.apply(.takeOver, to: run)
+            check(published.count == 3 && watched.state(run) == .takenOver, "publisher fires on external takeover")
+            watched.apply(.handBack, to: run)
+            check(published.count == 4 && posted.count == 4 && watched.state(run) == .running, "publisher fires on hand back")
+            check(watched.apply(.handBack, to: run) == nil && published.count == 4, "no event when nothing changes")
+            watched.finished(run: run)
+            check(published.count == 5 && published.allSatisfy { $0 == run }, "publisher fires on finish, for that run only")
+            subscription.cancel()
+            NotificationCenter.default.removeObserver(observer)
+        }
 
         if failures > 0 { print("\(failures) failure(s)"); exit(1) }
         print("run supervisor: all checks passed")

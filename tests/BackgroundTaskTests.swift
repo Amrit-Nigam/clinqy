@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurrences(of: "test-secret", with: "[private]") } }
@@ -103,6 +104,22 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         check(BackgroundPolicy.route(["do":"collect"], hasWorkerPage: false) == .api, "worker collection doesn't require foreground access")
         check(BackgroundPolicy.route(["do":"type","id":"w2"], hasWorkerPage: true) == .browser, "owned web field allowed")
         check(BackgroundPolicy.route(["do":"key","keys":"cmd+a"], hasWorkerPage: true) == .browser, "owned select-all allowed")
+        // Coordinate clicks: allowed in an owned/adopted tab (from its own screenshot), never without one.
+        check(BackgroundPolicy.route(["do":"click","x":487,"y":548], hasWorkerPage: true) == .browser, "owned-tab x/y click allowed")
+        check(denied(["do":"click","text":"I consent"]), "text-label click still refused in background")
+        if case .attention = BackgroundPolicy.route(["do":"click","x":487,"y":548], hasWorkerPage: false) { check(true, "x/y without an owned tab refused") }
+        else { check(false, "x/y without an owned tab refused") }
+        // A 2x screenshot of a 1280x800 viewport, downscaled to 1280 px wide for the model.
+        check(BackgroundPolicy.viewportPoint(x: 640, y: 400, image: CGSize(width: 1280, height: 800), viewport: CGSize(width: 1280, height: 800)) == CGPoint(x: 640, y: 400), "1:1 screenshot maps directly")
+        check(BackgroundPolicy.viewportPoint(x: 1000, y: 500, image: CGSize(width: 2000, height: 1250), viewport: CGSize(width: 1000, height: 625)) == CGPoint(x: 500, y: 250), "device-pixel screenshot halves to CSS pixels")
+        check(BackgroundPolicy.viewportPoint(x: 400, y: 250, image: CGSize(width: 800, height: 500), viewport: CGSize(width: 1600, height: 1000)) == CGPoint(x: 800, y: 500), "downscaled screenshot scales up")
+        check(BackgroundPolicy.viewportPoint(x: 900, y: 10, image: CGSize(width: 800, height: 500), viewport: CGSize(width: 1600, height: 1000)) == nil, "outside the image refused")
+        check(BackgroundPolicy.screenshotStillCurrent(shotTab: 7, shotDocument: "d1", shotViewport: CGSize(width: 1280, height: 800), shotScrollY: 120,
+                                                      pageTab: 7, pageDocument: "d1", pageViewport: CGSize(width: 1280, height: 800), pageScrollY: 120), "same tab, document and scroll is current")
+        check(!BackgroundPolicy.screenshotStillCurrent(shotTab: 7, shotDocument: "d1", shotViewport: CGSize(width: 1280, height: 800), shotScrollY: 120,
+                                                       pageTab: 7, pageDocument: "d1", pageViewport: CGSize(width: 1280, height: 800), pageScrollY: 400), "scrolled since the screenshot is stale")
+        check(!BackgroundPolicy.screenshotStillCurrent(shotTab: 7, shotDocument: "d1", shotViewport: CGSize(width: 1280, height: 800), shotScrollY: 0,
+                                                       pageTab: 8, pageDocument: "d1", pageViewport: CGSize(width: 1280, height: 800), pageScrollY: 0), "another tab's screenshot is stale")
         check(BackgroundPolicy.route(["do":"tab","op":"list"], hasWorkerPage: false, allowTabDiscovery: true) == .browser, "explicit existing-tab request can discover URLs before opening a task page")
         if case .attention = BackgroundPolicy.route(["do":"tab","op":"list"], hasWorkerPage: false) {
             check(true, "ordinary workers cannot discover personal tabs")

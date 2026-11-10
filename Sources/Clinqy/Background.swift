@@ -110,16 +110,36 @@ enum Background {
         windowsAtStart = Set(list.compactMap { ($0[kCGWindowNumber as String] as? Int).map(CGWindowID.init) })
     }
 
+    /// A final capture of the run's own tab that the tab's release waits for (bounded), so the completion message
+    /// isn't captured from a tab already closed or frozen.
+    private static var cleanupGate: Task<Data?, Never>?
+    static func holdCleanup(until capture: Task<Data?, Never>) { cleanupGate = capture }
+    /// Waits for the gate, at most `seconds`.
+    static func wait(for gate: Task<Data?, Never>?, seconds: Double = 8) async {
+        guard let gate else { return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { _ = await gate.value }
+            group.addTask { try? await Task.sleep(for: .seconds(seconds)) }
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
     static func end() {
         if active, app != nil || tab != nil { last = (tab, app) }
+        let gate = cleanupGate
+        cleanupGate = nil
         if active {
             lastRun = Date()
             if usesExtension {
-                BrowserBridge.shared.endBackgroundRun()
+                BrowserBridge.shared.endBackgroundRun(after: gate)
             } else {
                 let keep = tab?.connection == ChromeWorker.shared.identity ? tab?.id : nil
                 let run = ChromeWorker.shared.generation
-                Task { await ChromeWorker.shared.runEnded(keep: keep, generation: run) }
+                Task {
+                    await wait(for: gate)
+                    await ChromeWorker.shared.runEnded(keep: keep, generation: run)
+                }
             }
         }
         _ = SkyLight.retryPendingCleanup()

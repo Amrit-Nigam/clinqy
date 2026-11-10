@@ -520,6 +520,17 @@ final class BrowserBridge: ObservableObject {
         }
     }
 
+    /// Every user tab (all windows) of `app`'s connected extension, for an explicitly named direct-control target.
+    /// Metadata only: nothing is attached, focused or changed; never falls back to another browser.
+    func namedTargetTabs(in app: NSRunningApplication) async -> [(id: Int, url: String)]? {
+        guard isConnected(app), let (_, conn) = await frontConnection(for: app),
+              let raw = try? await request(conn, ["cmd": "adoptCandidates"], timeout: 3) else { return nil }
+        return (raw["tabs"] as? [[String: Any]] ?? []).compactMap { t in
+            guard let id = t["id"] as? Int else { return nil }
+            return (id, t["url"] as? String ?? "")
+        }
+    }
+
     /// Adopts the user's tab `tabID` (showing `url`) for this run: the extension attaches to it with emulated focus and
     /// shows the activity marker, without activating it or its window. Blocked origins are refused before anything is
     /// sent; the extension refuses if the tab moved to another site since it was chosen. It then counts as a task tab.
@@ -573,12 +584,16 @@ final class BrowserBridge: ObservableObject {
         }
     }
 
-    func endBackgroundRun() {
+    func endBackgroundRun(after gate: Task<Data?, Never>? = nil) {
         // Explicit ids prevent late cleanup from detaching the next run's debugger. Adopted tabs go back to the user.
+        // Ids are taken now; only the release waits for the run's final capture (bounded).
         Self.adoptionReleaseRoutes[taskRunID] = nil
         guard let key = taskConnection, let conn = connections[key] else { return }
         let ids = Array(taskTabs.union(releasedAdoptedTabs))
-        Task { _ = try? await request(conn, ["cmd": "clinqyDone", "tabIds": ids], timeout: 5) }
+        Task {
+            await Background.wait(for: gate)
+            _ = try? await request(conn, ["cmd": "clinqyDone", "tabIds": ids], timeout: 5)
+        }
     }
 
     func ownsBackgroundPage(_ page: Page?) -> Bool {
@@ -640,6 +655,11 @@ final class BrowserBridge: ObservableObject {
                 // Ownership refusals and a vanished tab/connection are final; navigation races are not.
                 if case BridgeError.notConnected = error { break }
                 if (error as? BridgeError).map({ if case .failed(let why) = $0 { return why.contains("does not belong") } else { return false } }) == true { break }
+                if error.localizedDescription.contains("was closed") {
+                    // The tab is gone (a popup's own window.close(), the user): no longer this run's, and final.
+                    taskTabs.remove(tab.id)
+                    break
+                }
                 if error.localizedDescription.contains("owned worker tab is gone") { break }
             }
         }
@@ -699,6 +719,11 @@ final class BrowserBridge: ObservableObject {
             page.pinned = true
             page.estimatedArea = CGRect(origin: .zero, size: page.viewport)
             return page
+        }
+        if Background.active, Background.usesExtension, tab.connection == taskConnection, !taskTabs.contains(tab.id),
+           !releasedAdoptedTabs.contains(tab.id) {
+            // A popup opened by input to an owned tab is owned in the extension before the app hears of it: learn it.
+            _ = await ownedTaskTabs()
         }
         try requireTaskTab(tab)
         guard let conn = connections[tab.connection] else { throw BridgeError.notConnected }
@@ -924,6 +949,40 @@ final class BrowserBridge: ObservableObject {
         return page
     }
 
+    /// The run's owned tabs as the extension lists them (filtered by this run's token), learning popups inherited from
+    /// an owned opener and forgetting tabs that closed. `closed` maps a closed task tab to its opener when known.
+    func ownedTaskTabs() async -> (tabs: [(id: Int, url: String)], closed: [Int: Int])? {
+        guard Background.active, Background.usesExtension, let key = taskConnection, let conn = connections[key] else { return nil }
+        let generation = taskGeneration
+        guard let reply = try? await request(conn, ["cmd": "tabs", "workOnly": true], timeout: 3),
+              generation == taskGeneration, !Task.isCancelled else { return nil }
+        var closed: [Int: Int] = [:]
+        for entry in reply["closed"] as? [[String: Any]] ?? [] {
+            guard let id = entry["id"] as? Int else { continue }
+            taskTabs.remove(id)
+            if let opener = entry["openerTabId"] as? Int { closed[id] = opener } else { closed[id] = -1 }
+        }
+        var owned: [(id: Int, url: String)] = []
+        for t in reply["tabs"] as? [[String: Any]] ?? [] {
+            guard let id = t["id"] as? Int else { continue }
+            if t["inherited"] as? Bool == true, let opener = t["openerTabId"] as? Int, taskTabs.contains(opener) { taskTabs.insert(id) }
+            if taskTabs.contains(id) { owned.append((id, t["url"] as? String ?? "")) }
+        }
+        return (owned, closed)
+    }
+
+    /// The run's tab `lost` is gone (closed by the page or the user): continue on its opener when that is still
+    /// owned, else on another owned tab. Never opens anything and never activates a window.
+    func recoverOwnedTab(afterLosing lost: TabInfo) async -> (tab: TabInfo, page: Page, opener: Int?)? {
+        guard Background.active, Background.usesExtension, lost.connection == taskConnection,
+              let listing = await ownedTaskTabs(), !listing.tabs.contains(where: { $0.id == lost.id }) else { return nil }
+        taskTabs.remove(lost.id)
+        let opener = listing.closed[lost.id].flatMap { $0 >= 0 ? $0 : nil }
+        guard let id = OwnedTabRecovery.fallback(closed: lost.id, opener: opener, owned: listing.tabs.map(\.id)),
+              let page = await snapshot(of: TabInfo(id: id, url: "", connection: lost.connection)), ownsBackgroundPage(page) else { return nil }
+        return (TabInfo(id: id, url: page.url, connection: lost.connection), page, opener)
+    }
+
     func tabs(in app: NSRunningApplication? = nil) async throws -> [BrowserTab] {
         if Background.active && Background.usesExtension {
             let generation = taskGeneration
@@ -939,6 +998,7 @@ final class BrowserBridge: ObservableObject {
             }
             guard let key = taskConnection, let conn = connections[key] else { return [] }
             let raw = try await request(conn, ["cmd": "tabs", "workOnly": !allowsExistingTabDiscovery], timeout: 3)
+            for entry in raw["closed"] as? [[String: Any]] ?? [] { if let id = entry["id"] as? Int { taskTabs.remove(id) } }
             return (raw["tabs"] as? [[String: Any]] ?? []).compactMap { t in
                 guard let id = t["id"] as? Int else { return nil }
                 if !allowsExistingTabDiscovery, t["inherited"] as? Bool == true,

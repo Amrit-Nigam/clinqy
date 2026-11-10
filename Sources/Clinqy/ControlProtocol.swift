@@ -35,6 +35,20 @@ enum ControlProtocol {
             guard let task = body["task"] as? String, !task.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                   task.utf8.count <= 8000 else { return "Initial observe requires the user's task (up to 8000 bytes)" }
         } else if body["session"] == nil { return "session is required" }
+        // An explicit target (app name/bundle id, browser tab id or URL substring) binds only the initial observe.
+        if body["app"] != nil || body["tab"] != nil {
+            guard op == "observe", body["session"] == nil else { return "app and tab select the target only on the initial observe" }
+            if let app = body["app"] {
+                guard let name = app as? String, !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, name.utf8.count <= 200 else { return "Invalid app" }
+            }
+            if let tab = body["tab"] {
+                if let number = tab as? NSNumber, CFGetTypeID(number) != CFBooleanGetTypeID() {
+                    guard number.doubleValue >= 0, number.doubleValue == number.doubleValue.rounded() else { return "Invalid tab" }
+                } else {
+                    guard let text = tab as? String, !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty, text.utf8.count <= 2048 else { return "Invalid tab" }
+                }
+            }
+        }
         if ["act", "verify", "wait"].contains(op) {
             guard body["observation"] != nil, var action = body["action"] as? [String: Any] else { return "observation and action are required" }
             if op != "act" { action["do"] = op }

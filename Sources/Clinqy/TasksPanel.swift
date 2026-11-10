@@ -1,4 +1,5 @@
 import AppKit
+import Combine
 import SwiftUI
 
 @MainActor
@@ -53,7 +54,8 @@ private struct TaskRecordView: View {
     @ObservedObject var store: TaskStore
     let item: TaskStore.Record
     @State private var showActions = false
-    /// Pause state lives in RunSupervisor (not TaskStore); bumping this redraws after a control tap.
+    /// Pause state lives in RunSupervisor (not TaskStore); bumping this redraws after a control tap or any
+    /// supervisor change made elsewhere (Telegram, a notification, a takeover from the task card).
     @State private var controlRevision = 0
     private var recoverable: Bool { [.interrupted, .failed, .cancelled].contains(item.state) }
     private var canStart: Bool { (item.background || store.activeForeground == nil) && item.reviewReason?.contains("Private values") != true }
@@ -139,6 +141,7 @@ private struct TaskRecordView: View {
             }
         }.padding(16).frame(maxWidth: .infinity, alignment: .leading)
             .background(.quaternary.opacity(0.35), in: RoundedRectangle(cornerRadius: 10))
+            .onReceive(RunSupervisor.shared.changes.filter { [id = item.id] in $0 == id }.receive(on: DispatchQueue.main)) { _ in controlRevision += 1 }
     }
     private func command(_ command: RunControl.Command) {
         if RunSupervisor.shared.apply(command, to: item.id)?.reveal == true { RunSupervisor.shared.onReveal(item.id) }

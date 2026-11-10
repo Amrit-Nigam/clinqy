@@ -86,6 +86,24 @@ enum Secrets { static func mask(_ text: String) -> String { text } }
               && TabAdoptionRouting.consent("[No reply after 10 min] Skip this step") == .newTab, "anything else (incl. timeout) opens a new tab")
         check(TabAdoptionRouting.consentOptions(site: "github.com") == ["Yes", "Yes, always on github.com", "Open a new tab instead"], "consent options")
         check(TabAdoptionRouting.lane(extensionConnected: true, nativeLaneEnabled: true) == .extensionAdopt, "extension adopts")
+        // Live report C2/W1: background app requests run on the main agent's native lane, not in isolated browser jobs.
+        let apps: Set<String> = ["textedit", "whatsapp", "notes", "slack", "google chrome", "github desktop"]
+        let installed = { (name: String) in apps.contains(name) }
+        let lane = { (text: String) in BackgroundRouting.lane(for: text, isApp: installed) }
+        check(lane("In TextEdit, type hello world and make it bold.") == .mainAgent, "TextEdit request stays native")
+        check(lane("In TextEdit, paste the youtube link from https://example.com") == .mainAgent, "TextEdit names the target even with a URL")
+        check(lane("in WhatsApp, send mom the youtube link") == .mainAgent, "WhatsApp app target beats a browser word")
+        check(lane("msg mom hi on whatsapp") == .mainAgent, "Telegram-style msg on whatsapp is native")
+        check(lane("add the gmail summary on Notes") == .mainAgent, "on Notes names the Notes app")
+        check(lane("open whatsapp web and read my chats") == .browserJob, "WhatsApp Web is the site")
+        check(lane("open github in chrome") == .browserJob, "open github in chrome is a browser job")
+        check(lane("search google for flights on the website") == .browserJob, "search on a website is a browser job")
+        check(lane("open https://github.com/notes in chrome") == .browserJob, "a URL in Chrome is a browser job")
+        check(lane("open the notes tab in chrome") == .browserJob, "lowercase notes is not the Notes app")
+        check(lane("book a cab for tonight") == .mainAgent, "ambiguous non-browser request runs on the main agent")
+        check(lane("search google for the weather") == .mainAgent, "no browser word: main agent decides")
+        check(BackgroundRouting.namedNativeApp(in: "In TextEdit, type hi", isApp: installed) == "textedit", "app name extracted")
+        check(BackgroundRouting.namedNativeApp(in: "check github in Google Chrome", isApp: installed) == nil, "browsers are not native targets")
         check(TabAdoptionRouting.lane(extensionConnected: false, nativeLaneEnabled: true) == .nativeWindow, "no extension: native window lane")
         check(TabAdoptionRouting.lane(extensionConnected: false, nativeLaneEnabled: false) == .unavailable, "neither: unavailable")
         let folder = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
@@ -103,6 +121,37 @@ enum Secrets { static func mask(_ text: String) -> String { text } }
         check(store.start(ids[3]), "coordinator waiting for children frees its browser slot")
         check(store.record(ids[0])?.coordinating == true, "parent coordination state is durable")
         check(store.activeBackground.count == 3 && store.activeForeground?.id == native, "separate foreground and background ownership")
+        // A final answer may not claim an action whose latest result failed.
+        let failedUpload: [FailedClaimGuard.Attempt] = [.init(step: "Type “Amrit”", failed: false), .init(step: "Upload Amrit_Resume_C.pdf", failed: true)]
+        let claimed = "Form filled but not submitted: the consent checkbox has no clickable element in background mode, so I couldn't tick it. Filled and checked: name Amrit Nigam, a@b.com, +91 93267-70790, and Amrit_Resume_C.pdf uploaded. The consent box is still unticked."
+        check(FailedClaimGuard.correction(answer: claimed, attempts: failedUpload)?.contains("upload of Amrit_Resume_C.pdf failed") == true, "false upload claim gets a correction")
+        check(FailedClaimGuard.correction(answer: "Not submitted: the form is filled (Amrit Nigam, Amrit_Resume_C.pdf uploaded), but the consent box can't be ticked.", attempts: failedUpload) != nil, "claim inside parentheses is caught")
+        check(FailedClaimGuard.correction(answer: "Filled the form. I couldn't upload Amrit_Resume_C.pdf: the page didn't take the file.", attempts: failedUpload) == nil, "an honest failure report is left alone")
+        check(FailedClaimGuard.correction(answer: "Filled and the resume uploaded.", attempts: failedUpload) != nil, "an upload claim without the file name is caught")
+        check(FailedClaimGuard.correction(answer: claimed, attempts: failedUpload + [.init(step: "Upload Amrit_Resume_C.pdf", failed: false)]) == nil, "a later successful retry clears it")
+        check(FailedClaimGuard.correction(answer: "Clicked Apply and submitted.", attempts: [.init(step: "Click Apply", failed: true)])?.contains("clicking “Apply” failed") == true, "false click claim gets a correction")
+        check(FailedClaimGuard.correction(answer: "Searched and opened the page.", attempts: [.init(step: "Click Apply", failed: true)]) == nil, "unrelated answers are left alone")
+        // Round 5 J2: a not-ok run always names the failed action, even when its answer was already honest.
+        let j2: [FailedClaimGuard.Attempt] = [.init(step: "Type “Test”", failed: false), .init(step: "Upload test-resume.pdf", failed: true),
+                                              .init(step: "Verify outcome", failed: true), .init(step: "Upload test-resume.pdf", failed: true)]
+        check(FailedClaimGuard.failureNote(attempts: j2) == "Note: the upload of test-resume.pdf failed.", "failed upload is noted once; failed checks are not actions")
+        check(FailedClaimGuard.failureNote(attempts: j2 + [.init(step: "Upload test-resume.pdf", failed: false)]) == nil, "a later successful retry clears the note")
+        check(FailedClaimGuard.failureNote(attempts: [.init(step: "Click Apply", failed: true), .init(step: "Press cmd+s", failed: true)]) == "Note: clicking “Apply” failed; “Press cmd+s” failed.", "every failed action is named")
+        check(FailedClaimGuard.failureNote(attempts: [.init(step: "Verify outcome", failed: true)]) == nil, "only failed checks: no note")
+
+        // Round 5 J4: a plain follow-up inherits the prior task's mode, lane and browser before the mode is chosen.
+        let chrome = FollowUpInheritance.prior(historyRequest: "In the background: In Google Chrome, open http://127.0.0.1:58834/?key=k and fill it. Fill but do not submit.", task: nil)
+        check(chrome.background && chrome.request.hasPrefix("In Google Chrome"), "history's background prefix is the prior mode")
+        let submit = FollowUpInheritance.route(followUp: "submit it", prior: chrome, explicitBackground: nil, isApp: { _ in false })
+        check(submit == .init(background: true, lane: .browserJob, browser: "Google Chrome"), "“submit it” stays a background Chrome browser job")
+        check(FollowUpInheritance.route(followUp: "submit it", prior: chrome, explicitBackground: false, isApp: { _ in false }) == .init(background: false, lane: .mainAgent, browser: "Google Chrome"), "an explicit foreground follow-up runs in front")
+        let front = FollowUpInheritance.prior(historyRequest: "In Google Chrome, open https://example.com", task: nil)
+        check(FollowUpInheritance.route(followUp: "submit it", prior: front, explicitBackground: nil, isApp: { _ in false }).background == false, "a foreground prior stays foreground")
+        let nativePrior = FollowUpInheritance.prior(historyRequest: "In the background: In TextEdit, type hello", task: nil)
+        check(FollowUpInheritance.route(followUp: "make it bold", prior: nativePrior, explicitBackground: nil, isApp: { _ in false }) == .init(background: true, lane: .mainAgent, browser: nil), "a native background prior stays on the main agent in the background")
+        let chained = FollowUpInheritance.prior(historyRequest: "In the background: continue", task: "In the background: In Google Chrome, open https://jobs.test/apply")
+        check(FollowUpInheritance.route(followUp: "submit it", prior: chained, explicitBackground: nil, isApp: { _ in false }).lane == .browserJob, "the chain's first request names the lane")
+        check(FollowUpInheritance.route(followUp: "paste it in TextEdit", prior: chrome, explicitBackground: nil, isApp: { _ in false }).lane == .mainAgent, "a follow-up naming its own app takes the native lane")
         print("PASS \(checks) parallel task ownership, capacity, routing and cancellation checks")
     }
 }
