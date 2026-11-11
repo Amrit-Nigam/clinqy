@@ -8,7 +8,13 @@ enum SettleWait {
     /// or after the cap). True when it held; false on timeout or cancellation.
     @discardableResult
     static func until(capMs: Int, stepMs: Int, _ condition: () async -> Bool) async -> Bool {
-        let clock = ContinuousClock()
+        await until(capMs: capMs, stepMs: stepMs, clock: ContinuousClock(), condition)
+    }
+
+    /// Accept a clock so polling and deadline behavior can be tested without scheduler timing assumptions.
+    @discardableResult
+    static func until<C: Clock>(capMs: Int, stepMs: Int, clock: C, _ condition: () async -> Bool) async -> Bool
+    where C.Duration == Duration {
         let deadline = clock.now.advanced(by: .milliseconds(max(0, capMs)))
         let step = Duration.milliseconds(max(1, stepMs))
         while true {
@@ -17,7 +23,8 @@ enum SettleWait {
             let now = clock.now
             guard now < deadline else { return false }
             let left = now.duration(to: deadline)
-            do { try await Task.sleep(for: left < step ? left : step) } catch { return false }
+            do { try await clock.sleep(until: now.advanced(by: left < step ? left : step), tolerance: nil) }
+            catch { return false }
         }
     }
 
