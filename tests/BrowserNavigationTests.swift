@@ -17,6 +17,12 @@ import Foundation
         check(NSDictionary(dictionary: early).isEqual(to: final), "Streamed and final opens match")
         let click: [String: Any] = ["do":"click", "id":"w2"]
         check(NSDictionary(dictionary: BrowserNavigation.normalizedAction(click)).isEqual(to: click), "Other actions remain exact")
-        print("PASS: 8 browser navigation identity checks")
+        check(BrowserNavigation.isReady(info: ["url":"https://example.com/form", "status":"loading", "ready":"interactive"], requested: "https://example.com/form", previous: "about:blank"), "interactive DOM usable while subresources load")
+        check(!BrowserNavigation.isReady(info: ["url":"https://example.com/form", "status":"complete", "ready":"loading"], requested: "https://example.com/form", previous: nil), "DOM loading overrides stale tab complete")
+        check(!BrowserNavigation.isReady(info: ["url":"about:blank", "status":"complete"], requested: "https://example.com/form", previous: nil), "blank page not destination")
+        check(!BrowserNavigation.isReady(info: ["url":"https://example.com/old", "ready":"complete"], requested: "https://example.com/form", previous: "https://example.com/old"), "old document not arrival")
+        check(BrowserNavigation.isReady(info: ["url":"https://example.com/form", "status":"complete"], requested: "https://example.com/form", previous: nil), "older extension readiness supported")
+        check(BrowserNavigation.isReady(info: ["url":"https://example.com/redirect", "ready":"interactive"], requested: "https://example.com/form", previous: "about:blank"), "redirected interactive destination accepted")
+        print("PASS: 14 browser navigation identity and readiness checks")
     }
 }

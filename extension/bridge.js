@@ -4,6 +4,8 @@ const URL_ = "ws://127.0.0.1:47823";
 // This script's own version, kept equal to manifest.json's. Chrome can keep running an older copy of the worker after
 // a reload (the manifest is re-read, the script isn't), so the app checks this one, not the manifest's.
 const SCRIPT_VERSION = "1.9.16";
+const SCRIPT_BUILD = "2026-11-browser-reliability-2";
+const CAPABILITIES = ["document-tokens", "task-ownership", "condition-waits", "activity-phases", "cooperative-cancellation", "upload-readback", "html-range-state", "effect-receipts", "adopted-tabs"];
 let socket = null;
 let retry = 1000;
 // A snapshot must not overwrite index maps while an earlier action is resolving its target.
@@ -14,9 +16,41 @@ let connectionEpoch = 0;
 // Requests the app gave up on (timeout/cancel) before they started running. Bounded; entries are tiny.
 const cancelledIDs = new Set();
 const runningIDs = new Set();
+const runningRequests = new Map();
+const tabRequestsInFlight = new Map();
+// Input commands whose popups inherit the opener's task, and how long after such an input a popup still does.
+const POPUP_INPUT_COMMANDS = ["click", "clickOption", "cdpClick", "cdpKey", "cdpGesture"];
+const POPUP_INPUT_GRACE_MS = 5000;
+const recentTabInput = new Map();
+// Task tabs that closed (a popup's own window.close(), the user): reads of them say so, not "does not belong".
+const closedTaskTabs = new Map();
+function closedTaskTabMessage(tabId, closed) {
+  return `Task tab ${tabId} was closed (the page closed its own window, or the user closed it); it was not taken away from the task.`
+    + (Number.isInteger(closed.opener) ? ` Its opener tab ${closed.opener} is still this task's: switch back to it instead of reopening the page.` : "");
+}
+function assertRequestLive(tabId) {
+  const request = tabRequestsInFlight.get(tabId);
+  if (request && (request.cancelled || request.epoch !== connectionEpoch || Date.now() > request.deadline))
+    throw new Error("operation interrupted; observe the result before retrying any input");
+}
+async function connectionHello() {
+  const stored = await chrome.storage.local.get("clinqyProfileIdentity");
+  const profileIdentity = stored.clinqyProfileIdentity || crypto.randomUUID();
+  if (!stored.clinqyProfileIdentity) await chrome.storage.local.set({clinqyProfileIdentity:profileIdentity});
+  // This identifies an extension installation, not a Chrome profile directory or account.
+  return {type:"hello",agent:navigator.userAgent,version:SCRIPT_VERSION,manifest:chrome.runtime.getManifest().version,
+    profileIdentity, build:SCRIPT_BUILD, capabilities:CAPABILITIES, protocolVersion:7};
+}
 const NOT_DISPATCHED = "cancelled before dispatch";
 function markCancelled(id) {
-  if (typeof id !== "string" || runningIDs.has(id)) return false;   // already running: its outcome is reported, never undone
+  if (typeof id !== "string") return false;
+  const running = runningRequests.get(id);
+  if (running) {
+    running.cancelled = true;
+    if (Number.isInteger(running.tabId)) void chrome.scripting.executeScript({target:{tabId:running.tabId,allFrames:true},
+      func:() => window.__clinqy?.cancelWaits?.()}).catch(() => {});
+    return true; // Delivered input is never undone; remaining input and waits are cancelled.
+  }
   cancelledIDs.add(id);
   if (cancelledIDs.size > 500) cancelledIDs.delete(cancelledIDs.values().next().value);
   return true;
@@ -34,8 +68,21 @@ function serializedHandle(msg, origin = {}) {
     if (msg.id != null && cancelledIDs.delete(msg.id)) throw new Error(NOT_DISPATCHED + ": the app stopped waiting for it");
     if (origin.epoch != null && origin.epoch !== connectionEpoch) throw new Error(NOT_DISPATCHED + ": its connection was replaced");
     if (ttl != null && Date.now() - receivedAt > ttl) throw new Error(NOT_DISPATCHED + ": it expired while queued");
-    if (msg.id != null) runningIDs.add(msg.id);
-    return handle(msg).finally(() => { if (msg.id != null) runningIDs.delete(msg.id); });
+    let finishRequest;
+    const finished = new Promise(resolve => {finishRequest=resolve;});
+    const request = {finished,cancelled:false, epoch:origin.epoch ?? connectionEpoch, deadline:ttl == null ? Infinity : receivedAt+ttl,
+      command:msg.cmd, tabId:msg.tabId == null ? null : Number(msg.tabId)};
+    if (msg.id != null) { runningIDs.add(msg.id); runningRequests.set(msg.id,request); }
+    if (Number.isInteger(request.tabId)) tabRequestsInFlight.set(request.tabId,request);
+    return handle(msg).finally(() => {
+      if (msg.id != null) { runningIDs.delete(msg.id); runningRequests.delete(msg.id); }
+      // A page may open its popup a moment after the input that caused it returned (a handler's timer, a
+      // navigation): remember the input briefly so that popup still inherits the opener's task.
+      if (Number.isInteger(request.tabId) && POPUP_INPUT_COMMANDS.includes(request.command) && !request.cancelled)
+        recentTabInput.set(request.tabId, { at: Date.now(), command: request.command });
+      if (tabRequestsInFlight.get(request.tabId) === request) tabRequestsInFlight.delete(request.tabId);
+      finishRequest();
+    });
   });
   const tail = next.catch(() => {});
   commandQueues.set(key, tail);
@@ -51,9 +98,9 @@ function connect() {
   const epoch = ++connectionEpoch;
   // Replies go out on the socket the request arrived on, and only while it is still the current connection.
   const reply = (obj) => { if (ws === socket && epoch === connectionEpoch && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(obj)); };
-  ws.onopen = () => {
+  ws.onopen = async () => {
     retry = 1000;
-    reply({ type: "hello", agent: navigator.userAgent, version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version });
+    try { reply(await connectionHello()); } catch { reply({type:"hello",version:SCRIPT_VERSION,build:SCRIPT_BUILD,capabilities:CAPABILITIES}); }
   };
   ws.onmessage = async (event) => {
     let msg;
@@ -68,7 +115,7 @@ function connect() {
   };
   // Back quickly when the app restarts or Chrome wakes the worker (1 s, doubling to 10 s).
   ws.onclose = () => {
-    if (ws === socket) { socket = null; queueActivity(() => clinqyDone()); setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); }
+    if (ws === socket) { for (const id of runningRequests.keys()) markCancelled(id); socket = null; queueActivity(() => clinqyDone()); setTimeout(connect, retry); retry = Math.min(retry * 2, 10000); }
   };
   ws.onerror = () => {};
 }
@@ -130,7 +177,9 @@ const pickerUpload = async (name, type, b64) => {
   caught.files = dt.files;
   caught.dispatchEvent(new Event("input", { bubbles: true }));
   caught.dispatchEvent(new Event("change", { bubbles: true }));
-  return { ok: caught.files.length > 0, files: [...caught.files].map((f) => f.name) };
+  const files=[...(caught.files || [])];
+  return {ok:files.some(f=>f.name===name && f.size===bytes.length),files:files.map(f=>f.name),
+    attached:files.map(f=>({name:f.name,size:f.size,type:f.type})),verified:"file-input-readback",serverAccepted:false};
 };
 
 async function inject(target) {
@@ -138,10 +187,12 @@ async function inject(target) {
 }
 
 async function call(tabId, frameId, name, args = []) {
+  assertRequestLive(tabId);
   const target = { tabId, frameIds: [frameId] };
   await inject(target);
   let res;
   const token = (await mapFor(tabId)).frameTokens?.[frameId] || null;
+  assertRequestLive(tabId);
   try { [res] = await chrome.scripting.executeScript({ target, func: runner, args: [name, args, token] }); }
   catch (e) { throw new Error("the page can't be scripted: " + String(e && e.message || e)); }
   const out = res && res.result;
@@ -152,11 +203,13 @@ async function call(tabId, frameId, name, args = []) {
 
 // Every frame's answer that worked: [{frameId, result}].
 async function callAll(tabId, name, args = []) {
+  assertRequestLive(tabId);
   const target = { tabId, allFrames: true };
   await inject(target);
   let res = [];
   const frameTokens = (await mapFor(tabId)).frameTokens || {};
   const tokens = Object.fromEntries(Object.values(frameTokens).map((t) => [t.documentID, t]));
+  assertRequestLive(tabId);
   try { res = await chrome.scripting.executeScript({ target, func: runner, args: [name, args, tokens] }); } catch {}
   return res.filter((r) => r && r.result && !r.result.__error).map((r) => ({ frameId: r.frameId, result: r.result.__ok }));
 }
@@ -228,13 +281,16 @@ function associateFrames(boxes, subs, claimed) {
   const matches = [];
   const free = [];
   for (const box of boxes) {
-    const sub = box.frameId != null ? subs.get(box.frameId) : null;
-    if (sub && !claimed.has(box.frameId)) { claimed.add(box.frameId); matches.push({ box, frameId: box.frameId, sub }); }
+    const inline = box.inlineDocumentID ? [...subs].filter(([, sub]) => sub.documentID === box.inlineDocumentID && /^about:(blank|srcdoc)(?:[#?]|$)/.test(sub.url || "")) : [];
+    const frameId = inline.length === 1 ? inline[0][0] : box.frameId;
+    const sub = frameId != null ? subs.get(frameId) : null;
+    const permitted = sub && (/^https?:/.test(sub.url || "") || (inline.length === 1 && sub.documentID === box.inlineDocumentID));
+    if (permitted && !claimed.has(frameId)) { claimed.add(frameId); matches.push({ box, frameId, sub }); }
     else free.push(box);
   }
   const unplaced = free.filter((b) => b.frameId == null);
   for (const [frameId, sub] of subs) {
-    if (claimed.has(frameId) || !unplaced.length) continue;
+    if (claimed.has(frameId) || !unplaced.length || !/^https?:/.test(sub.url || "")) continue;
     const addressed = unplaced.filter((f) => f.src && samePage(f.src, sub.url));
     let box = addressed.length === 1 ? addressed[0] : null;
     if (!box) {
@@ -251,6 +307,7 @@ function associateFrames(boxes, subs, claimed) {
 }
 
 async function snapshot(tab) {
+  const frameSnapshots = await callAll(tab.id, "snapshot", [{ excludeTop: true }]);
   const top = await call(tab.id, 0, "snapshot");
   const list = top.elements.map((e) => ({ key: e.key, frameId: 0, local: e.i, e }));
   if (!top.documentID || !top.snapshotID) throw new Error("update browser page helpers before acting");
@@ -261,8 +318,8 @@ async function snapshot(tab) {
   const elements = top.elements;
   const extraText = [];
   if (top.frames && top.frames.length) {
-    const subs = new Map((await callAll(tab.id, "snapshot", [{ excludeTop: true }]))
-      .filter((s) => s.frameId !== 0 && /^https?:/.test(s.result.url || "")).map((s) => [s.frameId, s.result]));
+    const subs = new Map(frameSnapshots
+      .filter((s) => s.frameId !== 0 && /^(https?:|about:(blank|srcdoc)(?:[#?]|$))/.test(s.result.url || "")).map((s) => [s.frameId, s.result]));
     const claimed = new Set();
     const queue = [{ parent: 0, boxes: top.frames, origin: offsets[0], depth: 1 }];
     while (queue.length) {
@@ -305,6 +362,8 @@ async function snapshot(tab) {
   const snapshotID = crypto.randomUUID();
   await saveMap(tab.id, { ...assignIds(previous.documentID === top.documentID ? previous : null, top.url, list),
     documentID: top.documentID, snapshotID, frameTokens, frameBoxes, offsets, coverage });
+  // A new document in an adopted tab needs the user-input watcher again before Clinqy acts in it.
+  if (await isAdopted(tab.id)) await armUserWatch(tab.id, true);
   if (coverage.length) extraText.push("[frames not read: " + coverage.map((c) => `${c.frame} (${c.reason})`).join("; ") + "]");
   if (extraText.length) top.text = [top.text, ...extraText].filter(Boolean).join(" · ").slice(0, 2400);
   return { ...top, snapshotID, elements, tabId: tab.id, active: !!tab.active, frameCoverage: coverage };
@@ -317,7 +376,7 @@ async function frameChainStable(tabId, map, frameId) {
     if (!observed) return false;
     const live = (await call(tabId, observed.parent ?? 0, "frameBoxes")).frames || [];
     const current = live.find((box) => box.nodeToken === observed.nodeToken);
-    if (!current || ["x", "y", "w", "h"].some((key) => Math.abs(current[key] - observed[key]) > 0.5)
+    if (!current || (observed.inlineDocumentID && current.inlineDocumentID !== observed.inlineDocumentID) || ["x", "y", "w", "h"].some((key) => Math.abs(current[key] - observed[key]) > 0.5)
         || Math.abs((current.sx || 1) - (observed.sx || 1)) > 0.01 || Math.abs((current.sy || 1) - (observed.sy || 1)) > 0.01 || current.rotated) return false;
     f = observed.parent ?? 0;
     if (f === 0) return true;
@@ -454,8 +513,9 @@ async function backgroundTab(url, at) {
 }
 
 // A task in the user's own browser works in a tab of its own, in a "Clinqy" group beside theirs. It's never made active,
-// so they keep the tab and window they're in. Metrics and focus are emulated because a tab out of sight has no size and
-// counts as hidden. Only tabs Clinqy opened are touched, and it lets go of them when the task ends.
+// so they keep the tab and window they're in. Focus is emulated, while layout keeps the browser's natural viewport.
+// Screenshots, DOM targets and the visible task halo therefore share the same geometry when a user views the tab.
+// Only tabs Clinqy opened are touched, and it lets go of them when the task ends.
 async function workTabs() {
   try { return (await chrome.storage.session.get("workTabs")).workTabs || []; } catch { return []; }
 }
@@ -467,18 +527,30 @@ async function clinqyGroup(tabId, windowId) {
   if (!group) await chrome.tabGroups.update(id, { title: "Clinqy", color: "blue", collapsed: false });
 }
 
-async function clinqyTab(url, width, height) {
-  const [front] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
-  const t = await chrome.tabs.create({ ...(front ? { windowId: front.windowId } : {}), url, active: false });
+// All task ownership storage changes share a lane, including asynchronously opened popups.
+let ownershipQueue = Promise.resolve();
+function withOwnership(update) {
+  const next = ownershipQueue.then(update);
+  ownershipQueue = next.catch(() => {});
+  return next;
+}
+const endingTaskTabs = new Set();
+async function clinqyTab(url, width, height, runID) {
+  return withOwnership(() => createClinqyTab(url, width, height, runID));
+}
+async function createClinqyTab(url, width, height, runID) {
+  if (runID != null && (typeof runID !== "string" || !runID.length || runID.length > 128)) throw Error("invalid task ownership token");
+  const t = await createInactiveTaskTab(url);
   const mine = await openedTabs();
   mine.add(t.id);
   await setOpened(mine);
   // Arc exposes tab-group APIs whose promises can remain pending. Grouping is cosmetic;
   // it must never hold up attaching to or driving the owned tab.
-  void clinqyGroup(t.id, t.windowId).catch(() => {});
+  void clinqyGroup(t.id, t.windowId).then(() => reminimizeOwnWindow(t)).catch(() => {});
   try { await chrome.storage.session.set({ workTabs: [...await workTabs(), t.id], workSize: { width, height } }); } catch {}
   try {
     await cdp(t.id, "Page.enable");
+    await reminimizeOwnWindow(t);
   } catch (error) {
     // A denied debugger permission must not leave an orphan task tab behind.
     try { await chrome.debugger.detach({ tabId: t.id }); } catch {}
@@ -489,30 +561,117 @@ async function clinqyTab(url, width, height) {
     await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => id !== t.id) });
     throw error;
   }
+  if (runID) await chrome.storage.session.set({["owner"+t.id]:runID});
   await showActivity(t.id);
   return { id: t.id };
 }
 
+// A task tab goes into an existing normal window, never activated. With no browser window at all (Chrome running
+// windowless), tabs.create fails with "No current window": open the tab in a new minimized window that is never
+// focused, so Chrome does not come forward and the user's Space is untouched.
+async function createInactiveTaskTab(url) {
+  let front = null;
+  try { [front] = await chrome.tabs.query({ active: true, lastFocusedWindow: true }); } catch {}
+  let windowId = front?.windowId;
+  if (windowId == null) {
+    try { windowId = (await chrome.windows.getAll({ windowTypes: ["normal"] }))?.[0]?.id; } catch {}
+  }
+  if (windowId != null) return await chrome.tabs.create({ windowId, url, active: false });
+  // Chrome can ignore `state` when combined with other create options, so create unfocused and minimize explicitly.
+  const win = await chrome.windows.create({ url, focused: false, type: "normal" });
+  ownTaskWindows.add(win.id);
+  await minimizeTaskWindow(win.id);
+  const tab = win?.tabs?.[0] || (await chrome.tabs.query({ windowId: win.id }))[0];
+  if (!tab) throw Error("The browser did not create a task window");
+  return tab;
+}
+
+// Keep a no-window task window minimized (never focused). Best effort; safe to repeat.
+const ownTaskWindows = new Set();
+async function minimizeTaskWindow(windowId) {
+  if (windowId == null) return;
+  try { if ((await chrome.windows.get(windowId))?.state === "minimized") return; } catch {}
+  try { await chrome.windows.update(windowId, { state: "minimized" }); } catch {}
+}
+async function reminimizeOwnWindow(tab) { if (ownTaskWindows.has(tab.windowId)) await minimizeTaskWindow(tab.windowId); }
+
 async function prepareWorkTab(tabId) {
   const target = { tabId };
-  const { workSize } = await chrome.storage.session.get("workSize");
   await chrome.debugger.sendCommand(target, "Page.enable");
   // A hidden task must never open a native file picker over the user’s work. Uploads use page fields directly.
   await chrome.debugger.sendCommand(target, "Page.setInterceptFileChooserDialog", { enabled: true });
   try { await chrome.debugger.sendCommand(target, "Page.setDownloadBehavior", { behavior: "default" }); } catch {}   // lifecycle events; best effort
   await chrome.debugger.sendCommand(target, "Emulation.setFocusEmulationEnabled", { enabled: true });
-  await chrome.debugger.sendCommand(target, "Emulation.setDeviceMetricsOverride", { ...(workSize || { width: 1280, height: 900 }), deviceScaleFactor: 1, mobile: false });
+  // Do not force a 1280px canvas inside a wider visible tab. Inactive Chrome tabs retain their layout viewport;
+  // use that same geometry for DOM observations, screenshots and input. Clear overrides left by older sessions.
+  await chrome.debugger.sendCommand(target, "Emulation.clearDeviceMetricsOverride");
 }
 
 // The task ended: Chrome's debugging bar goes, and the tab behaves normally if the user looks at it.
-async function clinqyDone(tabIds) {
+async function clinqyDone(tabIds, closeInactive = false) {
+  // Stop new descendants inheriting ownership before draining already queued adoptions.
+  const roots = tabIds || await activityTabs();
+  for (const id of roots) endingTaskTabs.add(id);
+  await Promise.all([...popupAdoptions]);
+  return withOwnership(() => finishClinqyTabs(tabIds, closeInactive));
+}
+async function finishClinqyTabs(tabIds, closeInactive = false) {
+  if(Array.isArray(tabIds)) {
+    const ids=new Set(tabIds), owned=await workTabs();
+    const records=await chrome.storage.session.get(owned.flatMap(id=>["popup"+id,"owner"+id]));
+    // Include only descendants whose recorded owner still matches their parent's task.
+    for(let depth=0;depth<8;depth++) {
+      let added=false;
+      for(const id of owned) {
+        const popup=records["popup"+id];
+        if(!ids.has(id) && popup && ids.has(popup.opener) && popup.runID===records["owner"+popup.opener] && popup.runID===records["owner"+id]) {ids.add(id);added=true;}
+      }
+      if(!added)break;
+    }
+    tabIds=[...ids];
+  }
+  const affected=tabIds || await activityTabs();
+  for (const id of affected) endingTaskTabs.add(id);
+  const finishing=[];
+  for(const [id,request] of runningRequests) if(affected.includes(request.tabId)) {
+    markCancelled(id); finishing.push(request.finished);
+  }
+  // Let key/button release cleanup run before detaching. A wedged renderer cannot hold cleanup indefinitely.
+  if(finishing.length)await Promise.race([Promise.all(finishing),new Promise(resolve=>setTimeout(resolve,1500))]);
   await finishActivity(tabIds);
+  // Adopted tabs go back to the user exactly as they were: detached, no emulation, never closed.
+  const adoptedNow = await adoptedRecords();
+  for (const id of Object.keys(adoptedNow).map(Number).filter(id => !tabIds || tabIds.includes(id))) {
+    await dropAdoption(id);
+    await restoreAdopted(id);
+  }
   const owned = await workTabs();
   for (const tabId of tabIds ? owned.filter(id => tabIds.includes(id)) : owned) {
     try { await chrome.debugger.detach({ tabId }); } catch {}
     attached.delete(tabId);
   }
-  return { done: true };
+  const closed = [], kept = [];
+  // Only an explicit test-run list may be removed. Never sweep another run's tabs,
+  // and a tab the user selected or which is playing audio belongs to the user now.
+  if (closeInactive && Array.isArray(tabIds)) {
+    const mine = await openedTabs();
+    for (const tabId of owned.filter(id => tabIds.includes(id) && mine.has(id))) {
+      try {
+        const tab = await chrome.tabs.get(tabId);
+        if (tab.active || tab.audible) { kept.push(tabId); continue; }
+        await chrome.tabs.remove(tabId);
+        closed.push(tabId);
+      } catch { kept.push(tabId); }
+    }
+    // Do not overwrite storage from the beginning of this await-heavy operation: another run may have opened a tab.
+    const current = await openedTabs();
+    for (const id of closed) current.delete(id);
+    await setOpened(current);
+    await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => !closed.includes(id)) });
+  }
+  for (const id of affected) endingTaskTabs.delete(id);
+  for (const id of tabIds || [...userReleased.keys()]) userReleased.delete(id);
+  return { done: true, closed, kept };
 }
 
 // The next task starts: the last one's tabs go, except one the user is on or one playing sound, which are theirs now.
@@ -589,6 +748,9 @@ function onDebuggerEvent(source, method, params = {}) {
     const known = downloads.get(params.guid) || { tabId, state: "started" };
     known.state = params.state; known.received = params.receivedBytes; known.total = params.totalBytes;
     downloads.set(params.guid, known);
+    if (downloads.size > 200) {
+      for (const [guid, download] of downloads) if (["completed","canceled"].includes(download.state) && guid !== params.guid) {downloads.delete(guid);break;}
+    }
     if (params.state !== "inProgress") {
       recordEvent(known.tabId ?? tabId, { kind: "download", phase: params.state === "completed" ? "completed" : params.state, guid: params.guid,
                                           url: known.url, filename: known.filename, bytes: params.totalBytes ?? params.receivedBytes });
@@ -601,15 +763,19 @@ if (chrome.debugger) {
 }
 
 async function cdp(tabId, method, params = {}) {
+  assertRequestLive(tabId);
+  if (userReleased.has(tabId)) throw new Error(releasedMessage(tabId));
   if (!attached.has(tabId)) {
     const mine = await openedTabs();
-    if (!mine.has(tabId)) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
+    // Only Clinqy's own tabs, or a tab the user's request handed over for this run (adoptTab), are ever attached.
+    if (!mine.has(tabId) && !(await isAdopted(tabId))) throw new Error("tab " + tabId + " wasn't opened by Clinqy, so it isn't driven in the background");
     if (!chrome.debugger) throw new Error("reload the Clinqy extension to allow this action");
     try { await chrome.debugger.attach({ tabId }, "1.3"); }
     catch (e) { if (!/already attached/i.test(String(e && e.message || e))) throw e; }
     attached.add(tabId);
     if ((await workTabs()).includes(tabId)) await prepareWorkTab(tabId);
   }
+  assertRequestLive(tabId);
   return await chrome.debugger.sendCommand({ tabId }, method, params);
 }
 
@@ -641,19 +807,76 @@ async function cdpKey(tabId, combo) {
   const commands = modifiers === 4 && COMMANDS[name] ? [COMMANDS[name]]
     : modifiers === 12 && name === "z" ? ["redo"] : undefined;
   const base = { key, code, windowsVirtualKeyCode: vk, nativeVirtualKeyCode: vk, modifiers };
-  await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: text ? "keyDown" : "rawKeyDown", text, unmodifiedText: text, commands });
-  await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: "keyUp" });
+  try {
+    await cdp(tabId, "Input.dispatchKeyEvent", { ...base, type: text ? "keyDown" : "rawKeyDown", text, unmodifiedText: text, commands });
+  } finally {
+    // Releasing an already dispatched key is cleanup, even after cancellation.
+    await chrome.debugger.sendCommand({tabId}, "Input.dispatchKeyEvent", {...base,type:"keyUp"});
+  }
   return { pressed: combo };
+}
+
+// An owned/adopted task tab's (hidden) file input gets the file from the browser itself (CDP DOM.setFileInputFiles):
+// a real file selection, with the input/change events the page expects. null = this route isn't available (not a
+// task tab, input in a shadow root, protocol refused) and NOTHING was assigned, so the page-side route may run.
+// Once the browser accepted the file it is never assigned a second time: the readback is the answer.
+async function uploadThroughBrowser(tabId, local, msg) {
+  let mark;
+  try {
+    mark = await call(tabId, 0, "markFileInput", [local, msg.name]);
+    const doc = await cdp(tabId, "DOM.getDocument", { depth: 0 });
+    const found = await cdp(tabId, "DOM.querySelector", { nodeId: doc.root.nodeId, selector: '[data-clinqy-file="' + mark.token + '"]' });
+    if (!found || !found.nodeId) return null;
+    await cdp(tabId, "DOM.setFileInputFiles", { nodeId: found.nodeId, files: [String(msg.path)] });
+  } catch (e) {
+    if (mark) { try { await call(tabId, 0, "fileReadback", [mark.token, "", -1, true]); } catch {} }   // clears the tag
+    if (/operation interrupted/.test(String(e && e.message || e))) throw e;
+    return null;
+  }
+  const size = Number.isFinite(Number(msg.size)) ? Number(msg.size) : -1;
+  const r = await call(tabId, 0, "fileReadback", [mark.token, msg.name, size, !!mark.shownBefore]);
+  return { ...r, assigned: true, cleared: !r.held, via: "cdp" };
 }
 
 async function cdpClick(tabId, x, y, count = 1) {
   const at = { x: Number(x), y: Number(y) };
+  if (!Number.isFinite(at.x) || !Number.isFinite(at.y) || at.x < 0 || at.y < 0 || !Number.isInteger(count) || count < 1 || count > 2)
+    throw Error("invalid click coordinates or count");
   await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseMoved", ...at });
   for (let i = 1; i <= count; i++) {
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: i });
-    await cdp(tabId, "Input.dispatchMouseEvent", { type: "mouseReleased", ...at, button: "left", buttons: 0, clickCount: i });
+    try {
+      await cdp(tabId, "Input.dispatchMouseEvent", { type: "mousePressed", ...at, button: "left", buttons: 1, clickCount: i });
+    } finally {
+      await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", {type:"mouseReleased",...at,button:"left",buttons:0,clickCount:i});
+    }
   }
   return { clicked: at };
+}
+
+// Effect receipts armed before an input (token → tab, URL and frames). Collecting merges every frame's report;
+// a frame that no longer answers was replaced or navigated, which is itself an observed effect.
+const receiptsArmed = new Map();
+async function receiptCollect(tab, msg) {
+  const armed = receiptsArmed.get(msg.token);
+  if (!armed || armed.tabId !== tab.id) throw Error("no armed receipt for this tab");
+  receiptsArmed.delete(msg.token);
+  const out = { urlChanged: false, unreadable: false, targetStateChanged: false, targetRemoved: false, dialogOpened: false,
+    focusChanged: false, focusIntoNew: false, structural: false, addedText: "", removedText: "", mutationCount: 0 };
+  const quiet = Number(msg.quietMs) || 120, cap = Number(msg.capMs) || 800;
+  await Promise.all(armed.frames.map(async (frameId) => {
+    let r;
+    try { r = await call(tab.id, frameId, "receiptCollect", [msg.token, quiet, cap]); }
+    catch { out.unreadable = true; return; }
+    for (const key of ["urlChanged", "targetStateChanged", "targetRemoved", "dialogOpened", "focusChanged", "focusIntoNew", "structural"]) out[key] = out[key] || !!r[key];
+    for (const key of ["addedText", "removedText"]) if (r[key]) out[key] = (out[key] ? out[key] + " | " : "") + r[key];
+    out.mutationCount += Number(r.mutationCount) || 0;
+  }));
+  try {
+    const now = await chrome.tabs.get(tab.id);
+    if ((now.pendingUrl || now.url || "") !== armed.url) out.urlChanged = true;
+  } catch {}
+  out.addedText = out.addedText.slice(0, 800); out.removedText = out.removedText.slice(0, 800);
+  return out;
 }
 
 // Endpoint identity is checked before any pointer input. A lost acknowledgement never triggers a retry.
@@ -685,6 +908,7 @@ async function cdpGesture(tabId, msg) {
         if (destination) for (let step = 1; step <= 12; step++) {
           last = { x: start.x + (destination.x - start.x) * step / 12, y: start.y + (destination.y - start.y) * step / 12 };
           await post({ type: "mouseMoved", ...last, button, buttons });
+          if (msg._activity && step % 4 === 0) await renderActivity(tabId,{kind:"drag",...last});
           await new Promise(resolve => setTimeout(resolve, 20));
         }
         await post({ type: "mouseReleased", ...last, button, buttons: 0, clickCount: count });
@@ -692,7 +916,11 @@ async function cdpGesture(tabId, msg) {
       }
     }
   } finally {
-    if (held) await post({ type: "mouseReleased", ...last, button, buttons: 0, clickCount: 1 }).catch(() => {});
+    if (held) await chrome.debugger.sendCommand({tabId}, "Input.dispatchMouseEvent", { type: "mouseReleased", ...last, button, buttons: 0, clickCount: 1 }).catch(() => {});
+  }
+  if (destination && msg._activityState) {
+    Object.assign(msg._activityState,destination);
+    delete msg._activityState.localIndex;
   }
   return { delivered: true, verified: false };
 }
@@ -709,17 +937,213 @@ if (chrome.tabs.onUpdated) chrome.tabs.onUpdated.addListener((tabId, change) => 
   });
 });
 
+const popupAdoptions = new Set();
+chrome.tabs.onCreated?.addListener(tab => {
+  if(tab.openerTabId == null)return;
+  const opener=tab.openerTabId, request=tabRequestsInFlight.get(opener);
+  recordEvent(opener,{kind:"popup",tabId:tab.id,url:tab.pendingUrl || tab.url || "",state:"opened; observation required"});
+  // Only a popup produced by Clinqy's input to an owned task tab can inherit that task: while that input is being
+  // dispatched, or within a short grace after it returned (pages often open the window from a timer or after a fetch).
+  const inFlight=!!request && !request.cancelled && POPUP_INPUT_COMMANDS.includes(request.command);
+  const recent=recentTabInput.get(opener);
+  const afterInput=!request && !!recent && Date.now()-recent.at<=POPUP_INPUT_GRACE_MS;
+  if(!inFlight && !afterInput)return;
+  const adoption=withOwnership(async()=>{
+    const owner=(await chrome.storage.session.get("owner"+opener))["owner"+opener];
+    if(!owner || endingTaskTabs.has(opener) || !(await workTabs()).includes(opener) || request?.cancelled)return;
+    const current=await chrome.tabs.get(tab.id);
+    if(current.openerTabId!==opener)return;
+    await chrome.storage.session.set({["owner"+tab.id]:owner,["popup"+tab.id]:{opener,runID:owner}});
+    const mine=await openedTabs(); mine.add(tab.id); await setOpened(mine);
+    await chrome.storage.session.set({workTabs:[...new Set([...await workTabs(),tab.id])]});
+    // No tabs.update(active:true) or windows.update(focused:true): selection is logical and explicit.
+    recordEvent(opener,{kind:"popup",tabId:tab.id,openerTabId:opener,state:"task-owned; select explicitly",owned:true});
+  }).catch(error=>recordEvent(opener,{kind:"popup",tabId:tab.id,state:"not adopted",error:String(error?.message || error)}));
+  popupAdoptions.add(adoption); void adoption.finally(()=>popupAdoptions.delete(adoption));
+});
 chrome.tabs.onRemoved.addListener((tabId) => queueActivity(async () => {
+  try {
+    const stored = await chrome.storage.session.get(["owner" + tabId, "popup" + tabId]);
+    const runID = stored["owner" + tabId];
+    if (runID && (await workTabs()).includes(tabId)) {
+      closedTaskTabs.set(tabId, { runID, opener: stored["popup" + tabId]?.opener, at: Date.now() });
+      if (closedTaskTabs.size > 200) closedTaskTabs.delete(closedTaskTabs.keys().next().value);
+    }
+  } catch {}
+  recentTabInput.delete(tabId);
   await finishActivity([tabId]);
+  endingTaskTabs.delete(tabId);
   attached.delete(tabId);
   maps.delete(tabId);
   focusFrames.delete(tabId);
   tabEvents.delete(tabId);
   dialogPolicy.delete(tabId);
-  try { await chrome.storage.session.remove("map" + tabId); } catch {}
-  const mine = await openedTabs();
-  if (mine.delete(tabId)) await setOpened(mine);
+  for (const [guid,download] of downloads) if (download.tabId === tabId) downloads.delete(guid);
+  clinqyInput.delete(tabId);
+  const adoption = await withOwnership(() => dropAdoption(tabId));
+  if (adoption) send({ type: "adoptedReleased", tabId, runID: adoption.runID, reason: "closed" });
+  userReleased.delete(tabId);
+  await withOwnership(async () => {
+    try { await chrome.storage.session.remove(["map" + tabId,"owner"+tabId,"popup"+tabId]); } catch {}
+    const mine = await openedTabs();
+    if (mine.delete(tabId)) await setOpened(mine);
+    await chrome.storage.session.set({workTabs:(await workTabs()).filter(id => id !== tabId)});
+  });
 }));
+
+// ---- the user's own tab, adopted for one run ----
+// "Work in the tab I have open": the user's request hands one existing tab to one run. It gets the same ownership
+// token as a task tab (owner<id>, workTabs) plus an adoption record, the debugger with emulated focus, and the
+// activity marker. It is never activated, nor its window focused, and never closed. The moment the user acts in it
+// (a real click, key or scroll that Clinqy did not send) or selects it, Clinqy lets go: the debugger detaches,
+// focus emulation and the marker go, and the app is told so the run pauses until the user hands it back.
+async function adoptedRecords() {
+  try { return (await chrome.storage.session.get("adoptedTabs")).adoptedTabs || {}; } catch { return {}; }
+}
+async function setAdoptedRecords(records) {
+  try { await chrome.storage.session.set({ adoptedTabs: records }); } catch {}
+}
+async function isAdopted(tabId) { return !!(await adoptedRecords())[tabId]; }
+// Tabs the user took back during a run: actions on them stop with this reason instead of a generic ownership error.
+const userReleased = new Map();   // tabId → { runID, reason }
+function releasedMessage(tabId) {
+  return "the user took tab " + tabId + " back (" + (userReleased.get(tabId)?.reason || "user input") + "); Clinqy let go of it and sends nothing more to it";
+}
+// Input Clinqy itself is sending to a tab: CDP input is trusted, so a page cannot tell it from the user's. Real
+// input is whatever arrives while Clinqy is not sending any, plus a short grace for events still in flight.
+const clinqyInput = new Map();   // tabId → { depth, until }
+const CLINQY_INPUT_GRACE_MS = 400;
+const INPUT_COMMANDS = new Set(["cdpClick", "cdpKey", "cdpType", "cdpScroll", "cdpGesture", "click", "clickOption", "fill", "fillActive",
+  "setRange", "focus", "prepare", "upload", "uploadVia", "scroll"]);
+function beginClinqyInput(tabId) {
+  const state = clinqyInput.get(tabId) || { depth: 0, until: 0 };
+  state.depth++; clinqyInput.set(tabId, state);
+}
+function endClinqyInput(tabId) {
+  const state = clinqyInput.get(tabId);
+  if (!state) return;
+  state.depth = Math.max(0, state.depth - 1); state.until = Date.now() + CLINQY_INPUT_GRACE_MS;
+}
+function clinqyInputActive(tabId) {
+  const state = clinqyInput.get(tabId);
+  return !!state && (state.depth > 0 || Date.now() < state.until);
+}
+function hostOf(raw) {
+  try { return new URL(raw).hostname.toLowerCase().replace(/^www\./, ""); } catch { return ""; }
+}
+function originOf(raw) { try { return new URL(raw).origin; } catch { return ""; } }
+// Same rule as the app's AccessBlocklist: a host or its subdomains, "*" matching any run of characters.
+function blockedHost(url, patterns) {
+  const host = hostOf(url);
+  if (!host) return false;
+  return patterns.some(raw => {
+    const pattern = String(raw || "").trim().toLowerCase();
+    if (!pattern) return false;
+    if (pattern.includes("*")) return new RegExp("^" + pattern.split("*").map(p => p.replace(/[.+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$").test(host);
+    const bare = hostOf(pattern.includes("://") ? pattern : "https://" + pattern) || pattern;
+    return host === bare || host.endsWith("." + bare);
+  });
+}
+async function armUserWatch(tabId, on) {
+  try {
+    if (on) await inject({ tabId, allFrames: true });
+    await chrome.scripting.executeScript({ target: { tabId, allFrames: true }, func: on => window.__clinqy?.watchUser?.(on), args: [on] });
+  } catch {} // a navigating or restricted document; the next observation re-arms it
+}
+async function adoptTab(msg) {
+  const tabId = Number(msg.tabId), runID = msg.runID;
+  if (!Number.isInteger(tabId)) throw Error("adoptTab needs a tab id");
+  if (typeof runID !== "string" || !runID.length || runID.length > 128) throw Error("invalid task ownership token");
+  const adopted = await withOwnership(async () => {
+    const tab = await chrome.tabs.get(tabId);
+    const url = tab.url || tab.pendingUrl || "";
+    if (!/^(https?|file):/.test(url)) throw Error("this tab is a browser page (new tab, settings, extensions) that extensions can't drive");
+    if (msg.expectedOrigin && originOf(url) !== msg.expectedOrigin) throw Error("the tab changed site since it was chosen; choose it again");
+    if (Array.isArray(msg.blockedHosts) && blockedHost(url, msg.blockedHosts)) throw Error("this site is on Clinqy's blocked list and is never operated");
+    const owner = (await chrome.storage.session.get("owner" + tabId))["owner" + tabId];
+    if (owner && owner !== runID) throw Error("this tab is already in use by another Clinqy task");
+    const records = await adoptedRecords();
+    records[tabId] = { runID, url, windowId: tab.windowId, at: Date.now() };
+    await setAdoptedRecords(records);
+    await chrome.storage.session.set({ ["owner" + tabId]: runID, workTabs: [...new Set([...await workTabs(), tabId])] });
+    userReleased.delete(tabId);
+    return tab;
+  });
+  try {
+    await cdp(tabId, "Page.enable");   // attaches and prepares it like a task tab: emulated focus, no native pickers
+  } catch (error) {
+    await withOwnership(() => dropAdoption(tabId));
+    await restoreAdopted(tabId);
+    throw error;
+  }
+  await armUserWatch(tabId, true);
+  await showActivity(tabId);
+  // No tabs.update(active) or windows.update(focused): the user keeps the tab and window they are in.
+  return { id: tabId, adopted: true, url: adopted.url || adopted.pendingUrl || "", title: adopted.title || "", active: !!adopted.active, windowId: adopted.windowId };
+}
+// Ownership records only; callers hold the ownership lane.
+async function dropAdoption(tabId) {
+  const records = await adoptedRecords();
+  if (!records[tabId]) return null;
+  const record = records[tabId];
+  delete records[tabId];
+  await setAdoptedRecords(records);
+  try { await chrome.storage.session.remove(["owner" + tabId]); } catch {}
+  try { await chrome.storage.session.set({ workTabs: (await workTabs()).filter(id => id !== tabId) }); } catch {}
+  return record;
+}
+// The tab behaves as it did before: no focus emulation, native pickers allowed, no debugger bar, no watcher.
+async function restoreAdopted(tabId) {
+  await armUserWatch(tabId, false);
+  if (attached.has(tabId)) {
+    for (const [method, params] of [["Emulation.setFocusEmulationEnabled", { enabled: false }], ["Page.setInterceptFileChooserDialog", { enabled: false }]]) {
+      try { await chrome.debugger.sendCommand({ tabId }, method, params); } catch {}
+    }
+  }
+  try { await chrome.debugger.detach({ tabId }); } catch {}
+  attached.delete(tabId);
+  clinqyInput.delete(tabId);
+  dialogPolicy.delete(tabId);
+}
+// The user acted in an adopted tab (or the run ended): let go at once and say why.
+async function releaseAdopted(tabId, reason) {
+  const record = (await adoptedRecords())[tabId];
+  if (!record) return { released: false };
+  if (reason !== "done") userReleased.set(tabId, { runID: record.runID, reason });
+  for (const [id, request] of runningRequests) if (request.tabId === tabId) markCancelled(id);
+  await restoreAdopted(tabId);
+  await finishActivity([tabId]);
+  await withOwnership(() => dropAdoption(tabId));
+  if (reason !== "done") {
+    recordEvent(tabId, { kind: "adoption", state: "released", reason });
+    send({ type: "adoptedReleased", tabId, runID: record.runID, reason });
+  }
+  return { released: true, reason };
+}
+async function userTookTab(tabId, reason) {
+  if (reason.startsWith("input") && clinqyInputActive(tabId)) return;
+  if (!(await isAdopted(tabId))) return;
+  if (reason.startsWith("input") && clinqyInputActive(tabId)) return;
+  await releaseAdopted(tabId, reason);
+}
+chrome.runtime.onMessage?.addListener((message, sender) => {
+  if (message?.clinqy !== "userInput" || sender?.tab?.id == null) return;
+  void userTookTab(sender.tab.id, "input:" + String(message.kind || "event").slice(0, 20));
+});
+// Clinqy never activates an adopted tab, so its activation is the user's.
+chrome.tabs.onActivated?.addListener(({ tabId }) => { void userTookTab(tabId, "selected"); });
+// The user's tabs to choose from (metadata only: nothing is attached, focused or changed).
+async function adoptCandidates() {
+  const [front] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+  const own = new Set(await workTabs());
+  const agent = await agentWindow();
+  const all = await chrome.tabs.query({});
+  return { lastFocusedWindow: front ? front.windowId : null, tabs: all
+    .filter(t => !own.has(t.id) && (!agent || t.windowId !== agent.id) && !t.incognito)
+    .slice(0, 300)
+    .map(t => ({ id: t.id, windowId: t.windowId, title: (t.title || "").slice(0, 200), url: (t.url || t.pendingUrl || "").slice(0, 2048),
+      active: !!t.active, lastFocusedWindow: !!front && t.windowId === front.windowId })) };
+}
 
 async function tabCommand(msg) {
   const tabId = Number(msg.tabId);
@@ -751,13 +1175,38 @@ async function tabCommand(msg) {
 
 // Tokens and page-initiated events travel with every tab-scoped result, so a caller never has to guess which
 // observation an outcome belongs to or whether a dialog/download happened while it ran.
+function activityKind(msg) {
+  if (/^(cdpClick|click|clickOption)$/.test(msg.cmd)) return "click";
+  if (/^(cdpType|fill|fillActive|cdpKey|setRange)$/.test(msg.cmd)) return "type";
+  if (/^(scroll|cdpScroll)$/.test(msg.cmd)) return "scroll";
+  if (/^(upload|uploadVia)$/.test(msg.cmd)) return "upload";
+  if (/^(navigate|goBack)$/.test(msg.cmd)) return "navigating";
+  if (/^(waitText|waitCondition)$/.test(msg.cmd)) return "waiting";
+  if (msg.cmd === "cdpGesture") return msg.gesture === "drag" ? "drag" : msg.gesture === "hover" ? "hover" : "click";
+  return "observing";
+}
 async function handle(msg) {
-  const out = await handleCommand(msg);
+  msg._startedAt=Date.now();
+  let out;
+  const inputTab = INPUT_COMMANDS.has(msg.cmd) && msg.tabId != null ? Number(msg.tabId) : null;
+  if (inputTab != null) beginClinqyInput(inputTab);
+  try {
+    out = await handleCommand(msg);
+    if (msg._activity && msg.tabId != null && msg._activityState && !userReleased.has(Number(msg.tabId)) && !["observing","waiting"].includes(msg._activityState.kind))
+      await showActivity(Number(msg.tabId), {...msg._activityState,stage:out?.ok===false || out?.skipped || out?.cancelled ? "failed" : "delivered",
+        ...(out?.ok===false || out?.skipped || out?.cancelled ? {kind:"error"} : {})});
+  } catch(error) {
+    if (msg._activity && msg.tabId != null && !userReleased.has(Number(msg.tabId))) await showActivity(Number(msg.tabId),{kind:"error"});
+    throw error;
+  } finally {
+    if (inputTab != null) endClinqyInput(inputTab);
+  }
   const id = msg.tabId != null && msg.tabId !== "" ? Number(msg.tabId) : null;
   if (id == null || !Number.isInteger(id) || !out || typeof out !== "object" || Array.isArray(out)) return out;
   const events = drainEvents(id);
   if (events.length && out.events === undefined) out.events = events;
-  if (!["snapshot", "tabs", "tabInfo", "newTab", "clinqyTab", "switchTab", "closeTab", "clinqyDone"].includes(msg.cmd) && out.observation === undefined) {
+  out.elapsedMs = Math.max(0, Date.now() - (msg._startedAt || Date.now()));
+  if (!["snapshot", "tabs", "tabInfo", "newTab", "clinqyTab", "switchTab", "closeTab", "clinqyDone", "adoptTab", "releaseAdopted"].includes(msg.cmd) && out.observation === undefined) {
     const map = maps.get(id);
     if (map && map.documentID) out.observation = { documentID: map.documentID, snapshotID: map.snapshotID };
   }
@@ -766,35 +1215,62 @@ async function handle(msg) {
 
 async function handleCommand(msg) {
   if (msg.cmd === "reload") { setTimeout(() => chrome.runtime.reload(), 100); return { reloading: true }; }
-  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version };
+  if (msg.cmd === "version") return { version: SCRIPT_VERSION, manifest: chrome.runtime.getManifest().version, build:SCRIPT_BUILD, capabilities:CAPABILITIES, protocolVersion:7 };
+  if (msg.cmd === "adoptTab") return await adoptTab(msg);
+  if (msg.cmd === "adoptCandidates") return await adoptCandidates();
+  if (msg.cmd === "releaseAdopted") {
+    const record = (await adoptedRecords())[Number(msg.tabId)];
+    if (record && record.runID !== msg.runID) throw new Error("This tab does not belong to Clinqy's task");
+    return await releaseAdopted(Number(msg.tabId), "done");
+  }
   // Task commands are explicitly scoped: they cannot fall through to the user's active tab.
   if (msg.workOnly) {
-    const owned = await workTabs();
+    let owned = await workTabs();
+    if (msg.runID) {
+      const owners = await chrome.storage.session.get(owned.map(id => "owner"+id));
+      owned = owned.filter(id => owners["owner"+id] === msg.runID);
+    }
     if (msg.cmd === "tabs") {
-      const tabs = [];
+      // A popup's tab event can trail its opener action; wait only for already-known ownership checks.
+      await Promise.all([...popupAdoptions]);
+      if (msg.runID) {
+        const all=await workTabs(), ownership=await chrome.storage.session.get(all.map(id=>"owner"+id));
+        owned=all.filter(id=>ownership["owner"+id]===msg.runID);
+      }
+      const tabs = [], adoptedNow = await adoptedRecords();
       for (const id of owned) {
         try {
           const t = await chrome.tabs.get(id);
-          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true });
+          const popup=(await chrome.storage.session.get("popup"+id))["popup"+id];
+          tabs.push({ id, title: t.title || "", url: t.url || t.pendingUrl || "", opened: true, adopted: !!adoptedNow[id],
+            inherited:!!popup && popup.runID===msg.runID, openerTabId:popup?.opener });
         } catch {}
       }
-      return { tabs };
+      const closed = [...closedTaskTabs].filter(([, c]) => !msg.runID || c.runID === msg.runID)
+        .map(([id, c]) => ({ id, openerTabId: c.opener ?? null }));
+      return { tabs, closed };
     }
     if (msg.cmd === "newTab") throw new Error("Use clinqyTab to create an inactive task tab");
+    const released = msg.tabId != null ? userReleased.get(Number(msg.tabId)) : null;
+    if (released && (!msg.runID || released.runID === msg.runID) && !owned.includes(Number(msg.tabId)))
+      throw new Error(releasedMessage(Number(msg.tabId)));
+    const closed = msg.tabId != null ? closedTaskTabs.get(Number(msg.tabId)) : null;
+    if (closed && (!msg.runID || closed.runID === msg.runID) && !owned.includes(Number(msg.tabId)))
+      throw new Error(closedTaskTabMessage(Number(msg.tabId), closed));
     if (msg.tabId == null || !owned.includes(Number(msg.tabId)))
       throw new Error("This tab does not belong to Clinqy's task");
     if (msg.cmd === "switchTab") return { id: Number(msg.tabId) };
   }
   if (/^(tabs|switchTab|closeTab)$/.test(msg.cmd)) return await tabCommand(msg);
   if (msg.cmd === "backgroundTab") return await backgroundTab(msg.url, msg.at);
-  if (msg.cmd === "clinqyTab") return await clinqyTab(msg.url, Number(msg.width) || 1280, Number(msg.height) || 900);
+  if (msg.cmd === "clinqyTab") return await clinqyTab(msg.url, Number(msg.width) || 1280, Number(msg.height) || 900, msg.runID);
   if (msg.cmd === "clinqyDone") {
     let ids = msg.tabIds;
     if (msg.operationIDs?.length) {
       const requests = (await chrome.storage.session.get("tabRequests")).tabRequests || {};
       ids = [...new Set([...(ids || []), ...msg.operationIDs.map(token => requests[token]?.id).filter(Number.isInteger)])];
     }
-    return await clinqyDone(ids);
+    return await clinqyDone(ids, msg.closeInactive === true);
   }
   if (msg.cmd === "clinqyClear") return await clinqyClear();
   // A window Clinqy left behind (it quit without closing it) goes; one the user took over is only forgotten.
@@ -807,21 +1283,32 @@ async function handleCommand(msg) {
   if (msg.cmd === "newTab") return await foregroundTab(msg);
   // Every action is pinned to its explicit observed tab when available.
   const tab = msg.tabId != null ? await chrome.tabs.get(Number(msg.tabId)) : await activeTab();
-  if (msg.activity || (await activityTabs()).includes(tab.id)) {
-    const kind = /^(cdpClick|click|clickOption)$/.test(msg.cmd) ? "click"
-      : /^(cdpType|fill|fillActive)$/.test(msg.cmd) ? "type"
-      : /^(scroll|cdpScroll)$/.test(msg.cmd) ? "scroll" : "working";
-    const state = { kind };
-    if (msg.x != null && msg.y != null) { state.x = Number(msg.x); state.y = Number(msg.y); }
-    else if (Number.isInteger(msg.index) && ["locate", "focus", "focusFor", "click", "fill", "prepare", "upload"].includes(msg.cmd)) {
+  const request = runningRequests.get(msg.id);
+  if(request && request.tabId == null) {
+    if(tabRequestsInFlight.has(tab.id)) throw Error("this tab is busy with another request; observe again after it finishes");
+    request.tabId=tab.id; tabRequestsInFlight.set(tab.id,request);
+  }
+  assertRequestLive(tab.id);
+  if (msg.cmd === "activityStatus") {
+    if (!(await activityTabs()).includes(tab.id)) return {updated:false};
+    await showActivity(tab.id,{kind:msg.phase}); return {updated:true};
+  }
+  msg._activity = !userReleased.has(tab.id) && (msg.activity || (await activityTabs()).includes(tab.id));
+  if (msg._activity) {
+    const kind = activityKind(msg);
+    const state = {kind,stage:"prepare"};
+    if (Number.isFinite(msg.x) && Number.isFinite(msg.y)) {state.x=msg.x;state.y=msg.y;}
+    else if (Number.isInteger(msg.index)) {
       try {
-        const { frameId, local } = await route(tab.id, msg.index);
-        const point = await call(tab.id, frameId, "activityPoint", [local]);
-        const offset = (await mapFor(tab.id)).offsets?.[frameId];
-        if (point && offset) { const p = toTop(offset, point.x, point.y); state.x = p.x; state.y = p.y; }
-      } catch {}
+        const {frameId,local} = await route(tab.id,msg.index);
+        const point = await call(tab.id,frameId,"activityPoint",[local]);
+        const map = await mapFor(tab.id), offset = map.offsets?.[frameId];
+        if (point && offset) Object.assign(state,toTop(offset,point.x,point.y));
+        if (frameId===0) {state.localIndex=local;state.documentID=map.documentID;}
+      } catch {} // Feedback never substitutes for the action's actual target validation below.
     }
-    await showActivity(tab.id, state);
+    msg._activityState=state;
+    await showActivity(tab.id,state);
   }
   if (msg.cmd === "selection") {
     const win = await chrome.windows.get(tab.windowId);
@@ -832,9 +1319,20 @@ async function handleCommand(msg) {
   if (msg.cmd === "captureTask") {
     // The debugger helper only accepts tabs opened by Clinqy. Never activate a tab or capture the user's display.
     if (msg.tabId == null) throw new Error("task screenshot requires an explicit tab");
-    const captured = await cdp(tab.id, "Page.captureScreenshot", {
-      format: msg.format || "png", ...(msg.quality ? { quality: Number(msg.quality) } : {}), fromSurface: true, captureBeyondViewport: false
-    });
+    // Our task feedback is not page evidence. Hide it only for capture, restoring even on CDP failure.
+    const captureVisibility = async hidden => {
+      await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] },
+        func: hidden => window.__clinqyActivity?.setCaptureHidden(hidden), args: [hidden] });
+    };
+    let captured;
+    try {
+      await captureVisibility(true);
+      captured = await cdp(tab.id, "Page.captureScreenshot", {
+        format: msg.format || "png", ...(msg.quality ? { quality: Number(msg.quality) } : {}), fromSurface: true, captureBeyondViewport: false
+      });
+    } finally {
+      try { await captureVisibility(false); } catch {} // A navigated/closed document no longer owns this overlay.
+    }
     // Freshness/coverage: which observation this picture matches, when it was taken, and what it can show.
     const meta = { capturedAt: Date.now(), coverage: "viewport", beyondViewport: false };
     const map = await mapFor(tab.id);
@@ -849,7 +1347,14 @@ async function handleCommand(msg) {
   }
   if (msg.cmd === "tabInfo") {
     const win = await chrome.windows.get(tab.windowId);
-    return { id: tab.id, url: tab.url || tab.pendingUrl || "", status: tab.status, title: tab.title || "", focused: !!win.focused };
+    let live = null;
+    try {
+      const [result] = await chrome.scripting.executeScript({ target: { tabId: tab.id, frameIds: [0] },
+        func: () => ({ url: location.href, ready: document.readyState }) });
+      live = result?.result;
+    } catch {} // Restricted or navigating documents retain the browser's status fallback.
+    return { id: tab.id, url: live?.url || tab.url || tab.pendingUrl || "", ready: live?.ready,
+      status: tab.status, title: tab.title || "", focused: !!win.focused };
   }
   if (msg.cmd === "dialogPolicy") {
     // The app's explicit decision for the next dialog on this owned tab (or every one, when persistent).
@@ -860,12 +1365,15 @@ async function handleCommand(msg) {
   if (msg.cmd === "downloadStatus") {
     return { downloads: [...downloads.entries()].filter(([, d]) => d.tabId === tab.id).map(([guid, d]) => ({ guid, ...d })) };
   }
+  // A receipt is collected after the input it watched, which may have navigated or replaced the observed document.
+  if (msg.cmd === "receiptCollect") return await receiptCollect(tab, msg);
   const unguarded = new Set(["snapshot", "goBack", "navigate"]);
   if (!unguarded.has(msg.cmd)) {
     const map = await mapFor(tab.id);
     if (msg.documentID !== map.documentID || msg.snapshotID !== map.snapshotID || !map.documentID || !map.snapshotID)
       throw new Error("stale browser observation; update the extension and take a new look");
     await call(tab.id, 0, "check");
+    if (msg.cmd === "cdpClick" && !Number.isInteger(msg.index)) await call(tab.id,0,"coordinateGuard",[Number(msg.x),Number(msg.y)]);
     if (["cdpKey", "cdpType", "cdpScroll"].includes(msg.cmd)) {
       // A child can reload without changing its parent's URL or document token.
       for (const frame of Object.keys(map.frameTokens || {}).map(Number)) await call(tab.id, frame, "check");
@@ -955,6 +1463,20 @@ async function handleCommand(msg) {
       return await call(tab.id, frame, "clickOption", [msg.pointToken]);
     }
     case "activeOption": return await indexed("activeOption", [msg.want || ""]);
+    case "receiptArm": {
+      // Armed in the target's own frame (its state and local changes) and in the top page (dialogs, navigation).
+      const token = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+      const frames = [];
+      if (Number.isInteger(msg.index)) {
+        const { frameId, local } = await route(tab.id, msg.index);
+        await call(tab.id, frameId, "receiptArm", [token, local]);
+        frames.push(frameId);
+      }
+      if (!frames.includes(0)) { await call(tab.id, 0, "receiptArm", [token, null]); frames.push(0); }
+      receiptsArmed.set(token, { tabId: tab.id, url: tab.url || "", frames, at: Date.now() });
+      for (const [old, r] of receiptsArmed) if (Date.now() - r.at > 60000) receiptsArmed.delete(old);
+      return { token };
+    }
     case "locate": {
       // In top-page coordinates, so a frame's element (LinkedIn's Easy Apply form) is placed right too.
       const { frameId, local } = await route(tab.id, msg.index);
@@ -976,18 +1498,24 @@ async function handleCommand(msg) {
       return (res && res.result) || { ok: false, why: "the page didn't answer" };
     }
     case "fill": return await indexed("fill", [msg.text]);
+    case "setRange": return await indexed("setRange", [msg.state]);
     case "waitText": return await call(tab.id, 0, "waitText", [msg.text, !!msg.gone, Number(msg.ms) || 10000]);
     case "upload": {
-      if (msg.index >= 0) return await indexed("upload", [msg.name, msg.type, msg.data]);
-      const map = await mapFor(tab.id);
-      const counts = [];
-      for (const frame of Object.keys(map.frameTokens || {}).map(Number)) {
-        const result = await call(tab.id, frame, "fileInputCount");
-        if (result.count > 0) counts.push({ frame, count: result.count });
+      let frameId = 0, local = -1;
+      if (msg.index >= 0) ({ frameId, local } = await route(tab.id, msg.index));
+      else {
+        const map = await mapFor(tab.id);
+        const counts = [];
+        for (const frame of Object.keys(map.frameTokens || {}).map(Number)) {
+          const result = await call(tab.id, frame, "fileInputCount");
+          if (result.count > 0) counts.push({ frame, count: result.count });
+        }
+        if (!counts.length) throw new Error("this page has no file upload field (it may use its own picker, e.g. Google Drive)");
+        if (counts.length !== 1 || counts[0].count !== 1) throw new Error("ambiguous file upload fields; choose the exact input");
+        frameId = counts[0].frame;
       }
-      if (!counts.length) throw new Error("this page has no file upload field (it may use its own picker, e.g. Google Drive)");
-      if (counts.length !== 1 || counts[0].count !== 1) throw new Error("ambiguous file upload fields; choose the exact input");
-      return await call(tab.id, counts[0].frame, "upload", [-1, msg.name, msg.type, msg.data]);
+      const viaBrowser = msg.path && frameId === 0 ? await uploadThroughBrowser(tab.id, local, msg) : null;
+      return viaBrowser || await call(tab.id, frameId, "upload", [local, msg.name, msg.type, msg.data]);
     }
     case "findOption": {
       // The open list may be in the page or in an embedded form; report its box in top-page coordinates. The
@@ -1046,7 +1574,20 @@ async function handleCommand(msg) {
       return info;
     }
     case "fillActive": return await call(tab.id, focusFrames.get(tab.id) || 0, "fillActive", [msg.text]);
-    case "scroll": return await call(tab.id, 0, "scroll", [msg.dy]);
+    case "scroll": {
+      if (Number.isInteger(msg.index)) {
+        const {frameId,local}=await route(tab.id,msg.index);
+        return await call(tab.id,frameId,"scroll",[msg.dy,local,msg.dx || 0]);
+      }
+      return await call(tab.id,0,"scroll",[msg.dy,null,msg.dx || 0]);
+    }
+    case "waitCondition": {
+      const condition={...msg.condition}; let frameId=0;
+      if(condition.kind === "element") {
+        const target=await route(tab.id,condition.index); frameId=target.frameId; condition.index=target.local;
+      }
+      return await call(tab.id,frameId,"waitCondition",[condition,Math.min(30000,Number(msg.ms)||10000)]);
+    }
     default: throw new Error("unknown command " + msg.cmd);
   }
 }
@@ -1058,6 +1599,6 @@ chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
 setInterval(() => {
   connect(); send({ type: "ping" });
-  if (socket?.readyState === WebSocket.OPEN) queueActivity(async () => { for (const id of await activityTabs()) await renderActivity(id, { kind: "working" }); });
+  if (socket?.readyState === WebSocket.OPEN) queueActivity(async () => { for (const id of await activityTabs()) await renderActivity(id, { heartbeat: true }); });
 }, 20000);
 connect();

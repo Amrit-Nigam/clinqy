@@ -227,6 +227,35 @@ final class DashboardModel: ObservableObject {
         }
     }
 
+    // MARK: Asking (autonomy level, trusted sites)
+
+    @Published var autonomy = Autonomy.parse(Config.value("AUTONOMY")).rawValue
+    @Published var trustedSites = Config.value("ALLOWED_ORIGINS") ?? ""
+    var autonomyManaged: Bool { ProcessInfo.processInfo.environment["AUTONOMY"] != nil }
+
+    func saveAutonomy() {
+        guard !autonomyManaged else { status = "Asking level is managed by an environment variable."; return }
+        let sites = AskingPolicy.list(trustedSites).joined(separator: ",")
+        do {
+            try Config.write(["AUTONOMY": autonomy == Autonomy.irreversible.rawValue ? nil : autonomy,
+                              "ALLOWED_ORIGINS": sites.isEmpty ? nil : sites])
+            trustedSites = sites
+            status = "Asking settings saved. They apply to the next task."
+        } catch {
+            status = "Couldn't save asking settings: \(error.localizedDescription)"
+        }
+    }
+
+    func forgetAlwaysAllow() {
+        let url = AlwaysAllowStore.defaultURL
+        do {
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+            status = "Forgot every “always” answer. Clinqy will ask again."
+        } catch {
+            status = "Couldn't clear the “always” answers: \(error.localizedDescription)"
+        }
+    }
+
     func resetTalkShortcut() {
         talkKey = ""
         saveShortcuts()
@@ -338,6 +367,7 @@ struct DashboardContentView: View {
 
     private let pages = ["Overview", "Usage", "AI & Model", "Background", "Shortcuts"]
     @AppStorage("backgroundMode") private var backgroundMode = false
+    @AppStorage("notificationsEnabled") private var notificationsEnabled = true
     @AppStorage("backgroundWebMode") private var backgroundWebMode = "extension"
     private let surface = Brand.text.opacity(0.035)
     private let text = Brand.text
@@ -404,6 +434,16 @@ struct DashboardContentView: View {
                 .toggleStyle(.switch)
             }
             card {
+                Toggle(isOn: $notificationsEnabled) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Notifications").font(.system(size: 15, weight: .semibold))
+                        Text("Banners when a background task finishes or needs you. Off: questions stay answerable in Clinqy and Telegram.")
+                            .font(.system(size: 11)).foregroundStyle(muted)
+                    }
+                }
+                .toggleStyle(.switch)
+            }
+            card {
                 Picker("Web browser mode", selection: $backgroundWebMode) {
                     Text("Signed-in browser tabs").tag("extension")
                     Text("Separate headless Chrome").tag("headless")
@@ -416,6 +456,22 @@ struct DashboardContentView: View {
                 HStack {
                     Button("Sign in…") { (NSApp.delegate as? AppDelegate)?.workerLogin() }.brand()
                     Button("Finish sign-in") { (NSApp.delegate as? AppDelegate)?.finishWorkerLogin() }.brand()
+                }
+            }
+            card {
+                Text("When Clinqy asks").font(.system(size: 14, weight: .semibold))
+                Picker("Asking level", selection: $model.autonomy) {
+                    ForEach(Autonomy.allCases, id: \.rawValue) { level in Text(level.title).tag(level.rawValue) }
+                }
+                .disabled(model.autonomyManaged)
+                Text("Default: asks only before paying or booking, sending to someone, deleting permanently or posting publicly — never when your request already said to (“buy it”, “send it to Riya”, “submit the form”). “Ask once at the start” shows the plan first, then only money needs a yes. “Trusted” skips questions on the sites below and wherever you answered “Yes, always”. A request can also say “don't ask me” or “ask before anything”. Banking sites and password managers are always blocked (BLOCKED_ORIGINS / BLOCKED_APPS).")
+                    .font(.system(size: 11)).foregroundStyle(muted)
+                TextField("Trusted sites, comma separated (e.g. github.com, notion.so)", text: $model.trustedSites)
+                    .textFieldStyle(.roundedBorder)
+                    .disabled(model.autonomyManaged)
+                HStack {
+                    Button("Save") { model.saveAutonomy() }.brand().disabled(model.autonomyManaged)
+                    Button("Forget “always” answers") { model.forgetAlwaysAllow() }.brand()
                 }
             }
             card {

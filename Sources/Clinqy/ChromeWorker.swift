@@ -136,8 +136,37 @@ final class WorkerCDP {
     }
 }
 
+/// Merges per-frame effect receipts into the one reply the extension's bridge returns (same keys as bridge.js receiptCollect).
+enum WorkerReceipt {
+    static let flags = ["urlChanged", "targetStateChanged", "targetRemoved", "dialogOpened", "focusChanged", "structural"]
+    /// A nil reply is a frame that stopped answering: reported as `unreadable`, never as "nothing changed".
+    static func merge(_ replies: [[String: Any]?], urlChanged: Bool) -> [String: Any] {
+        var out: [String: Any] = [:]
+        for key in flags { out[key] = false }
+        out["unreadable"] = false; out["addedText"] = ""; out["removedText"] = ""; out["mutationCount"] = 0
+        var added = "", removed = "", count = 0
+        for reply in replies {
+            guard let reply else { out["unreadable"] = true; continue }
+            for key in flags where reply[key] as? Bool == true { out[key] = true }
+            if let text = reply["addedText"] as? String, !text.isEmpty { added += (added.isEmpty ? "" : " | ") + text }
+            if let text = reply["removedText"] as? String, !text.isEmpty { removed += (removed.isEmpty ? "" : " | ") + text }
+            count += (reply["mutationCount"] as? NSNumber)?.intValue ?? 0
+        }
+        if urlChanged { out["urlChanged"] = true }
+        out["addedText"] = String(added.prefix(800)); out["removedText"] = String(removed.prefix(800)); out["mutationCount"] = count
+        return out
+    }
+    /// Frames to watch: the target's own frame (when there is one) plus the top frame.
+    static func frames(target: String?, top: String) -> [String] {
+        guard let target, target != top else { return [top] }
+        return [target, top]
+    }
+}
+
 @MainActor
 final class ChromeWorker {
+    private struct ArmedReceipt { let tab: Tab; let url: String; let frames: [String]; let at: Date }
+    private var receipts: [String: ArmedReceipt] = [:]
     private static let primary = ChromeWorker()
     static var shared: ChromeWorker {
         guard let context = TaskExecution.current else { return primary }
@@ -513,7 +542,7 @@ final class ChromeWorker {
             _ = try await tab.cdp.call("Page.setWebLifecycleState", ["state": "active"], timeout: 3)
             frozen.remove(id)
         }
-        let unguarded: Set<String> = ["dialogPolicy", "switchTab", "closeTab", "tabInfo", "navigate", "goBack", "captureTask", "capturePreview", "captureVision", "snapshot"]
+        let unguarded: Set<String> = ["dialogPolicy", "switchTab", "closeTab", "tabInfo", "navigate", "goBack", "captureTask", "capturePreview", "captureVision", "snapshot", "receiptCollect"]
         if !unguarded.contains(command) {
             guard let documentID = tab.documentID, let snapshotID = tab.snapshotID,
                   args["documentID"] as? String == documentID, args["snapshotID"] as? String == snapshotID,
@@ -903,6 +932,7 @@ final class ChromeWorker {
             return try await call(tab, frame: frame, function: "clickOption", args: [token])
         case "activeOption": return try await indexed(command, [args["want"] ?? ""])
         case "fill": return try await indexed(command, [args["text"] ?? ""])
+        case "setRange": return try await indexed(command, [args["state"] ?? NSNull()])
         case "locate", "findOption":
             var result = command == "locate" ? try await indexed(command, [args["reveal"] as? Bool ?? true]) : try await call(tab, frame: element?.frame ?? top, function: command, args: [args["text"] ?? "", element?.local ?? -1])
             if command == "findOption" { result["pointFrame"] = element?.frame ?? top }
@@ -911,6 +941,29 @@ final class ChromeWorker {
                 if let vx = result[kx] as? Double, let vy = result[ky] as? Double { let p = place.point(vx, vy); result[kx] = p.x; result[ky] = p.y }
             }
             return result
+        case "receiptArm":
+            let token = "r" + String(Int(Date().timeIntervalSince1970 * 1000), radix: 36) + String(UUID().uuidString.prefix(6)).lowercased()
+            let frames = WorkerReceipt.frames(target: element?.frame, top: top)
+            for frame in frames {
+                _ = try await call(tab, frame: frame, function: "receiptArm", args: [token, frame == element?.frame ? element!.local : NSNull()])
+            }
+            let url = (try? await evaluate(tab, expression: "location.href", frame: top)) as? String ?? ""
+            receipts = receipts.filter { Date().timeIntervalSince($0.value.at) < 60 }
+            receipts[token] = ArmedReceipt(tab: tab, url: url, frames: frames, at: Date())
+            return ["token": token]
+        case "receiptCollect":
+            guard let token = args["token"] as? String, let armed = receipts.removeValue(forKey: token),
+                  armed.tab === tab else { throw WorkerCDP.error("no armed receipt for this tab") }
+            let quiet = (args["quietMs"] as? NSNumber)?.intValue ?? 120, cap = (args["capMs"] as? NSNumber)?.intValue ?? 800
+            var replies: [[String: Any]?] = []
+            try await withThrowingTaskGroup(of: [String: Any]?.self) { group in
+                for frame in armed.frames {
+                    group.addTask { @MainActor in try? await self.call(tab, frame: frame, function: "receiptCollect", args: [token, quiet, cap]) }
+                }
+                for try await reply in group { replies.append(reply) }
+            }
+            let now = try? await evaluate(tab, expression: "location.href", frame: top) as? String
+            return WorkerReceipt.merge(replies, urlChanged: now != nil && now! != armed.url)
         case "images": return try await call(tab, frame: top, function: "images")
         case "review", "read", "tables":
             guard !tab.incomplete else { throw WorkerCDP.error("An embedded frame is unreadable; I won't present an incomplete form review.") }
@@ -958,7 +1011,20 @@ final class ChromeWorker {
             }
             return try await call(tab, frame: top, function: "activeValue")
         case "fillActive": return try await call(tab, frame: tab.focusedFrame ?? top, function: "fillActive", args: [args["text"] ?? ""])
-        case "scroll": return try await call(tab, frame: top, function: "scroll", args: [args["dy"] ?? 0])
+        case "scroll":
+            if args["index"] != nil {
+                guard let element else { throw WorkerCDP.error("The scroll target is stale. Take a fresh look.") }
+                return try await call(tab, frame: element.frame, function: "scroll", args: [args["dy"] ?? 0, element.local, args["dx"] ?? 0])
+            }
+            return try await call(tab, frame: top, function: "scroll", args: [args["dy"] ?? 0, NSNull(), args["dx"] ?? 0])
+        case "waitCondition":
+            var condition = args["condition"] as? [String: Any] ?? [:]
+            var frame = top
+            if condition["kind"] as? String == "element" {
+                guard let index = condition["index"] as? Int, let target = tab.elements[index] else { throw WorkerCDP.error("The wait target is stale. Take a fresh look.") }
+                frame = target.frame; condition["index"] = target.local
+            }
+            return try await call(tab, frame: frame, function: "waitCondition", args: [condition, args["ms"] ?? 10000])
         case "waitText": return try await call(tab, frame: top, function: "waitText", args: [args["text"] ?? "", args["gone"] ?? false, args["ms"] ?? 10000])
         default: throw WorkerCDP.error("Unsupported worker command: " + command)
         }

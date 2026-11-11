@@ -18,6 +18,11 @@ import AppKit
         }
     }
 
+    static func stop() {
+        observers.forEach { NotificationCenter.default.removeObserver($0) }
+        observers.removeAll()
+    }
+
     /// Motion runs at the fastest connected display's refresh rate (120 Hz on ProMotion), decoration at 30 fps.
     static func animationInterval(moving: Bool) -> TimeInterval {
         if constrained { return 1 / (moving ? 30.0 : 20.0) }

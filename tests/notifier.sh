@@ -7,3 +7,5 @@ swiftc -parse-as-library Sources/Clinqy/NotificationLedger.swift tests/Notificat
 "$TEST_DIR/ledger-tests"
 swiftc -parse-as-library Sources/Clinqy/ConnectionDrafts.swift tests/ConnectionDraftsTests.swift -o "$TEST_DIR/drafts-tests"
 "$TEST_DIR/drafts-tests"
+swiftc -parse-as-library Sources/Clinqy/NotificationPolicy.swift tests/NotificationPolicyTests.swift -o "$TEST_DIR/policy-tests"
+"$TEST_DIR/policy-tests"

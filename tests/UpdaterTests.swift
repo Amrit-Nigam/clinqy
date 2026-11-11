@@ -17,6 +17,7 @@ enum Config { static func value(_ key: String) -> String? { nil } }
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
         do { try Updater.validateApp(root, expectedVersion: version); fatalError("unsigned app was accepted") } catch {}
         try swapTests()
+        try competingUpdateTest()
         print("PASS updater version ordering, signed app acceptance, mismatched version and unsigned bundle rejection")
     }
 
@@ -32,9 +33,18 @@ enum Config { static func value(_ key: String) -> String? { nil } }
         try Data("new".utf8).write(to: staged.appendingPathComponent("marker"))
         if lockParent { try fm.setAttributes([.posixPermissions: 0o555], ofItemAtPath: parent.path) }
         let receipt = root.appendingPathComponent("receipt")
-        let p = try Updater.swapInAndReopen(staged, replacing: target, waitingFor: nil, reopen: false, receipt: receipt)
-        p.waitUntilExit()
-        if lockParent { try fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path) }
+        defer { if lockParent { try? fm.setAttributes([.posixPermissions: 0o755], ofItemAtPath: parent.path) } }
+        do {
+            let p = try Updater.swapInAndReopen(staged, replacing: target, waitingFor: nil, reopen: false, receipt: receipt)
+            p.waitUntilExit()
+        } catch {
+            // A denied installation directory now refuses before returning a helper, so the app
+            // can stay open. Accept only that explicit ownership error for this denied fixture.
+            let refusal = error as NSError
+            guard lockParent && refusal.domain == "Clinqy" && refusal.code == 8 else { throw error }
+            precondition((try? String(contentsOf: target.appendingPathComponent("marker"), encoding: .utf8)) == "original")
+            return ("ownership-refused", target, parent)
+        }
         let text = (try? String(contentsOf: receipt, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         return (text, target, parent)
     }
@@ -54,5 +64,41 @@ enum Config { static func value(_ key: String) -> String? { nil } }
             precondition(locked.receipt != "installed")
             precondition((try? String(contentsOf: locked.target.appendingPathComponent("marker"), encoding: .utf8)) == "original", "original bundle was lost: receipt \(locked.receipt)")
         }
+    }
+
+    /// A second helper must fail before replacing the app while another helper owns the kernel lock.
+    static func competingUpdateTest() throws {
+        let fm = FileManager.default
+        let root = fm.temporaryDirectory.appendingPathComponent("clinqy-update-contention-\(UUID())")
+        defer { try? fm.removeItem(at: root) }
+        let target = root.appendingPathComponent("Clinqy.app")
+        let staged = root.appendingPathComponent("stage/Clinqy.app")
+        let ready = root.appendingPathComponent("ready"), release = root.appendingPathComponent("release")
+        try fm.createDirectory(at: target, withIntermediateDirectories: true)
+        try fm.createDirectory(at: staged, withIntermediateDirectories: true)
+        try Data("original".utf8).write(to: target.appendingPathComponent("marker"))
+        try Data("replacement".utf8).write(to: staged.appendingPathComponent("marker"))
+        func q(_ text: String) -> String { "'" + text.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        let owner = Process()
+        owner.executableURL = URL(fileURLWithPath: "/usr/bin/lockf")
+        owner.arguments = ["-k", "-t", "0", target.path + ".update-lock", "/bin/sh", "-c",
+                           "printf ready > " + q(ready.path) + "; attempt=0; while [ ! -f " + q(release.path) + " ]; do attempt=$((attempt + 1)); [ \"$attempt\" -lt 200 ] || exit 1; sleep 0.05; done"]
+        try owner.run()
+        defer {
+            try? Data().write(to: release)
+            owner.waitUntilExit()
+        }
+        for _ in 0..<100 where !fm.fileExists(atPath: ready.path) { usleep(20_000) }
+        precondition(fm.fileExists(atPath: ready.path), "fixture acquired installation lock")
+        do {
+            _ = try Updater.swapInAndReopen(staged, replacing: target, waitingFor: nil, reopen: false)
+            preconditionFailure("competing update was accepted")
+        } catch {
+            let refusal = error as NSError
+            precondition(refusal.domain == "Clinqy" && refusal.code == 8, "lock contention explicitly refused")
+        }
+        precondition((try? String(contentsOf: target.appendingPathComponent("marker"), encoding: .utf8)) == "original")
+        precondition(!fm.fileExists(atPath: target.path + ".old") && !fm.fileExists(atPath: target.path + ".new"))
+        print("PASS updater contention refuses replacement while another helper owns installation")
     }
 }

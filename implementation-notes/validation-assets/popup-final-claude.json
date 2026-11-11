@@ -1,0 +1,109 @@
+{
+  "schema_version": 2,
+  "fixture_sha256": "a14b1182874292b2b6693a5f2d0b2035c2d323afda33261282ab6eff21b42a87",
+  "environment": {
+    "os": "macOS-27.0-arm64-arm-64bit-Mach-O",
+    "machine": "arm64",
+    "app_bundle": "/Applications/Clinqy.app",
+    "installed_app_version": "0.3.1",
+    "installed_extension_version": "1.9.16",
+    "connected_extension_status": [
+      {
+        "browser": "Arc",
+        "version": "1.9.16",
+        "build": "2026-11-browser-reliability-2",
+        "expectedVersion": "1.9.16",
+        "expectedBuild": "2026-11-browser-reliability-2",
+        "compatible": true
+      },
+      {
+        "browser": "Google Chrome",
+        "version": "1.9.16",
+        "build": "2026-11-browser-reliability-2",
+        "expectedVersion": "1.9.16",
+        "expectedBuild": "2026-11-browser-reliability-2",
+        "compatible": true
+      }
+    ]
+  },
+  "label": "default",
+  "browser": "Google Chrome",
+  "provider": "claude",
+  "mode": "background",
+  "repeat": 1,
+  "cancellation_experiment": null,
+  "scoring": "fixture outcome independent of agent verdict",
+  "summary": {
+    "tasks": 1,
+    "verified_completions": 1,
+    "finished_tasks": 1,
+    "cancelled_tasks": 0,
+    "interrupted_tasks": 0,
+    "verified_completion_rate": 1.0,
+    "false_successes": 0,
+    "wrong_target_actions": 0,
+    "duplicate_effects": 0,
+    "median_seconds": 37.516,
+    "p95_seconds": 37.516
+  },
+  "results": [
+    {
+      "name": "popup",
+      "iteration": 1,
+      "receipt": "16f51fee-f3b0-405d-977d-d1e52f5b7328",
+      "status": "finished",
+      "seconds": 37.516,
+      "task_template": "Open Review window once, click Confirm local review in that new window once, then return to the workspace. Do not submit the workspace.",
+      "expected": {
+        "popup_opened": 1,
+        "popup_confirmed": 1,
+        "submitted": 0
+      },
+      "verified_completion": true,
+      "false_success": false,
+      "wrong_target_actions": 0,
+      "duplicate_effects": 0,
+      "cancellation_confirmed": true,
+      "reported_success": true,
+      "timed_out": false,
+      "fixture_state_received": true,
+      "fixture_state": {
+        "project": "",
+        "draft": "Replace this draft",
+        "other": "Leave this editor alone",
+        "reviewer": "",
+        "final_checked": false,
+        "attachment": "",
+        "preview_count": 0,
+        "preview_ready": false,
+        "submitted": 0,
+        "accepted": false,
+        "popup_opened": 1,
+        "popup_confirmed": 1,
+        "download_requested": 0,
+        "session_signed_in": false,
+        "session_report": false,
+        "session_attempts": 0,
+        "wrong": 0
+      },
+      "agent_output": "Go to 127.0.0.1\nVerify outcome\nScroll down\nClick Open Review window\nVerify outcome\nSwitch tab\nSwitch tab\nVerify outcome\nSwitch tab\nClick Confirm local review\nSwitch tab\nVerify outcome\nVerify outcome\nReview confirmed once in the review window; back on the workspace, which was not submitted (submitted:0).",
+      "phase_milliseconds": {
+        "action": 3214.6992500056513,
+        "total": 36712.40699291229,
+        "verification": 2325.3869583422784,
+        "startup_observation_and_retrieval": 114.82274999434594,
+        "checkpoint": 98.99095832952298,
+        "model": 29221.54887499346,
+        "observation": 174
+      },
+      "phase_metrics_source": "app receipt",
+      "desktop_observation": null,
+      "desktop_monitor_error": null,
+      "download_path": null,
+      "interventions": null,
+      "recovery_attempts": null,
+      "model_cost": null,
+      "foreground_interruptions": null
+    }
+  ]
+}

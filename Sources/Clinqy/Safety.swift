@@ -6,35 +6,36 @@ import Foundation
 
 /// Guard rails enforced in code, not left to the model: confirm consequential clicks, notice live calls.
 enum Safety {
-    /// Button words that commit money, messages or data: (pattern, word the user would have used to ask for it).
-    private static let risky: [(String, [String])] = [
-        (#"\b(pay|payment|pay now)\b"#, ["pay"]),
-        (#"\b(buy|purchase|place (your )?order|checkout|check out|proceed to (pay|checkout))\b"#, ["buy", "order", "purchase", "checkout"]),
-        (#"\b(book|confirm booking|reserve)\b"#, ["book", "reserve"]),
-        (#"\b(transfer|withdraw|donate)\b"#, ["transfer", "send money", "donate"]),
-        (#"\b(delete|remove|trash|erase|discard)\b"#, ["delete", "remove", "trash", "erase", "clear"]),
-        (#"\b(send|reply all)\b"#, ["send", "reply", "message", "tell", "text", "email", "say"]),
-        (#"\b(submit|apply|sign up|register)\b"#, ["submit", "apply", "sign up", "register"]),
-        (#"\b(post|publish|tweet|share)\b"#, ["post", "publish", "tweet", "share"]),
-        (#"\b(unsubscribe|cancel (my )?(subscription|order|plan)|deactivate|close account)\b"#, ["unsubscribe", "cancel"]),
+    /// The broad list of button words that may commit money, messages or data. Used only to decide that a click can't
+    /// confirm itself (verification); whether to ASK is the narrower `needsConfirmation`.
+    private static let consequential: [String] = [
+        #"\b(pay|payment|pay now)\b"#,
+        #"\b(buy|purchase|place (your )?order|checkout|check out|proceed to (pay|checkout))\b"#,
+        #"\b(book|confirm booking|reserve)\b"#,
+        #"\b(transfer|withdraw|donate)\b"#,
+        #"\b(delete|remove|trash|erase|discard)\b"#,
+        #"\b(send|reply all)\b"#,
+        #"\b(submit|apply|sign up|register)\b"#,
+        #"\b(post|publish|tweet|share)\b"#,
+        #"\b(unsubscribe|cancel (my )?(subscription|order|plan)|deactivate|close account)\b"#,
     ]
 
-    /// If clicking a control labelled `label` would commit something the request didn't clearly ask for,
-    /// returns a short description to confirm with the user.
-    static func needsConfirmation(label: String, request: String) -> String? {
+    /// True when a control's label alone says it may be irreversible or reach other people.
+    static func isConsequential(_ label: String) -> Bool {
         let text = label.lowercased()
-        let asked = request.lowercased()
-        for (pattern, verbs) in risky where text.range(of: pattern, options: .regularExpression) != nil {
-            // They asked for this — and said "don't …" / "without …" about none of its words: "fill the Easy Apply form
-            // but don't submit" names apply, yet the Submit button still needs their OK.
-            let negated = verbs.contains { verb in
-                asked.range(of: #"\b(don['’]?t|do not|never|without|not|no)\s+(\w+\s+){0,2}"# + NSRegularExpression.escapedPattern(for: verb),
-                            options: .regularExpression) != nil
-            }
-            if !negated, verbs.contains(where: asked.contains) { return nil }
-            return String(label.prefix(80))
-        }
-        return nil
+        return consequential.contains { text.range(of: $0, options: .regularExpression) != nil }
+    }
+
+    /// If clicking a control labelled `label` needs the user's yes under the default level, returns a short
+    /// description to confirm with. Only paying/buying/booking/transferring, permanent deletion, sending to someone
+    /// and public posting ask (judged with `context`: page title, URL, form fields); the request naming that action
+    /// pre-authorises it. A word the request rules out ("fill it but don't submit") always asks.
+    static func needsConfirmation(label: String, request: String, context: String = "") -> String? {
+        guard let kind = RiskClassifier.classify(label: label, context: context) else { return nil }
+        let verbs = RiskClassifier.verbs(label: label, kind: kind)
+        let situation = AskingPolicy.Situation(kind: kind, preauthorized: PreAuthorization.covers(label: label, kind: kind, request: request),
+                                               negated: PreAuthorization.negated(verbs, in: request))
+        return AskingPolicy.shouldAsk(situation) ? String(label.prefix(80)) : nil
     }
 
     /// True when a confirmation answer means yes.

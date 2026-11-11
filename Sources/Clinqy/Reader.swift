@@ -126,22 +126,10 @@ enum Reader {
 
     /// Capture only the selected AX window; another, larger window of the app must never substitute for it.
     private static func windowCapture(_ app: NSRunningApplication, window requested: NativeWindowObservation?) async -> (image: CGImage, frame: CGRect)? {
-        guard let snapshot = requested ?? NativeWindowObservation.capture(app), snapshot.pid == app.processIdentifier,
-              snapshot.staleness(includeContent: true) == nil, CGPreflightScreenCaptureAccess(),
-              let content = try? await SCShareableContent.excludingDesktopWindows(false, onScreenWindowsOnly: true),
-              let window = content.windows.first(where: { $0.owningApplication?.processID == snapshot.pid && $0.windowID == snapshot.windowID }),
-              ObservationGeometry(frame: snapshot.frame, imageSize: CGSize(width: 1, height: 1)).matches(window.frame)
-        else { return nil }
-        let config = SCStreamConfiguration()
-        // Full resolution for OCR. Geometry stays in screen points regardless of the backing pixel scale.
-        // The scale of the display the window is on (not always the main one), bounded so a huge window stays tractable.
-        let scale = min(Screenshot.backingScale(for: window.frame), 8192 / max(window.frame.width, window.frame.height, 1))
-        config.width = max(1, Int(window.frame.width * scale))
-        config.height = max(1, Int(window.frame.height * scale))
-        config.showsCursor = false
-        guard let image = try? await SCScreenshotManager.captureImage(contentFilter: SCContentFilter(desktopIndependentWindow: window),
-                                                                      configuration: config),
-              snapshot.staleness(includeContent: true) == nil else { return nil }
+        guard let snapshot = requested ?? NativeWindowObservation.capture(app), snapshot.pid == app.processIdentifier else { return nil }
+        let scale = min(Screenshot.backingScale(for: snapshot.frame), 8192 / max(snapshot.frame.width, snapshot.frame.height, 1))
+        guard let image = await Screenshot.rawImage(window: snapshot, width: max(1, Int(snapshot.frame.width * scale)),
+                                                  height: max(1, Int(snapshot.frame.height * scale))) else { return nil }
         return (image, snapshot.frame)
     }
 

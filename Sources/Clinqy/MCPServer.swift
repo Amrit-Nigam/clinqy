@@ -16,7 +16,9 @@ enum MCPServer {
     single-use observation and screenshot. Call clinqy_act, clinqy_wait or clinqy_verify with both tokens;
     observe again after every action. Never repeat input after a timeout; inspect and verify instead.
     Finish with clinqy_release complete=true only after verifying the final goal. complete=false stops.
-    Direct control uses one foreground controller; delegated browser jobs run in independent background tabs. clinqy_stats: how recent runs went.
+    Direct control is one controller bound to the tab or window it first observed (background input when possible, foreground otherwise); \
+    pass app (exact name or bundle id) and/or tab (tab id or URL substring) on the initial clinqy_observe to bind an explicit target \
+    instead of whatever is frontmost. Delegated browser jobs run in independent background tabs. clinqy_stats: how recent runs went.
     """
 
     private static func tool(_ name: String, _ title: String, _ description: String, _ props: [String: Any], required: [String] = [],
@@ -58,8 +60,12 @@ enum MCPServer {
              ["mode": ["type": "string", "enum": ["page", "read", "url"], "description": "page (default), read (full text) or url."]],
              readOnly: true),
         tool("clinqy_observe", "Observe for direct control",
-             "Start with task (the user's goal), then use session for subsequent observations. Returns semantic ids, a single-use observation token and a JPEG image when available. Reserves the foreground controller for 120 seconds. No inner model.",
-             ["task": ["type": "string"], "session": ["type": "string"], "image": ["type": "boolean", "default": true]], readOnly: true),
+             "Start with task (the user's goal), then use session for subsequent observations. Returns semantic ids, a single-use observation token and a JPEG image when available. Binds the session to the observed browser tab or app window (acted on in the background when possible, else it must stay in front) and reserves the controller for 120 seconds. No inner model. "
+             + "On the initial observe, app and/or tab name the target explicitly instead of whatever is frontmost: app is an exact app name or bundle id; tab is a browser tab id or a URL substring matching exactly one tab (without app, the user's background-browser setting is used). Exactly what is named is used; nothing else is substituted.",
+             ["task": ["type": "string"], "session": ["type": "string"], "image": ["type": "boolean", "default": true],
+              "app": ["type": "string", "description": "Initial observe only: exact app name (e.g. Google Chrome) or bundle id to bind, read without bringing it forward."],
+              "tab": ["type": ["string", "integer"], "description": "Initial observe only: browser tab id, or a URL substring matching exactly one open tab, to bind (adopted in the background through the extension)."]],
+             readOnly: true),
         tool("clinqy_act", "Perform one precise action",
              "One action through Clinqy's existing target validation and approval path. Requires a fresh single-use observation. Returns delivery/status separately; unverified input must be checked before further mutation. Observe after each call, including errors; never automatically replay a timeout.",
              ["session": ["type": "string"], "observation": ["type": "string"], "action": directActionSchema],
@@ -143,7 +149,9 @@ enum MCPServer {
                 let key = "\(rid)"
                 let receipt = lock.withLock { running.removeValue(forKey: key) }
                 if let receipt { openLink("cancel", ["receipt": receipt]) }
-                if let session = lock.withLock({ controlRequests[key] }) { openLink("control-cancel", ["session": session]) }
+                if let session = lock.withLock({ controlRequests[key] }) {
+                    if case .response = ControlSocket.request(["cancel": session], timeout: 3) {} else { openLink("control-cancel", ["session": session]) }
+                }
             }
             return nil   // other notifications need no answer
         }
@@ -248,7 +256,9 @@ enum MCPServer {
             if let data = try? Data(contentsOf: file), let result = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
                 let ok = result["ok"] as? Bool == true
                 let steps = (result["steps"] as? [String] ?? []).map { "- " + $0 }.joined(separator: "\n")
-                return text((steps.isEmpty ? "" : steps + "\n\n") + (ok ? "Done: " : "Needs checking: ") + (result["answer"] as? String ?? ""), isError: !ok)
+                let unconfirmed = !ok && result["status"] as? String == "unconfirmed"
+                return text((steps.isEmpty ? "" : steps + "\n\n") + (ok ? "Done: " : unconfirmed ? "Unconfirmed — needs a look: " : "Needs checking: ")
+                            + (result["answer"] as? String ?? ""), isError: !ok)
             }
             try? await Task.sleep(for: .milliseconds(200))
         }
@@ -260,6 +270,7 @@ enum MCPServer {
     static func control(_ arguments: [String: Any]) async -> [String: Any] {
         if let why = ControlProtocol.validateRequest(arguments) { return text(why, isError: true) }
         guard await ensureApp() else { return text("Clinqy couldn't start. Build/install the updated app first.", isError: true) }
+        if let result = await controlOverSocket(arguments) { return result }
         let id = UUID().uuidString
         let dir = support.appendingPathComponent("cli", isDirectory: true)
         let request = dir.appendingPathComponent(id + ".request.json"), response = dir.appendingPathComponent(id + ".response.json")
@@ -281,6 +292,32 @@ enum MCPServer {
             try? await Task.sleep(for: .milliseconds(100))
         }
         return text("Control response unavailable. The action may have been delivered. Do not replay it; observe the existing session and verify the real outcome.", isError: true)
+    }
+
+    /// Primary transport: the app's local control socket (no URL launch, no polling). nil = socket unavailable, use the file relay.
+    /// Once a request has been written, a missing answer is reported, never retried through the relay (that could repeat input).
+    private static func controlOverSocket(_ arguments: [String: Any]) async -> [String: Any]? {
+        guard FileManager.default.fileExists(atPath: ControlSocket.path) else { return nil }
+        var body = arguments
+        body["deadline"] = Date().addingTimeInterval(180).timeIntervalSince1970
+        let cancelled = CancelFlag()
+        let box = UncheckedBox(body)
+        let outcome = await withTaskCancellationHandler {
+            await Task.detached { ControlSocket.request(box.value, timeout: 180, shouldStop: { cancelled.isSet }) }.value
+        } onCancel: { cancelled.set() }
+        switch outcome {
+        case .response(let r): return r
+        case .unavailable: return nil
+        case .noAnswer:
+            return text("Control response unavailable. The action may have been delivered. Do not replay it; observe the existing session and verify the real outcome.", isError: true)
+        }
+    }
+
+    private final class CancelFlag: @unchecked Sendable {
+        private let lock = NSLock()
+        private var value = false
+        var isSet: Bool { lock.withLock { value } }
+        func set() { lock.withLock { value = true } }
     }
 
     /// The browser tab through the extension; other apps (or no extension) through Accessibility.

@@ -25,5 +25,9 @@ assert 'observation' in tools['clinqy_act']['inputSchema']['required']
 assert 'condition' in tools['clinqy_verify']['inputSchema']['required']
 assert 'single-use' in replies[1]['result']['instructions']
 assert tools['clinqy_observe']['annotations']['readOnlyHint'] is True
+observe = tools['clinqy_observe']['inputSchema']['properties']
+assert observe['app']['type'] == 'string' and set(observe['tab']['type']) == {'string', 'integer'}
+assert 'app' not in tools['clinqy_observe']['inputSchema']['required'] and 'tab' not in tools['clinqy_observe']['inputSchema']['required']
+assert 'instead of whatever is frontmost' in replies[1]['result']['instructions']
 assert 'Native input requires' in tools['clinqy_run']['description']
 print('PASS MCP initialization, discovery, direct schemas and task delegation compatibility')

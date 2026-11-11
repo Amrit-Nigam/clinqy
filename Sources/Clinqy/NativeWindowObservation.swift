@@ -10,6 +10,7 @@ struct NativeWindowObservation: @unchecked Sendable {
     let identity: AXEngine.ProcessIdentity
     let windowID: CGWindowID
     let contentRevision: Int
+    let diagnostics = NativeObservationDiagnostics()
     var pid: pid_t { identity.pid }
 
     /// Verification may follow an attached sheet, but never an unrelated window from the same application.
@@ -27,9 +28,10 @@ struct NativeWindowObservation: @unchecked Sendable {
         }, equal: { CFEqual($0, $1) })
     }
 
-    static func capture(_ app: NSRunningApplication, windowID: CGWindowID? = nil) -> NativeWindowObservation? {
-        let window = windowID.flatMap { id in AXEngine.windows(of: app).first { AXEngine.windowID(of: $0) == id } }
+    static func capture(_ app: NSRunningApplication, windowID: CGWindowID? = nil, followAttachedSheet: Bool = false) -> NativeWindowObservation? {
+        var window = windowID.flatMap { id in AXEngine.windows(of: app).first { AXEngine.windowID(of: $0) == id } }
             ?? (windowID == nil ? AXEngine.selectedWindow(of: app) : nil)
+        if followAttachedSheet, let owner = window, let sheet = AXEngine.blockingDialog(in: owner) { window = sheet }
         guard let window, let id = AXEngine.windowID(of: window), let identity = AXEngine.identity(of: app),
               let frame = AXEngine.liveFrame(of: window), frame.width > 0, frame.height > 0 else { return nil }
         let result = NativeWindowObservation(id: UUID(), capturedAt: Date(), element: window, frame: frame,
@@ -38,14 +40,16 @@ struct NativeWindowObservation: @unchecked Sendable {
     }
 
     func staleness(includeContent: Bool = false) -> String? {
-        guard AXEngine.isSameProcess(identity) else { return "the target application restarted; look again" }
+        guard AXEngine.isSameProcess(identity), let app = NSRunningApplication(processIdentifier: pid) else { return "the target application restarted; look again" }
+        guard !app.isHidden else { return "the target application is hidden; restore it and observe again" }
+        if (AXEngine.attribute(element, kAXMinimizedAttribute) as Bool?) == true { return "the target window is minimized; restore it and observe again" }
+        if AXEngine.blockingDialog(in: element) != nil { return "a modal sheet is blocking the target window; observe the sheet before acting" }
         guard AXEngine.windowID(of: element) == windowID, let now = AXEngine.liveFrame(of: element) else {
             return "the target window was closed or replaced; look again"
         }
         let geometry = ObservationGeometry(frame: frame, imageSize: CGSize(width: 1, height: 1))
         guard geometry.matches(now) else { return "the target window moved or resized; look again" }
-        let list = CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]] ?? []
-        guard let info = list.first(where: { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }),
+        guard let info = Self.serverInfo(windowID),
               (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value == pid,
               let bounds = info[kCGWindowBounds as String] as? NSDictionary,
               let serverFrame = CGRect(dictionaryRepresentation: bounds), geometry.matches(serverFrame) else {
@@ -56,4 +60,22 @@ struct NativeWindowObservation: @unchecked Sendable {
         }
         return nil
     }
+
+    /// WindowServer's row for exactly one window. The single-window query is far cheaper than enumerating
+    /// every window; it omits off-screen windows (other Space, hidden), so those fall back to the full list.
+    static func serverInfo(_ windowID: CGWindowID) -> [String: Any]? {
+        func match(_ rows: [[String: Any]]) -> [String: Any]? {
+            rows.first { ($0[kCGWindowNumber as String] as? NSNumber)?.uint32Value == windowID }
+        }
+        if let row = match(CGWindowListCopyWindowInfo([.optionIncludingWindow], windowID) as? [[String: Any]] ?? []) { return row }
+        return match(CGWindowListCopyWindowInfo([.optionAll], kCGNullWindowID) as? [[String: Any]] ?? [])
+    }
+}
+
+/// Observation diagnostics travel with their exact snapshot, including an empty bounded scan.
+final class NativeObservationDiagnostics: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedNotice: String?
+    var notice: String? { lock.lock(); defer { lock.unlock() }; return storedNotice }
+    func setNotice(_ value: String?) { lock.lock(); storedNotice = value; lock.unlock() }
 }

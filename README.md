@@ -121,6 +121,28 @@ Validation: `zsh tests/browser-navigation.sh` checks URL and streamed-action ide
 
 `zsh tests/native-compatibility.sh` probes native targeting against two disposable fixture windows only. It checks exact-window observations, moved-window rejection and unchanged foreground app, pointer, clipboard and existing window order. It explicitly skips when Accessibility permission or the graphical session is unavailable; it never prompts for permissions or sends input to your applications. A passing fixture probe does not enable general native background control. Legacy daily workflow schedules still run only during their configured minute; new scheduled requests expose their missed-run policy explicitly.
 
+## macOS observation and input limits
+
+While a browser task is running, its page displays a blue edge glow, a compact working-status badge, and a labeled Clinqy cursor that follows action targets. These are page overlays, not the system mouse: they do not intercept clicks or change focus. Reduced-motion preferences are respected. Feedback is temporarily hidden from model screenshots, restored after capture, and removed when work ends. Test runs close only their own inactive, silent tabs; a tab you select is preserved.
+
+Verification first offers autonomous inspection before asking whether an outcome occurred. Fresh screenshots are scoped to the current run and original window or browser document; ordinary UI outcomes can be confirmed visually, while saves and consequential actions require stronger evidence. Browser text checks can use scoped OCR for current state, but cannot compare OCR against a DOM-only baseline to claim new text appeared. Restored uncertain actions require saved-artifact evidence or explicit user review. Three unsuccessful completion attempts stop with an unverified result. Antigravity must successfully view the exact current screenshot before its response is accepted (a skipped image fails the lead turn rather than automatically retrying); cancellation closes that provider session so late output cannot become a later reply.
+
+Native screenshots use ScreenCaptureKit with an exact window identity, paired with Accessibility elements and coordinate geometry. Screen Recording permits capture; Accessibility permits supported UI actions. Grant both to the installed Clinqy app in **System Settings → Privacy & Security**, then reopen it when macOS requests it. A permission granted to a terminal or another app does not automatically grant it to Clinqy.
+
+Capturing an occluded window does not make keyboard or pointer input independent of the foreground desktop. macOS process-targeted events do not identify a specific window, and individual applications differ in their focus behavior. Clinqy therefore keeps generic native app input behind the foreground handoff described above. Minimized or unavailable windows cannot supply trustworthy fresh visual evidence. No browser extension is needed for native Accessibility reading or window capture; the extension is needed for the default signed-in background browser route.
+
+Available model adapters are Claude Code, Codex and Antigravity CLIs; Anthropic, OpenAI, Gemini and OpenRouter APIs; Ollama and an OpenAI-compatible endpoint. Image support also depends on the selected model and endpoint. Configuring an adapter does not establish that every model has passed live visual-control tests. Use `clinqy model test` to check your configured connection, then start with an observable, reversible task such as “open Calculator and calculate 12 × 7.” Use a background request such as “in Google Chrome, open example.com and report its page title” to exercise isolated browser work.
+
+Verification first checks fresh evidence in the task's own window or browser document. A model's request for user confirmation does not skip that inspection. Explicit text, URL, value and path predicates remain intact; ambiguous claims do not become semantic guesses. Observation failures and model timeouts get at most two fresh-observation retries without replaying an action. Restored pending actions need trustworthy file or user evidence. Visual evidence can establish ordinary visible outcomes; it cannot prove a consequential send or submission merely because the screen changed.
+
+For a provider-specific disposable Chrome check, run `clinqy run --test --provider codex "in the background: in Google Chrome, open example.com and report its page title"`. This selects the provider only for that run. The benchmark runner defaults to Chrome and scores actual fixture state independently: `python3 tests/benchmarks/run.py --provider claude --browser "Google Chrome" --out /tmp/clinqy-results.json`.
+
+OpenAI API control replies have an explicit output budget. If the first request is rejected as too large for the account’s token limit, Clinqy can retry once with a compact control prompt while preserving the task and screenshot. It does not change your selected model or account settings.
+
+Local Chrome validation (2026-11-03): Claude passed the final 17-case matrix; Clinqy with Codex passed the same 17 scenarios across iterative runs; Antigravity passed form/iframe/randomized-canvas probes; OpenAI API passed a field-entry task after bounded rate-limit recovery. These are disposable fixture results, not a guarantee for every website. [Per-case records](docs/computer-use-live-results.json).
+
+See [computer-use research and validation boundaries](docs/computer-use-research.md) for the public OpenAI benchmark, macOS capability evidence, failure-log findings and remaining live validation. Deterministic tests establish specific invariants; they do not establish end-to-end success rates across all providers or applications.
+
 ## Setup on Windows
 
 Download, paste one prompt into your coding agent, done. It needs Windows 10 (1903 or later) or Windows 11, on x64, and no admin rights.
@@ -604,3 +626,9 @@ Connect with `clinqy connect claude --skill` or `clinqy connect codex --skill`, 
 The [Clinqy skill](skills/clinqy/SKILL.md) explains `/clinqy`, task delegation, and the direct observe/act/wait/verify/release tools.
 Existing personal skills are preserved; `--replace-skill` explicitly updates one.
 Run local workflow benchmarks with `python3 tests/benchmarks/run.py` (`--help` for options).
+
+### Computer-use implementation and validation
+
+The current improvement branch adds durable action journaling, per-outcome task checklists, stronger browser ownership and cancellation, editor-scoped input, targeted scrolling/condition waits, and viewport-attached cursor feedback. Native background input is explicitly experimental and opt-in with `BACKGROUND_NATIVE=1`; supported operations remain tied to a running app and exact window, with foreground handoff for unsupported controls.
+
+The initial implementation pass deliberately deferred testing. The subsequent [build and test validation](implementation-notes/validation.md) records signed builds, automated regression checks, real Chrome checks, live workflow results and remaining acceptance limits. The [66-item coverage ledger](implementation-notes/backlog.md) distinguishes source coverage from demonstrated behavior. The [evaluation guide](tests/benchmarks/README.md) contains Chrome workflows, provider comparisons, passive interference measurements and result comparison commands. These results do not establish computer-use parity or superiority.

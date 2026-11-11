@@ -450,7 +450,7 @@ final class FastLane {
         return detail.isEmpty ? kind : "\(kind) \(detail)"
     }
 
-    static let system = AgentPrompt.system + """
+    static var system: String { AgentPrompt.controlSystem + """
 
 
     You are the fast helper here, not the lead. A lead model planned some routine steps and gave them to you; \
@@ -461,4 +461,5 @@ final class FastLane {
     wasn't given, or the next step would submit, send, pay, book, delete, post, upload, save, sign in or finish, \
     reply {"say":"<why, a few words>","actions":[],"handback":true} and the lead takes over.
     """
+    }
 }

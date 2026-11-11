@@ -27,6 +27,7 @@ final class BrowserJobs: ObservableObject {
         @Published var answer = ""
         var children: [UUID] = []
         var observer: AnyCancellable?
+        var questionObserver: AnyCancellable?
         var detail: NSPanel?
         var buddy: Buddy?
         var waiters: [CheckedContinuation<Void, Never>] = []
@@ -105,10 +106,18 @@ final class BrowserJobs: ObservableObject {
             job.status = phase == .waiting ? "Needs your answer" : job.coordinating ? "Waiting for parallel tasks" : narration.isEmpty ? "Working" : String(narration.prefix(100))
             self.objectWillChange.send()
         }
-        worker.onQuestion = { [weak self, weak job] in
+        worker.onQuestion = { [weak self, weak job, weak worker] in
             guard let self, let job else { return }
             job.status = "Needs your answer — click to respond"
             self.objectWillChange.send()
+            if let worker { self.notifyQuestion(job, worker: worker) }
+        }
+        // Answered anywhere (dock, notification, Telegram, timeout): every surface's copy of the question goes.
+        job.questionObserver = worker.$question.dropFirst().removeDuplicates().sink { [weak job, weak worker] question in
+            guard let job, question == nil else { return }
+            Notifier.clearQuestion(run: job.id)
+            RunSupervisor.shared.answered(run: job.id)
+            if let worker { Telegram.shared.dismissQuestion(from: worker) }
         }
         worker.onResult = { [weak self, weak worker] in
             self?.objectWillChange.send()
@@ -124,6 +133,11 @@ final class BrowserJobs: ObservableObject {
                 return await self.parallel(job, requests: requests)
             }
         }
+        if !job.test {
+            let source = Self.source(of: job)
+            RunSupervisor.shared.register(run: job.id, source: source, title: job.request, background: true, parent: job.parent)
+            if source != .telegram { Telegram.shared.mirror(worker, taskID: job.id, source: source) }
+        }
         TaskExecution.$current.withValue(job.context) {
             Background.chooseBrowser(job.browser)
             BrowserBridge.shared.allowsExistingTabDiscovery = BrowserTaskRouting.requestsExistingTabs(job.request)
@@ -134,6 +148,32 @@ final class BrowserJobs: ObservableObject {
             complete(job, answer: reason, ok: false)
             if TaskStore.shared.record(job.id)?.source == .telegram { Telegram.shared.failedToStart(taskID: job.id, reason: reason) }
         }
+    }
+
+    /// Where an isolated job came from: Telegram, a schedule/workflow occurrence, an MCP/CLI receipt, or the Mac.
+    private static func source(of job: Job) -> RunSource {
+        let record = TaskStore.shared.record(job.parent ?? job.id)
+        if record?.source == .telegram { return .telegram }
+        if let key = TaskStore.shared.record(job.id)?.dispatchKey ?? record?.dispatchKey,
+           key.hasPrefix("schedule:") || key.hasPrefix("schedule-now:") || key.hasPrefix("workflow:") { return .scheduled }
+        if job.receipt != nil { return .mcp }
+        return .mac
+    }
+
+    /// Isolated jobs used to wait silently: their questions now reach the Mac (notification) and the phone, carry a
+    /// timeout with a safe default, and are answered back to this exact job.
+    private func notifyQuestion(_ job: Job, worker: Agent) {
+        guard let question = worker.question, !job.test else { return }
+        let pending = RunSupervisor.shared.question(run: job.id, text: question.text, options: question.options, sensitive: question.sensitive) { [weak worker] fallback in
+            guard let worker, worker.question == question else { return }
+            Agent.writeLog("question timed out; using the safe default: " + (fallback.map { String($0.prefix(60)) } ?? "(no answer)"))
+            // Marked as a timeout default even when it is a plain option ("No"): never filled in, remembered or read as a yes.
+            worker.answer(AskApproval.timeoutReply(fallback))
+        }
+        Notifier.ask(question.text, options: question.options, sensitive: question.sensitive, run: job.id, note: pending.note,
+                     title: String(job.request.prefix(80)))
+        // Telegram-owned jobs are also asked by the agent itself; Telegram ignores the repeat.
+        Telegram.shared.ask(question.text, options: question.options, sensitive: question.sensitive, from: worker)
     }
 
     private func parallel(_ parent: Job, requests: [String]) async -> (ok: Bool, summary: String) {
@@ -173,7 +213,19 @@ final class BrowserJobs: ObservableObject {
     private func complete(_ job: Job, answer: String, ok: Bool) {
         guard !job.finished else { return }
         job.finished = true; job.ok = ok; job.answer = answer; job.status = ok ? "Done — click to check" : "Stopped — click for details"
-        if let receipt = job.receipt { RunReceipt.write(id: receipt, ok: ok, answer: answer, steps: job.agent?.steps.map(\.text) ?? []) }
+        Notifier.clearQuestion(run: job.id)
+        RunSupervisor.shared.finished(run: job.id)
+        if !job.test, let worker = job.agent {
+            // Like any other background run: say when it's through. Parallel children report through their parent.
+            if job.parent == nil {
+                Notifier.finished(request: job.request, answer: answer, ok: ok, result: worker.result,
+                                  needsLook: !ok && worker.finishStatus == Agent.unconfirmedStatus)
+            }
+            // Mirrored (non-Telegram) jobs get their terminal card here; Telegram-owned ones already did.
+            Telegram.shared.finished(answer: answer, ok: ok || worker.finishStatus == Agent.unconfirmedStatus, result: worker.result, from: worker)
+        }
+        if let receipt = job.receipt { RunReceipt.write(id: receipt, ok: ok, answer: answer, steps: job.agent?.steps.map(\.text) ?? [], timings: job.agent?.runtimeTimings ?? [:], counts: job.agent?.runtimeCounts ?? [:],
+                                                        status: !ok && job.agent?.finishStatus == Agent.unconfirmedStatus ? Agent.unconfirmedStatus : nil) }
         if let parentID = job.parent, let parent = jobs.first(where: { $0.id == parentID }),
            parent.children.allSatisfy({ id in jobs.first(where: { $0.id == id })?.finished == true }) {
             let waiters = parent.waiters; parent.waiters = []; waiters.forEach { $0.resume() }

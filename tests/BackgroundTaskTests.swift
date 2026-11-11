@@ -1,3 +1,4 @@
+import CoreGraphics
 import Foundation
 
 enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurrences(of: "test-secret", with: "[private]") } }
@@ -15,7 +16,9 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         let queued = store.enqueue("Next task", source: .telegram, conversationID: 42)!
         let restored = TaskStore(file: file)
         check(restored.record(id)?.state == .interrupted, "running becomes interrupted")
-        check(restored.record(id)?.pendingAction == "click", "uncertain action survives restart")
+        check(restored.record(id)?.pendingAction == nil && restored.record(id)?.unverifiedAction == "click", "unfinished dispatch becomes an uncertain outcome on restart")
+        check(restored.record(id)?.pendingProvenance?.delivery == .unknown, "restart cannot invent delivery evidence")
+        check(restored.actionHistory(id).first?.state == .unknown, "unfinished journal reservation recovers unknown")
         check(!restored.start(id, explicitlyReviewed: true), "never replays interrupted submit")
         check(!restored.start(queued), "restored queue requires review")
         check(restored.start(queued, explicitlyReviewed: true), "review starts queued request")
@@ -30,9 +33,10 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         check(final.endAction(uncertain, kind: "click", outcome: .uncertain, completedSteps: 0), "persists unknown delivery")
         check(final.record(uncertain)?.lastConfirmedStep == nil, "unknown delivery is never confirmed")
         check(final.record(uncertain)?.unverifiedAction == "click", "retains uncertain action separately")
-        check(final.beginAction(uncertain, kind: "read"), "permits independent readback")
+        check(final.beginAction(uncertain, kind: "read", mutation: false), "permits independent readback")
         check(final.endAction(uncertain, kind: "read", outcome: .confirmed, completedSteps: 1), "records readback")
         check(final.record(uncertain)?.unverifiedAction == "click", "unrelated successful read does not erase uncertain input")
+        check(final.actionHistory(uncertain).first?.state == .unknown, "unrelated read never confirms the mutation journal")
         let crash = TaskStore(file: file)
         check(crash.record(uncertain)?.unverifiedAction == "click", "uncertain outcome survives crash after delivery")
         final.finish(uncertain, ok: true, answer: "Done")
@@ -100,6 +104,22 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         check(BackgroundPolicy.route(["do":"collect"], hasWorkerPage: false) == .api, "worker collection doesn't require foreground access")
         check(BackgroundPolicy.route(["do":"type","id":"w2"], hasWorkerPage: true) == .browser, "owned web field allowed")
         check(BackgroundPolicy.route(["do":"key","keys":"cmd+a"], hasWorkerPage: true) == .browser, "owned select-all allowed")
+        // Coordinate clicks: allowed in an owned/adopted tab (from its own screenshot), never without one.
+        check(BackgroundPolicy.route(["do":"click","x":487,"y":548], hasWorkerPage: true) == .browser, "owned-tab x/y click allowed")
+        check(denied(["do":"click","text":"I consent"]), "text-label click still refused in background")
+        if case .attention = BackgroundPolicy.route(["do":"click","x":487,"y":548], hasWorkerPage: false) { check(true, "x/y without an owned tab refused") }
+        else { check(false, "x/y without an owned tab refused") }
+        // A 2x screenshot of a 1280x800 viewport, downscaled to 1280 px wide for the model.
+        check(BackgroundPolicy.viewportPoint(x: 640, y: 400, image: CGSize(width: 1280, height: 800), viewport: CGSize(width: 1280, height: 800)) == CGPoint(x: 640, y: 400), "1:1 screenshot maps directly")
+        check(BackgroundPolicy.viewportPoint(x: 1000, y: 500, image: CGSize(width: 2000, height: 1250), viewport: CGSize(width: 1000, height: 625)) == CGPoint(x: 500, y: 250), "device-pixel screenshot halves to CSS pixels")
+        check(BackgroundPolicy.viewportPoint(x: 400, y: 250, image: CGSize(width: 800, height: 500), viewport: CGSize(width: 1600, height: 1000)) == CGPoint(x: 800, y: 500), "downscaled screenshot scales up")
+        check(BackgroundPolicy.viewportPoint(x: 900, y: 10, image: CGSize(width: 800, height: 500), viewport: CGSize(width: 1600, height: 1000)) == nil, "outside the image refused")
+        check(BackgroundPolicy.screenshotStillCurrent(shotTab: 7, shotDocument: "d1", shotViewport: CGSize(width: 1280, height: 800), shotScrollY: 120,
+                                                      pageTab: 7, pageDocument: "d1", pageViewport: CGSize(width: 1280, height: 800), pageScrollY: 120), "same tab, document and scroll is current")
+        check(!BackgroundPolicy.screenshotStillCurrent(shotTab: 7, shotDocument: "d1", shotViewport: CGSize(width: 1280, height: 800), shotScrollY: 120,
+                                                       pageTab: 7, pageDocument: "d1", pageViewport: CGSize(width: 1280, height: 800), pageScrollY: 400), "scrolled since the screenshot is stale")
+        check(!BackgroundPolicy.screenshotStillCurrent(shotTab: 7, shotDocument: "d1", shotViewport: CGSize(width: 1280, height: 800), shotScrollY: 0,
+                                                       pageTab: 8, pageDocument: "d1", pageViewport: CGSize(width: 1280, height: 800), pageScrollY: 0), "another tab's screenshot is stale")
         check(BackgroundPolicy.route(["do":"tab","op":"list"], hasWorkerPage: false, allowTabDiscovery: true) == .browser, "explicit existing-tab request can discover URLs before opening a task page")
         if case .attention = BackgroundPolicy.route(["do":"tab","op":"list"], hasWorkerPage: false) {
             check(true, "ordinary workers cannot discover personal tabs")
@@ -160,6 +180,92 @@ enum Secrets { static func mask(_ text: String) -> String { text.replacingOccurr
         } else { check(false, "click without owned tab needs attention") }
         check(BackgroundPolicy.route(["do": "verify", "user_confirms": "uploaded"], hasWorkerPage: false) == .api, "user confirmation needs no page")
         check(BackgroundPolicy.route(["do": "click", "id": "w1"], hasWorkerPage: true) == .browser, "w-id click on owned tab allowed")
+        // Durable identity, explicit resumption and outcome requirements exercise real SQLite reopen paths.
+        let auditFile = root.appendingPathComponent("audit.sqlite")
+        let audit = TaskStore(file: auditFile)
+        let auditID = audit.enqueue("Produce two reports", source: .mac)!
+        check(audit.start(auditID), "audit task starts")
+        check(audit.addChecklist(auditID, titles: ["First report", "Second report"]), "requested outcomes persist")
+        let dispatch = UUID()
+        check(audit.beginAction(auditID, kind: "click", actionID: dispatch, runID: "fixture"), "reserves durable dispatch identity")
+        check(audit.endAction(auditID, kind: "click", outcome: .confirmed, completedSteps: 1, actionID: dispatch), "confirms dispatched action")
+        check(!audit.beginAction(auditID, kind: "click", actionID: dispatch), "a completed dispatch ID cannot be reused")
+        check(audit.record(auditID)?.pendingAction == nil && audit.actionHistory(auditID).count == 1, "duplicate reservation is atomic and leaves no checkpoint")
+        check(audit.verifyChecklist(auditID, step: "s1", evidence: "first artifact read"), "first outcome independently verified")
+        check(!audit.verifyChecklist(auditID, step: "missing", evidence: "irrelevant"), "unknown outcome ID is refused")
+        check(audit.finish(auditID, ok: true, answer: "Done"), "incomplete terminal state persists")
+        check(audit.record(auditID)?.state == .failed, "unfinished checklist blocks success")
+        var readyID: UUID?
+        audit.onReady = { readyID = $0 }
+        check(audit.requestResume(auditID) && readyID == auditID, "explicit resume queues same task identity")
+        check(audit.start(auditID), "resumed task starts after fresh dispatch request")
+        check(audit.record(auditID)?.checklist?.first?.complete == true && audit.record(auditID)?.openChecklist.map(\.id) == ["s2"], "resume preserves completed and unfinished outcomes")
+        check(audit.verifyChecklist(auditID, step: "s2", evidence: "second artifact read"), "second outcome independently verified")
+        let firstFile = root.appendingPathComponent("first.txt"), secondFile = root.appendingPathComponent("second.txt")
+        try Data("first".utf8).write(to: firstFile)
+        let alias = root.appendingPathComponent("alias.txt")
+        try FileManager.default.createSymbolicLink(at: alias, withDestinationURL: firstFile)
+        check(audit.addRequirements(auditID, [(.deliverable, firstFile.path), (.deliverable, secondFile.path)], provenance: "user"), "two independent file requirements")
+        check(audit.satisfyDeliverable(auditID, path: alias.path, evidence: "alias resolves to first"), "canonical matching file path satisfies its requirement")
+        check(audit.record(auditID)?.openRequirements.map(\.text) == [secondFile.path], "one verified file never clears another deliverable")
+        check(audit.finish(auditID, ok: true, answer: "Done") && audit.record(auditID)?.state == .failed, "missing file evidence independently blocks completion")
+        check(audit.requestResume(auditID) && audit.start(auditID), "file requirement failure can be inspected and continued")
+        check(audit.satisfyDeliverable(auditID, path: secondFile.path, evidence: "second file independently checked"), "second file requirement accepts its own evidence")
+        let faultDB = try SQLiteDatabase(file: auditFile)
+        try faultDB.execute("CREATE TRIGGER refuse_completion BEFORE UPDATE ON tasks BEGIN SELECT RAISE(ABORT, 'fixture storage failure'); END;")
+        check(!audit.finish(auditID, ok: true, answer: "Done"), "failed durable completion returns failure")
+        check(audit.record(auditID)?.state == .running && audit.storageError != nil, "storage failure never publishes successful state")
+        try faultDB.execute("DROP TRIGGER refuse_completion")
+        check(audit.finish(auditID, ok: true, answer: "Both reports verified"), "completion persists after storage recovers")
+        let finishedAudit = TaskStore(file: auditFile)
+        check(finishedAudit.record(auditID)?.state == .succeeded && finishedAudit.record(auditID)?.openRequirements.isEmpty == true, "successful completion survives restart")
+        let pendingID = finishedAudit.enqueue("One uncertain input", source: .mac)!
+        check(finishedAudit.start(pendingID) && finishedAudit.beginAction(pendingID, kind: "click"), "new pending dispatch recorded")
+        check(finishedAudit.finish(pendingID, ok: false, answer: "Stopped"), "cancellation persists")
+        check(finishedAudit.actionHistory(pendingID).first?.state == .unknown, "cancelled in-flight dispatch is unknown")
+        check(finishedAudit.requestResume(pendingID) && finishedAudit.start(pendingID), "cancelled task explicitly resumes")
+        check(finishedAudit.record(pendingID)?.unverifiedAction == "click", "resumed cancelled task retains unknown barrier")
+        check(!finishedAudit.beginAction(pendingID, kind: "type"), "resume never authorizes new mutation over unknown input")
+        check(finishedAudit.resolveAction(pendingID, evidence: "user checked no effect") && finishedAudit.actionHistory(pendingID).first?.state == .resolved, "explicit review resolves but never confirms unknown dispatch")
+        // A popup's result can appear in its exact owned opener, but closure or an unrelated tab is
+        // never evidence. Each baseline belongs to that parent document before the child input.
+        func openerEvidence(delivery: ActionOutcome.Delivery = .delivered, consequential: Bool = false,
+                            sameRun: Bool = true, sameConnection: Bool = true,
+                            expectedTab: Int? = 10, currentTab: Int? = 10,
+                            expectedDocument: String? = "parent-doc", currentDocument: String? = "parent-doc",
+                            before: String? = "Review window opened", after: String? = "Local review confirmed") -> Bool {
+            OwnedOpenerEvidencePolicy.accepts(kind: "click", delivery: delivery, consequential: consequential,
+                sameRun: sameRun, sameConnection: sameConnection, expectedTab: expectedTab, currentTab: currentTab,
+                expectedDocument: expectedDocument, currentDocument: currentDocument,
+                expected: "Local review confirmed", before: before, after: after)
+        }
+        check(openerEvidence(), "fresh owned-parent confirmation resolves known delivered ordinary click")
+        check(!openerEvidence(delivery: .unknown), "unknown delivery cannot use alternate opener evidence")
+        check(!openerEvidence(delivery: .notAttempted), "unsent input cannot use alternate opener evidence")
+        check(!openerEvidence(consequential: true), "consequential inputs retain their original verification boundary")
+        check(!openerEvidence(sameRun: false), "restored or unrelated run cannot reuse opener baseline")
+        check(!openerEvidence(sameConnection: false), "another browser connection cannot reuse opener baseline")
+        check(!openerEvidence(currentTab: 11), "sibling or child tab is not the captured parent")
+        check(!openerEvidence(expectedTab: nil), "missing parent identity is rejected")
+        check(!openerEvidence(currentDocument: "reloaded-parent"), "same URL with a changed parent document is rejected")
+        check(!openerEvidence(expectedDocument: nil), "missing document provenance is rejected")
+        check(!openerEvidence(before: "Local review confirmed"), "preexisting parent acknowledgement proves nothing new")
+        check(!openerEvidence(before: nil), "child text cannot substitute for an absent parent baseline")
+        check(!openerEvidence(after: nil), "popup closure alone provides no result evidence")
+        check(!openerEvidence(after: "Review window opened"), "opening acknowledgement cannot confirm later child action")
+        let restoredOpener = OwnedOpenerEvidencePolicy.permitsObservation(kind: "click", delivery: .delivered, consequential: false,
+            sameRun: true, sameConnection: true, expectedTab: 10, currentTab: 10,
+            expectedDocument: "parent-doc", currentDocument: "parent-doc")
+        check(restoredOpener, "captured owned opener can restore observation when child is unavailable")
+        for action: [String: Any] in [["do": "verify", "text": "Local review confirmed"], ["do": "read"], ["do": "tab", "op": "list"], ["do": "tab", "op": "switch", "id": 10]] {
+            check(BackgroundPolicy.route(action, hasWorkerPage: restoredOpener) == .browser, "restored opener makes read-only verification and tab routes reachable")
+            if case .attention = BackgroundPolicy.route(action, hasWorkerPage: false) { check(true, "no recovered target still fails closed") }
+            else { check(false, "no recovered target still fails closed") }
+        }
+        check(!OwnedOpenerEvidencePolicy.permitsObservation(kind: "click", delivery: .unknown, consequential: false,
+            sameRun: true, sameConnection: true, expectedTab: 10, currentTab: 10,
+            expectedDocument: "parent-doc", currentDocument: "parent-doc"), "unknown delivery does not acquire a new observation route")
+        check(!openerEvidence(after: "Review window opened"), "restoring observation cannot itself resolve pending input")
         print("PASS: \(checks) task recovery and background policy checks")
     }
 }

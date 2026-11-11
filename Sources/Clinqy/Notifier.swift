@@ -5,10 +5,10 @@ import AppKit
 /// needs them, answerable right there (a button per option, or a typed reply). Tapping either opens Clinqy.
 @MainActor
 enum Notifier {
-    /// The user answered the question from the notification.
-    static var onAnswer: (String) -> Void = { _ in }
+    /// The user answered the question from the notification (`run`: the browser job that asked, nil = main agent).
+    static var onAnswer: (_ text: String, _ run: UUID?) -> Void = { _, _ in }
     /// The user tapped a notification (true: the question one): show them Clinqy, or the work.
-    static var onOpen: (_ question: Bool) -> Void = { _ in }
+    static var onOpen: (_ question: Bool, _ run: UUID?) -> Void = { _, _ in }
 
     private static let delegate = Delegate()
     /// Which question is on show and the options it was issued with; responses resolve through it by notification id.
@@ -23,9 +23,11 @@ enum Notifier {
 
     /// The run has finished (or given up). The result's first items ride along (prices, places, links), and the
     /// notification can show the work, bring its window over, or open the first link. Several stack as one group.
-    static func finished(request: String, answer: String, ok: Bool, result: ResultCard? = nil) {
+    /// `needsLook`: a consequential item finished unconfirmed (not ok, but not a failure either).
+    static func finished(request: String, answer: String, ok: Bool, result: ResultCard? = nil, needsLook: Bool = false) {
+        guard NotificationPolicy.enabled else { return }
         let content = UNMutableNotificationContent()
-        content.title = ok ? "Done" : answer == "Stopped" ? "Stopped" : "Couldn't finish"
+        content.title = finishedTitle(ok: ok, answer: answer, needsLook: needsLook)
         content.subtitle = String(request.prefix(80))
         let items = (result?.items ?? []).prefix(3).map { "• " + $0.title + ($0.subtitle.map { " — " + $0 } ?? "") }
         content.body = ([String(answer.prefix(items.isEmpty ? 240 : 140))] + items).joined(separator: "\n")
@@ -44,22 +46,34 @@ enum Notifier {
         post("clinqy.done.\(UUID().uuidString)", content)
     }
 
+    static func finishedTitle(ok: Bool, answer: String, needsLook: Bool) -> String {
+        ok ? "Done" : needsLook ? "Needs a look" : answer == "Stopped" ? "Stopped" : "Couldn't finish"
+    }
+
+    private static var questionCategories: [String] = []
     private static func register(_ category: UNNotificationCategory) {
-        // Only the newest question's buttons are needed.
-        if category.identifier.hasPrefix("clinqy.q.") { categories = categories.filter { !$0.key.hasPrefix("clinqy.q.") } }
+        // Parallel jobs can each have a live question: keep the newest few question categories.
+        if category.identifier.hasPrefix("clinqy.q.") {
+            questionCategories.append(category.identifier)
+            while questionCategories.count > 8 { categories[questionCategories.removeFirst()] = nil }
+        }
         categories[category.identifier] = category
         UNUserNotificationCenter.current().setNotificationCategories(Set(categories.values))
     }
 
     /// The run is waiting on the user. A private answer (a password, a code) is never typed into a notification:
-    /// that one only opens Clinqy.
-    static func ask(_ text: String, options: [String], sensitive: Bool) {
+    /// that one only opens Clinqy. `run` is nil for the main agent; a browser job passes its task ID so the answer goes
+    /// back to it. `note` says what happens with no answer ("No answer in 10 min → I'll skip this step").
+    static func ask(_ text: String, options: [String], sensitive: Bool, run: UUID? = nil, note: String? = nil, title: String? = nil) {
+        // Notifications off: no banner. The question stays answerable in Clinqy's panel/bar/badge and Telegram.
+        guard NotificationPolicy.enabled else { return }
         let content = UNMutableNotificationContent()
         content.title = "Clinqy needs you"
-        content.body = String(text.prefix(240))
+        if let title, !title.isEmpty { content.subtitle = String(title.prefix(80)) }
+        let limit = note == nil ? 240 : 190
+        content.body = String(text.prefix(limit)) + (note.map { "\n" + $0 } ?? "")
         content.sound = .default
-        let previous = ledger.liveID
-        let issued = ledger.issue(options: options, sensitive: sensitive)
+        let issued = ledger.issue(options: options, sensitive: sensitive, run: run)
         var actions = issued.actions.map { UNNotificationAction(identifier: $0.id, title: $0.title, options: []) as UNNotificationAction }
         if !sensitive {
             actions.append(UNTextInputNotificationAction(identifier: "reply", title: options.isEmpty ? "Reply" : "Something else…",
@@ -69,15 +83,13 @@ enum Notifier {
         let category = UNNotificationCategory(identifier: "clinqy.q.\(UUID().uuidString)", actions: actions, intentIdentifiers: [], options: [])
         register(category)
         content.categoryIdentifier = category.identifier
-        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: previous.map { [$0] } ?? [])
+        UNUserNotificationCenter.current().removeDeliveredNotifications(withIdentifiers: issued.replaced.map { [$0] } ?? [])
         post(issued.id, content)
     }
 
-    /// The question was answered (here or in Clinqy): its notification goes.
-    static func clearQuestion() {
-        let live = ledger.liveID
-        ledger.clear()
-        guard let live else { return }
+    /// The question was answered (here or in Clinqy): its notification goes. nil = the main agent's question.
+    static func clearQuestion(run: UUID? = nil) {
+        guard let live = ledger.clear(run: run) else { return }
         let center = UNUserNotificationCenter.current()
         center.removeDeliveredNotifications(withIdentifiers: [live])
         center.removePendingNotificationRequests(withIdentifiers: [live])
@@ -104,8 +116,8 @@ enum Notifier {
             if let link, let url = URL(string: link) { NSWorkspace.shared.open(url) }
         default:
             switch ledger.resolve(notificationID: notificationID, action: action, typed: typed) {
-            case .answer(let text): onAnswer(text)
-            case .open(let question): onOpen(question)
+            case .answer(let text, let run): onAnswer(text, run)
+            case .open(let question, let run): onOpen(question, run)
             case .stale: Agent.writeLog("notification response ignored: its question is no longer open")
             }
         }

@@ -15,6 +15,7 @@ enum Background {
         var windowsAtStart: Set<CGWindowID> = []
         var usesExtension = true
         var browserOverride: String?
+        var nativeWindowID: CGWindowID?
     }
     private static let primaryState = State()
     private static var state: State { TaskExecution.current?.service(State.self, make: State.init) ?? primaryState }
@@ -34,6 +35,8 @@ enum Background {
     private static var appSince: Date { get { state.appSince } set { state.appSince = newValue } }
     /// Clinqy's tab in its own browser window: every page read and page action of the run is pinned to it.
     static var tab: BrowserBridge.TabInfo? { get { state.tab } set { state.tab = newValue } }
+    /// Explicit native selection, scoped to this task; unrelated focused windows never replace it.
+    static var nativeWindowID: CGWindowID? { get { state.nativeWindowID } set { state.nativeWindowID = newValue } }
     /// Per app the run worked in: the windows it already had then (the user's), which never move. Any other window
     /// of that app (one the run opened: ⌘N, a dialog) goes to Clinqy's hidden screen.
     private static var userWindows: [pid_t: Set<CGWindowID>] { get { state.userWindows } set { state.userWindows = newValue } }
@@ -50,7 +53,7 @@ enum Background {
 
     /// Moves the windows the run's apps opened since onto Clinqy's hidden screen (browsers place their own).
     static func sweep() {
-        guard active, AgentScreen.bounds != nil else { return }
+        guard active, nativeWindowID == nil, AgentScreen.bounds != nil else { return }
         let front = NSWorkspace.shared.frontmostApplication?.processIdentifier
         let list = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
         for info in list where info[kCGWindowLayer as String] as? Int == 0 {
@@ -101,24 +104,48 @@ enum Background {
         active = on
         app = nil
         tab = nil
+        nativeWindowID = nil
         userWindows = [:]
         let list = on ? CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? [] : []
         windowsAtStart = Set(list.compactMap { ($0[kCGWindowNumber as String] as? Int).map(CGWindowID.init) })
     }
 
+    /// A final capture of the run's own tab that the tab's release waits for (bounded), so the completion message
+    /// isn't captured from a tab already closed or frozen.
+    private static var cleanupGate: Task<Data?, Never>?
+    static func holdCleanup(until capture: Task<Data?, Never>) { cleanupGate = capture }
+    /// Waits for the gate, at most `seconds`.
+    static func wait(for gate: Task<Data?, Never>?, seconds: Double = 8) async {
+        guard let gate else { return }
+        await withTaskGroup(of: Void.self) { group in
+            group.addTask { _ = await gate.value }
+            group.addTask { try? await Task.sleep(for: .seconds(seconds)) }
+            await group.next()
+            group.cancelAll()
+        }
+    }
+
     static func end() {
         if active, app != nil || tab != nil { last = (tab, app) }
+        let gate = cleanupGate
+        cleanupGate = nil
         if active {
             lastRun = Date()
             if usesExtension {
-                BrowserBridge.shared.endBackgroundRun()
+                BrowserBridge.shared.endBackgroundRun(after: gate)
             } else {
                 let keep = tab?.connection == ChromeWorker.shared.identity ? tab?.id : nil
                 let run = ChromeWorker.shared.generation
-                Task { await ChromeWorker.shared.runEnded(keep: keep, generation: run) }
+                Task {
+                    await wait(for: gate)
+                    await ChromeWorker.shared.runEnded(keep: keep, generation: run)
+                }
             }
         }
+        _ = SkyLight.retryPendingCleanup()
+        SkyLight.releaseKeepAlive()   // a pinned native window kept "visible" for input goes back to normal
         active = false
+        nativeWindowID = nil
         userWindows = [:]
         app = nil
         tab = nil

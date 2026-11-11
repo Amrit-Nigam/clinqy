@@ -7,7 +7,7 @@ import Darwin
 struct UIElementInfo: @unchecked Sendable {
     let id: String
     let role: String
-    let label: String
+    var label: String
     /// Frame in global top-left-origin coordinates (the same space CGEvent uses).
     let frame: CGRect
     let element: AXUIElement
@@ -27,6 +27,8 @@ struct UIElementInfo: @unchecked Sendable {
     var selected: Bool? = nil
     /// Caret (length 0) or selection of a text input, in UTF-16 offsets.
     var selection: NSRange? = nil
+    /// Explains bounded observation; never silently presents a truncated tree as complete.
+    var observationNotice: String? = nil
 
     var center: CGPoint { CGPoint(x: frame.midX, y: frame.midY) }
 }
@@ -49,7 +51,7 @@ enum AXEngine {
         "AXButton", "AXLink", "AXTextField", "AXTextArea", "AXSearchField", "AXCheckBox",
         "AXRadioButton", "AXPopUpButton", "AXMenuButton", "AXTab", "AXComboBox",
         "AXMenuBarItem", "AXDisclosureTriangle", "AXCell", "AXRow", "AXImage", "AXSegmentedControl",
-        "AXStaticText", "AXMenuItem", "AXHeading", "AXGroup",
+        "AXStaticText", "AXMenuItem", "AXHeading", "AXGroup", "AXSlider", "AXIncrementor", "AXSwitch",
     ]
 
     nonisolated(unsafe) private static var enabledElectron = Set<pid_t>()
@@ -83,38 +85,56 @@ enum AXEngine {
         AXUIElementSetMessagingTimeout(root, 0.5)
 
         var roots: [(AXUIElement, Bool)] = []
-        let window = snapshot?.element ?? mainWindow(root)
+        let window = snapshot?.element ?? selectedWindow(of: app)
         let dialog = window.flatMap { dialogElement(in: $0) }
         if let dialog, let window, !CFEqual(dialog.element, window) { roots.append((dialog.element, true)) }
         if let window { roots.append((window, dialog.map { CFEqual($0.element, window) } ?? false)) }
         if menuBar, let bar: AXUIElement = attr(root, kAXMenuBarAttribute) { roots.append((bar, false)) }
         let windowTitle = window.flatMap { attr($0, kAXTitleAttribute) as String? } ?? ""
+        let observedFrame = snapshot?.frame ?? window.flatMap { frame(of: $0) }
 
         // Visible means on an actual display: the bounding box of several monitors also covers the gaps between them.
         let displays = NSScreen.screens.map { flipped($0.frame) }
         // Roots are walked one after another (not interleaved), so the sheet's controls come first.
-        var pending = ArraySlice(roots.map { (element: $0.0, depth: 0, inDialog: $0.1) })
-        var queue: [(element: AXUIElement, depth: Int, inDialog: Bool)] = []
+        var pending = ArraySlice(roots.map { (element: $0.0, depth: 0, inDialog: $0.1, parent: -1, inCollection: false) })
+        typealias Pending = (element: AXUIElement, depth: Int, inDialog: Bool, parent: Int, inCollection: Bool)
+        var queue: [Pending] = []
+        var metas: [AXTreeBudget.Node] = []
+        var visitCount = 0
         var head = 0
         var found: [UIElementInfo] = []
         var seen = Set<String>(), refCounts: [String: Int] = [:]
         // Gather a little past the limit, then drop the least useful (unlabeled groups, loose text) rather than
         // whatever happened to come last in the walk.
-        let gather = limit + limit / 2
+        let limit = min(1200, max(1, limit))
+        let candidateBudget = min(10000, max(256, limit * 12))
+        let deadline = Date().addingTimeInterval(2)
+        var deferred: [Pending] = []
+        var visited: [CFHashCode: [AXUIElement]] = [:]
+        var truncated = false
 
-        while found.count < gather, head < 4000 {
+        while head < candidateBudget, Date() < deadline, !Task.isCancelled {
             if head == queue.count {
-                guard let next = pending.popFirst() else { break }
-                queue.append(next)
+                if let next = pending.popFirst() { queue.append(next) }
+                else if !deferred.isEmpty { queue.append(contentsOf: deferred); deferred.removeAll(keepingCapacity: true) }
+                else { break }
             }
-            let (element, depth, inDialog) = queue[head]
+            let (element, depth, inDialog, parentVisit, inCollection) = queue[head]
             head += 1
+            let visit = visitCount
+            visitCount += 1
+            let hash = CFHash(element)
+            guard !(visited[hash]?.contains(where: { CFEqual($0, element) }) ?? false) else { continue }
+            visited[hash, default: []].append(element)
             if let dialog, !inDialog, CFEqual(element, dialog.element) { continue }   // already walked first
             let v = attrs(element, scanAttrs)
             let role = v[0] as? String ?? ""
+            if actionableRoles.contains(role), let bounds = frame(position: v[2], size: v[3]),
+               let observedFrame, !observedFrame.intersects(bounds) { truncated = true }
 
             if actionableRoles.contains(role), let frame = frame(position: v[2], size: v[3]),
-               frame.width > 2, frame.height > 2, ObservationGeometry.intersectsAnyDisplay(frame, displays: displays) {
+               frame.width > 2, frame.height > 2, ObservationGeometry.intersectsAnyDisplay(frame, displays: displays),
+               observedFrame.map({ $0.intersects(frame) }) ?? true {
                 // A password field's value never reaches the model: not as its label, not as its value.
                 let secure = role == "AXSecureTextField" || v[1] as? String == "AXSecureTextField"
                 let raw: Any? = secure ? Safety.redacted(v[8] as? String, role: role, subrole: v[1] as? String) : v[8]
@@ -130,6 +150,8 @@ enum AXEngine {
                                          fallback: input ? (v[7] as? String ?? v[6] as? String) : label)
                     let n = (refCounts[base] ?? 0) + 1
                     refCounts[base] = n
+                    metas.append(.init(visit: visit, parent: parentVisit, role: role, label: label, enabled: v[10] as? Bool,
+                                       visible: true, inCollection: inCollection, inDialog: inDialog, isInput: input))
                     found.append(UIElementInfo(
                         id: "", role: role,
                         label: label.isEmpty ? "(unlabeled \(role.dropFirst(2)))" : label,
@@ -144,14 +166,33 @@ enum AXEngine {
             // Don't descend into closed menus from the menu bar.
             if role == "AXMenuBarItem" { continue }
             if depth < 30, !(excludingWebContent && role == "AXWebArea") {
-                queue.append(contentsOf: children(of: element, role: role).map { ($0, depth + 1, inDialog) })
+                let isCollection = ["AXTable", "AXOutline", "AXList", "AXBrowser"].contains(role)
+                let next: [Pending] = children(of: element, role: role).map { ($0, depth + 1, inDialog, visit, inCollection || isCollection) }
+                // Finish ordinary controls before walking large tables, lists and outlines.
+                if isCollection { deferred.append(contentsOf: next) }
+                else { queue.append(contentsOf: next) }
+                if next.count == childCap { truncated = true }
+            } else if depth >= 30 {
+                truncated = true
             }
         }
-        if found.count > limit { found = trimmed(found, to: limit) }
+        truncated = truncated || head < queue.count || !pending.isEmpty || !deferred.isEmpty || found.count > limit
+        // Compact the candidates (merge loose text, drop redundant wrappers and empty disabled nodes), then spend the
+        // node budget on visible controls first. Ids are assigned after this, so each still maps to its own element.
+        let plan = AXTreeBudget.compact(metas, limit: limit)
+        if plan.droppedAny || found.count > limit {
+            found = plan.keep.map { i in
+                var e = found[i]
+                if let merged = plan.mergedLabels[i] { e.label = merged }
+                return e
+            }
+        }
+        let notice = truncated ? "Accessibility observation is bounded; some controls are not shown. Scroll the relevant panel or observe again before assuming a control is absent." : nil
+        snapshot?.diagnostics.setNotice(notice)
         return found.enumerated().map { i, e in
             UIElementInfo(id: "e\(i)", role: e.role, label: e.label, frame: e.frame, element: e.element,
                           ref: e.ref, value: e.value, inDialog: e.inDialog, observationID: e.observationID, windowID: e.windowID,
-                          enabled: e.enabled, expanded: e.expanded, selected: e.selected, selection: e.selection)
+                          enabled: e.enabled, expanded: e.expanded, selected: e.selected, selection: e.selection, observationNotice: notice)
         }
     }
 
@@ -161,6 +202,55 @@ enum AXEngine {
         var range = CFRange()
         guard AXValueGetValue(raw as! AXValue, .cfRange, &range), range.location >= 0, range.length >= 0 else { return nil }
         return NSRange(location: range.location, length: range.length)
+    }
+
+    static func selection(of element: AXUIElement) -> NSRange? {
+        textRange(attr(element, kAXSelectedTextRangeAttribute) as CFTypeRef?)
+    }
+
+    /// Selects `range` in a text element and reads the selection back (nil = refused or didn't stick).
+    static func select(_ range: NSRange, in element: AXUIElement) -> String? {
+        var cf = CFRange(location: range.location, length: range.length)
+        guard let value = AXValueCreate(.cfRange, &cf) else { return nil }
+        let err = AXUIElementSetAttributeValue(element, kAXSelectedTextRangeAttribute as CFString, value)
+        guard err == .success || err == .cannotComplete, selection(of: element) == range else { return nil }
+        return selectedText(of: element)
+    }
+
+    static func selectedText(of element: AXUIElement) -> String? { attr(element, kAXSelectedTextAttribute) }
+    static func textValue(of element: AXUIElement) -> String? { attr(element, kAXValueAttribute) }
+
+    /// The character formatting of `range` as Accessibility reports it (AXAttributedStringForRange): one span per
+    /// attribute run, with the font's real traits when the font resolves. nil = the app doesn't expose it.
+    static func formattingSpans(of element: AXUIElement, range: NSRange) -> [TextFormatting.Span]? {
+        guard range.length > 0 else { return nil }
+        var cf = CFRange(location: range.location, length: range.length)
+        guard let param = AXValueCreate(.cfRange, &cf) else { return nil }
+        var raw: CFTypeRef?
+        guard AXUIElementCopyParameterizedAttributeValue(element, kAXAttributedStringForRangeParameterizedAttribute as CFString, param, &raw) == .success,
+              let attributed = raw as? NSAttributedString, attributed.length > 0 else { return nil }
+        var spans: [TextFormatting.Span] = []
+        attributed.enumerateAttributes(in: NSRange(location: 0, length: attributed.length)) { attrs, _, _ in
+            var span = TextFormatting.Span()
+            if let font = attrs[NSAttributedString.Key("AXFont")] as? [String: Any] {
+                span.fontName = font["AXFontName"] as? String
+                let size = (font["AXFontSize"] as? NSNumber)?.doubleValue ?? 12
+                if let name = span.fontName, let resolved = NSFont(name: name, size: size) {
+                    let traits = NSFontManager.shared.traits(of: resolved)
+                    span.boldTrait = traits.contains(.boldFontMask)
+                    span.italicTrait = traits.contains(.italicFontMask)
+                }
+            }
+            func flag(_ key: String) -> Bool {
+                let v = attrs[NSAttributedString.Key(key)]
+                if let n = v as? NSNumber { return n.intValue != 0 }
+                return v != nil
+            }
+            span.underline = flag("AXUnderline")
+            span.strikethrough = flag("AXStrikethrough")
+            spans.append(span)
+        }
+        return spans
     }
 
     /// Short state flags worth showing the model: only what differs from the unremarkable default.
@@ -189,15 +279,9 @@ enum AXEngine {
         return e.inDialog ? base + 10 : base
     }
 
-    /// Keeps the `count` most useful elements, in their original order.
-    private static func trimmed(_ elements: [UIElementInfo], to count: Int) -> [UIElementInfo] {
-        let keep = Set(elements.indices.sorted { (priority(elements[$0]), -$0) > (priority(elements[$1]), -$1) }.prefix(count))
-        return elements.indices.filter(keep.contains).map { elements[$0] }
-    }
-
     /// "e12 Button: Send" lines within `budget` characters. Over budget, whole low-value lines go (never a
     /// half-cut label), and a closing note says how many.
-    static func listing(_ elements: [UIElementInfo], budget: Int = 8000, refs: Bool = false) -> String {
+    static func listing(_ elements: [UIElementInfo], budget: Int = 8000, refs: Bool = false, window: NativeWindowObservation? = nil) -> String {
         let lines = elements.map { e in
             "\(e.id)\(refs ? " #\(e.ref)" : "") \(e.role.dropFirst(2)): \(e.label)\(stateFlags(e))"
                 + (e.value.map { isInput(e.role) && !e.label.contains($0) ? " = \($0.prefix(60).debugDescription)" : "" } ?? "")
@@ -213,6 +297,7 @@ enum AXEngine {
         }
         var text = lines.indices.filter { !dropped.contains($0) }.map { lines[$0] }.joined(separator: "\n")
         if !dropped.isEmpty { text += "\n(\(dropped.count) less important elements not shown)" }
+        if let notice = window?.diagnostics.notice ?? elements.first?.observationNotice { text += "\n" + notice }
         return text
     }
 
@@ -250,12 +335,21 @@ enum AXEngine {
     /// Children, at most `childCap`. Long tables and lists hand over their visible rows instead, since the first
     /// 200 of a scrolled list are usually off screen.
     private static func children(of element: AXUIElement, role: String, cap: Int = childCap) -> [AXUIElement] {
-        var values: CFArray?
-        guard AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, cap, &values) == .success,
-              let kids = values as? [AXUIElement] else { return [] }
-        if kids.count >= cap, ["AXTable", "AXOutline", "AXList", "AXBrowser"].contains(role) {
+        let collections = ["AXTable", "AXOutline", "AXList", "AXBrowser"]
+        // Visible children are useful even when the total list fits in the cap (a scrolled list
+        // can contain off-screen rows before its visible controls).
+        if collections.contains(role) {
             let visible: [AXUIElement]? = attr(element, kAXVisibleRowsAttribute) ?? attr(element, kAXVisibleChildrenAttribute)
             if let visible, !visible.isEmpty { return Array(visible.prefix(cap)) }
+        }
+        var values: CFArray?
+        var kids: [AXUIElement] = []
+        if AXUIElementCopyAttributeValues(element, kAXChildrenAttribute as CFString, 0, cap, &values) == .success {
+            kids = values as? [AXUIElement] ?? []
+        }
+        // NSOpenPanel/Finder column views may publish file controls through AXContents.
+        if kids.count < cap, let contents: [AXUIElement] = attr(element, "AXContents") {
+            for child in contents.prefix(cap - kids.count) where !kids.contains(where: { CFEqual($0, child) }) { kids.append(child) }
         }
         return kids
     }
@@ -281,20 +375,28 @@ enum AXEngine {
         return (found.kind, String(title.prefix(120)))
     }
 
-    /// The focused window, else the first. A focused sheet (Save panels) stands for its parent window here;
-    /// `dialogElement` finds the sheet again.
+    /// A sheet with its own WindowServer identity is the input/capture target, not its parent.
     static func selectedWindow(of app: NSRunningApplication) -> AXUIElement? {
-        mainWindow(AXUIElementCreateApplication(app.processIdentifier))
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let selected = mainWindow(root) else { return nil }
+        if let sheet = dialogElement(in: selected)?.element, windowID(of: sheet) != nil { return sheet }
+        return selected
     }
 
     private static func mainWindow(_ root: AXUIElement, orFirst: Bool = true) -> AXUIElement? {
-        guard let w: AXUIElement = attr(root, kAXFocusedWindowAttribute)
-                ?? (orFirst ? (attr(root, kAXWindowsAttribute) as [AXUIElement]?)?.first : nil) else { return nil }
-        if (attr(w, kAXRoleAttribute) as String?) == "AXSheet", let parent: AXUIElement = attr(w, kAXParentAttribute) { return parent }
-        return w
+        attr(root, kAXFocusedWindowAttribute)
+            ?? (orFirst ? (attr(root, kAXWindowsAttribute) as [AXUIElement]?)?.first : nil)
+    }
+
+    /// A newly opened modal invalidates actions aimed at its owner, even if the owner has not moved.
+    static func blockingDialog(in window: AXUIElement) -> AXUIElement? {
+        guard let dialog = dialogElement(in: window)?.element, !CFEqual(dialog, window),
+              windowID(of: dialog) != windowID(of: window) else { return nil }
+        return dialog
     }
 
     private static func dialogElement(in window: AXUIElement) -> (kind: String, element: AXUIElement)? {
+        if (attr(window, kAXRoleAttribute) as String?) == "AXSheet" { return ("sheet", window) }
         for child in children(of: window, role: "", cap: 60) where (attr(child, kAXRoleAttribute) as String?) == "AXSheet" {
             return ("sheet", child)
         }
@@ -336,10 +438,9 @@ enum AXEngine {
         }
         let joined = parts.joined(separator: " — ")
             .replacingOccurrences(of: "\n", with: " ")
-            .replacingOccurrences(of: "\u{200E}", with: "")
-            .replacingOccurrences(of: "\u{200F}", with: "")
+        let cleaned = stripFormatControls(joined)
         // Apps call the user's own chat "You"; name it so models can match "message amrit nigam".
-        let named = joined.replacingOccurrences(of: #"with You\b"#, with: "with \(userName) (You)", options: .regularExpression)
+        let named = cleaned.replacingOccurrences(of: #"with You\b"#, with: "with \(userName) (You)", options: .regularExpression)
         return String(named.prefix(140))
     }
 
@@ -709,7 +810,7 @@ enum AXEngine {
         for list in (attr(root, kAXChildrenAttribute) as [AXUIElement]?) ?? [] {
             for item in (attr(list, kAXChildrenAttribute) as [AXUIElement]?) ?? [] {
                 guard let title: String = attr(item, kAXTitleAttribute),
-                      title.replacingOccurrences(of: "\u{200E}", with: "").lowercased() == wanted,
+                      stripFormatControls(title).lowercased() == stripFormatControls(wanted),
                       let f = frame(of: item) else { continue }
                 return (item, f)
             }
@@ -922,6 +1023,55 @@ enum AXEngine {
         }
     }
 
+    /// Send a parsed shortcut to one process, with menu equivalents for background Command chords.
+    /// Returns uncertainty without a second delivery when an AX menu invocation timed out.
+    static func press(combo: String, in app: NSRunningApplication, window: NativeWindowObservation) -> PressDelivery {
+        guard !Task.isCancelled, window.pid == app.processIdentifier, window.staleness() == nil,
+              let focusedWindow = selectedWindow(of: app), windowID(of: focusedWindow) == window.windowID,
+              case .success(let chord) = KeyChord.parse(combo), let resolved = resolve(combo) else { return .unsupported }
+        if chord.modifiers.contains(.command), case .character(let character) = chord.key,
+           NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
+            return pressMenuEquivalent(character, modifiers: chord.modifiers, in: app)
+        }
+        keystroke(resolved.key, flags: resolved.flags, source: CGEventSource(stateID: .privateState), to: app.processIdentifier)
+        return .delivered
+    }
+
+    private static func pressMenuEquivalent(_ character: Character, modifiers: KeyChord.Modifiers, in app: NSRunningApplication) -> PressDelivery {
+        guard !modifiers.contains(.function) else { return .unsupported }
+        var expected = 0
+        if modifiers.contains(.shift) { expected |= 1 }
+        if modifiers.contains(.option) { expected |= 2 }
+        if modifiers.contains(.control) { expected |= 4 }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        guard let bar: AXUIElement = attr(root, kAXMenuBarAttribute) else { return .unsupported }
+        var queue: [(AXUIElement, Int)] = [(bar, 0)], head = 0
+        var matches: [AXUIElement] = []
+        let deadline = Date().addingTimeInterval(0.75)
+        while head < queue.count, head < 500, Date() < deadline, !Task.isCancelled {
+            let (element, depth) = queue[head]; head += 1
+            let values = attrs(element, [kAXRoleAttribute, "AXMenuItemCmdChar", "AXMenuItemCmdModifiers", kAXEnabledAttribute])
+            if values[0] as? String == "AXMenuItem",
+               (values[1] as? String)?.lowercased() == String(character).lowercased(),
+               (values[2] as? NSNumber)?.intValue == expected, values[3] as? Bool != false,
+               !matches.contains(where: { CFEqual($0, element) }) { matches.append(element) }
+            if depth < 8 { queue.append(contentsOf: children(of: element, role: "", cap: 100).map { ($0, depth + 1) }) }
+        }
+        // Ambiguous or truncated searches never choose the first match or fall through to a different route.
+        guard head == queue.count, matches.count == 1, !Task.isCancelled else { return .unsupported }
+        return axPressDelivery(matches[0])
+    }
+
+    /// One process-targeted Unicode insertion. No clipboard, global focus or automatic replay.
+    static func type(_ text: String, to pid: pid_t) {
+        let source = CGEventSource(stateID: .privateState)
+        for character in text {
+            guard !Task.isCancelled else { return }
+            let stroke = stroke(for: character) ?? KeyStroke(code: 0, flags: [])
+            keystroke(stroke.code, flags: stroke.flags, text: Array(String(character).utf16), source: source, to: pid)
+        }
+    }
+
     /// Presses a combo like "cmd+shift+t", "return" or "ctrl+a". Returns false, pressing nothing, for a malformed one.
     @discardableResult
     static func press(combo: String) -> Bool {
@@ -998,12 +1148,53 @@ extension AXEngine {
         return (false, enabled() ? "“\(title)” wouldn't press" : "“\(title)” is greyed out", false)
     }
 
+    /// The app's own menu item that applies `style` (Format ▸ Font ▸ Bold), found without opening any menu.
+    /// Nil when absent or ambiguous: nothing is pressed on a guess.
+    static func formattingMenuItem(_ style: TextFormatting.Style, in app: NSRunningApplication) -> AXUIElement? {
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        AXUIElementSetMessagingTimeout(root, 0.5)
+        guard let bar: AXUIElement = attr(root, kAXMenuBarAttribute) else { return nil }
+        var queue: [(AXUIElement, [String], Int)] = [(bar, [], 0)], head = 0
+        var items: [AXUIElement] = [], candidates: [TextFormatting.MenuCandidate] = []
+        let deadline = Date().addingTimeInterval(1.0)
+        while head < queue.count, head < 800, Date() < deadline, !Task.isCancelled {
+            let (element, ancestors, depth) = queue[head]; head += 1
+            let values = attrs(element, [kAXRoleAttribute, kAXTitleAttribute, kAXEnabledAttribute])
+            let role = values[0] as? String ?? "", title = values[1] as? String ?? ""
+            if role == "AXMenuItem", !title.isEmpty {
+                items.append(element)
+                candidates.append(.init(title: title, ancestors: ancestors, enabled: values[2] as? Bool != false))
+            }
+            let path = ["AXMenuBarItem", "AXMenuItem"].contains(role) && !title.isEmpty ? ancestors + [title] : ancestors
+            if depth < 8 { queue.append(contentsOf: children(of: element, role: "", cap: 100).map { ($0, path, depth + 1) }) }
+        }
+        guard head == queue.count, let index = TextFormatting.menuChoice(candidates, for: style) else { return nil }
+        return items[index]
+    }
+
+    /// The document text area of `window` (the AXTextArea in its AXScrollArea), whatever covers the window and
+    /// however far the document is scrolled: Accessibility doesn't depend on visibility.
+    static func documentTextArea(in window: AXUIElement) -> AXUIElement? {
+        AXUIElementSetMessagingTimeout(window, 0.5)
+        return TextFormatting.documentTextArea(in: window, role: { (attr($0, kAXRoleAttribute) as String?) ?? "" },
+                                               children: { (attr($0, kAXChildrenAttribute) as [AXUIElement]?) ?? [] })
+    }
+
     /// Menu title reduced for matching: no case, accents, ellipsis or stray spaces.
     private static func menuKey(_ s: String) -> String {
-        s.folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
+        stripFormatControls(s).folding(options: [.caseInsensitive, .diacriticInsensitive, .widthInsensitive], locale: nil)
             .replacingOccurrences(of: "…", with: "").replacingOccurrences(of: "...", with: "")
-            .replacingOccurrences(of: "\u{200E}", with: "")
             .split(whereSeparator: \.isWhitespace).joined(separator: " ")
+    }
+
+    /// Bidi / format controls apps wrap names in (U+200E, U+200F, U+202A–U+202E, U+2066–U+2069, U+FEFF), removed.
+    /// Same set as `AXText` (kept here so AXEngine compiles on its own in the unit scripts).
+    static func stripFormatControls(_ s: String) -> String {
+        var out = String.UnicodeScalarView()
+        out.append(contentsOf: s.unicodeScalars.lazy.filter {
+            switch $0.value { case 0x200E, 0x200F, 0x202A...0x202E, 0x2066...0x2069, 0xFEFF: return false; default: return true }
+        })
+        return String(out)
     }
 }
 
@@ -1107,17 +1298,30 @@ extension AXEngine {
 
     static func attribute<T>(_ element: AXUIElement, _ name: String) -> T? { attr(element, name) }
 
+    /// The element's on-screen frame (AX coordinates: top-left origin).
+    static func elementFrame(_ element: AXUIElement) -> CGRect? { frame(of: element) }
+
     /// The app's windows, as Accessibility lists them.
     static func windows(of app: NSRunningApplication) -> [AXUIElement] {
-        attr(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) ?? []
+        var result: [AXUIElement] = attr(AXUIElementCreateApplication(app.processIdentifier), kAXWindowsAttribute) ?? []
+        if let focused: AXUIElement = attr(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedWindowAttribute),
+           !result.contains(where: { CFEqual($0, focused) }) { result.append(focused) }
+        for window in Array(result) {
+            if let sheet = dialogElement(in: window)?.element, !result.contains(where: { CFEqual($0, sheet) }) { result.append(sheet) }
+        }
+        return result
     }
 
     /// The window server's number for an Accessibility window (private, long-stable _AXUIElementGetWindow).
+    /// Resolved once; nil (fail closed: no window binding, no native observation) if a macOS drops it.
+    private typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
+    private static let getWindow: GetWindow? = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow")
+        .map { unsafeBitCast($0, to: GetWindow.self) }
+
     static func windowID(of window: AXUIElement) -> CGWindowID? {
-        typealias GetWindow = @convention(c) (AXUIElement, UnsafeMutablePointer<CGWindowID>) -> AXError
-        guard let sym = dlsym(UnsafeMutableRawPointer(bitPattern: -2), "_AXUIElementGetWindow") else { return nil }
+        guard let getWindow else { return nil }
         var id: CGWindowID = 0
-        return unsafeBitCast(sym, to: GetWindow.self)(window, &id) == .success && id != 0 ? id : nil
+        return getWindow(window, &id) == .success && id != 0 ? id : nil
     }
 
     /// Moves a window into `rect` (global top-left), shrinking it to fit.
@@ -1219,13 +1423,24 @@ extension AXEngine {
         guard let result = mode.apply(to: value, selection: selection, text: text) else {
             return .unsupported("the reported selection does not fit the field's text")
         }
-        guard AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, result.value as CFString) == .success else {
-            return .unsupported("the app refused the new text")
+        guard !Task.isCancelled else { return .refused("text edit cancelled before delivery") }
+        guard (attr(field, kAXValueAttribute) as String?) == value,
+              mode != .insertAtCaret || textRange(attr(field, kAXSelectedTextRangeAttribute) as CFTypeRef?) == selection else {
+            return .refused("text or selection changed before delivery; observe again")
+        }
+        let delivery = AXUIElementSetAttributeValue(field, kAXValueAttribute as CFString, result.value as CFString)
+        guard delivery == .success else {
+            if delivery == .attributeUnsupported || delivery == .notImplemented { return .unsupported("the app does not support direct text replacement") }
+            return .unverified("text was submitted to the field but the app did not acknowledge it; inspect before retrying")
         }
         var caret = CFRange(location: result.caret, length: 0)
         if let ax = AXValueCreate(.cfRange, &caret) { AXUIElementSetAttributeValue(field, kAXSelectedTextRangeAttribute as CFString, ax) }
-        let read: String? = attr(field, kAXValueAttribute)
-        guard read == result.value else { return .unverified("the field now reads differently from what was written") }
+        guard settle(0.6, { (attr(field, kAXValueAttribute) as String?) == result.value }) else {
+            return .unverified("the field now reads differently from what was written; no second edit was sent")
+        }
+        if mode != .replaceAll, textRange(attr(field, kAXSelectedTextRangeAttribute) as CFTypeRef?) != NSRange(location: result.caret, length: 0) {
+            return .unverified("the text matches but the requested caret position could not be confirmed")
+        }
         return .done("\(mode == .append ? "appended" : mode == .insertAtCaret ? "inserted at the caret" : "replaced")")
     }
 }

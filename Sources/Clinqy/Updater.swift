@@ -20,6 +20,11 @@ final class Updater {
     /// Called when `available` changes (the app delegate updates its menu item).
     var onChange: () -> Void = {}
     private var timer: Timer?
+    private var initialCheck: Task<Void, Never>?
+    private var scheduledCheck: Task<Void, Never>?
+    private var checking = false
+    /// Supplied by the app; updates never interrupt an active foreground or background task.
+    var isBusy: () -> Bool = { false }
     private(set) var installing = false
 
     nonisolated static let repo = "Amrit-Nigam/clinqy"
@@ -67,23 +72,42 @@ final class Updater {
 
     /// Starts the background checks (a minute after launch, then daily).
     func start() {
-        guard Config.value("UPDATE_CHECK")?.lowercased() != "off" else { return }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 60) { [weak self] in Task { await self?.check(userAsked: false) } }
-        timer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
-            Task { @MainActor in await self?.check(userAsked: false) }
+        guard timer == nil, Config.value("UPDATE_CHECK")?.lowercased() != "off" else { return }
+        initialCheck = Task { [weak self] in
+            do { try await Task.sleep(for: .seconds(60)) } catch { return }
+            guard !Task.isCancelled else { return }
+            await self?.check(userAsked: false)
         }
+        timer = Timer.scheduledTimer(withTimeInterval: 24 * 3600, repeats: true) { [weak self] _ in
+            Task { @MainActor in
+                guard let self else { return }
+                self.scheduledCheck?.cancel()
+                self.scheduledCheck = Task { [weak self] in await self?.check(userAsked: false) }
+            }
+        }
+        timer?.tolerance = 300
+    }
+
+    func stop() {
+        timer?.invalidate(); timer = nil
+        initialCheck?.cancel(); initialCheck = nil
+        scheduledCheck?.cancel(); scheduledCheck = nil
     }
 
     /// Looks for a newer version. When the user asked (the menu item), always says what it found.
     func check(userAsked: Bool) async {
+        guard !checking, !installing, !Task.isCancelled else { return }
+        checking = true
+        defer { checking = false }
         do {
             let newest = try await Self.newestRelease()
+            guard !Task.isCancelled else { return }
             if let newest, Self.isNewer(newest.version, than: Self.current) {
                 available = newest
                 onChange()
                 Agent.writeLog("update: \(newest.version) is out (this is \(Self.current))")
                 let askedKey = "updateOffered"
-                if userAsked || UserDefaults.standard.string(forKey: askedKey) != newest.version {
+                if !isBusy(), userAsked || UserDefaults.standard.string(forKey: askedKey) != newest.version {
                     UserDefaults.standard.set(newest.version, forKey: askedKey)
                     offer(newest)
                 }
@@ -93,7 +117,7 @@ final class Updater {
                 if userAsked { info("Clinqy is up to date", "You have the newest version, \(Self.current).") }
             }
         } catch {
-            if userAsked { info("Couldn't check for updates", error.localizedDescription) }
+            if userAsked, !Task.isCancelled { info("Couldn't check for updates", error.localizedDescription) }
         }
     }
 
@@ -107,6 +131,7 @@ final class Updater {
 
     /// Asks whether to install `release` now.
     func offer(_ release: Release) {
+        guard !isBusy() else { return }
         let alert = NSAlert()
         alert.messageText = "Clinqy \(release.version) is available"
         let notes = release.notes.split(separator: "\n").map { $0.trimmingCharacters(in: .whitespaces) }
@@ -127,13 +152,20 @@ final class Updater {
     /// Downloads the release, swaps it in for this app, and reopens it.
     func install(_ release: Release) async {
         guard !installing else { return }
+        guard !isBusy() else { info("Finish the current task first", "The update is ready. Install it once Clinqy has finished its running tasks."); return }
         installing = true
         defer { installing = false }
         let target = Bundle.main.bundleURL
+        var stagedApp: URL?
+        var handedOff = false
+        defer { if !handedOff, let stagedApp { try? FileManager.default.removeItem(at: stagedApp.deletingLastPathComponent()) } }
         do {
             let staged = try await Self.download(release)
+            stagedApp = staged
+            guard !isBusy(), !Task.isCancelled else { throw NSError(domain: "Clinqy", code: 6, userInfo: [NSLocalizedDescriptionKey: "A task started while the update downloaded. Finish it, then install the update again."]) }
             guard target.path.hasSuffix(".app") else { throw NSError(domain: "Clinqy", code: 2, userInfo: [NSLocalizedDescriptionKey: "Clinqy isn't running from an app bundle"]) }
             try Self.swapInAndReopen(staged, replacing: target, waitingFor: getpid())
+            handedOff = true
             Agent.writeLog("update: installing \(release.version), reopening")
             NSApp.terminate(nil)
         } catch {
@@ -144,7 +176,10 @@ final class Updater {
 
     /// Downloads the disk image and copies the app out of it into a staging folder; returns the staged app.
     nonisolated static func download(_ release: Release) async throws -> URL {
-        let (file, response) = try await URLSession.shared.download(from: release.dmg)
+        var request = URLRequest(url: release.dmg)
+        request.timeoutInterval = 120
+        let (file, response) = try await URLSession.shared.download(for: request)
+        try Task.checkCancellation()
         guard (response as? HTTPURLResponse)?.statusCode == 200 else {
             throw NSError(domain: "Clinqy", code: 3, userInfo: [NSLocalizedDescriptionKey: "the download failed (HTTP \((response as? HTTPURLResponse)?.statusCode ?? 0))"])
         }
@@ -186,37 +221,74 @@ final class Updater {
     @discardableResult
     nonisolated static func swapInAndReopen(_ staged: URL, replacing target: URL, waitingFor pid: Int32?, reopen: Bool = true, receipt: URL? = nil) throws -> Process {
         func q(_ s: String) -> String { "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'" }
+        guard staged.standardizedFileURL != target.standardizedFileURL,
+              target.pathExtension == "app", staged.pathExtension == "app" else {
+            throw NSError(domain: "Clinqy", code: 7, userInfo: [NSLocalizedDescriptionKey: "Update staging and destination must be separate app bundles"])
+        }
+        let handshake = FileManager.default.temporaryDirectory.appendingPathComponent("clinqy-update-handshake-" + UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(at: handshake, withIntermediateDirectories: false, attributes: [.posixPermissions: 0o700])
+        var accepted = false
+        defer { if !accepted { try? FileManager.default.removeItem(at: handshake) } }
+        let ready = handshake.appendingPathComponent("ready"), acknowledgment = handshake.appendingPathComponent("accepted")
         let t = q(target.path), old = q(target.path + ".old"), new = q(target.path + ".new")
         let rec = receipt.map { q($0.path) }
+        let cleanup = staged.deletingLastPathComponent().lastPathComponent.hasPrefix("clinqy-update-")
+            ? staged.deletingLastPathComponent() : staged
         let script = """
-        \(pid.map { "while kill -0 \($0) 2>/dev/null; do sleep 0.2; done" } ?? "")
-        report() { \(rec.map { "echo \"$1\" > \($0)" } ?? ":") ; }
-        # A backup left by an interrupted earlier swap is the only copy if the app itself is gone: restore, never delete it.
-        if [ -e \(old) ] && [ ! -e \(t) ]; then mv \(old) \(t); fi
+        report() { \(rec.map { "printf '%s\\n' \"$1\" > \($0)" } ?? ":") ; }
+        cleanup() { rm -rf \(q(cleanup.path)) \(q(handshake.path)); }
+        trap cleanup EXIT
+        # A launched process is not proof that lockf acquired the lock. Acknowledge only inside it.
+        printf ready > \(q(ready.path)) || exit 1
+        attempt=0
+        while [ ! -f \(q(acknowledgment.path)) ]; do
+          attempt=$((attempt + 1))
+          if [ "$attempt" -ge 150 ]; then report handshake-expired; exit 1; fi
+          sleep 0.02
+        done
+        rm -rf \(q(handshake.path))
+        \(pid.map { "attempt=0; while kill -0 \($0) 2>/dev/null; do attempt=$((attempt + 1)); if [ \"$attempt\" -ge 300 ]; then report waiting-for-app; exit 1; fi; sleep 0.2; done" } ?? "")
+        # Keep the original intact until a complete sibling replacement exists.
+        if [ -e \(old) ] && [ ! -e \(t) ]; then mv \(old) \(t) || { report failed-recovery; exit 1; }; fi
         rm -rf \(new)
-        if /usr/bin/ditto \(q(staged.path)) \(new); then
-          if [ -e \(old) ]; then rm -rf \(old); fi
-          if mv \(t) \(old); then
-            if mv \(new) \(t); then rm -rf \(old); report installed
-            else
-              rm -rf \(new)
-              if [ -e \(old) ] && [ ! -e \(t) ]; then mv \(old) \(t); fi
-              report rolled-back
-            fi
-          else
-            rm -rf \(new); report unchanged
-          fi
-        else
-          rm -rf \(new); report failed-staging
+        if ! /usr/bin/ditto \(q(staged.path)) \(new); then rm -rf \(new); report failed-staging; exit 1; fi
+        if [ -e \(old) ]; then rm -rf \(old); fi
+        if ! mv \(t) \(old); then rm -rf \(new); report unchanged; exit 1; fi
+        if ! mv \(new) \(t); then
+          if mv \(old) \(t); then rm -rf \(new); report rolled-back; else report failed-recovery; fi
+          exit 1
         fi
-        rm -rf \(q(staged.deletingLastPathComponent().path))
-        \(reopen ? "/usr/bin/open \(t)" : "")
+        \(reopen ? """
+        if ! /usr/bin/open \(t); then
+          if mv \(t) \(new) && mv \(old) \(t); then
+            rm -rf \(new); /usr/bin/open \(t); report rolled-back
+          else report failed-recovery
+          fi
+          exit 1
+        fi
+        """ : "")
+        rm -rf \(old)
+        report installed
         """
         let p = Process()
+        // macOS lockf(1): -k keeps one inode for all contenders; kernel ownership disappears on exit.
+        // Unlike a directory lock, a crashed updater cannot leave a permanently held lock.
         p.executableURL = URL(fileURLWithPath: "/bin/sh")
-        p.arguments = ["-c", script]
+        let failureReceipt = rec.map { "if [ ! -e \($0) ]; then printf '%s\\n' failed-lock-or-helper > \($0); fi" } ?? ":"
+        p.arguments = ["-c", "if /usr/bin/lockf -k -t 0 " + q(target.path + ".update-lock") + " /bin/sh -c " + q(script)
+            + "; then exit 0; else status=$?; " + failureReceipt + "; rm -rf " + q(cleanup.path) + "; exit \"$status\"; fi"]
         try p.run()
-        return p
+        for _ in 0..<100 {
+            if FileManager.default.fileExists(atPath: ready.path) {
+                try Data("accepted".utf8).write(to: acknowledgment, options: .atomic)
+                accepted = true
+                return p
+            }
+            if !p.isRunning { break }
+            usleep(20_000)
+        }
+        // No acknowledgement: even a delayed helper must exit without touching the installed bundle.
+        throw NSError(domain: "Clinqy", code: 8, userInfo: [NSLocalizedDescriptionKey: "The update helper could not acquire installation ownership. Another update may be running; the current app was left open."])
     }
 
     @discardableResult

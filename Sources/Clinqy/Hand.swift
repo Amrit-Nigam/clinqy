@@ -40,14 +40,17 @@ final class Hand {
         keepFrontApp = false
         refusal = nil
         cursorLeftAt = nil
-        runCursor = Buddy.mouse()
+        runCursor = Self.exactPointer()
         let front = NSWorkspace.shared.frontmostApplication
         runFrontApp = front?.processIdentifier == getpid() ? nil : front
     }
 
-    /// Releases any button left down, puts the pointer back if Clinqy moved it and the user hasn't since, and
-    /// brings back the app the user was in (unless `keepFrontApp`). Safe to call on cancel and failure.
+    /// Releases held input and restores the pointer only when the user has not moved it.
+    /// Never changes foreground focus during cancellation or completion.
     func endRun() {
+        _ = SkyLight.retryPendingCleanup()
+        // Windows pinned visible for the run get their occlusion notifications back.
+        SkyLight.releaseKeepAlive()
         // A background run never touched the user's pointer, buttons or front app: nothing to put back.
         if Background.active {
             runCursor = nil
@@ -56,15 +59,11 @@ final class Hand {
             return
         }
         Self.releaseButtons()
-        if let start = runCursor, let left = cursorLeftAt, Self.near(Buddy.mouse(), left, 2) {
-            CGWarpMouseCursorPosition(start)
-            CGAssociateMouseAndMouseCursorPosition(1)
+        if let start = runCursor, let left = cursorLeftAt, Self.near(Self.exactPointer(), left, 2) {
+            Self.restorePointer(start)
         }
-        if !keepFrontApp, let app = runFrontApp, !app.isTerminated,
-           NSWorkspace.shared.frontmostApplication?.processIdentifier != app.processIdentifier {
-            // Plain activate() is ignored while Clinqy isn't frontmost; bringToFront opens it, which always works.
-            Task { await Launcher.bringToFront(app) }
-        }
+        // No activation during cleanup: a foreground change may be the user's choice.
+        // We cannot establish ownership of that focus change from the final frontmost PID.
         runCursor = nil
         runFrontApp = nil
         cursorLeftAt = nil
@@ -96,9 +95,10 @@ final class Hand {
               el.windowID == nil || el.windowID == window.windowID else { return refuse("the element's window cannot be verified; look again") }
         if let requested, el.observationID != requested.id { return refuse("the element belongs to another observation; look again") }
         if let why = window.staleness(includeContent: true) { return refuse(why) }
-        guard window.frame.contains(el.center) else { return refuse("the element is outside the observed window; look again") }
+        // A long text or scroll area may have its centre outside the window: aim at its part inside the window.
+        guard let aim = NativeAim.point(element: el.frame, window: window.frame) else { return refuse("the element is outside the observed window; look again") }
         lastMethod = "axpress"
-        await buddy.travel(to: el.center, framing: el.frame)
+        await buddy.travel(to: aim, framing: el.frame)
         guard !Task.isCancelled else { return "Stopped" }
         if Efficiency.humanMotion { try? await Task.sleep(for: .milliseconds(80)) }
         guard !Task.isCancelled else { return "Stopped" }
@@ -116,13 +116,37 @@ final class Hand {
         guard !Task.isCancelled else { return "Stopped" }
         // An explicitly unsupported AX action permits one checked pixel input.
         if let why = window.staleness(includeContent: true) { return refuse(why) }
-        if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        if let why = hitCheck(aim, pid: app.processIdentifier, window: window.element) { return refuse(why) }
         if Background.active {
             lastMethod = "background"
-            return backgroundClick(at: el.center, pid: app.processIdentifier)
+            return backgroundClick(at: aim, pid: app.processIdentifier, window: window)
         }
         lastMethod = "real"
-        realClick(at: el.center)
+        realClick(at: aim)
+        return nil
+    }
+
+    /// Selects the row (AXSelected=true) and, if nothing changed, clicks its centre inside the pinned window
+    /// (pid-posted/SkyLight in background, a real click in foreground). nil = sent.
+    func selectOrClickRow(_ el: UIElementInfo, in app: NSRunningApplication, fingerprint: Int, window requested: WindowSnapshot?) async -> String? {
+        var settable = DarwinBoolean(false)
+        if AXUIElementIsAttributeSettable(el.element, kAXSelectedAttribute as CFString, &settable) == .success, settable.boolValue,
+           AXUIElementSetAttributeValue(el.element, kAXSelectedAttribute as CFString, kCFBooleanTrue) == .success {
+            lastMethod = "axselect"
+            try? await Task.sleep(for: .milliseconds(150))
+            if await AXEngine.fingerprintAsync(of: app) != fingerprint { return nil }
+        }
+        guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
+              el.windowID == nil || el.windowID == window.windowID else { return refuse("the row's window cannot be verified; look again") }
+        if let why = window.staleness() { return refuse(why) }
+        guard let aim = NativeAim.point(element: el.frame, window: window.frame) else { return refuse("the row is outside the observed window; look again") }
+        if let why = hitCheck(aim, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        if Background.active {
+            lastMethod = "background"
+            return backgroundClick(at: aim, pid: app.processIdentifier, window: window)
+        }
+        lastMethod = "real"
+        realClick(at: aim)
         return nil
     }
 
@@ -154,28 +178,33 @@ final class Hand {
         case .background:
             guard let pid else { return refuse("a background click needs the app's pid") }
             if !Background.active, !SkyLight.isEnabled { return refuse("background clicks are off (BACKGROUND_CLICKS=1 enables them)") }
-            return backgroundClick(at: point, pid: pid)
+            return backgroundClick(at: point, pid: pid, window: window)
         }
         return nil
     }
 
     /// A click on `pid`'s window at `point` that leaves the pointer and the front app alone: SkyLight where this macOS
     /// has it (Chromium and Electron windows take nothing else), else posted to the app.
-    private func backgroundClick(at point: CGPoint, pid: pid_t) -> String? {
-        guard SkyLight.isAvailable else {
-            Self.postClick(at: point, pid: pid)
-            return nil
+    private func backgroundClick(at point: CGPoint, pid: pid_t, window: WindowSnapshot?, button: SkyLight.Button = .left, count: Int = 1) -> String? {
+        guard SkyLight.isAvailable else { return refuse("background pointer input is unavailable on this macOS; use a semantic control or foreground handoff") }
+        guard let window, window.pid == pid, window.frame.contains(point) else {
+            return refuse("background input needs the exact observed window; observe again")
         }
-        // On Clinqy's hidden screen whatever window is at the spot is the run's, even one a helper process owns
-        // (the file picker panel belongs to a macOS service, not the app).
-        let target = Self.windowInfo(pid: pid, containing: point).map { (pid, $0.id, $0.frame) }
-            ?? (AgentScreen.bounds?.contains(point) == true ? Self.topWindow(at: point) : nil)
-        guard let (owner, id, frame) = target else {
-            return refuse("no window of the target app at that point for a background click")
-        }
-        if let why = SkyLight.click(at: point, pid: owner, window: id, frame: frame) { return refuse(why) }
+        // Callers checked staleness immediately before; SkyLight.click re-captures the exact window and checks
+        // it again right before delivery, so no extra content fingerprint pass happens here.
+        // Never substitute another window or a helper process merely because it occupies the same coordinates.
+        if let why = SkyLight.click(at: point, pid: pid, window: window.windowID, frame: window.frame, button: button, count: count) { return refuse(why) }
         return nil
     }
+
+    /// Click options a SkyLight background click can honour exactly: left or right, one or two clicks,
+    /// no modifiers and no hold. Anything else stays a foreground handoff rather than an approximation.
+    nonisolated static func skyCompatible(_ options: ClickOptions) -> Bool {
+        options.button != .middle && (1...2).contains(options.count) && options.modifiers.isEmpty && options.holdMilliseconds == 0
+    }
+
+    /// Whether a window number still exists anywhere (including other Spaces).
+    nonisolated static func windowExists(_ id: CGWindowID) -> Bool { NativeWindowObservation.serverInfo(id) != nil }
 
     /// The frontmost normal-level window at `point`, whoever owns it.
     nonisolated static func topWindow(at point: CGPoint) -> (pid: pid_t, id: CGWindowID, frame: CGRect)? {
@@ -192,6 +221,7 @@ final class Hand {
     /// Puts the caret in a text box: travel, click, focus. Returns why it didn't, or nil.
     @discardableResult
     func focus(_ el: UIElementInfo, in app: NSRunningApplication, window requested: WindowSnapshot? = nil) async -> String? {
+        focusUnverified = false
         guard Self.isTextRole(el.role) else { return refuse("the requested element is not a text input; look again before typing") }
         guard let window = requested ?? WindowSnapshot.capture(app), window.pid == app.processIdentifier,
               el.windowID == nil || el.windowID == window.windowID,
@@ -205,23 +235,66 @@ final class Hand {
         buddy.click()
         var settable = DarwinBoolean(false)
         let canFocus = AXUIElementIsAttributeSettable(el.element, kAXFocusedAttribute as CFString, &settable) == .success && settable.boolValue
-        if canFocus {
-            _ = AXEngine.focus(el.element)
-        } else {
-            if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
-            if Background.active {
-                if let why = backgroundClick(at: el.center, pid: app.processIdentifier) { return refuse(why) }
-            } else { realClick(at: el.center) }
+        let setOK = canFocus && AXEngine.focus(el.element)
+        // AXFocused unavailable or ignored (chat composers often are): click the field itself, pid-posted in background.
+        if !canFocus || !Self.focusHeld(el.element, in: app, window: window.element, focusSet: setOK) {
+            if canFocus { try? await Task.sleep(for: .milliseconds(60)) }
+            if !canFocus || !Self.focusHeld(el.element, in: app, window: window.element, focusSet: setOK) {
+                if let why = hitCheck(el.center, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+                if Background.active {
+                    if let why = backgroundClick(at: el.center, pid: app.processIdentifier, window: window) { return refuse(why) }
+                } else { realClick(at: el.center) }
+            }
         }
         try? await Task.sleep(for: .milliseconds(120))
         if let why = window.staleness(includeContent: true) { return refuse(why) }
-        guard AXEngine.focusedWithin(el.element, in: app) else {
+        // The background lane: the app-wide focus may never update, so set AXFocused on the field once more and
+        // accept the pinned window's own focused element when it is this field.
+        var focusSet = setOK
+        if Background.active, canFocus, !Self.focusHeld(el.element, in: app, window: window.element, focusSet: setOK) {
+            focusSet = AXEngine.focus(el.element)
+            try? await Task.sleep(for: .milliseconds(60))
+        }
+        guard Self.focusHeld(el.element, in: app, window: window.element, focusSet: focusSet) else {
+            focusUnverified = true
             return refuse("the requested field did not acquire verifiable focus; look again before typing")
         }
         return nil
     }
 
-    static func isTextRole(_ role: String?) -> Bool {
+    /// The last `focus` refused only because the field's focus couldn't be verified (not staleness, not a hit check).
+    private(set) var focusUnverified = false
+
+    /// How `focused` relates to `target`: the target itself, an editable descendant of it, another text input, etc.
+    nonisolated static func focusRelation(_ focused: AXUIElement?, to target: AXUIElement) -> FocusVerification.Relation {
+        guard let focused else { return .unreadable }
+        if CFEqual(focused, target) { return .target }
+        let text = isTextRole(AXEngine.attribute(focused, kAXRoleAttribute))
+        var current: AXUIElement? = AXEngine.attribute(focused, kAXParentAttribute)
+        for _ in 0..<16 {
+            guard let item = current else { break }
+            if CFEqual(item, target) { return text ? .inside : .other }
+            current = AXEngine.attribute(item, kAXParentAttribute)
+        }
+        return text ? .otherText : .other
+    }
+
+    /// The app's focused element relation to `target` (one AX read).
+    nonisolated static func appFocusRelation(_ target: AXUIElement, in app: NSRunningApplication) -> FocusVerification.Relation {
+        focusRelation(AXEngine.attribute(AXUIElementCreateApplication(app.processIdentifier), kAXFocusedUIElementAttribute), to: target)
+    }
+
+    /// `target` holds focus: the app's focused element is it (or inside it); in the background, after a successful
+    /// AXFocused set, the pinned window's focused element being it counts too (FocusVerification).
+    static func focusHeld(_ target: AXUIElement, in app: NSRunningApplication, window: AXUIElement?, focusSet: Bool) -> Bool {
+        let appRelation = appFocusRelation(target, in: app)
+        let windowRelation: FocusVerification.Relation = window.map {
+            focusRelation(AXEngine.attribute($0, kAXFocusedUIElementAttribute), to: target)
+        } ?? .unreadable
+        return FocusVerification.accepts(app: appRelation, window: windowRelation, focusSet: focusSet, background: Background.active)
+    }
+
+    nonisolated static func isTextRole(_ role: String?) -> Bool {
         guard let role else { return false }
         return ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox", "AXWebArea"].contains(role)
     }
@@ -230,7 +303,18 @@ final class Hand {
     /// Foreground gestures use the same window provenance and hit checks as clicks. Always release a
     /// possibly delivered down event, including cancellation and failure during a drag.
     func gesture(_ plan: PointerGesture, in app: NSRunningApplication, window: WindowSnapshot) async -> String? {
-        guard !Background.active else { return refuse("Native pointer gestures require foreground mode") }
+        if Background.active {
+            // Right and double clicks are window-targeted SkyLight clicks; hover and drag need the real pointer.
+            guard plan.kind == .right_click || plan.kind == .double_click else { return refuse("Native hover and drag require foreground mode") }
+            let point = CGPoint(x: plan.start.x, y: plan.start.y)
+            guard app.processIdentifier == window.pid, window.frame.contains(point) else { return refuse("gesture endpoints must belong to the observed window") }
+            if let why = window.staleness(includeContent: true) { return refuse(why) }
+            if let why = hitCheck(point, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+            buddy.click()
+            lastMethod = "background"
+            return backgroundClick(at: point, pid: app.processIdentifier, window: window,
+                                   button: plan.kind == .right_click ? .right : .left, count: plan.kind == .double_click ? 2 : 1)
+        }
         let start = CGPoint(x: plan.start.x, y: plan.start.y), end = CGPoint(x: plan.end.x, y: plan.end.y)
         guard app.processIdentifier == window.pid, window.frame.contains(start), window.frame.contains(end) else {
             return refuse("gesture endpoints must belong to the observed window")
@@ -274,11 +358,25 @@ final class Hand {
     }
 
     private func realClick(at point: CGPoint) {
-        let saved = Buddy.mouse()
+        // The exact pointer location, fractions included: the restore puts the user's pointer back exactly where it
+        // was, not a fraction of a pixel away (round 10: 1389.59,591.52 came back as 1389,591).
+        let saved = Self.exactPointer()
         Self.postRealClick(at: point)
         usleep(25_000)
+        Self.restorePointer(saved)
+    }
+
+    /// The pointer in global display coordinates (top-left origin), with its fractional part kept.
+    static func exactPointer() -> CGPoint { CGEvent(source: nil)?.location ?? Buddy.mouse() }
+
+    /// Puts the pointer back at exactly `saved`. The warp may land on whole pixels; when the pointer then reads
+    /// differently, one mouse-moved event at the exact (fractional) point finishes the restore.
+    nonisolated static func restorePointer(_ saved: CGPoint) {
         CGWarpMouseCursorPosition(saved)
         CGAssociateMouseAndMouseCursorPosition(1)
+        guard let now = CGEvent(source: nil)?.location, PointerRestore.needsExactMove(saved: saved, now: now) else { return }
+        CGEvent(mouseEventSource: CGEventSource(stateID: .hidSystemState), mouseType: .mouseMoved,
+                mouseCursorPosition: saved, mouseButton: .left)?.post(tap: .cghidEventTap)
     }
 
     /// Down and up through the HID stream; the up is posted however the down went, so the button is never left held.
@@ -418,6 +516,29 @@ final class Hand {
         return AXEngine.press(combo: keys)
     }
 
+    /// Exact-window keyboard route used by native tasks, including the opt-in background capability.
+    @discardableResult
+    func press(_ keys: String, in app: NSRunningApplication, window: WindowSnapshot) -> Bool {
+        refusal = nil
+        if let why = Safety.blockedChord(keys, request: request) ?? AXEngine.chordProblem(keys) { _ = refuse(why); return false }
+        guard window.pid == app.processIdentifier, window.staleness() == nil, !Task.isCancelled else {
+            _ = refuse("the keyboard target changed; observe again"); return false
+        }
+        if let why = Safety.secureInputBlock() { _ = refuse(why); return false }
+        let session: SkyLight.KeyboardSession
+        switch SkyLight.beginKeyboard(in: window) {
+        case .failure(let error): _ = refuse(error.reason); return false
+        case .success(let value): session = value
+        }
+        let delivered = AXEngine.press(combo: keys, in: app, window: window)
+        guard session.finish() else { _ = refuse("keyboard delivery is uncertain because temporary focus cleanup failed"); return false }
+        switch delivered {
+        case .delivered: buddy.click(); return true
+        case .unsupported: _ = refuse("the target cannot deliver this shortcut without a foreground handoff"); return false
+        case .uncertain: _ = refuse("the shortcut may have taken effect; inspect before repeating it"); return false
+        }
+    }
+
     func scroll(up: Bool, in app: NSRunningApplication) async {
         await scroll(ScrollPlan(direction: up ? .up : .down, unit: .lines, amount: 12, isDefault: true), in: app, window: nil)
     }
@@ -428,6 +549,7 @@ final class Hand {
     @discardableResult
     func scroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint? = nil) async -> String? {
         refusal = nil
+        if Background.active { return await backgroundScroll(plan, in: app, window: window, anchor: anchor) }
         if let window {
             guard window.pid == app.processIdentifier else { return refuse("the scroll target belongs to another application; look again") }
             if let why = window.staleness() { return refuse(why) }
@@ -440,6 +562,7 @@ final class Hand {
         let (pixels, steps) = plan.chunks(viewport: frame?.size ?? CGSize(width: 800, height: 600))
         for step in steps {
             if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+            if let why = window?.staleness() { return refuse(why) }
             AXEngine.scroll(dy: step.dy, dx: step.dx, pixels: pixels, at: target, in: app)
             try? await Task.sleep(for: .milliseconds(70))
         }
@@ -449,22 +572,203 @@ final class Hand {
         return nil
     }
 
+    /// Background scrolling of the pinned window: AX scroll-by-page actions on the scroll area under the
+    /// anchor first (no events at all), otherwise wheel events posted to the app and tagged with the window.
+    /// The real pointer, frontmost app and window order never change.
+    private func backgroundScroll(_ plan: ScrollPlan, in app: NSRunningApplication, window: WindowSnapshot?, anchor: CGPoint?) async -> String? {
+        guard let window, window.pid == app.processIdentifier else { return refuse("background scrolling needs the exact observed window; observe again") }
+        if let why = window.staleness() { return refuse(why) }
+        if let anchor, !window.frame.contains(anchor) { return refuse("the scroll anchor is outside the observed window; look again") }
+        let target = anchor ?? CGPoint(x: window.frame.midX, y: window.frame.midY)
+        if let why = hitCheck(target, pid: app.processIdentifier, window: window.element) { return refuse(why) }
+        if plan.unit == .pages, let area = Self.scrollArea(at: target, pid: app.processIdentifier, window: window) {
+            let action = Self.pageScrollAction(plan.direction)
+            var names: CFArray?
+            if AXUIElementCopyActionNames(area, &names) == .success, (names as? [String] ?? []).contains(action) {
+                for _ in 0..<max(1, Int(plan.amount.rounded())) {
+                    if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+                    guard AXUIElementPerformAction(area, action as CFString) == .success else {
+                        return refuse("the scroll area stopped accepting page actions; inspect before repeating")
+                    }
+                }
+                lastMethod = "axscroll"
+                return nil
+            }
+        }
+        let (pixels, steps) = plan.chunks(viewport: window.frame.size)
+        for step in steps {
+            if Task.isCancelled { return refuse("scroll interrupted; inspect the result before repeating input") }
+            if let why = window.staleness() { return refuse(why) }
+            guard SkyLight.scroll(dy: step.dy, dx: step.dx, pixels: pixels, at: target, pid: app.processIdentifier, window: window.windowID) else {
+                return refuse("couldn't construct a scroll event")
+            }
+            try? await Task.sleep(for: .milliseconds(30))
+        }
+        lastMethod = "pidwheel"
+        return nil
+    }
+
+    nonisolated static func pageScrollAction(_ direction: ScrollPlan.Direction) -> String {
+        switch direction {
+        case .up: return "AXScrollUpByPage"
+        case .down: return "AXScrollDownByPage"
+        case .left: return "AXScrollLeftByPage"
+        case .right: return "AXScrollRightByPage"
+        }
+    }
+
+    /// The AXScrollArea of the observed window under `point` (walking up from the app-only hit test).
+    private static func scrollArea(at point: CGPoint, pid: pid_t, window: WindowSnapshot) -> AXUIElement? {
+        var hit: AXUIElement?
+        guard AXUIElementCopyElementAtPosition(AXUIElementCreateApplication(pid), Float(point.x), Float(point.y), &hit) == .success,
+              var node = hit, window.containsElement(node) else { return nil }
+        for _ in 0..<20 {
+            if (axAttr(node, kAXRoleAttribute) as String?) == "AXScrollArea" { return node }
+            guard let parent: AXUIElement = axAttr(node, kAXParentAttribute) else { return nil }
+            node = parent
+        }
+        return nil
+    }
+
+    // MARK: - Native choose and secondary actions (Accessibility only; work behind the user's window)
+
+    enum SemanticOutcome: Equatable { case done(String), uncertain(String), refused(String) }
+
+    /// Picks `option` from a native pop-up button, combo box or menu button through Accessibility: open the
+    /// control (AXPress / AXShowMenu), press the exactly matching AXMenuItem once, then read the value back.
+    func choose(_ option: String, on el: UIElementInfo, in app: NSRunningApplication, window: WindowSnapshot) async -> SemanticOutcome {
+        refusal = nil
+        guard window.pid == app.processIdentifier, el.observationID == window.id, el.windowID == window.windowID else {
+            return .refused(refuse("the control belongs to another observation; look again"))
+        }
+        if let why = window.staleness(includeContent: true) { return .refused(refuse(why)) }
+        let control = el.element
+        var names: CFArray?
+        _ = AXUIElementCopyActionNames(control, &names)
+        let actions = names as? [String] ?? []
+        let opener = actions.contains("AXShowMenu") && el.role != "AXPopUpButton" ? "AXShowMenu" : kAXPressAction as String
+        guard actions.contains(opener) else { return .refused(refuse("this control offers no Accessibility menu to choose from")) }
+        buddy.click()
+        guard AXUIElementPerformAction(control, opener as CFString) == .success else {
+            return .uncertain("the menu may have opened; inspect before choosing again")
+        }
+        var items: [AXUIElement] = []
+        for _ in 0..<15 where items.isEmpty {
+            try? await Task.sleep(for: .milliseconds(40))
+            items = Self.menuItems(under: control) ?? Self.menuItems(under: AXUIElementCreateApplication(app.processIdentifier)) ?? []
+        }
+        let titles = items.map { (Self.axAttr($0, kAXTitleAttribute) as String?) ?? "" }
+        let wanted = option.trimmingCharacters(in: .whitespaces).lowercased()
+        var hits = titles.indices.filter { titles[$0].lowercased() == wanted }
+        if hits.isEmpty { hits = titles.indices.filter { titles[$0].lowercased().hasPrefix(wanted) } }
+        guard hits.count == 1 else {
+            _ = AXUIElementPerformAction(control, kAXCancelAction as CFString)
+            let offered = titles.filter { !$0.isEmpty }.prefix(20).joined(separator: ", ")
+            return .refused(refuse(hits.isEmpty ? "no “\(option)” in that menu; it has: \(offered)" : "“\(option)” matches several items; name one exactly"))
+        }
+        let item = items[hits[0]]
+        guard (Self.axAttr(item, kAXEnabledAttribute) as Bool?) != false else {
+            _ = AXUIElementPerformAction(control, kAXCancelAction as CFString)
+            return .refused(refuse("“\(titles[hits[0]])” is disabled"))
+        }
+        switch AXUIElementPerformAction(item, kAXPressAction as CFString) {
+        case .success: break
+        default: return .uncertain("the choice may have been applied; inspect before choosing again")
+        }
+        for _ in 0..<10 {
+            try? await Task.sleep(for: .milliseconds(40))
+            let value = (Self.axAttr(control, kAXValueAttribute) as String?) ?? (Self.axAttr(control, kAXTitleAttribute) as String?) ?? ""
+            if value.lowercased() == titles[hits[0]].lowercased() { return .done(titles[hits[0]]) }
+        }
+        return .uncertain("chose “\(titles[hits[0]])” once, but the control did not read it back")
+    }
+
+    /// Sets an element's AXValue once and reads it back (sliders, steppers, text fields, date pickers).
+    func setValue(_ value: String, on el: UIElementInfo, window: WindowSnapshot) -> SemanticOutcome {
+        refusal = nil
+        guard el.observationID == window.id, el.windowID == window.windowID else { return .refused(refuse("the element belongs to another observation; look again")) }
+        if let why = window.staleness(includeContent: true) { return .refused(refuse(why)) }
+        guard !Safety.isSecureField(el.element), Safety.secureInputBlock() == nil else { return .refused(refuse("secure input is active; no value was set")) }
+        var settable = DarwinBoolean(false)
+        guard AXUIElementIsAttributeSettable(el.element, kAXValueAttribute as CFString, &settable) == .success, settable.boolValue else {
+            return .refused(refuse("this element's value is not settable through Accessibility"))
+        }
+        let current: CFTypeRef? = Self.axAttr(el.element, kAXValueAttribute)
+        let typed: CFTypeRef
+        if current is NSNumber, let number = Double(value.trimmingCharacters(in: .whitespaces)) { typed = NSNumber(value: number) }
+        else { typed = value as CFString }
+        buddy.click()
+        switch AXUIElementSetAttributeValue(el.element, kAXValueAttribute as CFString, typed) {
+        case .success: break
+        case .attributeUnsupported, .illegalArgument: return .refused(refuse("the element rejected that value"))
+        default: return .uncertain("the value may have been set; read it before trying again")
+        }
+        let now: CFTypeRef? = Self.axAttr(el.element, kAXValueAttribute)
+        if let now, CFEqual(now, typed) { return .done(value) }
+        if let text = now as? String, typed is String, TextReadback.matches(expected: value, actual: text) { return .done(value) }
+        if let n = now as? NSNumber, let want = typed as? NSNumber, abs(n.doubleValue - want.doubleValue) < 1e-6 { return .done(value) }
+        return .uncertain("the value was set once but did not read back exactly")
+    }
+
+    /// Open menu items below `root` (breadth-first, bounded). nil when no open AXMenu is found.
+    private static func menuItems(under root: AXUIElement) -> [AXUIElement]? {
+        var queue: [(AXUIElement, Int)] = [(root, 0)], head = 0
+        while head < queue.count, head < 400 {
+            let (node, depth) = queue[head]; head += 1
+            let role: String? = Self.axAttr(node, kAXRoleAttribute)
+            if role == "AXMenu" {
+                let items = ((Self.axAttr(node, kAXChildrenAttribute) as [AXUIElement]?) ?? [])
+                    .filter { (Self.axAttr($0, kAXRoleAttribute) as String?) == "AXMenuItem" }
+                if !items.isEmpty { return items }
+            }
+            // Never walk into the menu bar: its items are not this control's popup.
+            if depth < 4, role != "AXMenuBar" {
+                queue.append(contentsOf: ((axAttr(node, kAXChildrenAttribute) as [AXUIElement]?) ?? []).map { ($0, depth + 1) })
+            }
+        }
+        return nil
+    }
+
+    /// Performs one advertised non-press AX action (AXShowMenu, AXIncrement, AXPick, …) on an element of the
+    /// observed window. Delivered once; a timeout is uncertainty, never a reason to repeat it.
+    func performSecondaryAction(_ name: String, on el: UIElementInfo, window: WindowSnapshot) -> SemanticOutcome {
+        refusal = nil
+        guard el.observationID == window.id, el.windowID == window.windowID else { return .refused(refuse("the element belongs to another observation; look again")) }
+        if let why = window.staleness(includeContent: true) { return .refused(refuse(why)) }
+        var names: CFArray?
+        guard AXUIElementCopyActionNames(el.element, &names) == .success, (names as? [String] ?? []).contains(name),
+              !BackgroundPolicy.secondaryActionDenylist.contains(name) else {
+            return .refused(refuse("\(name) is not one of this element's secondary actions"))
+        }
+        buddy.click()
+        switch AXUIElementPerformAction(el.element, name as CFString) {
+        case .success: return .done(name)
+        case .actionUnsupported: return .refused(refuse("the element rejected \(name)"))
+        default: return .uncertain("\(name) may have been applied; inspect before repeating it")
+        }
+    }
+
     // MARK: - Click options
 
     /// A pixel click with the requested button, count, modifiers and hold, after the same window and hit checks as
     /// every other click. AXPress cannot express any of these, so it is never used here.
     @discardableResult
     func click(at point: CGPoint, options: ClickOptions, pid: pid_t, window: WindowSnapshot) async -> String? {
-        guard !Background.active else { return refuse("button, count, modifier and hold options need foreground mode") }
         guard pid == window.pid, window.frame.contains(point) else { return refuse("the point is outside the observed target window; look again") }
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
+        if Background.active {
+            guard Self.skyCompatible(options) else { return refuse("modifier, hold, middle-button and triple-click options need foreground mode") }
+            buddy.click()
+            lastMethod = "background"
+            return backgroundClick(at: point, pid: pid, window: window, button: options.button == .right ? .right : .left, count: options.count)
+        }
         await buddy.travel(to: point)
         try? await Task.sleep(for: .milliseconds(80))
         if let why = window.staleness(includeContent: true) { return refuse(why) }
         if let why = hitCheck(point, pid: pid, window: window.element) { return refuse(why) }
         buddy.click()
-        let saved = Buddy.mouse()
+        let saved = Self.exactPointer()
         let source = CGEventSource(stateID: .hidSystemState)
         var flags: CGEventFlags = []
         if options.modifiers.contains(.command) { flags.insert(.maskCommand) }
@@ -488,9 +792,8 @@ final class Hand {
         var held = false
         defer {
             if held { post(upType, state: 1) }
-            // Make sure no modifier stays latched, then give the pointer back.
-            CGWarpMouseCursorPosition(saved)
-            CGAssociateMouseAndMouseCursorPosition(1)
+            // Make sure no modifier stays latched, then give the pointer back (exactly, fractions included).
+            Self.restorePointer(saved)
             cursorLeftAt = nil
         }
         for step in options.steps {
@@ -580,6 +883,31 @@ final class Hand {
         return await Task.detached { AXEngine.setState(element, to: desired) }.value
     }
 
+    /// Applies a formatting toggle to the current selection of the exact pinned window through the app's own menu
+    /// item (Format ▸ Font ▸ Bold), pressed while that window is the target's synthetic key window. A toolbar
+    /// toggle pressed while the window isn't key changes only the toggle: its nil-targeted action reaches no text.
+    /// Never activates or raises anything. The caller verifies the text's own formatting afterwards.
+    func applyFormattingInBackground(_ style: TextFormatting.Style, in app: NSRunningApplication, window: WindowSnapshot) async -> AXEngine.StateOutcome {
+        guard window.pid == app.processIdentifier, !Task.isCancelled else { return .refused("the formatting target changed; look again") }
+        if let why = window.staleness() { return .refused(why) }
+        guard let item = await Task.detached(operation: { AXEngine.formattingMenuItem(style, in: app) }).value else {
+            return .unsupported("\(app.cleanName ?? "the app") has no single enabled \(TextFormatting.menuTitle(for: style)) menu item to apply it in the background")
+        }
+        if let why = Safety.secureInputBlock() { return .refused(why) }
+        let session: SkyLight.KeyboardSession
+        switch SkyLight.beginKeyboard(in: window) {
+        case .failure(let error): return .refused(error.reason)
+        case .success(let value): session = value
+        }
+        let delivery = AXEngine.axPressDelivery(item)
+        guard session.finish() else { return .unverified("the formatting may have been applied, but temporary focus cleanup failed") }
+        switch delivery {
+        case .delivered: buddy.click(); return .changed
+        case .uncertain: return .unverified("the \(TextFormatting.menuTitle(for: style)) menu item was pressed but the app did not confirm")
+        case .unsupported: return .unsupported("the \(TextFormatting.menuTitle(for: style)) menu item can't be pressed through Accessibility")
+        }
+    }
+
     // MARK: - Text placement
 
     /// Inserts or appends text at the real caret instead of replacing the field. Where the field gives Accessibility
@@ -599,71 +927,97 @@ final class Hand {
 
     // MARK: - Keyboard
 
-    /// Replaces the focused field's text, typed at a human rhythm, and confirms it landed.
-    /// Falls back to pasting once; never leaves half a message behind for a Return to send.
-    func type(_ text: String, in app: NSRunningApplication) async -> Bool {
+    /// Replaces exactly one verified focused field. Once a mutation is dispatched, a missing readback
+    /// is uncertainty, never permission to clear, paste again, or append a second copy.
+    /// The last `type` went into a field that can't be read back: delivered, but not confirmed by readback.
+    private(set) var unreadableEntry = false
+
+    /// `target`: the field `focus` just verified (by id); its focus is re-checked the same way (app focus, or in the
+    /// background the pinned window's focused element). Without it, the app's focused text field in the window.
+    func type(_ text: String, in app: NSRunningApplication, window requested: WindowSnapshot? = nil, target: AXUIElement? = nil) async -> Bool {
         refusal = nil
+        unreadableEntry = false
+        guard !Task.isCancelled,
+              let window = requested ?? WindowSnapshot.capture(app, windowID: Background.active ? Background.nativeWindowID : nil, followAttachedSheet: true),
+              window.pid == app.processIdentifier, window.staleness(includeContent: true) == nil else {
+            _ = refuse("the text target is unavailable; observe again"); return false
+        }
+        let root = AXUIElementCreateApplication(app.processIdentifier)
+        let appFocused: AXUIElement? = AXEngine.attribute(root, kAXFocusedUIElementAttribute)
+        let candidate: AXUIElement?
+        if let target, Self.focusHeld(target, in: app, window: window.element, focusSet: true) {
+            // The app's focused element when it is the target or inside it; else the target the window reports.
+            candidate = appFocused.flatMap { [.target, .inside].contains(Self.focusRelation($0, to: target)) ? $0 : nil } ?? target
+        } else { candidate = target == nil ? appFocused : nil }
+        guard let field = candidate, window.containsElement(field), Self.isTextRole(AXEngine.attribute(field, kAXRoleAttribute)) else {
+            _ = refuse("no verified text field in the observed window"); return false
+        }
+        let holds = { Self.focusHeld(field, in: app, window: window.element, focusSet: target != nil) }
+        guard !Safety.isSecureField(field), Safety.secureInputBlock() == nil else {
+            _ = refuse("secure input is active; no text was sent"); return false
+        }
         buddy.setTyping(true)
         defer { buddy.setTyping(false) }
-        // Browser editors whose text Accessibility can't see (Google Docs shows only zero-width spaces): typing
-        // can't be checked, and the check-then-clear fallback would wipe the document. Paste it once, fast.
-        let invisible = CharacterSet.whitespacesAndNewlines.union(CharacterSet(charactersIn: "\u{200B}\u{200C}\u{200D}\u{FEFF}"))
-        if Launcher.isBrowser(app), (AXEngine.focusedValue(of: app) ?? "").trimmingCharacters(in: invisible).isEmpty {
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            AXEngine.paste(text)
-            return true
+        guard window.staleness(includeContent: true) == nil, holds(), !Task.isCancelled else {
+            _ = refuse("the target changed before text delivery; observe again"); return false
         }
-        // In a background run, long or multi-line text goes straight into the field: pasting would borrow the
-        // user's clipboard. Fields that don't take a set value (or don't show it) fall through to the usual ways.
-        if Background.active, text.count > 80 || text.contains("\n"), !Self.codeEditorIDs.contains(app.bundleIdentifier ?? ""),
-           AXEngine.setFocusedValue(text, in: app), await landed(text, in: app) {
-            return true
+        switch AXEngine.edit(text, mode: .replaceAll, field: field) {
+        case .done: return true
+        case .refused(let why), .unverified(let why): _ = refuse(why); return false
+        case .unsupported: break
         }
-        // Long text (an answer list, a write-up) is pasted: typing 2,000 characters takes minutes and trips the
-        // watchdog halfway, leaving half a message behind. Pasted line breaks don't send in chat apps.
-        if text.count > 300, !Self.codeEditorIDs.contains(app.bundleIdentifier ?? "") {
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            if !(AXEngine.focusedValue(of: app) ?? "").isEmpty {
-                AXEngine.selectAll()
-                try? await Task.sleep(for: .milliseconds(60))
+        let readable: String? = AXEngine.attribute(field, kAXValueAttribute)
+        let count: Int? = (AXEngine.attribute(field, kAXNumberOfCharactersAttribute) as NSNumber?)?.intValue
+        let plan = BackgroundPolicy.textEntryPlan(value: readable, characterCount: count)
+        if case .refuse(let why) = plan { _ = refuse(why); return false }
+        let before = readable ?? ""
+        guard window.staleness() == nil, holds() else {
+            _ = refuse("the field changed before typing; observe again"); return false
+        }
+        let keyboard: SkyLight.KeyboardSession
+        switch SkyLight.beginKeyboard(in: window) {
+        case .success(let session): keyboard = session
+        case .failure(let error): _ = refuse(error.reason); return false
+        }
+        defer { if !keyboard.finish() { _ = refuse("text may have been delivered, but temporary keyboard state could not be released") } }
+        if !before.isEmpty {
+            guard case .delivered = AXEngine.press(combo: "cmd+a", in: app, window: window) else {
+                _ = refuse("select-all was not confirmed; no replacement text was sent"); return false
             }
-            AXEngine.paste(text)
-            return await landed(text, in: app)
+            try? await Task.sleep(for: .milliseconds(60))
+            // A menu shortcut can be accepted without selecting this field. Do not overwrite until its
+            // selection is visible, including UTF-16 length for emoji and non-Latin text.
+            guard AXEngine.selection(of: field) == NSRange(location: 0, length: (before as NSString).length) else {
+                _ = refuse("the field did not confirm select-all; no replacement text was sent"); return false
+            }
         }
-        // Multi-line text is still typed (that's the point of watching it), with Shift+Return for line breaks.
-        if text.contains("\n") {
-            AXEngine.targetPid = app.processIdentifier
-            defer { AXEngine.targetPid = nil }
-            AXEngine.selectAll()
-            try? await Task.sleep(for: .milliseconds(80))
-            let code = Self.codeEditorIDs.contains(app.bundleIdentifier ?? "")
-            await enterText(text, codeEditor: code)
-            return await landed(text, in: app)
+        let characters = Array(text)
+        for offset in stride(from: 0, to: characters.count, by: 16) {
+            let chunk = String(characters[offset..<min(characters.count, offset + 16)])
+            guard !Task.isCancelled, window.staleness() == nil, holds(),
+                  !Safety.isSecureField(field), Safety.secureInputBlock() == nil else {
+                _ = refuse("typing stopped after partial delivery; inspect the field before continuing"); return false
+            }
+            AXEngine.type(chunk, to: app.processIdentifier)
+            try? await Task.sleep(for: .milliseconds(20))
         }
-        // Replace existing text only when there is some: ⌘A where there's nothing to select just beeps.
-        if let existing = AXEngine.focusedValue(of: app), !existing.isEmpty {
-            AXEngine.selectAll()
+        // Empty replacement still needs one edit when the AX value setter is unavailable.
+        if text.isEmpty, !before.isEmpty { _ = AXEngine.press(combo: "backspace", in: app, window: window) }
+        if readable == nil {
+            // Nothing to read back: delivered keystrokes are reported as such, never as a confirmed value.
+            guard keyboard.finish() else { _ = refuse("text may have been delivered, but temporary keyboard state could not be released"); return false }
+            unreadableEntry = true
+            return true
+        }
+        for _ in 0..<10 {
+            guard !Task.isCancelled else { _ = refuse("typing interrupted; inspect the existing text before continuing"); return false }
+            if (AXEngine.attribute(field, kAXValueAttribute) as String?) == text {
+                guard keyboard.finish() else { _ = refuse("text matches, but temporary keyboard state could not be released"); return false }
+                return true
+            }
             try? await Task.sleep(for: .milliseconds(60))
         }
-
-        // Keys go only to the target app, never to whatever else might grab focus meanwhile.
-        AXEngine.targetPid = app.processIdentifier
-        defer { AXEngine.targetPid = nil }
-        await keystrokes(text)
-        if Task.isCancelled || refusal != nil { return false }
-        if await landed(text, in: app) { return true }
-
-        // Some apps only accept keys through the system stream: retry by pasting that way,
-        // replacing (never appending to) what's there.
-        AXEngine.targetPid = nil
-        AXEngine.selectAll()
-        try? await Task.sleep(for: .milliseconds(60))
-        AXEngine.paste(text)
-        if await landed(text, in: app) { return true }
-        AXEngine.selectAll()
-        AXEngine.press(0x33)
+        _ = refuse("text was sent once but exact readback was not confirmed; inspect before retrying")
         return false
     }
 
@@ -713,6 +1067,7 @@ final class Hand {
         refusal = nil
         for ch in text {
             if Task.isCancelled { return }
+            if let why = Safety.secureInputBlock() { _ = refuse(why); return }
             AXEngine.type(String(ch))
             var ms = base + Double.random(in: 0...(base * 0.9))
             if ch == " " { ms += base * 0.5 }

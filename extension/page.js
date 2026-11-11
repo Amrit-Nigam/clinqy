@@ -1,13 +1,16 @@
 // Runs inside web pages (in the extension's isolated world). Installed by background.js before each command;
 // all page-side logic lives here so helpers are available to every command.
 (() => {
-  const HELPER_VERSION = 2;
+  const HELPER_VERSION = 10;
+  const waits = new Set();
+  function cancelWaits() { for (const cancel of [...waits]) cancel(); }
   if (window.__clinqy?.protocolVersion === 7 && window.__clinqy?.version === HELPER_VERSION) return;
   window.__clinqy?.dispose?.();
   const documentID = typeof crypto.randomUUID === "function" ? crypto.randomUUID()
     : Array.from(crypto.getRandomValues(new Uint8Array(16)), (v) => v.toString(16).padStart(2, "0")).join("");
   let snapshotID = null;
   let revision = 0;
+  let observedGeometry = null;
   const optionTargets = new Map();
   let nextOptionTarget = 0;
   const frameNodes = new WeakMap();
@@ -242,8 +245,61 @@ const SEL = [
   "a[href]", "button", "input:not([type=hidden])", "textarea", "select", "summary", "label[for]",
   "[role=button]", "[role=link]", "[role=tab]", "[role=menuitem]", "[role=checkbox]", "[role=radio]",
   "[role=option]", "[role=switch]", "[role=textbox]", "[role=combobox]", "[role=searchbox]", "[role=treeitem]", "[role=listbox]",
-  "[contenteditable=''], [contenteditable=true]", "[onclick]", "[tabindex]:not([tabindex='-1'])",
+  "[contenteditable=''], [contenteditable=true]", "[onclick]", "[tabindex]:not([tabindex='-1'])", "[aria-checked]",
 ].join(",");
+
+// Styled tick boxes: the real <input type=checkbox|radio> is invisible (opacity 0, 1px, clipped, display:none) and a
+// label or wrapper draws the box. That visible proxy is listed and clicked; its state is read from the input.
+const proxyControls = new WeakMap();   // visible proxy → the hidden input it stands for
+function controlOf(el) { return (el && proxyControls.get(el)) || el; }
+function visuallyHidden(el) {
+  const cs = getComputedStyle(el), r = el.getBoundingClientRect();
+  if (cs.display === "none" || cs.visibility === "hidden" || Number(cs.opacity) < 0.05) return true;
+  if (r.width < 3 || r.height < 3) return true;
+  if (/rect\(\s*0(px)?[\s,]+0(px)?[\s,]+0(px)?[\s,]+0(px)?\s*\)/.test(cs.clip || "") || /inset\(\s*50%\s*\)/.test(cs.clipPath || "")) return true;
+  return cs.position === "absolute" && (r.right < -500 || r.bottom < -500);
+}
+function boxShown(el) {
+  const r = el.getBoundingClientRect();
+  if (r.width < 6 || r.height < 6) return false;
+  const cs = getComputedStyle(el);
+  return cs.display !== "none" && cs.visibility !== "hidden" && Number(cs.opacity) >= 0.05;
+}
+// The visible thing a person clicks for a hidden tick box: its label (wrapping or for=), else a small wrapper.
+function tickProxy(input) {
+  for (const l of input.labels || []) if (boxShown(l)) return l;
+  for (let p = input.parentElement, k = 0; p && k < 3 && p !== document.body && p !== document.documentElement; p = p.parentElement, k++) {
+    if (!boxShown(p)) continue;
+    const r = p.getBoundingClientRect();
+    if (r.width > 900 || r.height > 160) break;           // a whole form row/section is not the control
+    if (p.querySelectorAll("input[type=checkbox], input[type=radio]").length > 1) break;
+    return p;
+  }
+  return null;
+}
+// Proxies for every hidden checkbox/radio among the candidates (refreshed each snapshot; geometry can change
+// without any DOM mutation). Returns the proxies to list and the hidden inputs they replace.
+function tickProxies(nodes) {
+  const proxies = [], replaced = new Set();
+  for (const el of nodes) {
+    if (el.tagName !== "INPUT" || !/^(checkbox|radio)$/.test(el.type) || !visuallyHidden(el)) continue;
+    const proxy = tickProxy(el);
+    if (!proxy || proxyControls.get(proxy) && proxyControls.get(proxy) !== el && proxyControls.get(proxy).isConnected) continue;
+    proxyControls.set(proxy, el);
+    proxies.push(proxy);
+    replaced.add(el);
+  }
+  return { proxies, replaced };
+}
+// Text for a tick box that has none of its own (an empty <div role=checkbox> beside its caption).
+function tickCaption(el) {
+  for (let p = el.parentElement, k = 0; p && k < 2; p = p.parentElement, k++) {
+    const t = squash(p.innerText);
+    if (t && t.length <= 160) return t;
+  }
+  const next = el.nextElementSibling;
+  return next ? squash(next.innerText).slice(0, 160) : "";
+}
 
 // Cache only the candidate set. Geometry, labels, values and checked states are read fresh on every snapshot.
 let candidateCache = null, shadowHosts = [];
@@ -273,6 +329,13 @@ function candidates() {
 // What an element is, as listed to the model (null = not worth listing). Shared by snapshot and re-finding.
 function describe(el) {
   const tag = el.tagName.toLowerCase();
+  const ctl = proxyControls.get(el);
+  if (ctl) {
+    const role = ctl.getAttribute("role") === "switch" ? "switch" : ctl.type === "radio" ? "radio" : "checkbox";
+    const text = squash(ctl.getAttribute("aria-label") || labelledBy(ctl) || el.innerText || ctl.title || tickCaption(el) || ctl.value || ctl.name || role).slice(0, 100);
+    const q = questionOf(ctl);
+    return { tag, role, text, editable: false, listbox: false, q: q && norm(q) !== norm(text) && !norm(text).includes(norm(q)) ? q : "" };
+  }
   const role = el.getAttribute("role") || (tag === "a" ? "link" : tag === "input" ? (el.type || "text") : tag);
   // Fields are named by their label, never by what's typed in them (so a name stays stable run to run).
   const isField = tag === "input" || tag === "textarea" || tag === "select";
@@ -282,9 +345,16 @@ function describe(el) {
     el.getAttribute("placeholder") || el.title || el.getAttribute("alt") || el.name || (tag === "button" || tag === "a" ? el.innerText : "") ||
     (tag === "input" && el.type === "submit" ? el.value : "") || "").slice(0, 100);
   const editable = tag === "input" || tag === "textarea" || el.isContentEditable || /textbox|combobox|searchbox/.test(role);
+  const tickable = /^(checkbox|radio|switch)$/.test(role) || el.getAttribute("aria-checked") !== null;
+  if (!text && tickable && !editable) {
+    const caption = tickCaption(el).slice(0, 100);
+    return caption ? { tag, role: /^(checkbox|radio|switch)$/.test(role) ? role : "checkbox", text: caption, editable: false, listbox: false, q: "" } : null;
+  }
   if (!text && !editable && !listbox) return null;
-  // Closed dropdown options aren't targets: the dropdown itself lists them.
-  if (role === "option") { const lb = el.closest("[role=listbox]"); if (lb && lb.getAttribute("aria-expanded") !== "true" && lb !== el) return null; }
+  // Expanded state normally belongs to the controlling combobox, not its listbox. A visible
+  // listbox without that attribute (including a persistent list) still exposes selectable options.
+  // Explicitly collapsed lists remain non-actionable; hidden lists are excluded by geometry.
+  if (role === "option") { const lb = el.closest("[role=listbox]"); if (lb && lb.getAttribute("aria-expanded") === "false" && lb !== el) return null; }
   // A label is listed through its control (one line per field or choice, not two) — unless the control is hidden
   // (styled checkboxes), when the label is the thing to click.
   if (tag === "label" && el.querySelector("[role=radio], [role=checkbox], [role=switch], input[type=radio], input[type=checkbox]")) return null;
@@ -341,6 +411,13 @@ function frameBoxes() {
       // needn't guess from URL/size. Absent API or a detached element leaves it null and the bridge falls back.
       let frameId = null;
       try { if (typeof chrome !== "undefined" && chrome.runtime && chrome.runtime.getFrameId) { const id = chrome.runtime.getFrameId(f); if (Number.isInteger(id) && id >= 0) frameId = id; } } catch {}
+      // Same-origin inline documents have no unique URL. Read their isolated-world helper identity,
+      // never a page-controlled DOM attribute; cross-origin/sandboxed access fails closed.
+      let inlineDocumentID = null;
+      try {
+        if (/^about:(blank|srcdoc)(?:[#?]|$)/.test(f.contentWindow.location.href))
+          inlineDocumentID = f.contentWindow.__clinqy?.documentID || null;
+      } catch {}
       // CSS transforms: a scaled frame draws its content at rect.width / offsetWidth; a rotated or skewed one has
       // no translation-only placement, which the bridge refuses to guess at.
       const ow = f.offsetWidth || 0, oh = f.offsetHeight || 0;
@@ -355,7 +432,7 @@ function frameBoxes() {
         if (Math.abs(v[1]) > 1e-6 || Math.abs(v[2]) > 1e-6) rotated = true;
       }
       const scaleX = Math.abs(sx - 1) < 0.005 ? 1 : sx, scaleY = Math.abs(sy - 1) < 0.005 ? 1 : sy;
-      return { nodeToken: frameNodes.get(f), frameId, src: f.src || "", x: r.left + (f.clientLeft + (parseFloat(cs.paddingLeft) || 0)) * scaleX,
+      return { nodeToken: frameNodes.get(f), frameId, inlineDocumentID, src: f.src || "", x: r.left + (f.clientLeft + (parseFloat(cs.paddingLeft) || 0)) * scaleX,
                y: r.top + (f.clientTop + (parseFloat(cs.paddingTop) || 0)) * scaleY,
                w: f.clientWidth, h: f.clientHeight, sx: scaleX, sy: scaleY, rotated, hidden: cs.visibility === "hidden" || cs.display === "none" };
     }).filter((f) => !f.hidden && f.w >= 80 && f.h >= 40 && f.x < vw && f.y < vh && f.x + f.w * f.sx > 0 && f.y + f.h * f.sy > 0);
@@ -367,6 +444,7 @@ function snapshot() {
   optionTargets.clear();
   const started = performance.now();
   const vw = innerWidth, vh = innerHeight;
+  observedGeometry={width:vw,height:vh,x:scrollX,y:scrollY};
   const seen = new Set(), listed = new Set();
   const out = [], picked = [], sigs = [];
   const act = deepActive();
@@ -374,7 +452,20 @@ function snapshot() {
   const boxOf = new Map(), boxRects = new Map(), panes = new Map();
   const countable = (el) => el.getClientRects().length && (/^(INPUT|TEXTAREA|SELECT|BUTTON)$/.test(el.tagName)
     || /^(listbox|radio|checkbox|textbox|combobox|switch|button)$/.test(el.getAttribute("role") || ""));
-  for (const el of candidates()) {
+  const allCandidates = candidates();
+  // Controls come before long link/list collections so a large navigation list cannot hide Cancel or Submit.
+  // Bounds limit sorting work; the explicit truncation flag is carried to the agent.
+  const priority = [], ordinary = [];
+  let ticks = { proxies: [], replaced: new Set() };
+  try { ticks = tickProxies(allCandidates.slice(0, 10000)); } catch {}
+  priority.push(...ticks.proxies);
+  for (const el of allCandidates.slice(0, 10000)) {
+    if (ticks.replaced.has(el)) continue;
+    if (/^(BUTTON|INPUT|TEXTAREA|SELECT)$/.test(el.tagName) || /^(button|textbox|combobox|checkbox|radio|switch)$/.test(el.getAttribute("role") || "")) priority.push(el);
+    else ordinary.push(el);
+  }
+  if (allCandidates.length > 10000) truncated = true;
+  for (const el of [...priority, ...ordinary]) {
     if (seen.has(el)) continue;
     seen.add(el);
     if (performance.now() - started > 700) { truncated = true; break; }   // huge pages: list what we have
@@ -419,6 +510,10 @@ function snapshot() {
         if (v && el.type !== "password") item.value = String(v).slice(0, 80);
         if (el.getAttribute("placeholder")) item.placeholder = el.getAttribute("placeholder").slice(0, 60);
       }
+      if (tag === "input" && el.type === "range") {
+        item.value = el.value;
+        item.range = `min=${el.min || "0"} max=${el.max || "100"} step=${el.step || "1"}`;
+      }
       if (tag === "select") {
         item.editable = true;
         item.value = el.options[el.selectedIndex] ? el.options[el.selectedIndex].text.trim() : "";
@@ -437,14 +532,16 @@ function snapshot() {
         item.value = (chosen ? optionText(chosen) : "") || (shown && shown !== text ? shown.slice(0, 80) : "") || "(nothing chosen)";
       }
       if (d.q) item.q = d.q;
-      if (el.required || el.getAttribute("aria-required") === "true" || /\*\s*$/.test(d.q || text)) item.required = true;
+      const ctl = controlOf(el);
+      if (ctl !== el) item.proxy = true;   // a label/wrapper standing in for a hidden checkbox/radio
+      if (el.required || ctl.required || el.getAttribute("aria-required") === "true" || /\*\s*$/.test(d.q || text)) item.required = true;
       if (el.getAttribute("aria-invalid") === "true") item.invalid = true;
       if (covered) item.covered = true;
       if (tag === "a" && el.href) item.href = el.href.slice(0, 120);
-      if (el.disabled || el.getAttribute("aria-disabled") === "true") item.disabled = true;
+      if (el.disabled || ctl.disabled || el.getAttribute("aria-disabled") === "true") item.disabled = true;
       // Tick boxes, radios and switches always say which way they are, so nothing gets clicked twice "to make sure".
       const tickable = /^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(role) || el.hasAttribute("aria-checked");
-      if (el.getAttribute("aria-checked") === "true" || el.checked) item.checked = true;
+      if (el.getAttribute("aria-checked") === "true" || el.checked || (ctl !== el && (ctl.checked || ctl.getAttribute("aria-checked") === "true"))) item.checked = true;
       else if (tickable) item.unchecked = true;
       if (el.getAttribute("aria-selected") === "true") item.selected = true;
       if (act && (act === el || (d.editable && act !== document.body && within(el, act)))) item.focused = true;
@@ -490,6 +587,14 @@ function target(index) {
   throw new Error("element w" + index + " is stale (the page changed); take a new look");
 }
 
+function coordinateGuard(x,y) {
+  const geometry=observedGeometry;
+  if(!geometry || geometry.width!==innerWidth || geometry.height!==innerHeight || geometry.x!==scrollX || geometry.y!==scrollY)
+    throw Error("the viewport moved or resized; observe again before coordinate input");
+  if(!Number.isFinite(x) || !Number.isFinite(y) || x<0 || y<0 || x>=innerWidth || y>=innerHeight)
+    throw Error("the coordinate is outside the observed viewport");
+  return {ok:true};
+}
 function validate(expected) {
   if (!expected || expected.documentID !== documentID || expected.snapshotID !== snapshotID || !snapshotID)
     throw new Error("stale browser observation; take a new look before acting");
@@ -550,6 +655,16 @@ function clickNode(el) {
 }
 
 // The real text input for an element: itself, or the input inside a wrapper (search boxes are often wrapped).
+function replaceEditableText(el, text) {
+  if (!el.isConnected || !el.isContentEditable) throw Error("the editable field changed; observe again");
+  el.focus({preventScroll:true});
+  if (!within(el, deepActive())) throw Error("the editor did not accept focus");
+  // Scope selection to this editor; document-wide selectAll can select unrelated page content.
+  const selection = window.getSelection(), range = document.createRange();
+  range.selectNodeContents(el);
+  selection.removeAllRanges(); selection.addRange(range);
+  if (!document.execCommand("insertText", false, text)) throw Error("the editor rejected text insertion; observe before another attempt");
+}
 function editableOf(el) {
   const isEdit = (e) => e && (e.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(e.tagName));
   if (isEdit(el)) return el;
@@ -568,9 +683,33 @@ function focus(index) {
   return { focused: !!a && within(el, a) };
 }
 
-// Sets text the way frameworks (React etc.) notice, for when keystrokes don't land.
+// Range controls expose numeric constraints; arbitrary ARIA/canvas sliders need their own interaction.
+function setRange(index, desired) {
+  const el = target(index);
+  if (el.tagName !== "INPUT" || el.type !== "range") return { refused: true, why: "Only native HTML range inputs support numeric set_state" };
+  if (el.disabled || el.matches(":disabled") || el.getAttribute("aria-disabled") === "true" || !hitPoint(el))
+    return { refused: true, why: "The range input is disabled or covered" };
+  if (typeof desired !== "number" || !Number.isFinite(desired)) return { refused: true, why: "Range state must be a finite number" };
+  const number = (raw, fallback) => raw !== "" && Number.isFinite(Number(raw)) ? Number(raw) : fallback;
+  const min = number(el.min, 0), max = number(el.max, 100);
+  const rawStep = number(el.step, 1), step = rawStep > 0 ? rawStep : 1;
+  const base = el.hasAttribute("min") ? number(el.min, 0) : number(el.getAttribute("value") || "", 0);
+  const units = (desired - base) / step;
+  if (desired < min || desired > max || max < min || (el.step !== "any" && Math.abs(units - Math.round(units)) > 1e-7))
+    return { refused: true, why: "Value violates the range minimum, maximum or step" };
+  if (el.valueAsNumber === desired) return { already: true, value: el.value };
+  Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value").set.call(el, String(desired));
+  el.dispatchEvent(new Event("input", { bubbles: true, composed: true }));
+  el.dispatchEvent(new Event("change", { bubbles: true }));
+  return { delivered: true, value: el.isConnected ? el.value : null, matches: el.isConnected && el.valueAsNumber === desired };
+}
+
+// Sets text the way frameworks (React etc.) notice, for when keystrokes do not land.
 function fill(index, text) {
   const el = editableOf(target(index));
+  if (el.disabled || el.readOnly || el.getAttribute("aria-disabled") === "true") throw Error("the field is disabled or read-only");
+  if (el.type === "file" || el.type === "password") throw Error("this field requires its dedicated input path");
+  if (editorKind(el) && !el.isContentEditable) throw Error("use keyboard input for this code editor");
   el.focus({ preventScroll: true });
   if (el.tagName === "SELECT") {
     // Dropdowns: pick the option whose text (or value) matches.
@@ -584,8 +723,7 @@ function fill(index, text) {
     return { value: opt.text };
   }
   if (el.isContentEditable) {
-    document.execCommand("selectAll", false);
-    document.execCommand("insertText", false, text);
+    replaceEditableText(el, String(text));
   } else {
     const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
     Object.getOwnPropertyDescriptor(proto, "value").set.call(el, text);
@@ -672,14 +810,30 @@ function activeOption(index, want) {
 
 // Uploads require an explicit input/label/unique container, or the document's sole file input.
 function fileInputCount() { return { count: document.querySelectorAll("input[type=file]").length }; }
+// The (usually hidden) file input behind an upload button, label or drop zone: itself, its label's control, the
+// input it names (for/aria-controls), the one inside it, or the only one in its nearby wrapper.
+function fileInputNear(el) {
+  if (el.matches("input[type=file]")) return el;
+  if (el.tagName === "LABEL" && el.control && el.control.type === "file") return el.control;
+  for (const attr of ["for", "aria-controls"]) {
+    const id = el.getAttribute(attr);
+    const named = id && document.getElementById(id);
+    if (named && named.matches && named.matches("input[type=file]")) return named;
+  }
+  const inner = [...el.querySelectorAll("input[type=file]")];
+  if (inner.length === 1) return inner[0];
+  if (inner.length > 1) throw new Error("ambiguous file upload fields; choose the exact input");
+  for (let p = el.parentElement, k = 0; p && k < 4 && p !== document.body && p !== document.documentElement; p = p.parentElement, k++) {
+    const near = [...p.querySelectorAll("input[type=file]")];
+    if (near.length === 1) return near[0];
+    if (near.length > 1) break;
+  }
+  return null;
+}
 function fileInputFor(index) {
   if (index >= 0) {
-    const el = target(index);
-    if (el.matches("input[type=file]")) return el;
-    if (el.tagName === "LABEL" && el.control && el.control.type === "file") return el.control;
-    const inner = [...el.querySelectorAll("input[type=file]")];
-    if (inner.length === 1) return inner[0];
-    if (inner.length > 1) throw new Error("ambiguous file upload fields; choose the exact input");
+    const near = fileInputNear(target(index));
+    if (near) return near;
   }
   const all = [...document.querySelectorAll("input[type=file]")];
   if (!all.length) throw new Error("this page has no file upload field (it may use its own picker, e.g. Google Drive)");
@@ -697,19 +851,56 @@ function markUpload(index) {
   return { ok: true };
 }
 
+// Tags the file input an upload goes into, so the bridge can hand it to the browser (CDP DOM.setFileInputFiles).
+function markFileInput(index, name) {
+  const input = fileInputFor(index);
+  document.querySelectorAll("[data-clinqy-file]").forEach((n) => n.removeAttribute("data-clinqy-file"));
+  const token = "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  input.setAttribute("data-clinqy-file", token);
+  return { token, multiple: !!input.multiple, accept: input.accept || "", shownBefore: fileNameShown(name) };
+}
+// Is the file name visible on the page now (many sites show "resume.pdf ✓" and reset their input after reading it)?
+function fileNameShown(name) {
+  const text = (document.body && document.body.innerText) || "";
+  return !!name && text.includes(name);
+}
+// After the bridge set the files: what the input holds, and whether the page shows the name.
+async function fileReadback(token, name, size, shownBefore = false) {
+  const input = document.querySelector('[data-clinqy-file="' + token + '"]');
+  if (input) input.removeAttribute("data-clinqy-file");
+  const has = (files) => files.some((f) => f.name === name && (!(size >= 0) || f.size === size));
+  let files = input ? [...(input.files || [])] : [];
+  // A name already on the page before the upload (an earlier attempt, the user's own text) proves nothing.
+  const showing = () => !shownBefore && fileNameShown(name);
+  let held = has(files), shown = showing();
+  for (let waited = 0; name && !held && !shown && waited < 1200; waited += 150) {   // its change handler may render the name a moment later
+    await new Promise((res) => setTimeout(res, 150));
+    files = input ? [...(input.files || [])] : [];
+    held = has(files); shown = showing();
+  }
+  return { ok: held || shown, held, shown, files: files.map((f) => f.name), attached: files.map((f) => ({ name: f.name, size: f.size, type: f.type })),
+           verified: held ? "file-input-readback" : shown ? "page-shows-file-name" : "none", serverAccepted: false, accept: input ? input.accept || "" : "" };
+}
+
 // Puts a file into an upload field without the Mac file picker (bytes come from the app, base64).
-function upload(index, name, type, b64) {
+async function upload(index, name, type, b64) {
   const input = fileInputFor(index);
   const bin = atob(b64);
   const bytes = new Uint8Array(bin.length);
   for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  const shownBefore = fileNameShown(name);
   const dt = new DataTransfer();
   if (input.multiple) for (const f of input.files || []) dt.items.add(f);
   dt.items.add(new File([bytes], name, { type: type || "application/octet-stream", lastModified: Date.now() }));
   input.files = dt.files;
+  // Read back before the page's handlers run: many read the file and then clear their input.
+  const assigned = [...(input.files || [])].some((f) => f.name === name && f.size === bytes.length);
   input.dispatchEvent(new Event("input", { bubbles: true }));
   input.dispatchEvent(new Event("change", { bubbles: true }));
-  return { ok: input.files.length > 0, files: [...input.files].map((f) => f.name), accept: input.accept || "" };
+  const token = "f" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+  input.setAttribute("data-clinqy-file", token);
+  const r = await fileReadback(token, name, bytes.length, shownBefore);
+  return { ...r, assigned, cleared: assigned && !r.held, via: "datatransfer" };
 }
 
 // Every question on the page (not just the visible part) with its current answer, for a check before submitting.
@@ -800,7 +991,24 @@ function readText() {
   // so verification sees the same confirmation the snapshot lists instead of deadlocking.
   const overlays = [...document.querySelectorAll('[role="dialog"], [role="alertdialog"], dialog[open], [aria-modal="true"]')]
     .filter(el => !main.contains(el) && visible(el)).map(el => el.innerText || "");
-  const text = [...new Set([...overlays, main.innerText || ""])].join("\n\n").replace(/\n{3,}/g, "\n\n").slice(0, 8000);
+  // Adjacent inline controls and status spans concatenate in innerText ("ReviewLocal review
+  // confirmed"). Preserve each visible semantic message as its own text boundary instead of
+  // weakening whole-word verification, which must still distinguish "paid" from "unpaid".
+  const messages = [];
+  let messageChars = 0;
+  for (const el of [...document.querySelectorAll('[role="status"], [role="alert"], [aria-live="polite"], [aria-live="assertive"]')].slice(0, 80)) {
+    if (!visible(el) || el.closest('[hidden], [aria-hidden="true"], [data-clinqy-overlay]')) continue;
+    let hidden = false;
+    for (let parent = el.parentElement; parent; parent = parent.parentElement) {
+      const style = getComputedStyle(parent);
+      if (style.display === "none" || style.visibility === "hidden" || Number(style.opacity) <= 0.05) { hidden = true; break; }
+    }
+    if (hidden) continue;
+    const message = squash(el.innerText);
+    if (!message || messages.includes(message) || message.length > 2000 || messageChars + message.length > 3000) continue;
+    messages.push(message); messageChars += message.length;
+  }
+  const text = [...new Set([...messages, ...overlays, main.innerText || ""])].join("\n\n").replace(/\n{3,}/g, "\n\n").slice(0, 8000);
   return { url: location.href, title: document.title, text };
 }
 
@@ -812,9 +1020,22 @@ function readText() {
     const inner = editableOf(el), a = deepActive();
     return { active: !!a && a !== document.body && (within(inner, a) || within(el, a)) && document.hasFocus() };
   }
+  // A tick control's value is its checked state ("checked"/"unchecked"), read from the hidden input for a styled
+  // label/wrapper proxy, so "verify w0 checked" has something real to compare.
+  function tickState(el) {
+    const ctl = controlOf(el);
+    const role = (ctl.getAttribute && ctl.getAttribute("role")) || (el.getAttribute && el.getAttribute("role")) || "";
+    const native = ctl.tagName === "INPUT" && /^(checkbox|radio)$/.test(ctl.type);
+    const aria = ctl.getAttribute && ctl.getAttribute("aria-checked") !== null ? ctl : el.getAttribute && el.getAttribute("aria-checked") !== null ? el : null;
+    if (!native && !aria && !/^(checkbox|radio|switch|menuitemcheckbox|menuitemradio)$/.test(role)) return null;
+    const on = native ? !!ctl.checked : aria ? aria.getAttribute("aria-checked") === "true" : false;
+    return on ? "checked" : "unchecked";
+  }
   function value(i) {
     let el = null; try { el = target(i); } catch {}
     if (!el) return { value: null };
+    const tick = tickState(el);
+    if (tick) return { value: tick };
     const f = editableOf(el);
     return { value: f.tagName === "SELECT" ? (f.options[f.selectedIndex] ? f.options[f.selectedIndex].text.trim() : "")
                                            : String(f.isContentEditable ? f.innerText : f.value || "").slice(0, 400) };
@@ -846,8 +1067,9 @@ function readText() {
     // A code editor's hidden textarea isn't its text: setting it would corrupt the editor. Leave it be.
     const ed = editorKind(el);
     if (ed && !el.isContentEditable) return { value: editorText(ed).slice(0, 400), skipped: true };
-    if (el.isContentEditable) { document.execCommand("selectAll", false); document.execCommand("insertText", false, text); }
+    if (el.isContentEditable) { replaceEditableText(el, String(text)); }
     else if (/^(INPUT|TEXTAREA)$/.test(el.tagName)) {
+      if (el.disabled || el.readOnly || /^(file|password)$/.test(el.type)) throw Error("this field cannot be filled through the active-value path");
       const proto = el.tagName === "TEXTAREA" ? HTMLTextAreaElement.prototype : HTMLInputElement.prototype;
       Object.getOwnPropertyDescriptor(proto, "value").set.call(el, text);
       el.dispatchEvent(new Event("input", { bubbles: true })); el.dispatchEvent(new Event("change", { bubbles: true }));
@@ -858,23 +1080,145 @@ function readText() {
     let el = null; try { el = target(i); } catch {}
     if (!el) return { ok: false };
     const field = editableOf(el);
-    const all = field.form ? [...field.form.querySelectorAll("input, textarea")] : [field];
-    all.forEach((f) => { if (f.type !== "password") f.setAttribute("autocomplete", "off"); });
-    return { ok: true };
+    // Preparation must not rewrite autocomplete on unrelated user fields.
+    return { ok: !field.disabled && !field.readOnly };
+  }
+  // The target's own state plus the URL: the only fields the app compares (no whole-page text hash or focus).
+  function targetState(el) {
+    const a = (n) => el && el.getAttribute(n);
+    const ctl = controlOf(el);
+    return JSON.stringify([el && el.checked, ctl !== el ? [ctl.checked, ctl.getAttribute("aria-checked")] : null, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
+      el && el.value, location.href]);
   }
   function state(i) {
     let el = null; try { el = target(i); } catch {}
-    const a = (n) => el && el.getAttribute(n);
-    return { sig: JSON.stringify([el && el.checked, a("aria-checked"), a("aria-expanded"), a("aria-selected"), a("aria-pressed"),
-      el && el.value, location.href, textHash(), document.activeElement === el]) };
+    return { sig: targetState(el) };
   }
-  // Cheap hash of the visible text: its length alone misses same-length changes ("Step 2" → "Step 4"),
-  // and a click that did work would then be clicked again by the fallback.
-  function textHash() {
-    const t = document.body ? document.body.innerText : "";
-    let h = 0;
-    for (let i = 0; i < t.length; i++) h = (h * 31 + t.charCodeAt(i)) | 0;
-    return t.length + ":" + h;
+  // Effect receipt: a MutationObserver armed before an input records what the page did in response, so an ordinary
+  // click's effect is reported with its result instead of costing a separate verification turn.
+  const receipts = new Map();
+  const dialogSelector = "dialog[open], [role=dialog], [role=alertdialog], [aria-modal=true]";
+  function openDialogs() {
+    try { return [...document.querySelectorAll(dialogSelector)].filter((d) => d.getAttribute("aria-hidden") !== "true" && visible(d)).length; }
+    catch { return 0; }
+  }
+  function nodeText(node) {
+    if (!node) return "";
+    if (node.nodeType === 3) return node.data || "";
+    if (node.nodeType !== 1 || /^(SCRIPT|STYLE|NOSCRIPT|TEMPLATE|svg)$/i.test(node.tagName || "")) return "";
+    return node.innerText || node.textContent || "";
+  }
+  // Text only counts as the input's effect where the input could have caused it: inside the target's own container
+  // (its nearest form/section/list item/landmark/dialog, at most 3 levels up), inside a dialog/alert/menu that opened
+  // after arming, or in a node that is itself such a popup. Clocks, tickers, chats and live regions elsewhere don't.
+  const containerSelector = "form, dialog, section, article, li, fieldset, main, nav, aside, header, footer, tr, [role=dialog], [role=alertdialog], " +
+    "[role=form], [role=region], [role=listitem], [role=row], [role=main], [role=navigation], [role=complementary], [role=banner], " +
+    "[role=contentinfo], [role=search], [role=menu], [role=listbox], [role=tabpanel], [role=group], [role=toolbar], [role=article]";
+  const openedSelector = "dialog, [role=dialog], [role=alertdialog], [role=alert], [role=menu], [role=listbox], [aria-modal=true], [popover]";
+  const timeChurn = /^(?:[\d\s:.,/%+\-–—]*|(?:about |over |almost |updated |edited )?(?:\d+\s*|(?:a|an|one)\s+)(?:s|secs?|seconds?|m|mins?|minutes?|h|hrs?|hours?|d|days?|w|wks?|weeks?|mo|months?|y|yrs?|years?)( ago)?|just now|now|(?:updated |edited )?(?:just now|moments? ago|yesterday|today))$/i;
+  function isChurn(text) { return timeChurn.test(squash(text)); }
+  function matchesSel(n, sel) { try { return !!(n && n.nodeType === 1 && n.matches && n.matches(sel)); } catch { return false; } }
+  function closestUp(n, sel) {
+    for (let x = n, k = 0; x && k < 200; x = x.parentNode || x.host, k++) if (matchesSel(x, sel)) return x;
+    return null;
+  }
+  function receiptScope(el) {
+    if (!el) return null;
+    let scope = el;
+    for (let n = el.parentNode || el.host, level = 1; n && n.nodeType === 1 && level <= 3; n = n.parentNode || n.host, level++) {
+      if (n === document.body || n === document.documentElement) break;
+      scope = n;
+      if (matchesSel(n, containerSelector)) break;
+    }
+    return scope;
+  }
+  function openedNow(rec, node) {
+    if (matchesSel(node, openedSelector)) return !rec.preOpened.has(node);
+    try { if (node && node.nodeType === 1 && node.querySelector && node.querySelector(openedSelector)) return true; } catch {}
+    return false;
+  }
+  // Is a change at `place` (the mutation's target) attributable to the input?
+  function attributable(rec, place) {
+    if (rec.scope && within(rec.scope, place)) return true;
+    const popup = closestUp(place, openedSelector);
+    return !!(popup && !rec.preOpened.has(popup));
+  }
+  // Armed right before delivery (after locate and the pointer's approach), so a hover tooltip is not the click's effect.
+  function receiptArm(token, index) {
+    if (typeof token !== "string" || !token || token.length > 80) throw new Error("receipt needs a token");
+    receiptDrop(token);
+    const el = Number.isInteger(index) ? target(index) : null;
+    let preOpened = new Set();
+    try { preOpened = new Set(document.querySelectorAll(openedSelector)); } catch {}
+    const rec = { el, scope: receiptScope(el), preOpened, addedEls: [], sig: el ? targetState(el) : null, url: location.href, active: deepActive(),
+      dialogs: openDialogs(), added: [], removed: [], size: 0, count: 0, structural: false, armedAt: performance.now(), last: performance.now() };
+    const keep = (list, text) => {
+      const t = squash(text);
+      if (!t || isChurn(t) || rec.size > 4000 || list.includes(t)) return;
+      list.push(t.slice(0, 400)); rec.size += Math.min(400, t.length);
+    };
+    rec.observer = new MutationObserver((records) => {
+      for (const m of records) {
+        rec.count++;
+        if (m.type === "childList") {
+          if ([...(m.addedNodes || []), ...(m.removedNodes || [])].some((n) => n.nodeType === 1)) rec.structural = true;
+          const here = attributable(rec, m.target);
+          for (const n of m.addedNodes || []) {
+            if (n.nodeType === 1 && rec.addedEls.length < 200) rec.addedEls.push(n);
+            if (here || openedNow(rec, n)) keep(rec.added, nodeText(n));
+          }
+          if (here) for (const n of m.removedNodes || []) keep(rec.removed, nodeText(n));
+        } else if (m.type === "characterData") {
+          const now = squash(m.target && m.target.data), was = squash(m.oldValue);
+          if (now !== was && !(isChurn(now) && isChurn(was)) && attributable(rec, m.target)) { keep(rec.added, now); keep(rec.removed, was); }
+        }
+      }
+      rec.last = performance.now();
+    });
+    rec.observer.observe(document.documentElement, { childList: true, subtree: true, characterData: true, characterDataOldValue: true,
+      attributes: true, attributeFilter: ["open", "hidden", "aria-hidden", "aria-expanded", "aria-checked", "aria-selected", "aria-pressed", "checked", "value", "disabled"] });
+    rec.expiry = setTimeout(() => receiptDrop(token), 15000);
+    receipts.set(token, rec);
+    return { armed: true, url: rec.url };
+  }
+  function receiptDrop(token) {
+    const rec = receipts.get(token);
+    if (!rec) return;
+    try { rec.observer.disconnect(); } catch {}
+    clearTimeout(rec.expiry);
+    receipts.delete(token);
+  }
+  // Waits until the DOM has been quiet for `quietMs` (or `capMs` passed), then reports what changed.
+  function receiptCollect(token, quietMs = 120, capMs = 800) {
+    const rec = receipts.get(token);
+    if (!rec) throw new Error("no armed receipt " + token);
+    const quiet = Math.max(30, Math.min(1000, Number(quietMs) || 120)), cap = Math.max(quiet, Math.min(3000, Number(capMs) || 800));
+    const started = performance.now();
+    return new Promise((resolve) => {
+      const tick = () => {
+        const now = performance.now();
+        if (now - Math.max(rec.last, started) < quiet && now - started < cap) { setTimeout(tick, 30); return; }
+        try { rec.observer.takeRecords && rec.observer.takeRecords(); } catch {}
+        const el = rec.el;
+        const connected = !!(el && el.isConnected);
+        const result = {
+          urlChanged: location.href !== rec.url,
+          targetStateChanged: !!(el && connected && targetState(el) !== rec.sig),
+          targetRemoved: !!(el && !connected),
+          dialogOpened: openDialogs() > rec.dialogs,
+          focusChanged: deepActive() !== rec.active,
+          focusIntoNew: (() => { const a = deepActive(); return !!(a && a !== rec.active && rec.addedEls.some((n) => within(n, a))); })(),
+          addedText: rec.added.join(" | ").slice(0, 600),
+          removedText: rec.removed.join(" | ").slice(0, 600),
+          mutationCount: rec.count,
+          structural: rec.structural,
+          waitedMs: Math.round(now - started),
+        };
+        receiptDrop(token);
+        resolve(result);
+      };
+      tick();
+    });
   }
   // Apps like the AWS console scroll an inner panel, not the window: scroll whichever actually moves.
   function scroller() {
@@ -903,13 +1247,22 @@ function readText() {
     }
     return best;
   }
-  function scroll(dy) {
-    const el = scroller();
-    // Reports movement, not just a delivered wheel: a page at its boundary (or one that swallows the scroll) says so.
-    if (el) { const before = el.scrollTop; el.scrollBy({ top: dy, behavior: "instant" }); return { y: el.scrollTop, before, moved: el.scrollTop !== before, container: "element" }; }
-    const before = scrollY;
-    window.scrollBy({ top: dy, behavior: "instant" });
-    return { y: scrollY, before, moved: scrollY !== before, container: "page" };
+  function scroll(dy, index = null, dx = 0) {
+    if (!Number.isFinite(dy) || !Number.isFinite(dx)) throw Error("scroll distances must be finite");
+    let el = Number.isInteger(index) ? target(index) : scroller();
+    if (el && Number.isInteger(index)) {
+      while (el && el !== document.documentElement) {
+        const style=getComputedStyle(el);
+        if ((dy && el.scrollHeight > el.clientHeight+2 && /auto|scroll|overlay/.test(style.overflowY)) ||
+            (dx && el.scrollWidth > el.clientWidth+2 && /auto|scroll|overlay/.test(style.overflowX))) break;
+        el=el.parentElement || el.getRootNode()?.host;
+      }
+    }
+    const box=el || document.scrollingElement || document.documentElement;
+    const before=box.scrollTop, beforeX=box.scrollLeft;
+    box.scrollBy({top:dy,left:dx,behavior:"instant"});
+    return {y:box.scrollTop,x:box.scrollLeft,before,beforeX,moved:box.scrollTop!==before || box.scrollLeft!==beforeX,
+      container:box===document.scrollingElement?"page":"element",atStart:box.scrollTop<=0,atEnd:box.scrollTop+box.clientHeight>=box.scrollHeight-1};
   }
   // The selected text plus where its links go: "Apply here" alone loses the application URL the user meant.
   function selection() {
@@ -963,36 +1316,70 @@ function readText() {
 
   // Resolves as soon as `want` shows in the page's text or title — or, with gone, has stayed gone for half a second —
   // woken by the page's own changes (a MutationObserver) rather than polled; { met: false } at the timeout.
-  function waitText(want, gone, ms) {
-    const w = norm(want);
-    const has = () => norm(document.title + " " + (document.body ? document.body.innerText : "")).includes(w);
-    return new Promise((resolve) => {
-      let done = false, queued = false, goneTimer = null, obs = null, timer = null;
-      const finish = (met) => {
-        if (done) return;
-        done = true;
-        if (obs) obs.disconnect();
-        clearTimeout(timer); clearTimeout(goneTimer);
-        resolve({ met });
+  function waitCondition(condition, ms = 10000) {
+    if (!condition || !["text", "url", "ready", "element"].includes(condition.kind)) throw Error("unsupported wait condition");
+    if (["text","url"].includes(condition.kind) && !String(condition.text || "").trim()) throw Error("wait text must not be empty");
+    const expectedDocument=documentID;
+    const matches = () => {
+      if (condition.kind === "ready") return document.readyState === "interactive" || document.readyState === "complete";
+      if (condition.kind === "url") return location.href.includes(String(condition.text));
+      if (condition.kind === "element") {
+        let el;
+        try { el=target(condition.index); } catch { return condition.state === "gone"; }
+        if (condition.state === "gone") return !visible(el);
+        if (condition.state === "enabled") return visible(el) && !el.disabled && el.getAttribute("aria-disabled") !== "true";
+        return visible(el);
+      }
+      const content=norm(pageTitle()+" "+(document.body?.innerText || ""));
+      const present=content.includes(norm(condition.text));
+      return condition.gone ? !present : present;
+    };
+    return new Promise(resolve => {
+      let done=false,observer,timer,poll,mutationTimer,stableSince=null;
+      const started=performance.now();
+      const finish=(met,cancelled=false)=>{
+        if(done)return; done=true; observer?.disconnect(); clearTimeout(timer); clearTimeout(mutationTimer); clearInterval(poll); waits.delete(cancel);
+        resolve({met,cancelled,documentID:expectedDocument,elapsedMs:Math.round(performance.now()-started)});
       };
-      const check = () => {
-        queued = false;
-        if (done) return;
-        const seen = has();
-        if (!gone) { if (seen) finish(true); return; }
-        if (seen) { clearTimeout(goneTimer); goneTimer = null; }
-        else if (!goneTimer) goneTimer = setTimeout(() => { goneTimer = null; if (!has()) finish(true); }, 500);
+      const cancel=()=>finish(false,true);
+      const check=()=>{
+        if(done)return;
+        let met=false; try {met=matches();} catch {}
+        if(!met){stableSince=null;return;}
+        if(stableSince===null)stableSince=performance.now();
+        const stableMs=condition.gone || condition.state==="gone" ? 400 : 80;
+        if(performance.now()-stableSince>=stableMs)finish(true);
       };
-      // Bursts of changes are read once (innerText lays the page out): at most every 80 ms.
-      obs = new MutationObserver(() => { if (!queued) { queued = true; setTimeout(check, 80); } });
-      obs.observe(document.documentElement, { childList: true, subtree: true, characterData: true, attributes: true,
-                                              attributeFilter: ["hidden", "style", "class", "aria-hidden", "open"] });
-      timer = setTimeout(() => finish(false), Math.max(100, ms));
+      waits.add(cancel);
+      observer=new MutationObserver(()=>{if(!mutationTimer)mutationTimer=setTimeout(()=>{mutationTimer=null;check();},80);});
+      observer.observe(document.documentElement,{childList:true,subtree:true,characterData:true,attributes:true,
+        attributeFilter:["hidden","style","class","aria-hidden","disabled","aria-disabled","open"]});
+      poll=setInterval(check,100); // URL/ready/value changes need not mutate the DOM.
+      timer=setTimeout(()=>finish(false),Math.max(100,Math.min(30000,Number(ms)||10000)));
       check();
     });
   }
+  function pageTitle() { return window.__clinqyActivity?.pageTitle?.() || document.title; }
+  // In a tab the user handed over (adopted), their own click, key, scroll or touch means they want it back. Only
+  // trusted events are reported; the extension discards those arriving while it is sending its own CDP input.
+  const USER_EVENTS = ["pointerdown", "mousedown", "keydown", "wheel", "touchstart"];
+  let watchingUser = false, lastUserReport = 0;
+  function onUserEvent(event) {
+    if (!event.isTrusted) return;
+    const now = Date.now();
+    if (now - lastUserReport < 100) return;
+    lastUserReport = now;
+    try { chrome.runtime.sendMessage({ clinqy: "userInput", kind: event.type })?.catch?.(() => {}); } catch {}
+  }
+  function watchUser(on) {
+    if (on && !watchingUser) for (const type of USER_EVENTS) addEventListener(type, onUserEvent, { capture: true, passive: true });
+    if (!on && watchingUser) for (const type of USER_EVENTS) removeEventListener(type, onUserEvent, { capture: true });
+    watchingUser = !!on;
+    return { watching: watchingUser };
+  }
+  function waitText(want,gone,ms) { return waitCondition({kind:"text",text:want,gone},ms); }
 
-  window.__clinqy = { version: HELPER_VERSION, dispose: () => candidateObserver.disconnect(), protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
+  window.__clinqy = { version: HELPER_VERSION, dispose: () => { candidateObserver.disconnect(); cancelWaits(); watchUser(false); }, protocolVersion: 7, documentID, validate, invoke, check: () => ({ ok: true }),
     focusStatus: () => ({ documentID, hasFocus: document.hasFocus(), frame: /^(IFRAME|FRAME)$/.test((deepActive() || {}).tagName || "") }),
-    frameBoxes, snapshot, locate, alive, activityPoint, focusFor, activeOption, markUpload, click, clickOption, focus, fill, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, scroll, selection, waitText };
+    frameBoxes, snapshot, coordinateGuard, locate, alive, activityPoint, focusFor, activeOption, markUpload, markFileInput, fileReadback, click, clickOption, focus, fill, setRange, findOption, chosen, upload, fileInputCount, review, readText, tables, images, isActive, value, values, activeValue, fillActive, prepare, state, receiptArm, receiptCollect, receiptDrop, scroll, selection, waitText, waitCondition, cancelWaits, watchUser };
 })();

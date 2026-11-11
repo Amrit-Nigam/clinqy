@@ -14,9 +14,17 @@ enum AgentScreen {
     private(set) static var id: CGDirectDisplayID?
     private static var idleCheck: Timer?
 
+    /// Opt-in only (AGENT_SCREEN=1 in Clinqy's config or environment). By default no path makes the virtual display:
+    /// background browser work stays in owned/adopted tabs and native work in the pinned-window lane, so windows are
+    /// never moved off the user's screen. Every caller already handles `ensure()` returning nil.
+    nonisolated static var optedIn: Bool {
+        ["1", "on", "yes", "true"].contains((Config.value("AGENT_SCREEN") ?? "").lowercased())
+    }
+
     /// Its bounds in global top-left coordinates (CGEvent/Accessibility space), making it if needed.
-    /// nil when this macOS can't make one (the caller works behind the user's windows instead).
+    /// nil when this macOS can't make one, or it isn't opted in (the caller works behind the user's windows instead).
     static func ensure() -> CGRect? {
+        guard optedIn else { return nil }
         if let id, CGDisplayIsActive(id) != 0 || CGDisplayIsOnline(id) != 0 { return CGDisplayBounds(id) }
         guard let made = make() else { return nil }
         display = made.display

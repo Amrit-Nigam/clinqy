@@ -13,6 +13,7 @@ const storage = {
 const tabs = new Map([[1, { id: 1, windowId: 5, active: true, url: 'https://personal.test' }]]);
 let next = 10, denyAttach = false, denyCreate = false;
 const chrome = {
+  scripting: {async executeScript() { return []; }},
   storage: { session: storage, local: storage },
   runtime: { onStartup: event, onInstalled: event },
   alarms: { create() {}, onAlarm: event },
@@ -43,7 +44,8 @@ assert.equal(calls.find(c => c[0] === 'create')[1].active, false);
 assert.equal(tabs.get(1).active, true);
 assert(calls.some(c => c[0] === 'Emulation.setFocusEmulationEnabled' && c[2].enabled));
 assert(calls.some(c => c[0] === 'Page.setInterceptFileChooserDialog' && c[2].enabled));
-assert(calls.some(c => c[0] === 'Emulation.setDeviceMetricsOverride' && c[2].width === 1280));
+assert(calls.some(c => c[0] === 'Emulation.clearDeviceMetricsOverride'));
+assert(!calls.some(c => c[0] === 'Emulation.setDeviceMetricsOverride'), 'signed-in work tabs preserve natural browser viewport');
 const list = await context.handle({ cmd: 'tabs', workOnly: true });
 assert.deepEqual(Array.from(list.tabs, t => t.id), [10]);
 for (const cmd of ['snapshot', 'navigate', 'closeTab', 'switchTab', 'captureTask']) {
@@ -159,3 +161,38 @@ assert.equal(metadata.tabs.find(tab=>tab.id===1).url,longAssignmentURL);
 assert(!calls.slice(metadataBefore).some(call=>['attach','update','focusWindow','create','remove'].includes(call[0])));
 await assert.rejects(context.handle({cmd:'snapshot',workOnly:true,tabId:1}),/does not belong/);
 console.log('PASS existing-tab metadata preserves full lab URLs without granting page access, attaching, focusing or modifying tabs');
+
+chrome.scripting = {async executeScript({target}) {
+  assert.deepEqual(Array.from(target.frameIds), [0]);
+  return [{result:{url:'https://task.test/ready',ready:'interactive'}}];
+}};
+tabs.get(1).status = 'loading';
+const ready = await context.serializedHandle({cmd:'tabInfo',tabId:1});
+assert.equal(ready.ready,'interactive');
+assert.equal(ready.url,'https://task.test/ready');
+assert.equal(ready.status,'loading');
+chrome.scripting.executeScript = async () => { throw Error('navigation replaced document'); };
+const fallback = await context.serializedHandle({cmd:'tabInfo',tabId:1});
+assert.equal(fallback.ready,undefined);
+assert.equal(fallback.url,longAssignmentURL);
+assert.equal(fallback.status,'loading');
+console.log('PASS DOM readiness and live URL are reported despite loading resources; scripting failures retain tab status fallback');
+
+// Test cleanup is explicit and scoped; ordinary completion still preserves user artifacts.
+const cleanupA = await context.handle({ cmd: 'clinqyTab', url: 'https://cleanup.test/a' });
+const cleanupB = await context.handle({ cmd: 'clinqyTab', url: 'https://cleanup.test/b' });
+const cleanupC = await context.handle({ cmd: 'clinqyTab', url: 'https://cleanup.test/c' });
+const unrelated = await context.handle({ cmd: 'clinqyTab', url: 'https://other-run.test' });
+tabs.get(cleanupB.id).active = true;
+tabs.get(cleanupC.id).audible = true;
+await context.handle({ cmd: 'clinqyDone', tabIds: [cleanupA.id] });
+assert(tabs.has(cleanupA.id), 'ordinary completion preserves its result');
+await context.handle({ cmd: 'clinqyDone', closeInactive: true });
+assert(tabs.has(cleanupA.id), 'cleanup without explicit IDs never sweeps tabs');
+const cleanup = await context.handle({ cmd: 'clinqyDone', tabIds: [cleanupA.id, cleanupB.id, cleanupC.id, 1], closeInactive: true });
+assert.deepEqual(Array.from(cleanup.closed), [cleanupA.id]);
+assert(!tabs.has(cleanupA.id));
+assert(tabs.has(cleanupB.id) && tabs.has(cleanupC.id) && tabs.has(unrelated.id) && tabs.has(1));
+assert(!data.opened.includes(cleanupA.id) && !data.workTabs.includes(cleanupA.id));
+assert(data.workTabs.includes(unrelated.id));
+console.log('PASS test cleanup closes only explicit owned inactive silent tabs and preserves concurrent runs');
